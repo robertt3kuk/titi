@@ -43,6 +43,7 @@ pub struct ToolAgentRunner {
     touched: TouchedSink,
     approval_mode: ApprovalMode,
     max_rounds: u32,
+    mask_ips: bool,
 }
 
 impl ToolAgentRunner {
@@ -64,7 +65,14 @@ impl ToolAgentRunner {
             // Read-tier calls proceed; the registry decides what else exists.
             approval_mode: ApprovalMode::Write,
             max_rounds: DEFAULT_AGENT_ROUNDS,
+            mask_ips: true,
         }
+    }
+
+    /// Whether IPv4 addresses in tool output are masked; keys always are.
+    pub fn with_mask_ips(mut self, mask: bool) -> Self {
+        self.mask_ips = mask;
+        self
     }
 
     /// Sets the round cap.
@@ -187,6 +195,7 @@ impl AgentRunner for ToolAgentRunner {
                 &self.touched,
                 &self.claims,
                 &request.id,
+                self.mask_ips,
             )
             .await;
             messages.push(ChatMessage {

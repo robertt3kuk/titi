@@ -5,7 +5,7 @@ use titi_engine::{
     ModelDescriptor, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig, TrajectorySink,
 };
 use titi_providers::ApiKind;
-use titi_tools::{ApprovalMode, ToolRegistry, workspace_tools_with_cache};
+use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_policy};
 
 pub fn default_registry_config() -> ProviderRegistryConfig {
     ProviderRegistryConfig {
@@ -146,6 +146,40 @@ pub fn tail(
 }
 
 /// Parses `--approval <always-ask|write|yolo>`.
+/// Privacy from settings: which files are credentials, and whether IPv4
+/// addresses are masked in tool output.
+///
+/// A cloned repo controls its `.titi/config.yml`, so it may add sensitive
+/// files but can never turn masking off or open a file: `privacy.maskIps`
+/// and `privacy.allow` are read from the user's own layers only.
+pub fn privacy_policy(settings: &titi_config::settings::Settings) -> (SensitivePolicy, bool) {
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let extra = settings
+        .layer_values("privacy.sensitive")
+        .iter()
+        .flat_map(strings)
+        .collect();
+    let allow = settings
+        .get_user("privacy.allow")
+        .map(|value| strings(&value))
+        .unwrap_or_default();
+    let mask_ips = settings
+        .get_user("privacy.maskIps")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    (SensitivePolicy::new(extra, allow), mask_ips)
+}
+
 pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "always-ask" | "ask" => Ok(ApprovalMode::AlwaysAsk),
@@ -232,20 +266,28 @@ pub fn start_engine_with(
     // builds a ToolAgentRunner and hands it its own claims, touched set and
     // read cache. Passing a StreamingAgentRunner here would take its place and
     // leave the subagent unable to call a single tool.
+    let agent_dir = titi_config::agent_dir();
+    let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
+    // A config that fails to load keeps the strict defaults.
+    let (sensitive, mask_ips) = settings
+        .as_ref()
+        .map(privacy_policy)
+        .unwrap_or_else(|| (SensitivePolicy::default(), true));
+    engine_config.sensitive = sensitive.clone();
+    engine_config.mask_ips = mask_ips;
     let mut tools = ToolRegistry::new();
     // One cache for the main turn and every subagent it spawns.
     let read_cache = titi_tools::ReadCache::default();
     engine_config.read_cache = read_cache.clone();
-    for tool in workspace_tools_with_cache(&workspace, read_cache) {
+    for tool in workspace_tools_with_policy(&workspace, read_cache, sensitive) {
         tools.register(Arc::from(tool));
     }
-    let agent_dir = titi_config::agent_dir();
     tools.register(std::sync::Arc::new(
         titi_memory::tool::MemoryTool::with_providers(agent_dir.clone(), provider_ids),
     ));
     // `memory.embeddingModel` picks the vector space. Empty or "local" keeps
     // the trigram embedder; a model id is resolved through the registry.
-    if let Ok(settings) = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]) {
+    if let Some(settings) = &settings {
         engine_config.embedding_model = settings
             .get("memory.embeddingModel")
             .and_then(|v| v.as_str().map(str::to_owned))

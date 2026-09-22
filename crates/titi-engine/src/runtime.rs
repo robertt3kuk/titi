@@ -113,6 +113,12 @@ pub struct EngineConfig {
     /// Embeddings model from `memory.embeddingModel`. `None` uses the local
     /// trigram embedder, which needs no network.
     pub embedding_model: Option<String>,
+    /// Which files the subagent's tools refuse as credentials. The surface
+    /// builds the main turn's tools with the same policy.
+    pub sensitive: titi_tools::SensitivePolicy,
+    /// Mask IPv4 addresses in tool output (`privacy.maskIps`). Keys are
+    /// masked regardless.
+    pub mask_ips: bool,
 }
 
 impl EngineConfig {
@@ -137,6 +143,8 @@ impl EngineConfig {
             compaction: titi_core::compaction::CompactionPolicy::default(),
             agent_dir: None,
             embedding_model: None,
+            sensitive: titi_tools::SensitivePolicy::default(),
+            mask_ips: true,
         }
     }
 }
@@ -288,7 +296,11 @@ impl EngineRuntime {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
             let mut tools = ToolRegistry::new();
-            for tool in titi_tools::workspace_tools_with_cache(&root, config.read_cache.clone()) {
+            for tool in titi_tools::workspace_tools_with_policy(
+                &root,
+                config.read_cache.clone(),
+                config.sensitive.clone(),
+            ) {
                 tools.register(Arc::from(tool));
             }
             if !config.agent_writes {
@@ -304,7 +316,8 @@ impl EngineRuntime {
                     claims.clone(),
                     Arc::clone(&touched),
                 )
-                .with_max_rounds(config.agent_rounds),
+                .with_max_rounds(config.agent_rounds)
+                .with_mask_ips(config.mask_ips),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
         let agents = runner.map(|runner| {
@@ -798,6 +811,7 @@ async fn run_turn(
                             &touched,
                             &claims,
                             &MAIN_AGENT,
+                            config.mask_ips,
                         )
                         .await;
                         messages.extend(extra);

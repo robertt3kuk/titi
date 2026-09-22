@@ -178,6 +178,37 @@ async fn tool_output_is_masked_before_the_model_sees_it() {
     assert!(output.contains("host [ip]"), "{output}");
 }
 
+/// Turning address masking off is the user's call; keys stay masked anyway.
+#[tokio::test]
+async fn with_ip_masking_off_keys_are_still_masked() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events(
+            "echo",
+            r#"{"text":"KEY=sk-test-0000000000000000 host 203.0.113.7"}"#,
+        )),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.mask_ips = false;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), echo_registry());
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished { output, .. } => Some(output.to_string()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!output.contains("sk-test-0000000000000000"), "{output}");
+    assert!(output.contains("203.0.113.7"), "{output}");
+}
+
 #[tokio::test]
 async fn fragmented_tool_arguments_reach_the_handler_joined() {
     // The arguments arrive as fragments, the way a real OpenAI-compatible

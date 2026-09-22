@@ -119,6 +119,7 @@ pub(crate) async fn execute_tools(
     touched: &TouchedSink,
     claims: &Claims,
     agent_id: &SmolStr,
+    mask_ips: bool,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut assistant_calls = Vec::new();
@@ -202,6 +203,12 @@ pub(crate) async fn execute_tools(
                 .await
             }
         };
+        // Everything below goes to the provider, the transcript, and the
+        // session file. A key or a server address the tool printed stops here.
+        let result = Executed {
+            output: mask(&result.output, mask_ips).into(),
+            ..result
+        };
         if let Some(recorder) = trajectory.lock().await.as_mut() {
             let _ = recorder.record(titi_core::trajectory::EventKind::ToolResult {
                 id: result.call_id.to_string(),
@@ -224,6 +231,14 @@ pub(crate) async fn execute_tools(
         });
     }
     messages
+}
+
+fn mask(output: &str, mask_ips: bool) -> String {
+    if mask_ips {
+        titi_memory::redact::redact_for_model(output).text
+    } else {
+        titi_memory::redact::redact(output).text
+    }
 }
 
 struct Executed {
@@ -273,9 +288,6 @@ async fn invoke_one(
     }
     let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let ToolResult { output, is_error } = handler.invoke(args).await;
-    // Everything below goes to the provider, the transcript, and the session
-    // file. A key or a server address the tool printed stops here.
-    let output = titi_memory::redact::redact_for_model(&output).text.into();
     Executed {
         call_id: call.call_id,
         output,
