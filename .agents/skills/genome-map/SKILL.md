@@ -18,8 +18,9 @@ From the titi repo (compiles the example on first run):
 cargo run -p titi-genome --example map -- <path> <N>
 ```
 
-Or the prebuilt release binary (no compile), which already exists at
-`~/bin/titi-map`:
+Or the prebuilt release binary (no compile), if installed at
+`~/bin/titi-map` (it may be older than the source; otherwise use the
+`cargo run` form above):
 
 ```bash
 titi-map <path> <N>

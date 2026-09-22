@@ -15,11 +15,16 @@ master: `fmt` (`cargo fmt --all --check`), `clippy` (`cargo clippy
 ## Read the results with gh
 
 ```bash
+gh run list --repo robertt3kuk/titi --commit "$(git rev-parse HEAD)"
 gh run list --repo robertt3kuk/titi --branch master --limit 5
 gh run watch <run-id> --repo robertt3kuk/titi --exit-status
 gh run view <run-id> --repo robertt3kuk/titi
 gh run view <run-id> --repo robertt3kuk/titi --log-failed
 ```
+
+A `cancelled` run was superseded by a newer push (`cancel-in-progress`);
+read the latest run instead. Exceptions to "nothing local": TUI checks
+(skill `tui-smoke`) and the genome map (skill `genome-map`).
 
 `gh run watch --exit-status` blocks until the run finishes and exits
 non-zero if it failed. `--log-failed` prints only the failing steps —
