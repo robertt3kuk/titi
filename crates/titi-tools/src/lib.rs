@@ -20,8 +20,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use cache::{READ_CACHE_CAPACITY, ReadCache};
 pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
-    workspace_tools_with_cache,
+    workspace_tools_with_cache, workspace_tools_with_policy,
 };
+pub use sensitive::SensitivePolicy;
 
 /// How dangerous a tool is. Unknown tools are treated as [`ApprovalTier::Exec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -55,6 +55,71 @@ const SECRET_EXTENSIONS: &[&str] = &[
 /// `.env.example` and friends document the keys without holding them.
 const ENV_TEMPLATES: &[&str] = &[".example", ".sample", ".template", ".dist"];
 
+/// The built-in list plus what the user added, minus what the user allowed.
+///
+/// The allow-list comes only from the user's own settings: a cloned repo
+/// controls its project config and must not be able to open `.env`.
+#[derive(Debug, Clone, Default)]
+pub struct SensitivePolicy {
+    extra: Vec<String>,
+    allow: Vec<String>,
+}
+
+impl SensitivePolicy {
+    pub fn new(extra: Vec<String>, allow: Vec<String>) -> Self {
+        Self { extra, allow }
+    }
+
+    pub fn blocks(&self, path: &Path) -> bool {
+        if self.allow.iter().any(|pattern| matches(pattern, path)) {
+            return false;
+        }
+        is_sensitive(path) || self.extra.iter().any(|pattern| matches(pattern, path))
+    }
+}
+
+/// A pattern without `/` is a file name (`*` wildcards allowed); with `/` it
+/// must equal the trailing path components, the last of which may use `*`.
+fn matches(pattern: &str, path: &Path) -> bool {
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .collect();
+    let wanted: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let Some((last_wanted, dirs_wanted)) = wanted.split_last() else {
+        return false;
+    };
+    if parts.len() < wanted.len() {
+        return false;
+    }
+    let tail = &parts[parts.len() - wanted.len()..];
+    let Some((last, dirs)) = tail.split_last() else {
+        return false;
+    };
+    dirs == dirs_wanted && wildcard(last_wanted, last)
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+fn wildcard(pattern: &str, text: &str) -> bool {
+    let pieces: Vec<&str> = pattern.split('*').collect();
+    let Some((first, rest)) = pieces.split_first() else {
+        return false;
+    };
+    let Some(mut remaining) = text.strip_prefix(first) else {
+        return false;
+    };
+    let Some((last, middle)) = rest.split_last() else {
+        return remaining.is_empty();
+    };
+    for piece in middle {
+        match remaining.find(piece) {
+            Some(at) => remaining = &remaining[at + piece.len()..],
+            None => return false,
+        }
+    }
+    remaining.len() >= last.len() && remaining.ends_with(last)
+}
+
 /// Whether `path` names a file whose contents are credentials.
 pub fn is_sensitive(path: &Path) -> bool {
     let components: Vec<&str> = path
@@ -130,6 +195,44 @@ mod tests {
         ] {
             assert!(is_sensitive(Path::new(path)), "{path} should be sensitive");
         }
+    }
+
+    #[test]
+    fn extra_patterns_block_more_files() {
+        let policy = SensitivePolicy::new(
+            vec![
+                "*.sops.yml".into(),
+                "deploy/prod.yml".into(),
+                "secrets*".into(),
+            ],
+            Vec::new(),
+        );
+        for path in [
+            "k8s/app.sops.yml",
+            "infra/deploy/prod.yml",
+            "secrets.txt",
+            ".env",
+        ] {
+            assert!(policy.blocks(Path::new(path)), "{path} should be blocked");
+        }
+        for path in ["deploy/staging.yml", "prod.yml", "src/main.rs"] {
+            assert!(!policy.blocks(Path::new(path)), "{path} should pass");
+        }
+    }
+
+    #[test]
+    fn the_allow_list_opens_only_what_it_names() {
+        let policy = SensitivePolicy::new(Vec::new(), vec![".env.test".into()]);
+        assert!(!policy.blocks(Path::new("app/.env.test")));
+        assert!(policy.blocks(Path::new("app/.env")));
+        assert!(policy.blocks(Path::new(".ssh/id_ed25519")));
+    }
+
+    #[test]
+    fn the_default_policy_is_the_built_in_list() {
+        let policy = SensitivePolicy::default();
+        assert!(policy.blocks(Path::new(".env")));
+        assert!(!policy.blocks(Path::new("README.md")));
     }
 
     #[test]

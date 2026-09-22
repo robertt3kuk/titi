@@ -7,7 +7,7 @@ use serde_json::Value;
 use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
-use crate::sensitive::is_sensitive;
+use crate::sensitive::SensitivePolicy;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
 
 fn arg_str(args: &Value, key: &str) -> Option<String> {
@@ -41,9 +41,11 @@ fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
 /// `jail_path` for a tool that returns file contents to the model: the file
 /// must also not be a credential, checked on both the name asked for and the
 /// real path, so a harmless-looking link to `.env` is refused as well.
-fn readable_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
+fn readable_path(root: &Path, raw: &str, policy: &SensitivePolicy) -> Result<PathBuf, String> {
     let resolved = jail_path(root, raw)?;
-    if is_sensitive(Path::new(raw)) || is_sensitive(&resolved) {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let relative = resolved.strip_prefix(&canonical_root).unwrap_or(&resolved);
+    if policy.blocks(Path::new(raw)) || policy.blocks(relative) {
         return Err(format!(
             "{raw} holds credentials; titi does not send it to the model"
         ));
@@ -79,6 +81,8 @@ pub struct ReadFileTool {
     /// Shared across every agent in a dispatch, so the second read of the
     /// same file is a memory hit.
     pub cache: ReadCache,
+    /// Which files hold credentials and are refused.
+    pub policy: SensitivePolicy,
 }
 
 #[async_trait]
@@ -102,7 +106,8 @@ impl ToolHandler for ReadFileTool {
         let Some(path) = arg_str(&args, "path") else {
             return err("missing path");
         };
-        match readable_path(&self.root, &path).and_then(|path| self.cache.read(&path)) {
+        match readable_path(&self.root, &path, &self.policy).and_then(|path| self.cache.read(&path))
+        {
             Ok(content) => ok(content),
             Err(error) => err(error),
         }
@@ -160,6 +165,8 @@ pub struct EditFileTool {
     pub root: PathBuf,
     /// Invalidated on edit, so the next read sees the new body.
     pub cache: ReadCache,
+    /// Which files hold credentials and are refused.
+    pub policy: SensitivePolicy,
 }
 
 #[async_trait]
@@ -193,7 +200,7 @@ impl ToolHandler for EditFileTool {
         let Some(new) = arg_str(&args, "new_string") else {
             return err("missing new_string");
         };
-        match readable_path(&self.root, &path).and_then(|path| {
+        match readable_path(&self.root, &path, &self.policy).and_then(|path| {
             let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
             if !content.contains(&old) {
                 return Err("old_string not found".into());
@@ -240,6 +247,8 @@ impl ToolHandler for GlobTool {
 
 pub struct GrepTool {
     pub root: PathBuf,
+    /// Which files hold credentials and are skipped.
+    pub policy: SensitivePolicy,
 }
 
 #[async_trait]
@@ -270,7 +279,7 @@ impl ToolHandler for GrepTool {
             .and_then(|path| jail_path(&self.root, &path).ok())
             .unwrap_or_else(|| self.root.clone());
         let mut hits = Vec::new();
-        grep_walk(&self.root, &start, &pattern, &mut hits);
+        grep_walk(&self.root, &start, &pattern, &self.policy, &mut hits);
         ok(hits.join("\n"))
     }
 }
@@ -351,7 +360,13 @@ fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
     }
 }
 
-fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
+fn grep_walk(
+    root: &Path,
+    dir: &Path,
+    pattern: &str,
+    policy: &SensitivePolicy,
+    out: &mut Vec<String>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -369,11 +384,11 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
             {
                 continue;
             }
-            grep_walk(root, &path, pattern, out);
+            grep_walk(root, &path, pattern, policy, out);
             continue;
         }
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        if is_sensitive(relative) {
+        if policy.blocks(relative) {
             continue;
         }
         let Ok(content) = fs::read_to_string(&path) else {
@@ -397,11 +412,21 @@ pub fn workspace_tools_with_cache(
     root: impl Into<PathBuf>,
     cache: ReadCache,
 ) -> Vec<Box<dyn ToolHandler>> {
+    workspace_tools_with_policy(root, cache, SensitivePolicy::default())
+}
+
+/// The workspace tools with the user's credential-file policy.
+pub fn workspace_tools_with_policy(
+    root: impl Into<PathBuf>,
+    cache: ReadCache,
+    policy: SensitivePolicy,
+) -> Vec<Box<dyn ToolHandler>> {
     let root = root.into();
     vec![
         Box::new(ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: policy.clone(),
         }),
         Box::new(WriteFileTool {
             root: root.clone(),
@@ -410,9 +435,13 @@ pub fn workspace_tools_with_cache(
         Box::new(EditFileTool {
             root: root.clone(),
             cache,
+            policy: policy.clone(),
         }),
         Box::new(GlobTool { root: root.clone() }),
-        Box::new(GrepTool { root: root.clone() }),
+        Box::new(GrepTool {
+            root: root.clone(),
+            policy,
+        }),
         Box::new(BashTool { root }),
     ]
 }
@@ -445,10 +474,12 @@ mod tests {
         let read = ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: SensitivePolicy::default(),
         };
         let edit = EditFileTool {
             root: root.clone(),
             cache,
+            policy: SensitivePolicy::default(),
         };
 
         for path in [".env", ".ssh/id_ed25519"] {
@@ -480,6 +511,7 @@ mod tests {
         let read = ReadFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let result = read
             .invoke(serde_json::json!({ "path": "notes.txt" }))
@@ -489,12 +521,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_user_policy_reaches_read_and_grep() {
+        let root = temp_root();
+        fs::write(root.join(".env.test"), "FIXTURE=1\n").unwrap();
+        fs::write(root.join("app.sops.yml"), "NEEDLE: enc\n").unwrap();
+        fs::write(root.join("a.txt"), "NEEDLE plain\n").unwrap();
+        let policy = SensitivePolicy::new(vec!["*.sops.yml".into()], vec![".env.test".into()]);
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: policy.clone(),
+        };
+        let allowed = read
+            .invoke(serde_json::json!({ "path": ".env.test" }))
+            .await;
+        assert!(!allowed.is_error, "{}", allowed.output);
+        let blocked = read
+            .invoke(serde_json::json!({ "path": "app.sops.yml" }))
+            .await;
+        assert!(blocked.is_error, "{}", blocked.output);
+
+        let grep = GrepTool {
+            root: root.clone(),
+            policy,
+        };
+        let result = grep
+            .invoke(serde_json::json!({ "pattern": "NEEDLE" }))
+            .await;
+        assert!(result.output.contains("a.txt"), "{}", result.output);
+        assert!(!result.output.contains("sops"), "{}", result.output);
+    }
+
+    #[tokio::test]
     async fn a_template_env_file_still_reads() {
         let root = temp_root();
         fs::write(root.join(".env.example"), "API_KEY=\n").unwrap();
         let read = ReadFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let result = read
             .invoke(serde_json::json!({ "path": ".env.example" }))
@@ -508,7 +573,10 @@ mod tests {
         let root = temp_root();
         fs::write(root.join(".env"), "NEEDLE=sk-test-0000000000000000\n").unwrap();
         fs::write(root.join("a.txt"), "NEEDLE here\n").unwrap();
-        let grep = GrepTool { root: root.clone() };
+        let grep = GrepTool {
+            root: root.clone(),
+            policy: SensitivePolicy::default(),
+        };
         let result = grep
             .invoke(serde_json::json!({ "pattern": "NEEDLE" }))
             .await;
@@ -527,7 +595,10 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("private.txt"), root.join("linked.txt"))
             .unwrap();
 
-        let grep = GrepTool { root: root.clone() };
+        let grep = GrepTool {
+            root: root.clone(),
+            policy: SensitivePolicy::default(),
+        };
         let result = grep
             .invoke(serde_json::json!({ "pattern": "NEEDLE" }))
             .await;
@@ -547,6 +618,7 @@ mod tests {
         let read = ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: SensitivePolicy::default(),
         };
         let write = WriteFileTool {
             root: root.clone(),
@@ -555,6 +627,7 @@ mod tests {
         let edit = EditFileTool {
             root: root.clone(),
             cache,
+            policy: SensitivePolicy::default(),
         };
         let content = read.invoke(serde_json::json!({"path": "hello.txt"})).await;
         assert!(content.output.contains("hello"));
@@ -577,7 +650,10 @@ mod tests {
     async fn glob_and_grep_find_workspace_files() {
         let root = temp_root();
         let glob = GlobTool { root: root.clone() };
-        let grep = GrepTool { root };
+        let grep = GrepTool {
+            root,
+            policy: SensitivePolicy::default(),
+        };
         let listed = glob.invoke(serde_json::json!({"pattern": "hello"})).await;
         assert!(listed.output.contains("hello.txt"));
         let hits = grep.invoke(serde_json::json!({"pattern": "world"})).await;
@@ -590,6 +666,7 @@ mod tests {
         let read = ReadFileTool {
             root,
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let result = read.invoke(serde_json::json!({"path": "../secret"})).await;
         assert!(result.is_error);
@@ -602,6 +679,7 @@ mod tests {
         let read = ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: SensitivePolicy::default(),
         };
         let write = WriteFileTool {
             root: root.clone(),
@@ -624,6 +702,7 @@ mod tests {
         let read = ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: SensitivePolicy::default(),
         };
         read.invoke(serde_json::json!({"path": "hello.txt"})).await;
         assert_eq!(cache.stats(), (0, 1));
@@ -632,6 +711,7 @@ mod tests {
         let other = ReadFileTool {
             root: root.clone(),
             cache,
+            policy: SensitivePolicy::default(),
         };
         let again = other.invoke(serde_json::json!({"path": "hello.txt"})).await;
         assert!(again.output.contains("hello world"));
