@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod fs;
+pub mod sensitive;
 
 use std::collections::HashMap;
 use std::sync::Arc;

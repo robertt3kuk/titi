@@ -7,6 +7,7 @@ use serde_json::Value;
 use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
+use crate::sensitive::is_sensitive;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
 
 fn arg_str(args: &Value, key: &str) -> Option<String> {
@@ -35,6 +36,19 @@ fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
     } else {
         Err(format!("{} is outside the workspace", raw))
     }
+}
+
+/// `jail_path` for a tool that returns file contents to the model: the file
+/// must also not be a credential, checked on both the name asked for and the
+/// real path, so a harmless-looking link to `.env` is refused as well.
+fn readable_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let resolved = jail_path(root, raw)?;
+    if is_sensitive(Path::new(raw)) || is_sensitive(&resolved) {
+        return Err(format!(
+            "{raw} holds credentials; titi does not send it to the model"
+        ));
+    }
+    Ok(resolved)
 }
 
 fn ok(output: impl Into<String>) -> ToolResult {
@@ -88,7 +102,7 @@ impl ToolHandler for ReadFileTool {
         let Some(path) = arg_str(&args, "path") else {
             return err("missing path");
         };
-        match jail_path(&self.root, &path).and_then(|path| self.cache.read(&path)) {
+        match readable_path(&self.root, &path).and_then(|path| self.cache.read(&path)) {
             Ok(content) => ok(content),
             Err(error) => err(error),
         }
@@ -179,7 +193,7 @@ impl ToolHandler for EditFileTool {
         let Some(new) = arg_str(&args, "new_string") else {
             return err("missing new_string");
         };
-        match jail_path(&self.root, &path).and_then(|path| {
+        match readable_path(&self.root, &path).and_then(|path| {
             let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
             if !content.contains(&old) {
                 return Err("old_string not found".into());
@@ -312,7 +326,15 @@ fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // `file_type` does not follow links: a link to `~` would otherwise
+        // walk the home directory, past the workspace jail.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             if let Some(name) = path.file_name().and_then(|name| name.to_str())
                 && (name == "target" || name == ".git" || name == "node_modules")
             {
@@ -335,7 +357,13 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             if let Some(name) = path.file_name().and_then(|name| name.to_str())
                 && (name == "target" || name == ".git" || name == "node_modules")
             {
@@ -344,10 +372,13 @@ fn grep_walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
             grep_walk(root, &path, pattern, out);
             continue;
         }
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if is_sensitive(relative) {
+            continue;
+        }
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
-        let relative = path.strip_prefix(root).unwrap_or(&path);
         for (index, line) in content.lines().enumerate() {
             if line.contains(pattern) {
                 out.push(format!("{}:{}:{line}", relative.display(), index + 1));
@@ -402,6 +433,111 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("hello.txt"), "hello world").unwrap();
         root
+    }
+
+    #[tokio::test]
+    async fn read_and_edit_refuse_credential_files() {
+        let root = temp_root();
+        fs::write(root.join(".env"), "API_KEY=sk-test-0000000000000000\n").unwrap();
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::write(root.join(".ssh/id_ed25519"), "PRIVATE\n").unwrap();
+        let cache = ReadCache::default();
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: cache.clone(),
+        };
+        let edit = EditFileTool {
+            root: root.clone(),
+            cache,
+        };
+
+        for path in [".env", ".ssh/id_ed25519"] {
+            let result = read.invoke(serde_json::json!({ "path": path })).await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(!result.output.contains("sk-test"), "{}", result.output);
+            assert!(!result.output.contains("PRIVATE"), "{}", result.output);
+        }
+        let result = edit
+            .invoke(serde_json::json!({
+                "path": ".env", "old_string": "API_KEY", "new_string": "X"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(!result.output.contains("sk-test"), "{}", result.output);
+        assert!(
+            fs::read_to_string(root.join(".env"))
+                .unwrap()
+                .contains("API_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_to_a_credential_file_is_refused_too() {
+        let root = temp_root();
+        fs::write(root.join(".env"), "API_KEY=sk-test-0000000000000000\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let result = read
+            .invoke(serde_json::json!({ "path": "notes.txt" }))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(!result.output.contains("sk-test"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn a_template_env_file_still_reads() {
+        let root = temp_root();
+        fs::write(root.join(".env.example"), "API_KEY=\n").unwrap();
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let result = read
+            .invoke(serde_json::json!({ "path": ".env.example" }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("API_KEY="));
+    }
+
+    #[tokio::test]
+    async fn grep_skips_credential_files() {
+        let root = temp_root();
+        fs::write(root.join(".env"), "NEEDLE=sk-test-0000000000000000\n").unwrap();
+        fs::write(root.join("a.txt"), "NEEDLE here\n").unwrap();
+        let grep = GrepTool { root: root.clone() };
+        let result = grep
+            .invoke(serde_json::json!({ "pattern": "NEEDLE" }))
+            .await;
+        assert!(result.output.contains("a.txt:1:"), "{}", result.output);
+        assert!(!result.output.contains(".env"), "{}", result.output);
+        assert!(!result.output.contains("sk-test"), "{}", result.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_and_glob_do_not_follow_links_out_of_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("private.txt"), "NEEDLE outside\n").unwrap();
+        let root = temp_root();
+        std::os::unix::fs::symlink(outside.path(), root.join("home")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("private.txt"), root.join("linked.txt"))
+            .unwrap();
+
+        let grep = GrepTool { root: root.clone() };
+        let result = grep
+            .invoke(serde_json::json!({ "pattern": "NEEDLE" }))
+            .await;
+        assert!(!result.output.contains("outside"), "{}", result.output);
+
+        let glob = GlobTool { root: root.clone() };
+        let result = glob
+            .invoke(serde_json::json!({ "pattern": "private" }))
+            .await;
+        assert!(!result.output.contains("private.txt"), "{}", result.output);
     }
 
     #[tokio::test]
