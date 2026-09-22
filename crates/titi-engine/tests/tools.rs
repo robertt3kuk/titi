@@ -143,6 +143,41 @@ async fn auto_approves_read_tool_and_continues() {
     )));
 }
 
+/// Tool output goes to a remote provider; a key or a server address in it
+/// must be masked before the model or the transcript sees it.
+#[tokio::test]
+async fn tool_output_is_masked_before_the_model_sees_it() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events(
+            "echo",
+            r#"{"text":"KEY=sk-test-0000000000000000 host 203.0.113.7"}"#,
+        )),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut engine = EngineRuntime::start_with_tools(
+        EngineConfig::new("primary"),
+        resolver(transport),
+        echo_registry(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished { output, .. } => Some(output.to_string()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!output.contains("sk-test-0000000000000000"), "{output}");
+    assert!(!output.contains("203.0.113.7"), "{output}");
+    assert!(output.contains("host [ip]"), "{output}");
+}
+
 #[tokio::test]
 async fn fragmented_tool_arguments_reach_the_handler_joined() {
     // The arguments arrive as fragments, the way a real OpenAI-compatible

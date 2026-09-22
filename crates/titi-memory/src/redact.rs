@@ -31,6 +31,58 @@ pub fn redact(text: &str) -> Redaction {
 
 const MASK: &str = "[redacted]";
 
+/// `redact`, plus IPv4 addresses, for text about to leave for a provider.
+///
+/// Tool output can carry the address of a server the user runs; that is
+/// theirs to keep. Loopback and the unspecified address say nothing about
+/// anyone and stay, so "listening on 127.0.0.1" still reads.
+pub fn redact_for_model(text: &str) -> Redaction {
+    let secrets = redact(text);
+    let source = secrets.text;
+    let mut removed = secrets.removed;
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    for found in IPV4.find_iter(&source) {
+        let address = found.as_str();
+        if !is_address(&source, found.start(), found.end(), address)
+            || address.starts_with("127.")
+            || address == "0.0.0.0"
+        {
+            continue;
+        }
+        out.push_str(&source[last..found.start()]);
+        out.push_str(IP_MASK);
+        last = found.end();
+        removed += 1;
+    }
+    out.push_str(&source[last..]);
+    Redaction { text: out, removed }
+}
+
+const IP_MASK: &str = "[ip]";
+
+static IPV4: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}").expect("ipv4 pattern compiles")
+});
+
+/// Octets within 0–255, and not part of a longer dotted number such as a
+/// five-part version or `1300.1.2.3`.
+fn is_address(text: &str, start: usize, end: usize, address: &str) -> bool {
+    if !address.split('.').all(|octet| octet.parse::<u8>().is_ok()) {
+        return false;
+    }
+    let before = text[..start].chars().next_back();
+    if before.is_some_and(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+    let mut after = text[end..].chars();
+    match after.next() {
+        Some(c) if c.is_ascii_digit() => false,
+        Some('.') => !after.next().is_some_and(|c| c.is_ascii_digit()),
+        _ => true,
+    }
+}
+
 /// Shapes that are a secret and almost nothing else.
 ///
 /// A bare hex string is not here: commit hashes and colours look the same.
@@ -83,6 +135,37 @@ mod tests {
         let redacted = redact("token: supersecretvalue12345");
         assert_eq!(redacted.removed, 1);
         assert!(!redacted.text.contains("supersecretvalue12345"));
+    }
+
+    #[test]
+    fn for_the_model_an_address_is_masked_and_loopback_is_kept() {
+        let redacted = redact_for_model(
+            "ssh root@203.0.113.7 then curl 198.51.100.20:8080, local 127.0.0.1 and 0.0.0.0",
+        );
+        assert!(!redacted.text.contains("203.0.113.7"), "{}", redacted.text);
+        assert!(
+            !redacted.text.contains("198.51.100.20"),
+            "{}",
+            redacted.text
+        );
+        assert!(redacted.text.contains("root@[ip]"), "{}", redacted.text);
+        assert!(redacted.text.contains("127.0.0.1"), "{}", redacted.text);
+        assert!(redacted.text.contains("0.0.0.0"), "{}", redacted.text);
+        assert_eq!(redacted.removed, 2);
+    }
+
+    #[test]
+    fn for_the_model_secrets_are_masked_as_well() {
+        let redacted = redact_for_model("KEY=sk-test-0000000000000000 on 10.0.0.5");
+        assert!(!redacted.text.contains("sk-test-0000000000000000"));
+        assert!(!redacted.text.contains("10.0.0.5"));
+        assert_eq!(redacted.removed, 2);
+    }
+
+    #[test]
+    fn for_the_model_versions_that_are_not_addresses_pass() {
+        let redacted = redact_for_model("rust 1.85.0, semver 2.0.0, build 300.1.2.3");
+        assert_eq!(redacted.removed, 0, "{}", redacted.text);
     }
 
     #[test]

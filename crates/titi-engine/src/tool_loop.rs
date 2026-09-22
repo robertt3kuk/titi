@@ -273,6 +273,9 @@ async fn invoke_one(
     }
     let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let ToolResult { output, is_error } = handler.invoke(args).await;
+    // Everything below goes to the provider, the transcript, and the session
+    // file. A key or a server address the tool printed stops here.
+    let output = titi_memory::redact::redact_for_model(&output).text.into();
     Executed {
         call_id: call.call_id,
         output,
