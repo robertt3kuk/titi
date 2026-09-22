@@ -12,7 +12,8 @@ Last full manual pass: — (none recorded yet)
 | Approval `y`/`n` for write and bash | unverified | — | — | |
 | `/model` switch | unverified | — | — | |
 | `/checkpoint`, `/rewind`, `/recap`, `/pause` | unverified | — | — | |
-| Sign-in from chat, slash command list | unverified | — | — | |
+| Sign-in from chat, slash command list | partial | 2026-09-23 (d4dcc1c) | PTY (omp hub) | PTY check: `/` at line start lists the commands as before, `/help` dispatches and prints the list. Sign-in not exercised. |
+| Composer `/` picker: skills mid-sentence and at line start | pass | 2026-09-23 (d4dcc1c) | PTY (omp hub) and `script` 60×20 | PTY check, not visual. `please run /smo` opens the picker mid-sentence with `·skill` rows only; Tab completes to `please run /smoke-note ` with the sentence intact; `/smo` at line start lists the same skills after the commands; the transcript keeps `/smoke-note` verbatim. A flagged body showed `/smoke-bad not expanded: SKILL.md reads like a prompt injection` and the turn still ran (then failed on the missing key, as expected). At 60 cols the rows truncate without wrapping. Ctrl+D exits 0 and emits `ESC[?25h ESC[?1049l`, so the terminal is left clean. |
 | Local photos (kitty/ghostty) | unverified | — | — | |
 | Resize without drift | unverified | — | — | |
 | `--prompt` one-shot | unverified | — | — | |
