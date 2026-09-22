@@ -273,7 +273,7 @@ pub enum RegistryError {
     DuplicateProvider(SmolStr),
     #[error("duplicate model {0}")]
     DuplicateModel(SmolStr),
-    #[error("provider {provider} requires a credential from {env:?}")]
+    #[error("provider {provider} requires a credential from {}", .env.as_deref().unwrap_or("no key env configured"))]
     MissingCredential {
         provider: SmolStr,
         env: Option<SmolStr>,
@@ -284,4 +284,45 @@ pub enum RegistryError {
         #[source]
         source: TransportError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_credential_error_formats_env_var_plainly() {
+        let err = RegistryError::MissingCredential {
+            provider: "openai".into(),
+            env: Some("OPENAI_API_KEY".into()),
+        };
+        let msg = err.to_string();
+        // Should render the env var name plainly, not with Debug formatting
+        assert!(
+            msg.contains("OPENAI_API_KEY"),
+            "error message should contain plain env var name, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Some("),
+            "error message should not contain Debug-formatted Option, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_credential_error_handles_missing_env_var() {
+        let err = RegistryError::MissingCredential {
+            provider: "anthropic".into(),
+            env: None,
+        };
+        let msg = err.to_string();
+        // Should say "no key env configured" when env is None
+        assert!(
+            msg.contains("no key env configured"),
+            "error message should indicate no env var configured, got: {msg}"
+        );
+        assert!(
+            !msg.contains("None"),
+            "error message should not contain Debug-formatted None, got: {msg}"
+        );
+    }
 }
