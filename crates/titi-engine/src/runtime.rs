@@ -448,18 +448,23 @@ impl EngineRuntime {
             .await;
     }
 
-    /// Identity, personality and memory first, then the genome map.
+    /// Identity, personality and project rules first, then memory, then the genome map.
     ///
     /// The model used to see only the map, so it had no identity and no
     /// memory of earlier sessions. A missing agent directory degrades to the
-    /// map alone rather than failing the turn.
+    /// map alone rather than failing the turn. Project rules are their own
+    /// section: they are not folded into `SOUL.md`.
     async fn system_prompt(&self) -> Option<SmolStr> {
         let identity = self.identity_prompt();
+        let project = self.project_context();
         let recalled = self.recalled_memory().await;
         let genome = self.genome_system().await;
         let mut parts = Vec::new();
         if let Some(identity) = identity {
             parts.push(identity.to_string());
+        }
+        if let Some(project) = project {
+            parts.push(project);
         }
         if let Some(recalled) = recalled {
             parts.push(recalled.to_string());
@@ -473,6 +478,21 @@ impl EngineRuntime {
         } else {
             Some(joined.into())
         }
+    }
+
+    /// `AGENTS.md` from the workspace and the agent directory. Flagged files
+    /// are already omitted. A missing workspace still contributes the user file.
+    fn project_context(&self) -> Option<String> {
+        let cwd = self
+            .config
+            .workspace_root
+            .as_deref()
+            .or(self.config.genome_root.as_deref());
+        crate::project_context::render(
+            cwd,
+            self.config.agent_dir.as_deref(),
+            process_home().as_deref(),
+        )
     }
 
     /// The memories relevant to this turn, ranked against the files it has
@@ -560,6 +580,12 @@ impl EngineRuntime {
         });
         (turn_id, aborted)
     }
+}
+
+fn process_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 async fn run_turn(

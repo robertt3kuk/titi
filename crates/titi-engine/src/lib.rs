@@ -5,6 +5,7 @@ pub mod claims;
 pub mod compaction;
 pub mod findings;
 pub mod goal;
+pub mod project_context;
 pub mod protocol;
 pub mod registry;
 pub mod review;

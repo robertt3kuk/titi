@@ -17,7 +17,7 @@ mod soul;
 
 pub use builder::{SystemPrompt, SystemPromptBuilder};
 pub use personality::{Overlay, PersonalityPreset};
-pub use scan::{Pattern, ScanVerdict};
+pub use scan::{Pattern, ScanVerdict, scan};
 pub use soul::{DEFAULT_IDENTITY, MAX_SOUL_BYTES, Soul, SoulSource};
 
 use std::fmt;
