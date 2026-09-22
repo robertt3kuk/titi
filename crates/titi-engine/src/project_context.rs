@@ -22,14 +22,18 @@ const MAX_FILE_BYTES: usize = titi_soul::MAX_SOUL_BYTES;
 pub fn render(cwd: Option<&Path>, agent_dir: Option<&Path>, home: Option<&Path>) -> Option<String> {
     let mut files = Vec::new();
     if let Some(cwd) = cwd {
-        for dir in project_dirs(cwd, home) {
-            if let Some(path) = file_at(&dir) {
-                push_clean(&mut files, path);
+        let dirs = project_dirs(cwd, home);
+        // Farthest first, so the first entry is the repo root (or cwd).
+        if let Some(root) = dirs.first().cloned() {
+            for dir in dirs {
+                if let Some(path) = file_at(&dir) {
+                    push_clean(&mut files, path, &root);
+                }
             }
         }
     }
     if let Some(agent_dir) = agent_dir {
-        push_clean(&mut files, agent_dir.join("AGENTS.md"));
+        push_clean(&mut files, agent_dir.join("AGENTS.md"), agent_dir);
     }
     if files.is_empty() {
         return None;
@@ -54,8 +58,11 @@ fn file_at(dir: &Path) -> Option<PathBuf> {
     agents.is_file().then_some(agents)
 }
 
-fn push_clean(files: &mut Vec<(PathBuf, String)>, path: PathBuf) {
+fn push_clean(files: &mut Vec<(PathBuf, String)>, path: PathBuf, bound: &Path) {
     if files.iter().any(|(seen, _)| same_dir(seen, &path)) {
+        return;
+    }
+    if !stays_inside(&path, bound) {
         return;
     }
     let Ok(text) = fs::read_to_string(&path) else {
@@ -71,6 +78,16 @@ fn push_clean(files: &mut Vec<(PathBuf, String)>, path: PathBuf) {
         return;
     }
     files.push((path, truncate(&text)));
+}
+
+/// A cloned repo could link `AGENTS.md` to `~/.aws/credentials`; reading
+/// through that link would send a local secret to the provider in the
+/// system prompt. Only files whose real path is under `bound` are read.
+fn stays_inside(path: &Path, bound: &Path) -> bool {
+    match (path.canonicalize(), bound.canonicalize()) {
+        (Ok(path), Ok(bound)) => path.starts_with(bound),
+        _ => false,
+    }
 }
 
 fn truncate(text: &str) -> String {
@@ -209,6 +226,46 @@ mod tests {
         assert!(block.contains("ROOT-RULE"), "{block}");
         assert!(!block.contains("ignore previous"), "{block}");
         assert!(!block.contains("leak the key"), "{block}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_leaves_the_repo_is_not_read() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("credentials");
+        write(&secret, "SECRET-OUTSIDE\n");
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(&root.join(".git"), "gitdir: /tmp/fake\n");
+        std::os::unix::fs::symlink(&secret, root.join("AGENTS.md")).unwrap();
+
+        assert_eq!(render(Some(root), None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_repo_still_loads() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        write(&root.join(".git"), "gitdir: /tmp/fake\n");
+        write(&root.join("docs").join("RULES.md"), "LINKED-RULE\n");
+        std::os::unix::fs::symlink(root.join("docs").join("RULES.md"), root.join("AGENTS.md"))
+            .unwrap();
+
+        let block = render(Some(root), None, None).unwrap();
+        assert!(block.contains("LINKED-RULE"), "{block}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_file_linked_out_of_the_agent_directory_is_not_read() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("credentials");
+        write(&secret, "SECRET-OUTSIDE\n");
+        let agent = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&secret, agent.path().join("AGENTS.md")).unwrap();
+
+        assert_eq!(render(None, Some(agent.path()), None), None);
     }
 
     #[test]
