@@ -124,6 +124,8 @@ pub struct Chat {
     login_for: Option<String>,
     /// Highlight in the leading-slash command list.
     picker: usize,
+    /// Skills the engine discovered, offered by the same picker.
+    skills: Vec<SkillRow>,
     /// Kitty or Ghostty unicode placeholders are available.
     kitty: bool,
     tmux: bool,
@@ -157,6 +159,7 @@ impl Chat {
             hint: String::new(),
             login_for: None,
             picker: 0,
+            skills: Vec::new(),
             kitty: false,
             tmux: false,
             photos: Vec::new(),
@@ -252,14 +255,21 @@ impl Chat {
                 Applied::none()
             }
             Key::Enter => {
-                if let Some(prefix) = command_prefix(&self.input) {
-                    let matches = matching(prefix);
-                    let exact = matches.iter().any(|command| command.name == prefix);
-                    if prefix.is_empty() {
+                let token = slash_token(&self.input).map(|(start, name)| (start, name.to_owned()));
+                if let Some((start, name)) = token {
+                    let at_line_start = self.input[..start].trim().is_empty();
+                    if at_line_start && name.is_empty() {
                         return Applied::none();
                     }
-                    if !exact && !matches.is_empty() {
+                    let rows = picker_rows(self);
+                    let exact = rows.iter().any(|row| self.row_name(row) == name);
+                    if !exact && !rows.is_empty() {
                         self.accept_picker();
+                        // Mid-sentence the message is not finished: complete
+                        // the token and let the next Enter send it.
+                        if !at_line_start {
+                            return Applied::none();
+                        }
                     }
                 }
                 self.submit()
@@ -366,6 +376,10 @@ impl Chat {
             EngineEvent::TurnFinished { .. } => self.finish_turn(),
             EngineEvent::GoalFinished { report } => {
                 self.push(LineKind::Note, report.to_string());
+                Applied::none()
+            }
+            EngineEvent::Notice { message } => {
+                self.push(LineKind::Note, one_line(&message, TOOL_PREVIEW));
                 Applied::none()
             }
             _ => Applied::none(),
@@ -524,6 +538,11 @@ impl Chat {
             "logout" => self.logout(args),
             "keys" | "whoami" => self.keys(),
             _ => {
+                // A known skill is not a command: it goes to the model as a
+                // prompt, and the engine expands it there.
+                if self.skills.iter().any(|skill| skill.name == name) {
+                    return None;
+                }
                 self.push(LineKind::Error, format!("unknown command /{name}"));
                 Applied::none()
             }
@@ -644,15 +663,23 @@ impl Chat {
         Applied::none()
     }
 
+    fn row_name(&self, row: &PickRow) -> &str {
+        match row {
+            PickRow::Command(command) => command.name,
+            PickRow::Skill(index) => self
+                .skills
+                .get(*index)
+                .map(|skill| skill.name.as_str())
+                .unwrap_or_default(),
+        }
+    }
+
     fn picking(&self) -> bool {
-        self.login_for.is_none() && command_prefix(&self.input).is_some()
+        !picker_rows(self).is_empty()
     }
 
     fn move_picker(&mut self, delta: isize) {
-        let Some(prefix) = command_prefix(&self.input) else {
-            return;
-        };
-        let len = matching(prefix).len();
+        let len = picker_rows(self).len();
         if len == 0 {
             return;
         }
@@ -660,16 +687,21 @@ impl Chat {
         self.picker = (current as isize + delta).rem_euclid(len as isize) as usize;
     }
 
+    /// Replace the token being typed with the highlighted name. Everything
+    /// before it stays, so a skill named mid-sentence keeps its sentence.
     fn accept_picker(&mut self) {
-        let Some(prefix) = command_prefix(&self.input) else {
+        let rows = picker_rows(self);
+        let Some(row) = rows.get(self.picker % rows.len().max(1)) else {
             return;
         };
-        let matches = matching(prefix);
-        if matches.is_empty() {
+        let name = self.row_name(row).to_owned();
+        let Some((start, _)) = slash_token(&self.input) else {
             return;
-        }
-        let command = matches[self.picker % matches.len()];
-        self.input = format!("/{} ", command.name);
+        };
+        self.input.truncate(start);
+        self.input.push('/');
+        self.input.push_str(&name);
+        self.input.push(' ');
         self.picker = 0;
     }
 
@@ -913,6 +945,7 @@ pub fn run(
     if !models.is_empty() {
         chat.models = models;
     }
+    chat.skills = discovered_skills(&chat.agent_dir);
     let detect = titi_tui::image::PlaceholderDetect::from_env();
     if detect.supported() {
         chat.kitty = true;
@@ -1037,23 +1070,75 @@ const COMMANDS: &[Command] = &[
     },
 ];
 
-/// The command being typed, only when `/` starts the line and no argument
-/// has been started. A slash later in the sentence, or a path like
-/// `/tmp/photo.png`, is not a command list.
-fn command_prefix(input: &str) -> Option<&str> {
-    let text = input.trim_start();
-    let rest = text.strip_prefix('/')?;
-    if rest.contains('/') || rest.chars().any(char::is_whitespace) {
-        return None;
-    }
-    Some(rest)
+/// A skill the composer can complete, mirroring what the engine discovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillRow {
+    name: String,
+    about: String,
 }
 
-fn matching(prefix: &str) -> Vec<&'static Command> {
-    COMMANDS
-        .iter()
-        .filter(|command| command.name.starts_with(prefix))
+/// Discovery lives in the engine, so the picker offers exactly the names a
+/// `/name` reference can expand.
+fn discovered_skills(agent_dir: &Path) -> Vec<SkillRow> {
+    titi_engine::skills::catalog(Some(&crate::app::current_workspace()), Some(agent_dir))
+        .into_iter()
+        .map(|skill| SkillRow {
+            name: skill.name,
+            about: skill.description,
+        })
         .collect()
+}
+
+/// One offer in the `/` picker.
+enum PickRow {
+    Command(&'static Command),
+    Skill(usize),
+}
+
+/// The `/token` under the cursor: the trailing word, when it opens with a
+/// slash at the start of the line or after whitespace and holds nothing but
+/// name characters. That is what keeps `/tmp/photo.png` and `a/b` out.
+fn slash_token(input: &str) -> Option<(usize, &str)> {
+    let start = input.rfind('/')?;
+    if start > 0 && !input[..start].ends_with(char::is_whitespace) {
+        return None;
+    }
+    let name = &input[start + 1..];
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    Some((start, name))
+}
+
+/// Commands first, then skills. A command only counts at the start of the
+/// line, so a slash inside a sentence can only name a skill.
+fn picker_rows(chat: &Chat) -> Vec<PickRow> {
+    if chat.login_for.is_some() {
+        return Vec::new();
+    }
+    let Some((start, prefix)) = slash_token(&chat.input) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    if chat.input[..start].trim().is_empty() {
+        rows.extend(
+            COMMANDS
+                .iter()
+                .filter(|command| command.name.starts_with(prefix))
+                .map(PickRow::Command),
+        );
+    }
+    rows.extend(
+        chat.skills
+            .iter()
+            .enumerate()
+            .filter(|(_, skill)| skill.name.starts_with(prefix))
+            .map(|(index, _)| PickRow::Skill(index)),
+    );
+    rows
 }
 
 fn known_provider(id: &str) -> bool {
@@ -1064,52 +1149,57 @@ fn known_provider(id: &str) -> bool {
 }
 
 fn picker_height(chat: &Chat) -> u16 {
-    if chat.login_for.is_some() {
-        return 0;
-    }
-    let Some(prefix) = command_prefix(&chat.input) else {
-        return 0;
-    };
-    matching(prefix).len().min(8) as u16
+    picker_rows(chat).len().min(8) as u16
 }
 
 fn command_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
-    let prefix = command_prefix(&chat.input).unwrap_or("");
-    let matches = matching(prefix);
+    let rows = picker_rows(chat);
     let window = 8usize;
-    let selected = if matches.is_empty() {
+    let selected = if rows.is_empty() {
         0
     } else {
-        chat.picker % matches.len()
+        chat.picker % rows.len()
     };
-    let start = if matches.len() <= window {
+    let start = if rows.len() <= window {
         0
     } else {
-        selected
-            .saturating_sub(window / 2)
-            .min(matches.len() - window)
+        selected.saturating_sub(window / 2).min(rows.len() - window)
     };
     let room = (width as usize).saturating_sub(2).max(8);
-    let rows: Vec<Line<'static>> = matches
+    let lines: Vec<Line<'static>> = rows
         .iter()
         .enumerate()
         .skip(start)
         .take(window)
-        .map(|(index, command)| {
+        .map(|(index, row)| {
+            let (name, about, is_skill) = match row {
+                PickRow::Command(command) => (command.name, command.about, false),
+                PickRow::Skill(at) => chat
+                    .skills
+                    .get(*at)
+                    .map(|skill| (skill.name.as_str(), skill.about.as_str(), true))
+                    .unwrap_or(("", "", true)),
+            };
             let mark = if index == selected { "▶" } else { " " };
             let style = if index == selected {
                 ink.fg(ink.gold).add_modifier(Modifier::BOLD)
+            } else if is_skill {
+                ink.fg(ink.green)
             } else {
                 ink.fg(ink.muted)
             };
-            let label = format!(" {mark} /{:<12} {}", command.name, command.about);
+            let label = if is_skill {
+                format!(" {mark} /{name:<12} ·skill {about}")
+            } else {
+                format!(" {mark} /{name:<12} {about}")
+            };
             Line::from(Span::styled(
                 titi_tui::width::truncate_to_width(&label, room),
                 style,
             ))
         })
         .collect();
-    Paragraph::new(rows).style(ink.page())
+    Paragraph::new(lines).style(ink.page())
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
@@ -2039,6 +2129,78 @@ mod tests {
         type_text(&mut chat, "/mo");
         chat.on_key(Key::Esc, Instant::now());
         assert!(chat.input.is_empty());
+    }
+
+    fn chat_with_skills() -> Chat {
+        let mut chat = chat();
+        chat.skills = vec![SkillRow {
+            name: "code-review".to_owned(),
+            about: "check a diff".to_owned(),
+        }];
+        chat
+    }
+
+    #[test]
+    fn a_slash_inside_a_sentence_lists_skills() {
+        let mut chat = chat_with_skills();
+        type_text(&mut chat, "please run /cod");
+        let view = frame_text(&mut chat);
+        assert!(view.contains("code-review"), "{view}");
+        assert!(view.contains("·skill"), "{view}");
+    }
+
+    #[test]
+    fn completing_a_skill_keeps_the_rest_of_the_line() {
+        let mut chat = chat_with_skills();
+        type_text(&mut chat, "please run /cod");
+        chat.on_key(Key::Tab, Instant::now());
+        assert_eq!(chat.input, "please run /code-review ");
+    }
+
+    #[test]
+    fn enter_mid_sentence_completes_the_skill_instead_of_sending() {
+        let mut chat = chat_with_skills();
+        type_text(&mut chat, "please run /cod");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert_eq!(chat.input, "please run /code-review ");
+    }
+
+    #[test]
+    fn a_leading_skill_name_is_sent_as_typed() {
+        let mut chat = chat_with_skills();
+        type_text(&mut chat, "/code-review this diff");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt {
+                text: "/code-review this diff".into(),
+            }))
+        );
+        assert_eq!(
+            applied.log,
+            Some((Role::User, "/code-review this diff".to_owned()))
+        );
+        assert!(
+            !chat
+                .lines
+                .iter()
+                .any(|line| line.text.contains("unknown command")),
+            "a known skill must not be refused as a command"
+        );
+    }
+
+    #[test]
+    fn a_command_still_wins_over_a_skill_of_the_same_prefix() {
+        let mut chat = chat_with_skills();
+        chat.skills.push(SkillRow {
+            name: "recap-notes".to_owned(),
+            about: "notes".to_owned(),
+        });
+        type_text(&mut chat, "/recap");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.lines.iter().any(|line| line.text.contains("recap")));
     }
 
     #[test]
