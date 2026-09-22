@@ -2,11 +2,27 @@
 
 ## Активное направление: reference product functional port
 
-Статус: **0.1.0 работает** (чат на ratatui, headless, инструменты, сессии, Genome, память, SOUL). Встроенный каталог: OpenAI, OpenRouter, OpenCode, Anthropic; пользовательский конфиг накладывается по id, а не заменяет список. Канонический handoff: [`reference-product-port/STATE.md`](reference-product-port/STATE.md). Решения: [`reference-product-port/DECISIONS.md`](reference-product-port/DECISIONS.md). Roadmap: [`reference-product-port/README.md`](reference-product-port/README.md). Следующий код — goal loop поверх reviewer-а. Не начинать GPUI. Tree-sitter — замена эвристик Genome, не новый граф: symbol-level уже есть.
+Статус: **0.1.0 работает** (чат на ratatui, headless, инструменты, сессии, Genome, память, SOUL). Встроенный каталог: OpenAI, OpenRouter, OpenCode, Anthropic; пользовательский конфиг накладывается по id, а не заменяет список. Канонический handoff: [`reference-product-port/STATE.md`](reference-product-port/STATE.md). Решения: [`reference-product-port/DECISIONS.md`](reference-product-port/DECISIONS.md). Roadmap: [`reference-product-port/README.md`](reference-product-port/README.md). Goal loop поверх reviewer-а в master (`/goal`, 2026-09-23). Следующий шаг — ручная PTY-проверка `/goal` с живой моделью. Не начинать GPUI. Tree-sitter — замена эвристик Genome, не новый граф: symbol-level уже есть.
 
 Правило продолжения: сначала прочитать dedicated STATE, прогнать baseline, выполнить только NEXT, затем синхронизировать оба STATE-файла.
 
 Обновляется после каждого шага. Новая сессия начинает отсюда.
+
+## Goal loop и приватность (2026-09-23)
+
+| Шаг | Коммит | Статус |
+|-----|--------|--------|
+| Goal loop: coder ↔ свежий reviewer, лимит 8 раундов, осцилляция = повтор патча, отмена паркуется | 324c6eb, 13b19d0 | done, 11 тестов |
+| `AGENTS.md` проекта и метаданные скиллов в системном промпте | 09ab253, 184aace | done |
+| `AGENTS.md` читается только изнутри проекта (симлинк наружу отклоняется) | cbef3b6 | done, +3 теста |
+| Имя и описание скилла проходят сканер инъекций, описание ≤ 1024 байт | 75a7c6c | done, +2 теста |
+| `/goal` из чата, виден в списке после `/` | b8f6619, e7cc9c6 | done |
+| Алиасы ролей моделей (`modelRoles`) | b2041ce | done |
+| `read`/`edit` отказывают для `.env*`, ключей, `.ssh`, cookie-баз; `grep` их пропускает; `grep`/`glob` не ходят по симлинкам | db53389 | done, +7 тестов |
+| Вывод инструментов маскируется (секреты + IPv4, loopback остаётся) до модели, транскрипта и сессии | dee6960 | done, +4 теста |
+| Тесты checkpoint больше не коммитят в сам checkout (отсюда три `titi checkpoint` в master от 2026-09-21) | aa1f72c | done, +1 тест |
+
+Перенос из ветки `goal-loop`: только код, упоминания старого порта убраны.
 
 ## Артефакты Research Map — все done (2026-08-27)
 
