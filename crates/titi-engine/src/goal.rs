@@ -11,10 +11,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::review::{Review, ReviewRequest, Reviewer, Verdict};
 use async_trait::async_trait;
 use smol_str::SmolStr;
-
-use crate::review::{Review, ReviewRequest, Reviewer, Verdict};
+use tokio::sync::Notify;
 
 /// Rounds one goal may spend ("goal iterations" in the spec).
 pub const DEFAULT_GOAL_ROUNDS: u32 = 8;
@@ -92,12 +92,12 @@ pub enum GoalStop {
     Error,
 }
 
-/// A shared cancel flag. `Cancel` on a running turn uses the same idea: set
-/// the flag, and the loop stops at the next step boundary — or sooner, if the
-/// in-flight coder or reviewer future is still pending.
+/// A shared cancel flag. Setting it wakes a parked waiter; the loop does not
+/// poll the flag while a coder or reviewer call is in flight.
 #[derive(Clone, Debug, Default)]
 pub struct GoalCancel {
     aborted: Arc<AtomicBool>,
+    woken: Arc<Notify>,
 }
 
 impl GoalCancel {
@@ -107,6 +107,9 @@ impl GoalCancel {
 
     pub fn cancel(&self) {
         self.aborted.store(true, Ordering::SeqCst);
+        // `notify_one` stores a permit when nobody is waiting yet, so a cancel
+        // that lands between the flag check and the park is not lost.
+        self.woken.notify_one();
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -287,8 +290,14 @@ impl GoalLoop {
 }
 
 async fn wait_cancelled(cancel: &GoalCancel) {
-    while !cancel.is_cancelled() {
-        tokio::task::yield_now().await;
+    loop {
+        // Subscribe before the flag check. A permit from `cancel` is then
+        // either already stored or delivered to this waiter; nothing spins.
+        let notified = cancel.woken.notified();
+        if cancel.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 }
 
