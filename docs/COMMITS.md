@@ -11,8 +11,8 @@ Conventional Commits: `type(scope): summary`.
 - English, imperative, lowercase subject, no trailing period.
 - Types: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `style`, `chore`.
 - Scopes used in this repo: `ci`, `cargo`, `workspace`, `readme`, `agents`,
-  `commits`, `conveyor`, `skills`, plus crate names (`cli`, `engine`, `tui`,
-  …).
+  `commits`, `conveyor`, `skills`, `brain`, `audits`, `qa`, plus crate names
+  (`cli`, `engine`, `tui`, …).
 - No `Co-Authored-By` or other agent trailers.
 
 ```
