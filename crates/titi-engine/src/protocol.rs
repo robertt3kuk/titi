@@ -176,4 +176,12 @@ pub enum EngineEvent {
     GoalFinished {
         report: SmolStr,
     },
+    /// Something the user asked for was not done, without failing the turn.
+    ///
+    /// A refused skill body is the first use: the turn still runs, but the
+    /// reason the body is missing has to reach the surface, or the prompt
+    /// quietly means something else than the user read on screen.
+    Notice {
+        message: SmolStr,
+    },
 }

@@ -371,9 +371,10 @@ impl EngineRuntime {
                             if active.is_some() {
                                 queued.push_back(text);
                             } else {
+                                let text = self.expand_skills(text).await;
                                 let system = self.system_prompt().await;
-                                  active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
-                              }
+                                active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
+                            }
                         }
                         EngineCommand::RestoreHistory { messages } => {
                             self.config.restored_messages = messages;
@@ -465,8 +466,9 @@ impl EngineRuntime {
                             self.config.restored_messages = history;
                         }
                         if let Some(text) = queued.pop_front() {
+                            let text = self.expand_skills(text).await;
                             let system = self.system_prompt().await;
-                          active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
+                            active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
                         }
                     }
                 }
@@ -483,6 +485,38 @@ impl EngineRuntime {
                 message: message.into(),
             })
             .await;
+    }
+
+    /// Pull in the body of every skill the prompt names with `/name`.
+    ///
+    /// Only the bytes sent to the model change: the surface already logged
+    /// and drew the text as typed. A refused body is reported instead of
+    /// being pasted in, so a skill missing from a prompt is never silent.
+    async fn expand_skills(&self, text: SmolStr) -> SmolStr {
+        let cwd = self
+            .config
+            .workspace_root
+            .clone()
+            .or_else(|| self.config.genome_root.clone());
+        let agent_dir = self.config.agent_dir.clone();
+        let typed = text.clone();
+        // Reads a directory and up to BODY_CAP per skill: off the runtime thread.
+        let expanded = tokio::task::spawn_blocking(move || {
+            crate::skills::expand(&typed, cwd.as_deref(), agent_dir.as_deref())
+        })
+        .await;
+        let Ok(expanded) = expanded else {
+            return text;
+        };
+        for notice in expanded.notices {
+            let _ = self
+                .events
+                .send(EngineEvent::Notice {
+                    message: notice.into(),
+                })
+                .await;
+        }
+        expanded.text.map(SmolStr::from).unwrap_or(text)
     }
 
     /// Identity and personality, then project rules and skill names, then memory and the genome map.

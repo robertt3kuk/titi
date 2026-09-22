@@ -828,6 +828,10 @@ impl App {
             EngineEvent::GoalFinished { report } => {
                 self.set_alert(report.to_string());
             }
+            EngineEvent::Notice { message } => {
+                self.push_transcript(Section::Activity, message.to_string());
+                self.set_alert(message.to_string());
+            }
         }
     }
 
