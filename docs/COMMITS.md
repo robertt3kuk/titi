@@ -1,17 +1,19 @@
-# COMMITS — дисциплина коммитов и push
+# COMMITS — commit and push discipline
 
-Модель — Orca-grade: много сфокусированных коммитов, каждый объясняет сам
-себя. Живой пример:
+The model is Orca-grade: many focused commits, each one explaining itself.
+A live example:
 https://github.com/stablyai/orca/commit/9ece2730561375979405825462c812167d6bbbc1
 
-## Формат
+## Format
 
 Conventional Commits: `type(scope): summary`.
 
-- Английский, императив, lowercase subject, без точки в конце.
-- Типы: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `style`, `chore`.
-- Скоупы из репо: `ci`, `cargo`, `workspace`, `readme`, `agents`, `commits`,
-  `conveyor`, `skills`, а также имена крейтов (`cli`, `engine`, `tui`, …).
+- English, imperative, lowercase subject, no trailing period.
+- Types: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `style`, `chore`.
+- Scopes used in this repo: `ci`, `cargo`, `workspace`, `readme`, `agents`,
+  `commits`, `conveyor`, `skills`, plus crate names (`cli`, `engine`, `tui`,
+  …).
+- No `Co-Authored-By` or other agent trailers.
 
 ```
 fix(workspace): include titi-secrets as a member so its tests run
@@ -19,31 +21,33 @@ docs(readme): fix the broken "continue the work" links
 ci: run fmt, clippy, and tests on GitHub Actions
 ```
 
-## Одна забота — один коммит
+## One concern, one commit
 
-Каждый коммит меняет ровно одну вещь. Если в описании появляется «и», «плюс»
-или второй несвязанный файл — это два коммита. Рефактор отдельно от фичи,
-переименование отдельно от логики.
+Each commit changes exactly one thing. If the description needs "and",
+"plus", or a second unrelated file, it is two commits. Keep a refactor apart
+from a feature, and a rename apart from a logic change.
 
-## Тело — проза, не список галочек
+## The body is prose, not a checklist
 
-Несколько плотных предложений, перенос ~78 колонок. Тело отвечает на:
+A few dense sentences, wrapped at about 78 columns. The body answers:
 
-- **Зачем** — какая проблема/цель, а не пересказ diff.
-- **Инвариант** — что теперь гарантируется или защищено.
-- **Компромис** — почему так, а не альтернатива.
+- **Why**: the problem or goal, not a retelling of the diff.
+- **Invariant**: what is now guaranteed or protected.
+- **Tradeoff**: why this way and not the alternative.
 
-Без филлера, без «as requested», без «updated code».
+No filler, no "as requested", no "updated code".
 
 ## Push
 
-- Прямо в `master`: `git push origin master`.
-- Никогда не force-push (`-f` / `--force` / `--force-with-lease` запрещены).
-- Origin ушёл вперёд (Beka запушил) → `git fetch origin && git rebase
-  origin/master`, затем обычный push. Конфликт ребейза → остановиться и
-  сообщить, не ломать историю.
+- Straight to `master`: `git push origin master`.
+- Never force-push (`-f`, `--force`, and `--force-with-lease` are all
+  banned).
+- If origin moved ahead (Beka pushed), run `git fetch origin && git rebase
+  origin/master`, then push normally. If the rebase conflicts, stop and
+  report instead of rewriting history.
 
-## Шаблон
+## Template
 
-`.gitmessage` подключён для этого репо (`git config commit.template
-.gitmessage`) — subject-конвенция и подсказки для тела.
+`.gitmessage` is set up as this repo's commit template (`git config
+commit.template .gitmessage`). It holds the subject convention and prompts
+for the body.
