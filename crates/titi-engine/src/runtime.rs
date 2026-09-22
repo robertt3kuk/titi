@@ -807,6 +807,12 @@ async fn run_turn(
         });
         let mut tool_rounds = 0;
         loop {
+            // `execute_tools` returns as soon as the abort lands, and the loop
+            // used to walk straight back into another stream. Nothing below
+            // this point is worth doing for a turn nobody will read.
+            if aborted.load(Ordering::SeqCst) {
+                return None;
+            }
             // Anything typed mid-flight lands before the next attempt.
             for text in steering.drain() {
                 messages.push(ChatMessage {
@@ -965,6 +971,14 @@ async fn stream_attempt(
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
 ) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
+    // Every request the turn makes goes through here, including each transient
+    // retry, so this is the one place that can be the last look at the flag
+    // before bytes leave. It cannot close the window completely: a cancel that
+    // lands after `stream` was called hits a request already in flight, and
+    // only `RequestCtx::aborted` can cut that connection short.
+    if aborted.load(Ordering::SeqCst) {
+        return Ok((SmolStr::default(), Vec::new()));
+    }
     let mut request = WireRequest::new(model.clone());
     request.messages = messages.to_vec();
     request.tools = tools.specs();

@@ -988,6 +988,97 @@ async fn cancel_returns_the_queued_prompts_instead_of_firing_them_later() {
     );
 }
 
+/// A cancelled turn costs nothing more. Once the abort flag is up the turn
+/// must not open another request: the answer would be billed and thrown away.
+#[tokio::test]
+async fn a_cancelled_turn_sends_no_further_request() {
+    use titi_tools::{ApprovalMode, ShellProbeTool, ToolRegistry};
+
+    // Parking on an approval puts the turn mid-tool-round, which is where it
+    // used to loop back and stream again after the cancel.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "shell_probe".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: r#"{"command":"ls"}"#.into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ShellProbeTool));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
+        tools,
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "alpha".into(),
+        })
+        .await
+        .unwrap();
+    loop {
+        let Some(event) = engine.recv().await else {
+            break;
+        };
+        if matches!(event, EngineEvent::ToolApprovalNeeded { .. }) {
+            break;
+        }
+    }
+    let before = transport.requests().len();
+    assert_eq!(before, 1, "the parked turn sent exactly its first request");
+
+    engine.send(EngineCommand::Cancel).await.unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    // The aborted turn unwinds on its own after the approval wait breaks;
+    // give it room to make the request it must not make.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        collect_until_terminal(&mut engine),
+    )
+    .await;
+
+    let after: Vec<String> = transport
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .map(|message| message.content.to_string())
+        })
+        .collect();
+    assert_eq!(
+        after.len(),
+        before,
+        "a cancelled turn billed another request: {after:?}"
+    );
+}
+
 #[tokio::test]
 async fn follow_up_runs_after_active_turn() {
     let transport = Arc::new(MockTransport::new(vec![
