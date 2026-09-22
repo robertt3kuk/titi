@@ -389,6 +389,14 @@ impl EngineRuntime {
                                 aborted.store(true, Ordering::SeqCst);
                                 let _ = self.events.send(EngineEvent::Cancelled { turn_id }).await;
                             }
+                            // Cancel is a stop, and taking `active` already stops
+                            // the drain on the next `TurnDone`. Left in place the
+                            // queue would sit there and fire at some later turn's
+                            // end, answering a question the user walked away from.
+                            // The text goes back to the surface instead.
+                            for text in queued.drain(..) {
+                                let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                            }
                         }
                         EngineCommand::SwitchModel { model } => {
                             primary_model = model;

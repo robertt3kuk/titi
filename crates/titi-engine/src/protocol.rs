@@ -163,6 +163,15 @@ pub enum EngineEvent {
     Cancelled {
         turn_id: TurnId,
     },
+    /// A prompt that was waiting behind the cancelled turn and will not run.
+    ///
+    /// Cancel means stop, so the queue is not allowed to fire later and
+    /// answer a question the user walked away from. The text goes back to
+    /// the surface instead of being dropped, one event per queued prompt in
+    /// the order they were typed.
+    PromptReturned {
+        text: SmolStr,
+    },
     /// `/goal` finished. `report` is the line the surface shows.
     GoalFinished {
         report: SmolStr,

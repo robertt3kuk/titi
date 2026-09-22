@@ -846,6 +846,148 @@ async fn cancel_aborts_an_in_flight_turn() {
     );
 }
 
+/// Cancel means stop. Prompts that were waiting behind the cancelled turn
+/// must never reach the provider afterwards, and must not vanish either:
+/// each one comes back to the surface, in the order it was typed.
+#[tokio::test]
+async fn cancel_returns_the_queued_prompts_instead_of_firing_them_later() {
+    use titi_tools::{ApprovalMode, ShellProbeTool, ToolRegistry};
+
+    // The first turn parks on an approval that never arrives, so the two
+    // prompts behind it are genuinely queued when the cancel lands.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "shell_probe".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: r#"{"command":"ls"}"#.into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(ShellProbeTool));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
+        tools,
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "alpha".into(),
+        })
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let Some(event) = engine.recv().await else {
+            break;
+        };
+        let parked = matches!(event, EngineEvent::ToolApprovalNeeded { .. });
+        seen.push(event);
+        if parked {
+            break;
+        }
+    }
+
+    // Both land behind the parked turn.
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "bravo".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "charlie".into(),
+        })
+        .await
+        .unwrap();
+    engine.send(EngineCommand::Cancel).await.unwrap();
+    seen.extend(collect_until_terminal(&mut engine).await);
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "delta".into(),
+        })
+        .await
+        .unwrap();
+    seen.extend(collect_until_terminal(&mut engine).await);
+    // A queue that still holds the abandoned prompts fires one here, after
+    // the turn that followed the cancel finished; give it that chance.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        collect_until_terminal(&mut engine),
+    )
+    .await;
+
+    let prompts: Vec<String> = transport
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .map(|message| message.content.to_string())
+        })
+        .collect();
+    assert!(
+        prompts.contains(&"alpha".to_owned()),
+        "the cancelled turn did reach the provider: {prompts:?}"
+    );
+    assert!(
+        prompts.contains(&"delta".to_owned()),
+        "the turn after the cancel ran: {prompts:?}"
+    );
+    assert!(
+        !prompts
+            .iter()
+            .any(|prompt| prompt == "bravo" || prompt == "charlie"),
+        "an abandoned prompt reached the provider: {prompts:?}"
+    );
+
+    let returned: Vec<String> = seen
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::PromptReturned { text } => Some(text.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        returned,
+        vec!["bravo".to_owned(), "charlie".to_owned()],
+        "one event per queued prompt, oldest first: {seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn follow_up_runs_after_active_turn() {
     let transport = Arc::new(MockTransport::new(vec![

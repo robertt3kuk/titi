@@ -819,6 +819,12 @@ impl App {
                 self.turn_active = false;
                 self.set_alert("cancelled");
             }
+            EngineEvent::PromptReturned { text } => {
+                // The cancelled turn's queue is not replayed, so the text has
+                // to come back where the user can see and resend it.
+                self.push_transcript(Section::Activity, format!("not sent: {text}"));
+                self.set_alert(format!("cancelled · queued prompt returned: {text}"));
+            }
             EngineEvent::GoalFinished { report } => {
                 self.set_alert(report.to_string());
             }
