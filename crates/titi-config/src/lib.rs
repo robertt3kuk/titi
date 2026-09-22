@@ -7,6 +7,7 @@
 //! are replaced wholesale by the higher layer.
 
 pub mod config_file;
+pub mod roles;
 pub mod settings;
 
 use std::path::PathBuf;
