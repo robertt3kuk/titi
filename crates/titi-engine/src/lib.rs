@@ -10,6 +10,7 @@ pub mod protocol;
 pub mod registry;
 pub mod review;
 pub mod runtime;
+pub mod skills;
 pub mod steering;
 pub mod tool_agent;
 pub mod tool_loop;

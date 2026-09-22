@@ -150,6 +150,59 @@ async fn project_rules_enter_the_system_prompt_and_flagged_ones_do_not() {
     );
 }
 
+/// Skill metadata is a short list. The body of `SKILL.md` stays off the prompt.
+#[tokio::test]
+async fn skill_names_enter_the_system_prompt_without_their_bodies() {
+    let agent = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(agent.path().join("skills/review")).unwrap();
+    std::fs::write(
+        agent.path().join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Check a diff\n---\nSECRET-BODY\n",
+    )
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".titi/skills/review")).unwrap();
+    std::fs::write(
+        project.path().join(".titi/skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Project copy\n---\nOTHER-BODY\n",
+    )
+    .unwrap();
+
+    let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
+        StreamEvent::Done {
+            reason: StopReason::Stop,
+        },
+    ])]));
+    let captured = Arc::clone(&transport);
+    let mut config = EngineConfig::new("primary");
+    config.agent_dir = Some(agent.path().to_path_buf());
+    config.workspace_root = Some(project.path().to_path_buf());
+    let mut engine = EngineRuntime::start(config, resolver(vec![("primary", transport)]));
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = captured.requests();
+    let system = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::System)
+        .expect("a system message");
+    assert!(
+        system.content.contains("- review: Project copy"),
+        "{}",
+        system.content
+    );
+    assert!(
+        !system.content.contains("SECRET-BODY"),
+        "{}",
+        system.content
+    );
+    assert!(!system.content.contains("OTHER-BODY"), "{}", system.content);
+}
+
 /// A memory stored earlier comes back in the next turn's system prompt,
 /// ranked above an unrelated one because the turn touched its file.
 #[tokio::test]
