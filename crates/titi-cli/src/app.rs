@@ -1495,7 +1495,11 @@ impl App {
             }
             "checkpoint" => {
                 match self.session_id.as_deref() {
-                    Some(id) => match checkpoint_session(&titi_config::agent_dir(), id) {
+                    Some(id) => match checkpoint_session(
+                        &titi_config::agent_dir(),
+                        &current_workspace(),
+                        id,
+                    ) {
                         Ok(summary) => self.set_alert(summary),
                         Err(reason) => self.set_alert(format!("checkpoint: {reason}")),
                     },
@@ -1525,7 +1529,12 @@ impl App {
                     (None, _) => self.set_alert("rewind: no live session"),
                     (Some(_), Err(reason)) => self.set_alert(format!("rewind: {reason}")),
                     (Some(id), Ok(index)) => {
-                        match rewind_session(&titi_config::agent_dir(), id, index) {
+                        match rewind_session(
+                            &titi_config::agent_dir(),
+                            &current_workspace(),
+                            id,
+                            index,
+                        ) {
                             Ok(summary) => {
                                 self.set_alert(summary);
                                 // The engine still holds the pre-rewind history;
@@ -1882,15 +1891,26 @@ pub fn session_history(
     ))
 }
 
+/// The directory a checkpoint pins and a rewind restores: where titi runs.
+pub fn current_workspace() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| ".".into())
+}
+
 /// Record a rewind point on a session; returns a human summary.
-pub fn checkpoint_session(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
+///
+/// `workspace` is explicit: taking the process cwd here made the tests
+/// commit into whatever checkout ran them.
+pub fn checkpoint_session(
+    agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+) -> Result<String, String> {
     let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
     let mut checkpoint = store.checkpoint(session_id).map_err(|e| e.to_string())?;
     // Also pin the workspace, so a later rewind can undo code and not only
     // the transcript. A directory that is not a repo stays session-only.
-    let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let git = crate::git_checkpoint::snapshot(
-        &workspace,
+        workspace,
         &format!("{session_id} · {} entries", checkpoint.entries),
     );
     if let Ok(commit) = &git {
@@ -1925,6 +1945,7 @@ pub fn list_checkpoints(agent_dir: &std::path::Path, session_id: &str) -> Result
 /// Rewind a session to checkpoint `index` (1-based); the newest when `None`.
 pub fn rewind_session(
     agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
     session_id: &str,
     index: Option<usize>,
 ) -> Result<String, String> {
@@ -1946,13 +1967,10 @@ pub fn rewind_session(
     // Put the files back too, when the checkpoint pinned a commit and the
     // tree is clean. A dirty tree is reported rather than overwritten.
     let git = match &target.git_commit {
-        Some(commit) => {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            match crate::git_checkpoint::restore(&workspace, commit) {
-                Ok(()) => format!(" · git {}", &commit[..7.min(commit.len())]),
-                Err(reason) => format!(" · git not restored: {reason}"),
-            }
-        }
+        Some(commit) => match crate::git_checkpoint::restore(workspace, commit) {
+            Ok(()) => format!(" · git {}", &commit[..7.min(commit.len())]),
+            Err(reason) => format!(" · git not restored: {reason}"),
+        },
         None => String::new(),
     };
     Ok(format!(

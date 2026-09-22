@@ -508,6 +508,7 @@ impl Chat {
         let applied = match name {
             "checkpoint" => self.session_note(crate::app::checkpoint_session(
                 &self.agent_dir,
+                &crate::app::current_workspace(),
                 &self.session_id,
             )),
             "checkpoints" => self.session_note(crate::app::list_checkpoints(
@@ -553,7 +554,12 @@ impl Chat {
             );
             return Applied::none();
         };
-        match crate::app::rewind_session(&self.agent_dir, &self.session_id, index) {
+        match crate::app::rewind_session(
+            &self.agent_dir,
+            &crate::app::current_workspace(),
+            &self.session_id,
+            index,
+        ) {
             Ok(summary) => match crate::app::session_history(&self.agent_dir, &self.session_id) {
                 Ok(messages) => {
                     self.show_history(&messages);
