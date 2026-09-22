@@ -180,6 +180,27 @@ impl Settings {
         merged
     }
 
+    /// A dotted key from the user's own layers only: runtime, overlays, then
+    /// global. The project file is skipped, so a cloned repo cannot loosen a
+    /// setting that protects the user (privacy, approval).
+    pub fn get_user(&self, key: &str) -> Option<Value> {
+        std::iter::once(&self.runtime)
+            .chain(self.overlays.iter().rev())
+            .chain(std::iter::once(&self.global))
+            .find_map(|layer| lookup(layer, key))
+    }
+
+    /// The key's value in every layer that sets it, lowest first (global,
+    /// project, overlays, runtime), for settings that add up across layers.
+    pub fn layer_values(&self, key: &str) -> Vec<Value> {
+        std::iter::once(&self.global)
+            .chain(std::iter::once(&self.project))
+            .chain(self.overlays.iter())
+            .chain(std::iter::once(&self.runtime))
+            .filter_map(|layer| lookup(layer, key))
+            .collect()
+    }
+
     /// Write a dotted key into the **global** layer and persist it (the only
     /// persistent write path through this API).
     pub fn set(&mut self, key: &str, value: Value) -> Result<(), SettingsError> {
@@ -222,6 +243,14 @@ impl Settings {
             Ok(())
         })
     }
+}
+
+fn lookup(layer: &Value, key: &str) -> Option<Value> {
+    let mut current = layer;
+    for seg in key.split('.') {
+        current = current.get(seg)?;
+    }
+    Some(current.clone())
 }
 
 /// Objects deep-merge; scalars and arrays are replaced wholesale.
@@ -341,6 +370,68 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn get_user_ignores_the_project_layer() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "privacy:\n  maskIps: true\n",
+        );
+        write(
+            &project.path().join(PROJECT_SUBPATH),
+            "privacy:\n  maskIps: false\n  allow: [\".env\"]\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        // The effective view still sees the project value...
+        assert_eq!(settings.get("privacy.maskIps"), Some(Value::Bool(false)));
+        // ...but a key the project must not loosen reads past it.
+        assert_eq!(
+            settings.get_user("privacy.maskIps"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(settings.get_user("privacy.allow"), None);
+    }
+
+    #[test]
+    fn get_user_prefers_runtime_then_global() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "privacy:\n  maskIps: false\n",
+        );
+        let mut settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert_eq!(
+            settings.get_user("privacy.maskIps"),
+            Some(Value::Bool(false))
+        );
+        settings
+            .set_runtime("privacy.maskIps", Value::Bool(true))
+            .unwrap();
+        assert_eq!(
+            settings.get_user("privacy.maskIps"),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn layer_values_lists_every_layer_that_sets_the_key() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "privacy:\n  sensitive: [\"a\"]\n",
+        );
+        write(
+            &project.path().join(PROJECT_SUBPATH),
+            "privacy:\n  sensitive: [\"b\"]\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        let values = settings.layer_values("privacy.sensitive");
+        assert_eq!(values.len(), 2, "{values:?}");
     }
 
     fn obj(pairs: &[(&str, Value)]) -> Value {
