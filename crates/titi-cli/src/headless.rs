@@ -118,6 +118,7 @@ pub async fn run(
                     | EngineEvent::Failed { .. }
                     | EngineEvent::Cancelled { .. }
                     | EngineEvent::AgentFinished { .. }
+                    | EngineEvent::GoalFinished { .. }
             );
             if terminal {
                 break;

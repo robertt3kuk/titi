@@ -65,6 +65,10 @@ pub enum EngineCommand {
     StopAgent {
         agent_id: SmolStr,
     },
+    /// Run the coder/reviewer goal loop. This is not a chat turn.
+    RunGoal {
+        text: SmolStr,
+    },
     Shutdown,
 }
 
@@ -158,5 +162,9 @@ pub enum EngineEvent {
     },
     Cancelled {
         turn_id: TurnId,
+    },
+    /// `/goal` finished. `report` is the line the surface shows.
+    GoalFinished {
+        report: SmolStr,
     },
 }

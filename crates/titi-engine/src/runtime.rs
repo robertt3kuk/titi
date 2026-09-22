@@ -375,6 +375,9 @@ impl EngineRuntime {
                         EngineCommand::SwitchModel { model } => {
                             primary_model = model;
                         }
+                        EngineCommand::RunGoal { text } => {
+                            self.spawn_goal(text, primary_model.clone());
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
@@ -594,6 +597,41 @@ impl EngineRuntime {
             let _ = done.send(turn_id).await;
         });
         (turn_id, aborted)
+    }
+
+    /// `/goal` runs the existing loop on the session model. It does not
+    /// replace the active turn or queue a `SubmitPrompt`.
+    fn spawn_goal(&self, text: SmolStr, model: SmolStr) {
+        let events = self.events.clone();
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            tokio::spawn(async move {
+                let _ = events
+                    .send(EngineEvent::GoalFinished {
+                        report: "usage: /goal <text>".into(),
+                    })
+                    .await;
+            });
+            return;
+        }
+        let coder = Arc::new(crate::RunnerCoder::new(Arc::new(
+            crate::StreamingAgentRunner::new(Arc::clone(&self.resolver), model.clone()),
+        )));
+        let reviewer = Arc::new(crate::AgentReviewer::new(
+            Arc::new(crate::StreamingAgentRunner::new(
+                Arc::clone(&self.resolver),
+                model,
+            )),
+            "reviewer",
+        ));
+        tokio::spawn(async move {
+            let outcome = crate::run_goal(coder, reviewer, text).await;
+            let _ = events
+                .send(EngineEvent::GoalFinished {
+                    report: crate::goal_report(&outcome).into(),
+                })
+                .await;
+        });
     }
 }
 

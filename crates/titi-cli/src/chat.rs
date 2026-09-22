@@ -364,6 +364,10 @@ impl Chat {
                 self.finish_turn()
             }
             EngineEvent::TurnFinished { .. } => self.finish_turn(),
+            EngineEvent::GoalFinished { report } => {
+                self.push(LineKind::Note, report.to_string());
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -513,6 +517,7 @@ impl Chat {
             "rewind" => self.rewind(args),
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
+            "goal" => self.goal(args),
             "help" => self.help(),
             "login" => self.login(args),
             "logout" => self.logout(args),
@@ -781,6 +786,19 @@ impl Chat {
             self.push(LineKind::Note, format!("{}  {status}", provider.id));
         }
         Applied::none()
+    }
+
+    /// `/goal` runs the coder/reviewer loop. It never becomes `SubmitPrompt`.
+    fn goal(&mut self, args: &str) -> Applied {
+        let text = args.trim();
+        if text.is_empty() {
+            self.push(LineKind::Error, "usage: /goal <text>".to_owned());
+            return Applied::none();
+        }
+        self.push(LineKind::Note, format!("goal: {text}"));
+        Applied::effect(ChatEffect::Send(EngineCommand::RunGoal {
+            text: text.into(),
+        }))
     }
 
     fn arm_quit(&mut self, now: Instant) -> Applied {
@@ -2155,6 +2173,46 @@ mod tests {
         assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
         assert!(chat.take_kitty_flush().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn goal_is_reserved_and_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/goal fix the parser");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::RunGoal { text })) => {
+                assert_eq!(text.as_str(), "fix the parser");
+            }
+            other => panic!("expected RunGoal, got {other:?}"),
+        }
+        assert!(applied.log.is_none(), "a goal is not a user prompt");
+        assert!(!chat.turn_active);
+    }
+
+    #[test]
+    fn goal_without_text_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/goal");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /goal")),
+            "{:?}",
+            chat.lines
+        );
+    }
+
+    #[test]
+    fn a_goal_report_lands_on_the_transcript() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::GoalFinished {
+            report: "goal: passed · 1 round · verdict pass".into(),
+        });
+        assert!(chat.lines.iter().any(|line| line.text.contains("passed")));
+        assert!(!chat.turn_active);
     }
 }
 

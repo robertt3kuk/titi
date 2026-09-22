@@ -289,6 +289,85 @@ impl GoalLoop {
     }
 }
 
+/// The entry `/goal` uses. Surfaces and tests call this; it does not replace
+/// `SubmitPrompt`.
+pub async fn run_goal(
+    coder: Arc<dyn Coder>,
+    reviewer: Arc<dyn Reviewer>,
+    goal: impl Into<SmolStr>,
+) -> GoalOutcome {
+    GoalLoop::new(coder, reviewer).run(goal).await
+}
+
+/// One transcript line: stop, rounds, and verdict when there is one.
+pub fn goal_report(outcome: &GoalOutcome) -> String {
+    let stop = match outcome.stop {
+        GoalStop::Passed => "passed",
+        GoalStop::RoundCap => "round cap",
+        GoalStop::Oscillation => "oscillation",
+        GoalStop::Cancelled => "cancelled",
+        GoalStop::Error => "error",
+    };
+    let rounds = if outcome.rounds == 1 {
+        "1 round".to_owned()
+    } else {
+        format!("{} rounds", outcome.rounds)
+    };
+    let mut line = format!("goal: {stop} · {rounds}");
+    if let Some(verdict) = outcome.verdict {
+        line.push_str(" · verdict ");
+        line.push_str(&verdict.as_str().to_ascii_lowercase());
+    }
+    if let Some(error) = &outcome.error {
+        line.push_str(" · ");
+        line.push_str(error);
+    }
+    line
+}
+
+/// A coder that asks the session's [`crate::AgentRunner`] for the next patch.
+///
+/// The reviewer is a separate runner, so this conversation is not the review.
+pub struct RunnerCoder {
+    runner: Arc<dyn crate::AgentRunner>,
+}
+
+impl RunnerCoder {
+    pub fn new(runner: Arc<dyn crate::AgentRunner>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait]
+impl Coder for RunnerCoder {
+    async fn code(&self, request: CodeRequest) -> Result<Patch, SmolStr> {
+        let mut task = format!("Goal:\n{}\n\nRound {}.\n", request.goal, request.round);
+        if let Some(review) = &request.feedback {
+            task.push_str("Previous review (");
+            task.push_str(review.verdict.as_str());
+            task.push_str("):\n");
+            task.push_str(&review.notes);
+            task.push_str("\nRevise the patch.\n");
+        } else {
+            task.push_str("Produce a patch that meets the goal.\n");
+        }
+        let text = self
+            .runner
+            .run(
+                crate::AgentRequest {
+                    id: "coder".into(),
+                    name: "coder".into(),
+                    task: task.into(),
+                    kind: crate::AgentKind::Subagent,
+                    parent_id: None,
+                },
+                crate::AgentContext::detached(),
+            )
+            .await?;
+        Ok(Patch::new(text))
+    }
+}
+
 async fn wait_cancelled(cancel: &GoalCancel) {
     loop {
         // Subscribe before the flag check. A permit from `cancel` is then

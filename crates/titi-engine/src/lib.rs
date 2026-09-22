@@ -16,10 +16,9 @@ pub mod tool_agent;
 pub mod tool_loop;
 
 pub use agents::{AgentContext, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner};
-pub use claims::{ClaimError, Claims};
-pub use findings::{FINDINGS_CAPACITY, Finding, Findings};
 pub use goal::{
     CodeRequest, Coder, DEFAULT_GOAL_ROUNDS, GoalCancel, GoalLoop, GoalOutcome, GoalStop, Patch,
+    RunnerCoder, goal_report, run_goal,
 };
 pub use protocol::{AgentKind, AgentStatus, EngineCommand, EngineEvent, TurnId};
 pub use registry::{

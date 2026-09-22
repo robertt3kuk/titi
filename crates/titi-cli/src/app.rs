@@ -237,6 +237,7 @@ impl App {
             "Rewind the session to a checkpoint (newest by default)",
         );
         registry.register_builtin("recap", "Session recap: turns, tools, files, problems");
+        registry.register_builtin("goal", "Run the coder/reviewer goal loop");
         registry
     }
 
@@ -817,6 +818,9 @@ impl App {
             EngineEvent::Cancelled { .. } => {
                 self.turn_active = false;
                 self.set_alert("cancelled");
+            }
+            EngineEvent::GoalFinished { report } => {
+                self.set_alert(report.to_string());
             }
         }
     }
@@ -1477,6 +1481,15 @@ impl App {
             "recap" => {
                 if let Err(reason) = self.open_session_recap() {
                     self.set_alert(format!("recap: {reason}"));
+                }
+                None
+            }
+            "goal" => {
+                let text = args.trim();
+                if text.is_empty() {
+                    self.set_alert("usage: /goal <text>");
+                } else {
+                    self.set_alert(format!("goal: {text}"));
                 }
                 None
             }

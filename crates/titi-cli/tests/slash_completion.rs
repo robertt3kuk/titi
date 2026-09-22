@@ -39,6 +39,16 @@ fn reserved_builtins_route_as_builtin() {
 }
 
 #[test]
+fn goal_is_reserved() {
+    let app = app();
+    assert_eq!(
+        app.route_slash("/goal fix the parser"),
+        Route::Builtin("goal".into())
+    );
+    assert_eq!(app.route_slash("/goal"), Route::Builtin("goal".into()));
+}
+
+#[test]
 fn builtin_with_arguments_still_routes_as_builtin() {
     let app = app();
     // The command name (up to the first space) decides the route; the
