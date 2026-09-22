@@ -216,6 +216,9 @@ pub struct EngineRuntime {
     claims: Claims,
     /// Messages typed mid-flight, injected at the next step boundary.
     steering: Steering,
+    /// Bumped by every `RestoreHistory`. A turn that started before the
+    /// rewind must not write its stale history back over the replacement.
+    history_epoch: u64,
 }
 
 impl EngineRuntime {
@@ -342,6 +345,7 @@ impl EngineRuntime {
             touched,
             claims: claims.clone(),
             steering: Steering::default(),
+            history_epoch: 0,
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -353,7 +357,7 @@ impl EngineRuntime {
     }
 
     async fn run(mut self) {
-        let (done_tx, mut done_rx) = mpsc::channel::<TurnId>(8);
+        let (done_tx, mut done_rx) = mpsc::channel::<TurnDone>(8);
         let mut active: Option<(TurnId, Arc<AtomicBool>)> = None;
         let mut queued = VecDeque::<SmolStr>::new();
         let mut primary_model = self.config.primary_model.clone();
@@ -373,6 +377,7 @@ impl EngineRuntime {
                         }
                         EngineCommand::RestoreHistory { messages } => {
                             self.config.restored_messages = messages;
+                            self.history_epoch += 1;
                         }
                         EngineCommand::Steer { text } => {
                             // Queued, not applied here: the running turn drains it at
@@ -440,9 +445,17 @@ impl EngineRuntime {
                 }
                 completed = done_rx.recv() => {
                     if let Some(completed) = completed
-                        && active.as_ref().is_some_and(|(id, _)| *id == completed)
+                        && active.as_ref().is_some_and(|(id, _)| *id == completed.turn_id)
                     {
                         active = None;
+                        // A rewind that landed while the turn ran replaced the
+                        // history the turn was built on, so that turn's copy is
+                        // stale and must not come back.
+                        if let Some(history) = completed.history
+                            && completed.epoch == self.history_epoch
+                        {
+                            self.config.restored_messages = history;
+                        }
                         if let Some(text) = queued.pop_front() {
                             let system = self.system_prompt().await;
                           active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
@@ -575,8 +588,9 @@ impl EngineRuntime {
         prompt: SmolStr,
         primary_model: SmolStr,
         system: Option<SmolStr>,
-        done: mpsc::Sender<TurnId>,
+        done: mpsc::Sender<TurnDone>,
     ) -> (TurnId, Arc<AtomicBool>) {
+        let epoch = self.history_epoch;
         let turn_id = TurnId(self.next_turn.fetch_add(1, Ordering::SeqCst));
         let aborted = Arc::new(AtomicBool::new(false));
         let task_abort = Arc::clone(&aborted);
@@ -590,7 +604,7 @@ impl EngineRuntime {
         let claims = self.claims.clone();
         let steering = self.steering.clone();
         tokio::spawn(async move {
-            run_turn(
+            let history = run_turn(
                 turn_id,
                 prompt,
                 primary_model,
@@ -607,7 +621,13 @@ impl EngineRuntime {
                 steering,
             )
             .await;
-            let _ = done.send(turn_id).await;
+            let _ = done
+                .send(TurnDone {
+                    turn_id,
+                    history,
+                    epoch,
+                })
+                .await;
         });
         (turn_id, aborted)
     }
@@ -654,6 +674,18 @@ fn process_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// What a finished turn hands back to the command loop.
+struct TurnDone {
+    turn_id: TurnId,
+    /// The history the next turn must start from, without the system prompt
+    /// (rebuilt per turn). `None` when the turn did not finish cleanly.
+    history: Option<Vec<ChatMessage>>,
+    /// The value of `EngineRuntime::history_epoch` when the turn started.
+    epoch: u64,
+}
+
+/// Returns the visible history to keep, or `None` when this turn must leave
+/// the history untouched.
 async fn run_turn(
     turn_id: TurnId,
     prompt: SmolStr,
@@ -669,7 +701,7 @@ async fn run_turn(
     touched: TouchedSink,
     claims: Claims,
     steering: Steering,
-) {
+) -> Option<Vec<ChatMessage>> {
     let mut models = Vec::with_capacity(1 + config.fallback_models.len());
     models.push(primary_model);
     models.extend(config.fallback_models);
@@ -677,7 +709,7 @@ async fn run_turn(
 
     for model in models {
         if aborted.load(Ordering::SeqCst) {
-            return;
+            return None;
         }
         if let Some(previous) = previous_model.take() {
             let _ = events
@@ -698,7 +730,7 @@ async fn run_turn(
                         message: error.to_string().into(),
                     })
                     .await;
-                return;
+                return None;
             }
         };
         let api_key = resolved.credential.map(|credential| credential.access);
@@ -783,11 +815,18 @@ async fn run_turn(
                 )
                 .await
                 {
-                    Ok(calls) if calls.is_empty() => {
+                    Ok((text, calls)) if calls.is_empty() => {
+                        if !text.is_empty() {
+                            messages.push(ChatMessage {
+                                role: Role::Assistant,
+                                content: text,
+                                tool_calls: Vec::new(),
+                            });
+                        }
                         completed = true;
                         break;
                     }
-                    Ok(calls) => {
+                    Ok((text, calls)) => {
                         if tool_rounds >= config.max_tool_rounds {
                             let _ = events
                                 .send(EngineEvent::Failed {
@@ -796,12 +835,13 @@ async fn run_turn(
                                     message: "tool round cap reached".into(),
                                 })
                                 .await;
-                            return;
+                            return None;
                         }
                         tool_rounds += 1;
                         let extra = execute_tools(
                             turn_id,
                             calls,
+                            text,
                             &tools,
                             config.approval_mode,
                             &waiters,
@@ -820,11 +860,11 @@ async fn run_turn(
                     }
                     Err((error, visible_content)) => {
                         if aborted.load(Ordering::SeqCst) {
-                            return;
+                            return None;
                         }
                         if visible_content || !error.is_retryable() {
                             emit_transport_failure(&events, turn_id, error).await;
-                            return;
+                            return None;
                         }
                         last_error = Some(error);
                     }
@@ -834,7 +874,13 @@ async fn run_turn(
                 if let Some(recorder) = trajectory.lock().await.as_mut() {
                     let _ = recorder.record(titi_core::trajectory::EventKind::TurnEnd);
                 }
-                return;
+                // A cancelled turn contributes nothing. Its assistant output is
+                // partial and its last tool calls may have no results, and a
+                // tool call without its result is a request no provider accepts.
+                if aborted.load(Ordering::SeqCst) {
+                    return None;
+                }
+                return Some(visible_history(messages, system.as_ref()));
             }
             if last_error.is_some() {
                 previous_model = Some(model.clone());
@@ -850,6 +896,21 @@ async fn run_turn(
             message: "all configured models are unavailable".into(),
         })
         .await;
+    None
+}
+
+/// The turn's messages without the system prompt it was given: the next turn
+/// rebuilds that itself. A digest compaction put in its place is not the
+/// system prompt and stays, so folded messages do not come back.
+fn visible_history(mut messages: Vec<ChatMessage>, system: Option<&SmolStr>) -> Vec<ChatMessage> {
+    if let Some(system) = system
+        && messages
+            .first()
+            .is_some_and(|first| first.role == Role::System && first.content == *system)
+    {
+        messages.remove(0);
+    }
+    messages
 }
 
 async fn stream_attempt(
@@ -861,7 +922,7 @@ async fn stream_attempt(
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
-) -> Result<Vec<crate::tool_loop::PendingToolCall>, (TransportError, bool)> {
+) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
     let mut request = WireRequest::new(model.clone());
     request.messages = messages.to_vec();
     request.tools = tools.specs();
@@ -875,15 +936,17 @@ async fn stream_attempt(
         .map_err(|error| (error, false))?;
     let mut visible_content = false;
     let mut collector = ToolCallCollector::default();
+    let mut answer = String::new();
 
     while let Some(event) = stream.next().await {
         if aborted.load(Ordering::SeqCst) {
-            return Ok(Vec::new());
+            return Ok((SmolStr::default(), Vec::new()));
         }
         visible_content |= event.is_content();
         collector.observe(&event);
         match event {
             StreamEvent::TextDelta { text, .. } => {
+                answer.push_str(&text);
                 let _ = events
                     .send(EngineEvent::StreamDelta { turn_id, text })
                     .await;
@@ -900,7 +963,7 @@ async fn stream_attempt(
                         .send(EngineEvent::TurnFinished { turn_id, reason })
                         .await;
                 }
-                return Ok(calls);
+                return Ok((answer.into(), calls));
             }
             StreamEvent::Error { reason, message } => {
                 let error = if reason == ErrorReason::Connection && !visible_content {

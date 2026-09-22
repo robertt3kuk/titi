@@ -110,6 +110,8 @@ const WRITING_TOOLS: &[&str] = &["write", "edit"];
 pub(crate) async fn execute_tools(
     turn_id: TurnId,
     calls: Vec<PendingToolCall>,
+    // What the assistant said in the same message as these calls.
+    assistant_text: SmolStr,
     tools: &ToolRegistry,
     approval_mode: ApprovalMode,
     waiters: &ApprovalWaiters,
@@ -131,7 +133,7 @@ pub(crate) async fn execute_tools(
     }
     messages.push(ChatMessage {
         role: Role::Assistant,
-        content: "".into(),
+        content: assistant_text,
         tool_calls: assistant_calls,
     });
 

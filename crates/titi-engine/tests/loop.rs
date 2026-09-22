@@ -408,6 +408,61 @@ async fn genome_refreshes_between_turns() {
     );
 }
 
+/// What turn 1 said is in turn 2's request. The engine owns the history;
+/// no surface has to replay it after every turn.
+#[tokio::test]
+async fn a_finished_turn_is_fed_back_into_the_next_one() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("b0"),
+                text: "the answer to one".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut engine = EngineRuntime::start(
+        EngineConfig::new("primary"),
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "one".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "two".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    let second: Vec<(Role, String)> = requests[1]
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.to_string()))
+        .collect();
+    assert!(
+        second.contains(&(Role::User, "one".to_owned())),
+        "the first prompt is missing: {second:?}"
+    );
+    assert!(
+        second.contains(&(Role::Assistant, "the answer to one".to_owned())),
+        "the first answer is missing: {second:?}"
+    );
+    assert!(
+        second.contains(&(Role::User, "two".to_owned())),
+        "the new prompt is missing: {second:?}"
+    );
+}
+
 #[tokio::test]
 async fn restore_history_replaces_what_the_model_sees() {
     let transport = Arc::new(MockTransport::new(vec![

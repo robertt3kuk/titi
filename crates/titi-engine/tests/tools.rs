@@ -334,6 +334,60 @@ async fn cancelling_a_turn_unblocks_a_pending_approval() {
 }
 
 #[tokio::test]
+async fn a_cancelled_turn_leaves_no_orphan_tool_call_in_the_history() {
+    // The turn is cancelled between the tool call and its result. Keeping that
+    // half of the round would send an assistant tool call with no matching
+    // result, which Anthropic and OpenAI both reject, so the whole cancelled
+    // turn is dropped.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("shell_probe", r#"{"command":"ls"}"#)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let captured = Arc::clone(&transport);
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), echo_registry());
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "one".into() })
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.recv().await,
+        Some(EngineEvent::TurnStarted { .. })
+    ));
+    assert!(matches!(
+        next_tool_event(&mut engine).await,
+        Some(EngineEvent::ToolStarted { .. })
+    ));
+    assert!(matches!(
+        engine.recv().await,
+        Some(EngineEvent::ToolApprovalNeeded { .. })
+    ));
+    engine.send(EngineCommand::Cancel).await.unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "two".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = captured.requests();
+    let last = requests.last().expect("the second turn sent a request");
+    let shape: Vec<(Role, String)> = last
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.to_string()))
+        .collect();
+    assert_eq!(shape, vec![(Role::User, "two".to_owned())]);
+}
+
+#[tokio::test]
 async fn a_long_turn_folds_its_oldest_messages() {
     // A tiny window makes the threshold fire on the second round, which is
     // exactly what a long session does for real.
@@ -401,6 +455,75 @@ async fn a_long_turn_folds_its_oldest_messages() {
         event,
         EngineEvent::StreamDelta { text, .. } if text == "done"
     )));
+}
+
+#[tokio::test]
+async fn the_next_turn_starts_from_the_digest_not_the_folded_prefix() {
+    // History that outlives the turn must not undo compaction: what turn 1
+    // folded into a digest stays folded when turn 2 replays it.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("echo", r#"{"text":"pong"}"#)),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "done".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.context_window = 1;
+    config.compaction = titi_core::compaction::CompactionPolicy {
+        threshold_percent: 0.0,
+        keep_recent_tokens: 4,
+        ..Default::default()
+    };
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(Arc::clone(&transport) as _),
+        echo_registry(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "say something long enough to matter".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "two".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    let last = requests.last().expect("the second turn sent a request");
+    let shape: Vec<(Role, String)> = last
+        .messages
+        .iter()
+        .map(|message| (message.role, message.content.to_string()))
+        .collect();
+    assert!(
+        shape.iter().any(|(role, content)| *role == Role::System
+            && content.contains("earlier message(s) folded")),
+        "the digest leads the replayed history: {shape:#?}"
+    );
+    assert!(
+        !shape.iter().any(|(role, content)| *role == Role::User
+            && content == "say something long enough to matter"),
+        "the folded prompt came back as a message: {shape:#?}"
+    );
+    // The turn that ran before it is still there, minus what was folded.
+    assert!(
+        shape.contains(&(Role::Tool, "pong".to_owned())),
+        "{shape:#?}"
+    );
+    assert_eq!(shape.last(), Some(&(Role::User, "two".to_owned())));
 }
 
 #[tokio::test]

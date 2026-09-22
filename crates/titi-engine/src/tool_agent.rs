@@ -186,6 +186,7 @@ impl AgentRunner for ToolAgentRunner {
             let results = execute_tools(
                 TurnId(0),
                 calls,
+                text.into(),
                 &self.tools,
                 self.approval_mode,
                 &waiters,
@@ -198,11 +199,6 @@ impl AgentRunner for ToolAgentRunner {
                 self.mask_ips,
             )
             .await;
-            messages.push(ChatMessage {
-                role: Role::Assistant,
-                content: text.into(),
-                tool_calls: Vec::new(),
-            });
             messages.extend(results);
         }
 
