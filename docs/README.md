@@ -3,6 +3,7 @@
 - `BRAIN.md` — project health, tech debt, risks (updated only via audit).
 - `AUDIT_PROMPT.md` / `SYNTHESIS_PROMPT.md` — the audit cycle that feeds BRAIN.
 - `QA_STATUS.md` — manual terminal checks.
+- `ARCHITECTURE.md` — genome, tool tiers and jail, where agent state lives.
 - `CONVEYOR.md` — how one task runs. `PLAN.md` — milestones.
 - `COMMITS.md` — commit and push discipline.
 - `research/` — one folder per theme (`research/README.md` is the map,
