@@ -996,6 +996,10 @@ const COMMANDS: &[Command] = &[
         about: "list rewind points",
     },
     Command {
+        name: "goal",
+        about: "run coder and reviewer until the goal passes",
+    },
+    Command {
         name: "help",
         about: "list these commands",
     },
@@ -1968,6 +1972,39 @@ mod tests {
         let view = frame_text(&mut chat);
         assert!(view.contains("/login"), "{view}");
         assert!(view.contains("store a provider key"), "{view}");
+    }
+
+    #[test]
+    fn goal_is_listed_after_a_slash() {
+        let mut chat = chat();
+        type_text(&mut chat, "/go");
+        let view = frame_text(&mut chat);
+        assert!(view.contains("/goal"), "{view}");
+        assert!(view.contains("coder and reviewer"), "{view}");
+    }
+
+    /// A command that dispatches but is missing from the listing works yet
+    /// cannot be discovered; /goal shipped that way once.
+    #[test]
+    fn every_dispatched_command_is_listed() {
+        for name in [
+            "checkpoint",
+            "checkpoints",
+            "rewind",
+            "recap",
+            "pause",
+            "goal",
+            "help",
+            "login",
+            "logout",
+            "keys",
+            "whoami",
+        ] {
+            assert!(
+                COMMANDS.iter().any(|command| command.name == name),
+                "/{name} dispatches but is not listed"
+            );
+        }
     }
 
     #[test]
