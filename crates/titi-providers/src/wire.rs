@@ -56,11 +56,18 @@ fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
 /// way), so without folding those here they are dropped on the floor and the
 /// model runs with no identity, no project rules and no repository map.
 fn leading_system(req: &WireRequest) -> (Option<String>, usize) {
-    let folded = req
+    let mut folded = req
         .messages
         .iter()
         .take_while(|m| m.role == Role::System)
         .count();
+    // Both APIs reject a request with no messages at all, so a conversation
+    // that is nothing but system messages keeps its last one as a turn. The
+    // engine always adds the user prompt, so this is a guard against a caller
+    // that does not, not a case in today's turn loop.
+    if folded == req.messages.len() {
+        folded = folded.saturating_sub(1);
+    }
     let mut parts: Vec<&str> = Vec::with_capacity(folded + 1);
     if let Some(system) = &req.system {
         parts.push(system.as_str());
@@ -644,6 +651,35 @@ mod tests {
             .map(|m| m["content"].as_str().expect("content"))
             .collect();
         assert_eq!(sent, ["first", "3 earlier message(s) folded", "second"]);
+    }
+
+    /// Folding every message away would send an empty `messages` array, which
+    /// both APIs reject outright. The turn loop always adds the user prompt,
+    /// so this guards the boundary rather than a path taken today.
+    #[test]
+    fn a_conversation_of_nothing_but_system_messages_still_has_a_turn() {
+        let mut r = WireRequest::new("claude-test");
+        r.messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "you are titi".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::System,
+                content: "and nothing else was said".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["system"], "you are titi");
+        assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
+        assert_eq!(body["messages"][0]["content"], "and nothing else was said");
+
+        let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, None);
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["contents"].as_array().expect("contents").len(), 1);
     }
 
     #[test]
