@@ -201,6 +201,27 @@ impl SessionIndex {
             .map(Option::flatten)
     }
 
+    /// Catalog metadata recorded for a session, if it is known.
+    ///
+    /// A session seeded from another one inherits what its caller left
+    /// unset, so a fork keeps searching under the same bot.
+    pub fn session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>, SessionError> {
+        self.conn
+            .query_row(
+                "SELECT title, bot_id, source FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionMeta {
+                        title: row.get(0)?,
+                        bot_id: row.get(1)?,
+                        source: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(SessionError::Db)
+    }
+
     /// Records a title the user chose. The session namer never replaces it.
     pub fn set_title(&self, session_id: &str, title: &str) -> Result<(), SessionError> {
         self.conn

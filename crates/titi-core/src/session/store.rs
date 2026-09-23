@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::Checkpoint;
 use super::entry::{self, Entry, Role};
+use super::export::{self, ExportFormat};
 use super::index::{SearchHit, SessionIndex};
 use super::{SessionError, SessionMeta};
 
@@ -290,6 +291,105 @@ impl SessionStore {
         bot_id: Option<&str>,
     ) -> Result<Vec<SearchHit>, SessionError> {
         self.index.search(query, bot_id)
+    }
+
+    /// Catalog metadata recorded for a session.
+    pub fn session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>, SessionError> {
+        self.index.session_meta(session_id)
+    }
+
+    /// Copies a session's whole conversation into a fresh session and returns
+    /// its id.
+    ///
+    /// The copy is independent: appending to either side leaves the other
+    /// exactly as it was. That is the difference from [`fork`](Self::fork),
+    /// which only moves one session's leaf pointer.
+    pub fn fork_session(&self, source_id: &str, meta: SessionMeta) -> Result<String, SessionError> {
+        let entries = self.walk(source_id, None)?;
+        self.seed_session(source_id, &entries, meta, "fork")
+    }
+
+    /// Same as [`fork_session`](Self::fork_session), but seeded only with the
+    /// conversation up to `checkpoint` — everything the session said after
+    /// that rewind point is left behind.
+    pub fn branch_session(
+        &self,
+        source_id: &str,
+        checkpoint: &Checkpoint,
+        meta: SessionMeta,
+    ) -> Result<String, SessionError> {
+        let entries = match &checkpoint.entry_id {
+            Some(entry_id) => {
+                if self.entry(source_id, entry_id)?.is_none() {
+                    return Err(SessionError::NotFound(format!("{source_id}/{entry_id}")));
+                }
+                self.walk(source_id, Some(entry_id))?
+            }
+            // A checkpoint taken on an empty session branches to an empty
+            // session, but the source still has to exist.
+            None => {
+                self.load(source_id)?;
+                Vec::new()
+            }
+        };
+        self.seed_session(source_id, &entries, meta, "branch")
+    }
+
+    /// Creates a session carrying `entries` as its own history.
+    ///
+    /// Ids are fresh so the two sessions never name the same entry, while
+    /// timestamps are kept: a copy should read like the conversation it came
+    /// from, not like it all happened at the moment of copying.
+    fn seed_session(
+        &self,
+        source_id: &str,
+        entries: &[Entry],
+        meta: SessionMeta,
+        kind: &str,
+    ) -> Result<String, SessionError> {
+        let inherited = self.session_meta(source_id)?.unwrap_or_default();
+        let meta = SessionMeta {
+            title: meta.title.or(inherited.title),
+            bot_id: meta.bot_id.or(inherited.bot_id),
+            source: Some(meta.source.unwrap_or_else(|| format!("{kind}:{source_id}"))),
+        };
+        let new_id = self.create(meta)?;
+        for entry in entries {
+            self.append_entry(
+                &new_id,
+                Entry {
+                    id: entry::new_id(),
+                    parent_id: None,
+                    role: entry.role,
+                    content: entry.content.clone(),
+                    ts: entry.ts,
+                    tool_calls: entry.tool_calls.clone(),
+                },
+            )?;
+        }
+        Ok(new_id)
+    }
+
+    /// Renders the session's current conversation in `format`, titled with
+    /// whatever the catalog knows the session as.
+    pub fn export(&self, session_id: &str, format: ExportFormat) -> Result<String, SessionError> {
+        let entries = self.walk(session_id, None)?;
+        let title = self.index.title(session_id)?;
+        export::render(format, title.as_deref(), &entries)
+    }
+
+    /// Writes [`export`](Self::export) to `path`, creating its directory.
+    pub fn export_to_file(
+        &self,
+        session_id: &str,
+        format: ExportFormat,
+        path: &Path,
+    ) -> Result<(), SessionError> {
+        let rendered = self.export(session_id, format)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(SessionError::Io)?;
+        }
+        fs::write(path, rendered).map_err(SessionError::Io)
     }
 
     fn session_file(&self, session_id: &str) -> PathBuf {
@@ -768,6 +868,179 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn fork_session_copies_history_and_stays_independent() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let call = titi_providers::ToolCallRef {
+            call_id: "call-1".into(),
+            name: "read".into(),
+        };
+        s.append(&sid, Role::User, "read Cargo.toml")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append_with_tool_calls(&sid, Role::Assistant, "", vec![call.clone()])
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Tool, "[package]")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let before = s.walk(&sid, None).unwrap_or_else(|e| panic!("{e}"));
+
+        let forked = s
+            .fork_session(&sid, SessionMeta::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(forked, sid);
+
+        // Same conversation, including the tool round.
+        let copy = s.walk(&forked, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            copy.iter()
+                .map(|e| (e.role, e.content.clone(), e.tool_calls.clone()))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|e| (e.role, e.content.clone(), e.tool_calls.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Writing to the fork leaves the source exactly as it was.
+        s.append(&forked, Role::User, "now read the lockfile")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.walk(&sid, None).unwrap_or_else(|e| panic!("{e}")), before);
+        assert_eq!(s.open(&sid).unwrap_or_else(|e| panic!("{e}")), before);
+        assert_eq!(
+            s.walk(&forked, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            before.len() + 1
+        );
+
+        // And the source is unaffected by a write of its own afterwards.
+        s.append(&sid, Role::User, "stay here")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            s.walk(&forked, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            before.len() + 1
+        );
+
+        // Metadata is inherited, provenance recorded.
+        let inherited = s
+            .session_meta(&forked)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("metadata for the fork"));
+        assert_eq!(inherited.bot_id.as_deref(), Some("a"));
+        assert_eq!(inherited.source, Some(format!("fork:{sid}")));
+    }
+
+    #[test]
+    fn branch_session_keeps_only_what_came_before_the_checkpoint() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "one")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "two")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let checkpoint = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "three")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let branched = s
+            .branch_session(&sid, &checkpoint, SessionMeta::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(
+            s.walk(&branched, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .iter()
+                .map(|e| e.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+        // The source still has everything it had.
+        assert_eq!(
+            s.walk(&sid, None).unwrap_or_else(|e| panic!("{e}")).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn branch_from_an_empty_checkpoint_starts_blank() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let checkpoint = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "later")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let branched = s
+            .branch_session(&sid, &checkpoint, SessionMeta::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            s.walk(&branched, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn seeding_from_an_unknown_session_errors() {
+        let (_dir, s) = store();
+        assert!(matches!(
+            s.fork_session("ghost", SessionMeta::default()),
+            Err(SessionError::NotFound(_))
+        ));
+        let checkpoint = Checkpoint {
+            entry_id: Some("nope".into()),
+            entries: 1,
+            ts: 0,
+            git_commit: None,
+        };
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            s.branch_session(&sid, &checkpoint, SessionMeta::default()),
+            Err(SessionError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn export_renders_the_live_conversation_in_both_formats() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let asked = s
+            .append(&sid, Role::User, "hello")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "wrong turn")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.fork(&sid, &asked.id).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "hi there")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let md = s
+            .export(&sid, ExportFormat::Markdown)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let user = md.find("hello").unwrap_or_else(|| panic!("{md}"));
+        let answer = md.find("hi there").unwrap_or_else(|| panic!("{md}"));
+        assert!(user < answer, "{md}");
+        assert!(md.starts_with("# bot-a\n"), "{md}");
+        assert!(!md.contains("wrong turn"), "{md}");
+
+        let jsonl = s
+            .export(&sid, ExportFormat::Jsonl)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(jsonl.lines().count(), 2);
+        assert_eq!(
+            export::from_jsonl(&jsonl).unwrap_or_else(|e| panic!("{e}")),
+            s.walk(&sid, None).unwrap_or_else(|e| panic!("{e}"))
+        );
+
+        let path = _dir.path().join("out").join("chat.jsonl");
+        s.export_to_file(&sid, ExportFormat::Jsonl, &path)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}")),
+            jsonl
         );
     }
 }

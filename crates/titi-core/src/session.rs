@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod entry;
+pub mod export;
 pub mod index;
 pub mod namer;
 pub mod store;
