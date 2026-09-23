@@ -212,7 +212,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn only_connected_providers_are_offered() {
         let none = suggested_lines(&[]);
         assert_eq!(
@@ -230,6 +229,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn a_named_model_is_kept_verbatim() {
         assert_eq!(
             configured_model(Some("openai/text-embedding-3-small")),
