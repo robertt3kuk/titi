@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::embed::Embedder;
 use serde_json::Value;
@@ -36,6 +36,24 @@ pub struct Memory {
     pub use_count: i64,
 }
 
+/// How many memories one page of the browse view returns at most.
+pub const PAGE_MAX: usize = 50;
+
+/// How long a preview line may get before it is cut.
+const PREVIEW_CHARS: usize = 96;
+
+/// One row of the browse view: enough to recognise a memory and to forget it,
+/// without carrying its whole text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: i64,
+    pub category: String,
+    /// The summary, and the start of the details, on one line.
+    pub preview: String,
+    /// SQLite `datetime('now')`, UTC, second resolution.
+    pub created_at: String,
+}
+
 /// Why a write did not insert a new row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remembered {
@@ -51,6 +69,8 @@ pub enum Error {
     Db(#[from] rusqlite::Error),
     #[error("memory io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("no memory #{0}")]
+    NotFound(i64),
 }
 
 const SCHEMA: &str = "
@@ -146,34 +166,65 @@ impl MemoryIndex {
     /// FTS finds candidates; the embedding reranks them; a memory linked to a
     /// touched file is boosted, because that is the one the turn is about.
     pub fn recall(&self, query: &str, touched: &[String]) -> Result<Vec<Memory>, Error> {
-        let mut scored: Vec<(Memory, f32)> = Vec::new();
-        let embedder = crate::embed::LocalEmbedder;
-        let query_vec = embedder.embed(query);
-        for memory in self.candidates(query)? {
-            // A vector from another model lives in a different space, so it
-            // scores as unrelated rather than as a false neighbour.
-            let mut score = if self.embedder_of(memory.id)? == embedder.name() {
-                crate::embed::cosine(&query_vec, &self.embedding(memory.id)?)
-            } else {
-                0.0
-            };
-            if self.linked_to(memory.id, touched)? {
-                score += 0.5;
-            }
-            score += (memory.use_count as f32) * 0.01;
-            scored.push((memory, score));
-        }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(scored
-            .into_iter()
-            .take(RECALL_LIMIT)
-            .map(|(m, _)| m)
-            .collect())
+        let pool = self.candidates(query)?;
+        self.ranked(pool, query, touched, RECALL_LIMIT)
     }
 
     /// Every memory, newest use first. The browse view.
     pub fn list(&self) -> Result<Vec<Memory>, Error> {
         self.all()
+    }
+
+    /// One page of stored memories, newest first.
+    ///
+    /// `limit` is capped at [`PAGE_MAX`], so a surface may ask for more than it
+    /// can draw without pulling the whole index into a frame.
+    pub fn recent(&self, limit: usize) -> Result<Vec<MemoryEntry>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, summary, details, created_at
+               FROM memories ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![page(limit) as i64], row_to_entry)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
+    }
+
+    /// The memories matching `query`, best first, capped at [`PAGE_MAX`].
+    ///
+    /// The ranking is the one [`MemoryIndex::recall`] uses — FTS picks the
+    /// pool, the embedding orders it — minus the "nothing matched, so show
+    /// everything" fallback, which is right for a prompt and wrong for a
+    /// search.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, Error> {
+        let pool = self.matching(query)?;
+        let ranked = self.ranked(pool, query, &[], page(limit))?;
+        ranked.into_iter().map(|m| self.entry_of(m)).collect()
+    }
+
+    /// Deletes one memory. An id that is not stored is [`Error::NotFound`],
+    /// never a silent success.
+    pub fn forget(&self, id: i64) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let stored: Option<(String, String)> = tx
+            .query_row(
+                "SELECT summary, details FROM memories WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((summary, details)) = stored else {
+            return Err(Error::NotFound(id));
+        };
+        // The FTS table keeps its content in `memories`, so it cannot work out
+        // which terms to drop once the row is gone: it is told first, with the
+        // text the terms were built from.
+        tx.execute(
+            "INSERT INTO memories_fts (memories_fts, rowid, summary, details)
+               VALUES ('delete', ?1, ?2, ?3)",
+            params![id, summary, details],
+        )?;
+        tx.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// A near-duplicate of `summary` already stored, if the embedding says so.
@@ -189,23 +240,85 @@ impl MemoryIndex {
         Ok(best.map(|(m, _)| m))
     }
 
-    fn candidates(&self, query: &str) -> Result<Vec<Memory>, Error> {
-        let tokens: Vec<&str> = query.split_whitespace().filter(|t| t.len() >= 3).collect();
-        if tokens.is_empty() {
-            return self.all();
+    /// Scores a pool of memories against `query` and keeps the best `limit`.
+    fn ranked(
+        &self,
+        pool: Vec<Memory>,
+        query: &str,
+        touched: &[String],
+        limit: usize,
+    ) -> Result<Vec<Memory>, Error> {
+        let mut scored: Vec<(Memory, f32)> = Vec::new();
+        let embedder = crate::embed::LocalEmbedder;
+        let query_vec = embedder.embed(query);
+        for memory in pool {
+            // A vector from another model lives in a different space, so it
+            // scores as unrelated rather than as a false neighbour.
+            let mut score = if self.embedder_of(memory.id)? == embedder.name() {
+                crate::embed::cosine(&query_vec, &self.embedding(memory.id)?)
+            } else {
+                0.0
+            };
+            if self.linked_to(memory.id, touched)? {
+                score += 0.5;
+            }
+            score += (memory.use_count as f32) * 0.01;
+            scored.push((memory, score));
         }
-        let match_query = tokens.join(" OR ");
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().take(limit).map(|(m, _)| m).collect())
+    }
+
+    /// The pool a recall ranks: the FTS hits, or everything when the query
+    /// says nothing the index can match.
+    fn candidates(&self, query: &str) -> Result<Vec<Memory>, Error> {
+        let matched = self.matching(query)?;
+        if matched.is_empty() {
+            self.all()
+        } else {
+            Ok(matched)
+        }
+    }
+
+    /// The FTS hits for `query` and nothing else.
+    ///
+    /// Each token is matched as a quoted phrase, so a query carrying `"`, `(`
+    /// or a bare `NOT` is text to look for, not syntax that rewrites the match
+    /// expression.
+    fn matching(&self, query: &str) -> Result<Vec<Memory>, Error> {
+        let tokens: Vec<&str> = query
+            .split_whitespace()
+            .filter(|t| t.len() >= 3 && t.chars().any(char::is_alphanumeric))
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let match_query = tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.category, m.summary, m.details, m.use_count
              FROM memories_fts f JOIN memories m ON m.id = f.rowid
              WHERE memories_fts MATCH ?1 LIMIT 50",
         )?;
         let rows = stmt.query_map(params![match_query], row_to_memory)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        if out.is_empty() { self.all() } else { Ok(out) }
+        rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
+    }
+
+    fn entry_of(&self, memory: Memory) -> Result<MemoryEntry, Error> {
+        let created_at: String = self.conn.query_row(
+            "SELECT created_at FROM memories WHERE id = ?1",
+            params![memory.id],
+            |row| row.get(0),
+        )?;
+        Ok(MemoryEntry {
+            id: memory.id,
+            preview: preview(&memory.summary, &memory.details),
+            category: memory.category,
+            created_at,
+        })
     }
 
     fn all(&self) -> Result<Vec<Memory>, Error> {
@@ -278,6 +391,38 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         details: row.get(3)?,
         use_count: row.get(4)?,
     })
+}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    let summary: String = row.get(2)?;
+    let details: String = row.get(3)?;
+    Ok(MemoryEntry {
+        id: row.get(0)?,
+        category: row.get(1)?,
+        preview: preview(&summary, &details),
+        created_at: row.get(4)?,
+    })
+}
+
+/// The page size a caller actually gets.
+fn page(limit: usize) -> usize {
+    limit.min(PAGE_MAX)
+}
+
+/// The summary and the start of the details on one line, cut on a character
+/// boundary so a multi-byte name never splits.
+fn preview(summary: &str, details: &str) -> String {
+    let mut line = summary.trim().to_owned();
+    if !details.trim().is_empty() {
+        line.push_str(" — ");
+        line.push_str(details.trim());
+    }
+    let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= PREVIEW_CHARS {
+        return line;
+    }
+    let kept: String = line.chars().take(PREVIEW_CHARS - 1).collect();
+    format!("{kept}…")
 }
 
 /// Adds a column the first release did not have. SQLite has no `ADD COLUMN
@@ -425,5 +570,86 @@ mod tests {
     fn an_empty_index_recalls_nothing() {
         let (_dir, index) = idx();
         assert!(index.recall("anything", &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_page_lists_the_newest_memories_first() {
+        let (_dir, index) = idx();
+        for n in 0..3 {
+            index
+                .remember("context", &format!("note {n}"), "", &[])
+                .unwrap();
+        }
+        let page = index.recent(2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].preview, "note 2");
+        assert_eq!(page[1].preview, "note 1");
+    }
+
+    #[test]
+    fn a_page_never_grows_past_the_bound() {
+        let (_dir, index) = idx();
+        for n in 0..PAGE_MAX + 5 {
+            index
+                .remember("context", &format!("note {n}"), "", &[])
+                .unwrap();
+        }
+        assert_eq!(index.recent(usize::MAX).unwrap().len(), PAGE_MAX);
+    }
+
+    #[test]
+    fn search_finds_the_term_and_leaves_the_rest_out() {
+        let (_dir, index) = idx();
+        index
+            .remember("gotcha", "the auth token expires early", "", &[])
+            .unwrap();
+        index
+            .remember("context", "the readme explains the build", "", &[])
+            .unwrap();
+        let found = index.search("auth", 10).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].preview, "the auth token expires early");
+    }
+
+    #[test]
+    fn a_query_made_of_match_syntax_searches_for_the_text() {
+        let (_dir, index) = idx();
+        index
+            .remember("gotcha", "the auth token expires early", "", &[])
+            .unwrap();
+        let found = index.search("\"auth\" OR (", 10).unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn forget_removes_exactly_one_memory() {
+        let (_dir, index) = idx();
+        let Remembered::Added(id) = index.remember("context", "drop this one", "", &[]).unwrap()
+        else {
+            panic!("the first write should add a row");
+        };
+        index.remember("context", "keep this one", "", &[]).unwrap();
+        index.forget(id).unwrap();
+        let left = index.recent(10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].preview, "keep this one");
+        assert!(index.search("drop", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn forgetting_the_same_memory_twice_is_not_found() {
+        let (_dir, index) = idx();
+        let Remembered::Added(id) = index.remember("context", "drop this one", "", &[]).unwrap()
+        else {
+            panic!("the first write should add a row");
+        };
+        index.forget(id).unwrap();
+        assert!(matches!(index.forget(id), Err(Error::NotFound(gone)) if gone == id));
+    }
+
+    #[test]
+    fn forgetting_an_id_that_was_never_stored_is_not_found() {
+        let (_dir, index) = idx();
+        assert!(matches!(index.forget(404), Err(Error::NotFound(404))));
     }
 }
