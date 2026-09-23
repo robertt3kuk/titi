@@ -50,28 +50,53 @@ fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
     out
 }
 
-fn anthropic_messages_wire(req: &WireRequest) -> Vec<Value> {
+/// Anthropic and Gemini carry the system prompt in a top-level field, not in
+/// the message list. The engine hands it over as a leading `Role::System`
+/// message (`runtime.rs` builds it, compaction inserts its digest the same
+/// way), so without folding those here they are dropped on the floor and the
+/// model runs with no identity, no project rules and no repository map.
+fn leading_system(req: &WireRequest) -> (Option<String>, usize) {
+    let folded = req
+        .messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
+    let mut parts: Vec<&str> = Vec::with_capacity(folded + 1);
+    if let Some(system) = &req.system {
+        parts.push(system.as_str());
+    }
+    parts.extend(req.messages[..folded].iter().map(|m| m.content.as_str()));
+    let joined = parts.join("\n\n");
+    ((!joined.is_empty()).then_some(joined), folded)
+}
+
+fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
     req.messages
         .iter()
-        .filter_map(|m| {
-            m.role
-                .anthropic_role()
-                .map(|role| serde_json::json!({"role": role, "content": m.content.as_str()}))
+        .skip(folded)
+        .map(|m| {
+            // A system message further down is a compaction digest, and it
+            // belongs where it sits in the history. The role does not exist
+            // in this API, so it travels as user text rather than vanishing.
+            let role = m.role.anthropic_role().unwrap_or("user");
+            serde_json::json!({"role": role, "content": m.content.as_str()})
         })
         .collect()
 }
 
-fn gemini_contents_wire(req: &WireRequest) -> Vec<Value> {
+fn gemini_contents_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
     req.messages
         .iter()
-        .filter_map(|m| match m.role {
-            Role::User | Role::Tool => Some(serde_json::json!(
-                {"role": "user", "parts": [{"text": m.content.as_str()}]}
-            )),
-            Role::Assistant => Some(serde_json::json!(
+        .skip(folded)
+        .map(|m| match m.role {
+            Role::Assistant => serde_json::json!(
                 {"role": "model", "parts": [{"text": m.content.as_str()}]}
-            )),
-            Role::System => None, // systemInstruction field
+            ),
+            // User, Tool, and a compaction digest that sits mid-history all
+            // travel as user turns; this API has no other inbound role.
+            _ => serde_json::json!(
+                {"role": "user", "parts": [{"text": m.content.as_str()}]}
+            ),
         })
         .collect()
 }
@@ -188,10 +213,11 @@ pub fn build_http_request(
                 ("accept".into(), "text/event-stream".into()),
             ];
             auth_headers(&mut headers, api_key, "anthropic");
+            let (system, folded) = leading_system(req);
             let body = serde_json::json!({
                 "model": req.model.as_str(),
-                "messages": anthropic_messages_wire(req),
-                "system": req.system.as_deref().unwrap_or_default(),
+                "messages": anthropic_messages_wire(req, folded),
+                "system": system.unwrap_or_default(),
                 "stream": true,
                 "tools": anthropic_tools_wire(req),
                 "max_tokens": req.max_tokens.unwrap_or(4096),
@@ -214,11 +240,12 @@ pub fn build_http_request(
             if let Some(k) = api_key {
                 url.push_str(&format!("&key={k}"));
             }
+            let (system, folded) = leading_system(req);
             let mut body = serde_json::json!({
-                "contents": gemini_contents_wire(req),
+                "contents": gemini_contents_wire(req, folded),
                 "tools": gemini_tools_wire(req),
             });
-            if let Some(sys) = &req.system {
+            if let Some(sys) = &system {
                 body["systemInstruction"] = serde_json::json!({"parts": [{"text": sys.as_str()}]});
             }
             if let Some(max) = req.max_tokens {
@@ -526,6 +553,97 @@ mod tests {
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be brief");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 128);
+    }
+
+    /// The engine never fills `WireRequest::system`: it puts the system
+    /// prompt at the head of the messages. Anthropic has no system role, so
+    /// before this was folded the identity, the project rules, the skills and
+    /// the repository map were dropped and the model ran blind.
+    #[test]
+    fn a_leading_system_message_reaches_anthropic() {
+        let mut r = WireRequest::new("claude-test");
+        r.messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "you are titi".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["system"], "you are titi");
+        assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn a_leading_system_message_reaches_gemini() {
+        let mut r = WireRequest::new("gemini-test");
+        r.messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "you are titi".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "hi".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, None);
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "you are titi"
+        );
+        assert_eq!(body["contents"].as_array().expect("contents").len(), 1);
+        assert_eq!(body["contents"][0]["role"], "user");
+    }
+
+    /// Compaction replaces the folded prefix with a digest it marks as a
+    /// system message. It sits inside the history, not at its head, so it
+    /// travels as a user turn rather than disappearing.
+    #[test]
+    fn a_compaction_digest_inside_the_history_is_not_dropped() {
+        let mut r = WireRequest::new("claude-test");
+        r.messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "you are titi".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "first".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::System,
+                content: "3 earlier message(s) folded".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "second".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["system"], "you are titi");
+        let sent: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("msgs")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        assert_eq!(sent, ["first", "3 earlier message(s) folded", "second"]);
     }
 
     #[test]
