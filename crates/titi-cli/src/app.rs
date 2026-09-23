@@ -1888,14 +1888,15 @@ pub fn new_session(agent_dir: &std::path::Path) -> Result<String, String> {
 }
 
 /// The conversation a resumed session replays: the path to its current leaf,
-/// tail-capped so an old transcript cannot crowd out the workspace map.
+/// capped at a boundary that keeps every tool round whole, so an old
+/// transcript cannot crowd out the workspace map or replay an orphan call.
 pub fn session_history(
     agent_dir: &std::path::Path,
     session_id: &str,
 ) -> Result<Vec<titi_providers::ChatMessage>, String> {
     let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
     let entries = store.walk(session_id, None).map_err(|e| e.to_string())?;
-    Ok(crate::engine::tail(
+    Ok(crate::engine::restore_window(
         titi_core::session::entries_to_messages(&entries),
         crate::engine::MAX_RESTORED_MESSAGES,
     ))

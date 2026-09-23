@@ -134,15 +134,48 @@ pub fn load_registry_config() -> ProviderRegistryConfig {
 /// point they crowd the request without informing the next one.
 pub const MAX_RESTORED_MESSAGES: usize = 40;
 
-/// Keeps the newest `limit` messages, in order.
-pub fn tail(
+/// Trims a replayed conversation to at most `limit` messages, cutting only
+/// where no tool round is split.
+///
+/// A tool result whose call was cut away — or a call whose results a crash
+/// never recorded — is a request Anthropic and OpenAI both reject, so the
+/// cut skips forward over orphaned results and stops short of an unanswered
+/// call. The window is therefore sometimes shorter than `limit`, never
+/// inconsistent.
+pub fn restore_window(
     mut messages: Vec<titi_providers::ChatMessage>,
     limit: usize,
 ) -> Vec<titi_providers::ChatMessage> {
-    if messages.len() > limit {
-        messages.drain(..messages.len() - limit);
-    }
+    messages.truncate(unanswered_call(&messages));
+    let mut start = messages.len().saturating_sub(limit);
+    start += messages[start..]
+        .iter()
+        .take_while(|message| message.role == titi_providers::Role::Tool)
+        .count();
+    messages.drain(..start);
     messages
+}
+
+/// Index of the first tool call left without its result, or `messages.len()`
+/// when every call was answered.
+fn unanswered_call(messages: &[titi_providers::ChatMessage]) -> usize {
+    let mut index = 0;
+    while index < messages.len() {
+        let calls = messages[index].tool_calls.len();
+        if calls == 0 {
+            index += 1;
+            continue;
+        }
+        let results = messages[index + 1..]
+            .iter()
+            .take_while(|message| message.role == titi_providers::Role::Tool)
+            .count();
+        if results < calls {
+            return index;
+        }
+        index += 1 + results;
+    }
+    messages.len()
 }
 
 /// Parses `--approval <always-ask|write|yolo>`.

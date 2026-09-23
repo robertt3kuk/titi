@@ -257,6 +257,67 @@ fn a_restored_tool_round_is_the_one_the_live_session_had() {
     assert_eq!(session_history(agent_dir, &session_id).unwrap(), live);
 }
 
+/// Cutting the oldest messages must not split a tool round: a result without
+/// its call, or a call without its result, is a request both Anthropic and
+/// OpenAI reject.
+#[test]
+fn a_truncated_restore_never_splits_a_tool_round() {
+    use titi_cli::app::session_history;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let store = SessionStore::new(agent_dir).unwrap();
+    let session_id = store.create(SessionMeta::default()).unwrap();
+    let log = SessionLog::open(agent_dir, &session_id).unwrap();
+
+    // Four messages per round, so the cap lands inside a round whatever the
+    // cap is; then a call the crash left unanswered.
+    for index in 0..MAX_RESTORED_MESSAGES {
+        log.user(&format!("question {index}")).unwrap();
+        log.assistant_tool_calls(
+            "",
+            vec![titi_providers::ToolCallRef {
+                call_id: format!("call-{index}").into(),
+                name: "read".into(),
+            }],
+        )
+        .unwrap();
+        log.tool_result(&format!("output {index}")).unwrap();
+        log.assistant(&format!("answer {index}")).unwrap();
+    }
+    log.user("one more").unwrap();
+    log.assistant_tool_calls(
+        "",
+        vec![titi_providers::ToolCallRef {
+            call_id: "call-cut-short".into(),
+            name: "bash".into(),
+        }],
+    )
+    .unwrap();
+
+    let history = session_history(agent_dir, &session_id).unwrap();
+    assert!(history.len() <= MAX_RESTORED_MESSAGES, "{}", history.len());
+    assert!(!history.is_empty(), "a cut that keeps nothing is not a cut");
+
+    let mut open_calls = 0usize;
+    for message in &history {
+        if message.role == titi_providers::Role::Tool {
+            assert!(
+                open_calls > 0,
+                "a tool result without its call: {history:#?}"
+            );
+            open_calls -= 1;
+        } else {
+            assert_eq!(
+                open_calls, 0,
+                "a tool call without its result: {history:#?}"
+            );
+            open_calls = message.tool_calls.len();
+        }
+    }
+    assert_eq!(open_calls, 0, "the last call has no result: {history:#?}");
+}
+
 fn message(
     role: titi_providers::Role,
     text: &str,
