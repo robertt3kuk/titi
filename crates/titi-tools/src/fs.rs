@@ -517,10 +517,14 @@ pub fn workspace_tools_with_interrupt(
         Box::new(GlobTool { root: root.clone() }),
         Box::new(GrepTool {
             root: root.clone(),
-            policy,
+            policy: policy.clone(),
         }),
-        Box::new(BashTool { root, interrupt }),
+        Box::new(BashTool {
+            root: root.clone(),
+            interrupt,
+        }),
     ];
+    tools.extend(crate::git::git_tools(root, policy));
     // The search provider is read here, once per registry: `web_search`
     // answers "no provider configured" for the whole session rather than
     // re-reading the environment on every call.

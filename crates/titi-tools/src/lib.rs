@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod fs;
+pub mod git;
 pub mod hashline;
 pub mod pty;
 pub mod sensitive;
@@ -27,7 +28,7 @@ pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
     workspace_tools_with_cache, workspace_tools_with_interrupt, workspace_tools_with_policy,
 };
-pub use hashline::{HashlineEditTool, HashlineError, line_anchor};
+pub use git::{DiagnoseTool, GIT_TIMEOUT, GitCommitTool, GitError, GitTool, git_tools};
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
