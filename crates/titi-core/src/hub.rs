@@ -338,6 +338,52 @@ impl Drop for HubBroker {
     }
 }
 
+/// Joins the local hub, starting the broker if this is the first session in.
+///
+/// First-joiner-hosts: sessions on one machine share one broker per agent
+/// directory, but nothing hosts it until someone wants the hub. The first
+/// `/join` binds the broker in-process and connects to it; every later
+/// session finds the live socket and connects as a plain client.
+///
+/// `Some(broker)` means this call started the broker: the caller **must**
+/// keep the handle alive for as long as it wants the hub to exist, and
+/// dropping it removes the socket and disconnects the peers. `None` means a
+/// peer was already hosting.
+///
+/// A join that races another first-joiner is resolved without an error: the
+/// session that loses the bind ([`HubError::AlreadyRunning`]) connects to the
+/// winner instead of reporting a failure the user did not cause.
+pub fn join_or_host(
+    agent_dir: &Path,
+    agent_id: &str,
+) -> Result<(HubClient, Option<HubBroker>), HubError> {
+    match HubClient::connect(agent_dir, agent_id) {
+        Ok(client) => Ok((client, None)),
+        // No socket, or a dead one nobody is serving: this session hosts.
+        Err(HubError::Io(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            match HubBroker::bind(agent_dir) {
+                Ok(broker) => {
+                    let client = HubClient::connect(agent_dir, agent_id)?;
+                    Ok((client, Some(broker)))
+                }
+                // Another session bound first in the gap between our failed
+                // connect and our bind: connect to it, host nothing.
+                Err(HubError::AlreadyRunning(_)) => {
+                    let client = HubClient::connect(agent_dir, agent_id)?;
+                    Ok((client, None))
+                }
+                Err(other) => Err(other),
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 fn accept_loop(listener: UnixListener, state: Arc<State>) {
     let mut connections: Vec<JoinHandle<()>> = Vec::new();
     while state.running.load(Ordering::SeqCst) {
@@ -900,5 +946,65 @@ mod tests {
         // A crash leaves the file behind; the next broker must reclaim it.
         fs::write(dir.path().join(SOCKET_NAME), "").expect("a leftover file");
         let _reclaimed = HubBroker::bind(dir.path()).expect("a stale socket is replaced");
+    }
+
+    /// Waits until `client`'s roster holds every id in `want`, folding in the
+    /// `Joined` announcements that arrive after the initial snapshot.
+    fn roster_reaches(client: &HubClient, want: &[&str]) -> Vec<String> {
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<String> = client.peers().iter().cloned().collect();
+        let deadline = Instant::now() + WAIT;
+        while !want.iter().all(|id| seen.contains(*id)) && Instant::now() < deadline {
+            match client.recv_timeout(WAIT) {
+                Ok(HubEvent::Joined { agent_id }) => {
+                    seen.insert(agent_id);
+                }
+                Ok(HubEvent::Presence { agents }) => seen.extend(agents),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    /// First-joiner-hosts: the first `join_or_host` with no socket starts the
+    /// broker and joins it; a second session finds that broker and joins as a
+    /// plain client; dropping the host tears the socket down under the peer.
+    #[test]
+    fn join_or_host_starts_a_broker_then_a_second_session_joins_it() {
+        let dir = tempfile::tempdir().expect("a temp agent dir");
+
+        let (main, broker) = join_or_host(dir.path(), "main").expect("the first session hosts");
+        let broker = broker.expect("the first joiner starts the broker");
+        assert_eq!(main.peers(), ["main"]);
+
+        let (scout, none) = join_or_host(dir.path(), "scout").expect("the second session joins");
+        assert!(none.is_none(), "the second joiner must not host a broker");
+
+        assert_eq!(roster_reaches(&main, &["main", "scout"]), ["main", "scout"]);
+        assert_eq!(
+            roster_reaches(&scout, &["main", "scout"]),
+            ["main", "scout"]
+        );
+
+        // The host leaves: dropping its client and broker removes the socket,
+        // and the peer's reader ends rather than hanging.
+        drop(main);
+        drop(broker);
+        let disconnected = {
+            let deadline = Instant::now() + WAIT;
+            let mut ended = false;
+            while Instant::now() < deadline {
+                match scout.recv_timeout(WAIT) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+            ended
+        };
+        assert!(disconnected, "the peer must see the host's broker go away");
     }
 }
