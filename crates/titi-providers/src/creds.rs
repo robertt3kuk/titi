@@ -2,8 +2,16 @@
 //! fallback. The model-facing [`Credential`] type carries only the access
 //! material — refresh tokens are typologically hidden from this layer and
 //! owned exclusively by the auth actor.
+//!
+//! A provider may hold several accounts (`anthropic/work`,
+//! `anthropic/personal`); [`AccountRotation`] picks which one feeds the
+//! `stored` rung and moves to the next one when the upstream rate limits.
+
+use std::fmt;
 
 use smol_str::SmolStr;
+
+use crate::transport::TransportError;
 
 /// Ladder rungs in strict priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,8 +35,8 @@ pub enum LadderLevel {
 
 /// The resolved access material. Deliberately has **no** refresh field:
 /// refresh tokens never cross the credential-actor boundary into the model
-/// layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// layer. `Debug` masks the access material down to its last four characters.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub access: SmolStr,
     pub kind: CredKind,
@@ -36,10 +44,187 @@ pub struct Credential {
     pub level: LadderLevel,
 }
 
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("access", &mask_secret(&self.access))
+            .field("kind", &self.kind)
+            .field("level", &self.level)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredKind {
     ApiKey,
     BearerToken,
+}
+
+/// Reduce a secret to its last four characters. Anything shorter than five
+/// characters is hidden entirely.
+pub fn mask_secret(secret: &str) -> String {
+    let len = secret.chars().count();
+    if len <= 4 {
+        return "…".to_owned();
+    }
+    let tail: String = secret.chars().skip(len - 4).collect();
+    format!("…{tail}")
+}
+
+/// One account of a provider: the `label` half of a `provider/label` id plus
+/// its access material. The material is private — callers either build a
+/// [`Credential`] from it or render [`Account::masked`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct Account {
+    label: SmolStr,
+    access: SmolStr,
+    kind: CredKind,
+}
+
+impl Account {
+    pub fn new(label: impl Into<SmolStr>, access: impl Into<SmolStr>, kind: CredKind) -> Self {
+        Self {
+            label: label.into(),
+            access: access.into(),
+            kind,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn kind(&self) -> CredKind {
+        self.kind
+    }
+
+    /// The only renderable form: `label(…last4)`.
+    pub fn masked(&self) -> String {
+        format!("{}({})", self.label, mask_secret(&self.access))
+    }
+
+    /// Hand the access material to the model layer at `level`.
+    pub fn credential(&self, level: LadderLevel) -> Credential {
+        Credential {
+            access: self.access.clone(),
+            kind: self.kind,
+            level,
+        }
+    }
+}
+
+impl fmt::Debug for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Account")
+            .field("label", &self.label)
+            .field("access", &mask_secret(&self.access))
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// Whether `err` is an upstream rate limit (HTTP 429) — the only failure that
+/// rotates accounts. Server errors and stalls hit every account of the
+/// provider alike and belong to the fallback chain instead.
+pub fn is_rate_limit(err: &TransportError) -> bool {
+    matches!(
+        err,
+        TransportError::Retryable {
+            status: Some(429),
+            ..
+        } | TransportError::Fatal {
+            status: Some(429),
+            ..
+        }
+    )
+}
+
+/// Round-robin over the accounts of one provider.
+///
+/// Only a rate limit rotates: it retires the active account for the current
+/// cycle and hands out the next one, wrapping around the list. Each account
+/// is handed out at most once per cycle, so a provider with a single account
+/// behaves exactly as it did before rotation existed, and a provider whose
+/// accounts are all limited stops instead of spinning. A successful turn
+/// ([`AccountRotation::reset`]) opens a fresh cycle from the account that
+/// worked.
+#[derive(Debug, Clone, Default)]
+pub struct AccountRotation {
+    accounts: Vec<Account>,
+    active: usize,
+    /// Accounts handed out in the current cycle, the active one included.
+    used: usize,
+}
+
+impl AccountRotation {
+    pub fn new(accounts: Vec<Account>) -> Self {
+        let used = usize::from(!accounts.is_empty());
+        Self {
+            accounts,
+            active: 0,
+            used,
+        }
+    }
+
+    /// Same as [`AccountRotation::new`] but resumes on `label` (the last
+    /// account known to work); an unknown label starts at the first account.
+    pub fn starting_at(accounts: Vec<Account>, label: &str) -> Self {
+        let mut rot = Self::new(accounts);
+        if let Some(i) = rot.accounts.iter().position(|a| a.label == label) {
+            rot.active = i;
+        }
+        rot
+    }
+
+    pub fn current(&self) -> Option<&Account> {
+        self.accounts.get(self.active)
+    }
+
+    pub fn current_label(&self) -> Option<&str> {
+        self.current().map(Account::label)
+    }
+
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
+    /// Every account of this cycle has been rate limited.
+    pub fn is_exhausted(&self) -> bool {
+        !self.accounts.is_empty() && self.used >= self.accounts.len()
+    }
+
+    /// Advance after a failed turn. Returns the next account to try, or
+    /// `None` when the failure is not a rate limit or the cycle is spent.
+    pub fn next_on_rate_limit(&mut self, err: &TransportError) -> Option<&Account> {
+        if !is_rate_limit(err) || self.is_exhausted() || self.accounts.is_empty() {
+            return None;
+        }
+        self.active = (self.active + 1) % self.accounts.len();
+        self.used += 1;
+        self.accounts.get(self.active)
+    }
+
+    /// A turn succeeded: start a fresh cycle from the active account.
+    pub fn reset(&mut self) {
+        self.used = usize::from(!self.accounts.is_empty());
+    }
+
+    /// Adopt a freshly read account list (the store may have gained or lost
+    /// accounts) while keeping the active label and the cycle's progress, so
+    /// re-reading the store never un-rotates a rate-limited account.
+    pub fn refresh(&mut self, accounts: Vec<Account>) {
+        let active = self.current_label().map(SmolStr::new);
+        let used = self.used.min(accounts.len());
+        self.accounts = accounts;
+        self.active = active
+            .and_then(|label| self.accounts.iter().position(|a| a.label == label))
+            .unwrap_or(0);
+        self.used = used.max(usize::from(!self.accounts.is_empty()));
+    }
 }
 
 /// All ladder inputs for one resolution.
@@ -122,6 +307,173 @@ mod tests {
             stored_key: None,
             fallback_key: None,
         }
+    }
+
+    fn accounts(labels: &[&str]) -> Vec<Account> {
+        labels
+            .iter()
+            .map(|l| Account::new(*l, format!("sk-test-{l}"), CredKind::ApiKey))
+            .collect()
+    }
+
+    fn rate_limited() -> TransportError {
+        TransportError::Retryable {
+            status: Some(429),
+            message: "rate limited".into(),
+        }
+    }
+
+    #[test]
+    fn rate_limit_rotates_to_the_next_account_then_stops() {
+        let mut rot = AccountRotation::new(accounts(&["work", "personal", "spare"]));
+        assert_eq!(rot.current_label(), Some("work"));
+
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("personal")
+        );
+        assert_eq!(rot.current_label(), Some("personal"));
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("spare")
+        );
+        // Every account has been rate limited in this cycle: stop, never spin.
+        assert!(rot.next_on_rate_limit(&rate_limited()).is_none());
+        assert!(rot.is_exhausted());
+        assert_eq!(rot.current_label(), Some("spare"));
+
+        // A successful turn opens a fresh cycle from the account that worked.
+        rot.reset();
+        assert!(!rot.is_exhausted());
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn rotation_wraps_around_the_account_list() {
+        let mut rot = AccountRotation::starting_at(accounts(&["a", "b", "c"]), "c");
+        assert_eq!(rot.current_label(), Some("c"));
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("a")
+        );
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("b")
+        );
+        assert!(rot.next_on_rate_limit(&rate_limited()).is_none());
+    }
+
+    #[test]
+    fn refreshing_the_account_list_keeps_the_rotation_honest() {
+        let mut rot = AccountRotation::new(accounts(&["work", "personal", "spare"]));
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("personal")
+        );
+
+        // Re-reading the store must not un-rotate the rate-limited account …
+        rot.refresh(accounts(&["work", "personal", "spare"]));
+        assert_eq!(rot.current_label(), Some("personal"));
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("spare")
+        );
+        assert!(rot.next_on_rate_limit(&rate_limited()).is_none());
+
+        // … and a newly stored account joins the current cycle.
+        rot.refresh(accounts(&["work", "personal", "spare", "extra"]));
+        assert_eq!(rot.current_label(), Some("spare"));
+        assert_eq!(
+            rot.next_on_rate_limit(&rate_limited()).map(Account::label),
+            Some("extra")
+        );
+
+        // A dropped active account falls back to the first one.
+        rot.refresh(accounts(&["work"]));
+        assert_eq!(rot.current_label(), Some("work"));
+        assert!(rot.next_on_rate_limit(&rate_limited()).is_none());
+    }
+
+    #[test]
+    fn single_account_provider_never_rotates() {
+        let mut rot = AccountRotation::new(accounts(&["default"]));
+        assert_eq!(rot.current_label(), Some("default"));
+        assert!(rot.next_on_rate_limit(&rate_limited()).is_none());
+        assert_eq!(rot.current_label(), Some("default"));
+        assert_eq!(
+            rot.current().map(|a| a.credential(LadderLevel::Stored)),
+            Some(Credential {
+                access: "sk-test-default".into(),
+                kind: CredKind::ApiKey,
+                level: LadderLevel::Stored,
+            })
+        );
+
+        // No accounts at all: nothing to hand out, nothing to rotate.
+        let mut empty = AccountRotation::new(Vec::new());
+        assert!(empty.current().is_none());
+        assert!(empty.next_on_rate_limit(&rate_limited()).is_none());
+    }
+
+    #[test]
+    fn only_rate_limits_rotate_accounts() {
+        let not_rate_limits = [
+            TransportError::Retryable {
+                status: Some(500),
+                message: "server".into(),
+            },
+            TransportError::Retryable {
+                status: None,
+                message: "unknown".into(),
+            },
+            TransportError::Fatal {
+                status: Some(401),
+                message: "unauthorized".into(),
+            },
+            TransportError::Stalled {
+                phase: crate::transport::StallPhase::Idle,
+            },
+        ];
+        for err in not_rate_limits {
+            let mut rot = AccountRotation::new(accounts(&["work", "personal"]));
+            assert!(
+                rot.next_on_rate_limit(&err).is_none(),
+                "{err:?} must not rotate accounts"
+            );
+            assert_eq!(rot.current_label(), Some("work"));
+        }
+        // A 429 the provider marked fatal (quota exhausted) still rotates.
+        let mut rot = AccountRotation::new(accounts(&["work", "personal"]));
+        assert!(
+            rot.next_on_rate_limit(&TransportError::Fatal {
+                status: Some(429),
+                message: "quota".into(),
+            })
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn no_display_path_renders_a_full_secret() {
+        let account = Account::new("work", "sk-test-secret-1234", CredKind::ApiKey);
+        let rot = AccountRotation::new(vec![account.clone()]);
+        for rendered in [
+            format!("{account:?}"),
+            format!("{rot:?}"),
+            account.masked(),
+            format!("{:?}", account.credential(LadderLevel::Stored)),
+        ] {
+            assert!(
+                !rendered.contains("sk-test-secret-1234"),
+                "secret leaked: {rendered}"
+            );
+            assert!(rendered.contains("1234"), "last-4 missing: {rendered}");
+        }
+        assert_eq!(account.masked(), "work(…1234)");
+        assert_eq!(mask_secret("abcd"), "…");
     }
 
     /// Pairwise priority: with only rungs i and j set, the lower rung number
