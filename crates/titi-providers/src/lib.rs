@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod compat;
 pub mod creds;
+pub mod discovery;
 pub mod fallback;
 pub mod gemini;
 pub mod http;
@@ -25,6 +26,7 @@ pub use compat::{
     StreamDecodePolicy, StrictMode, ThinkingFormat, clamp_effort, resolve_compat,
 };
 pub use creds::{CredKind, Credential, LadderCtx, LadderLevel, parse_env_file, resolve_credential};
+pub use discovery::{DiscoveryError, MAX_DISCOVERY_BODY, list_models};
 pub use fallback::{FallbackChain, ModelRef};
 pub use gemini::GeminiStreamState;
 pub use http::{HttpFetch, HttpRequest, HttpResponse, ReqwestFetch};
