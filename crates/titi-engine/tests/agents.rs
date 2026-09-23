@@ -319,3 +319,95 @@ async fn streaming_runner_reports_provider_progress() {
         Some(EngineEvent::AgentFinished { success: true, summary, .. }) if summary == "found it"
     ));
 }
+
+/// A subagent has no surface to show an approval on: its tool events go to a
+/// dropped channel and nobody can answer the prompt. So with `agent_writes`
+/// the registry keeps write and exec tools *and* the runner must be able to
+/// run them — otherwise the first write parks forever and the agent never
+/// reports back.
+#[tokio::test]
+async fn a_subagent_with_write_access_does_not_park_on_approval() {
+    use std::time::Duration;
+    use titi_engine::ResolvedModel;
+    use titi_providers::{
+        BlockId, MockBody, MockTransport, StopReason, StreamEvent, ToolCallRef, Transport,
+    };
+    use titi_tools::{ApprovalMode, ToolRegistry};
+
+    let workspace = tempfile::tempdir().expect("a temp workspace");
+    let transport: Arc<dyn Transport> = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "write".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: r#"{"path":"notes.md","content":"from the subagent"}"#.into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "wrote the notes".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+    let resolver: Arc<dyn TransportResolver> = Arc::new(move |model: &str| {
+        Ok(ResolvedModel::without_credential(
+            model,
+            Arc::clone(&transport),
+        ))
+    });
+
+    let mut config = EngineConfig::new("primary");
+    config.agent_model = Some("agent-model".into());
+    config.workspace_root = Some(workspace.path().to_path_buf());
+    config.agent_writes = true;
+    // The session itself still asks for anything above read tier; the
+    // subagent's registry is the exception it was built with.
+    config.approval_mode = ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver, ToolRegistry::new());
+
+    engine
+        .send(EngineCommand::SpawnAgent {
+            name: "Worker".into(),
+            task: "write the notes".into(),
+            kind: AgentKind::Subagent,
+        })
+        .await
+        .unwrap();
+
+    let summary = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = engine.recv().await {
+            if let EngineEvent::AgentFinished {
+                success, summary, ..
+            } = event
+            {
+                assert!(success, "the subagent failed: {summary}");
+                return summary;
+            }
+        }
+        panic!("the engine stopped before the agent finished");
+    })
+    .await
+    .expect("a subagent parked on an approval nobody can answer");
+
+    assert_eq!(summary, "wrote the notes");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.md")).expect("the file was written"),
+        "from the subagent"
+    );
+}

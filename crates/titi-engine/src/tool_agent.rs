@@ -6,10 +6,12 @@
 //! identity, sharing the runtime's write claims, touched-file set and read
 //! cache.
 //!
-//! Safety: the registry it is given is the whole policy. An approval the
-//! engine cannot surface is a hang, so a subagent is handed a registry
-//! filtered to tiers that need no approval. Escalation is a caller decision,
-//! made once, at construction.
+//! Safety: the registry and the approval mode are one decision, made once by
+//! the caller at construction. An approval the engine cannot surface is a
+//! hang — the subagent's event sink goes nowhere and nobody can answer the
+//! prompt — so the two must agree: either the registry is filtered to tiers
+//! the mode auto-approves, or the mode covers everything the registry keeps.
+//! Escalation is the caller's decision, never this runner's.
 //!
 //! Spec: `docs/research/reference-product-port/README.md` (E4).
 

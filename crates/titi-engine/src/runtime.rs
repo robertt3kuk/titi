@@ -615,11 +615,19 @@ impl EngineRuntime {
             ) {
                 tools.register(Arc::from(tool));
             }
-            if !config.agent_writes {
-                // Nothing exec- or write-tier is registered, so no call can
-                // wait for an approval this surface cannot show.
+            // The registry is the whole policy: a subagent has no surface to
+            // show an approval on, so whatever it is handed it must be able
+            // to run. Without writes, everything above read tier is dropped
+            // and `Write` already auto-approves the rest. With writes, the
+            // write and exec tools are there on purpose, and leaving the
+            // runner on `Write` would park the first call on an approval
+            // nobody can answer.
+            let approval = if config.agent_writes {
+                ApprovalMode::Yolo
+            } else {
                 tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
-            }
+                ApprovalMode::Write
+            };
             Some(Arc::new(
                 crate::tool_agent::ToolAgentRunner::new(
                     Arc::clone(&resolver),
@@ -628,6 +636,7 @@ impl EngineRuntime {
                     claims.clone(),
                     Arc::clone(&touched),
                 )
+                .with_approval_mode(approval)
                 .with_max_rounds(config.agent_rounds)
                 .with_mask_ips(config.mask_ips),
             ) as Arc<dyn crate::agents::AgentRunner>)
