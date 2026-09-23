@@ -5,6 +5,7 @@ pub mod claims;
 pub mod compaction;
 pub mod findings;
 pub mod goal;
+pub mod judgment;
 pub mod naming;
 pub mod project_context;
 pub mod protocol;
@@ -21,6 +22,10 @@ pub use goal::{
     CodeRequest, Coder, CommandGates, DEFAULT_GOAL_ROUNDS, GATE_OUTPUT_CAP, GateCommand,
     GateVerdict, Gates, GoalCancel, GoalLoop, GoalOutcome, GoalStop, Patch, RunnerCoder,
     goal_report, run_goal,
+};
+pub use judgment::{
+    Capabilities, Capability, Choice, Confirm, JudgmentError, JudgmentModel, JudgmentProvider,
+    RoleJudgmentModel,
 };
 pub use naming::{SessionNamer, first_user_message};
 pub use protocol::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
