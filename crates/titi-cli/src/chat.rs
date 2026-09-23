@@ -616,6 +616,7 @@ impl Chat {
             "rewind" => self.rewind(args),
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
+            "switch" => self.switch(args),
             "goal" => self.goal(args),
             "usage" => self.usage(),
             "context" => self.describe_context(args),
@@ -654,6 +655,128 @@ impl Chat {
         );
         self.push(LineKind::Note, text);
         Applied::none()
+    }
+    fn switch(&mut self, args: &str) -> Applied {
+        if args.is_empty() {
+            self.push(
+                LineKind::Note,
+                "usage: /switch <model-id-or-alias>[:<level>]\ne.g. /switch opus, /switch @review:high, /switch anthropic/claude-3-5-sonnet"
+                    .to_owned(),
+            );
+            return Applied::none();
+        }
+
+        let models = self.catalog.ids();
+        if models.is_empty() {
+            self.push(LineKind::Error, "no models".to_owned());
+            return Applied::none();
+        }
+
+        let (base_query, level) = if let Some((q, lvl)) = args.rsplit_once(':') {
+            (q, Some(lvl))
+        } else {
+            (args, None)
+        };
+
+        let search_query = if let Some(role) = base_query.strip_prefix('@') {
+            if let Ok(settings) = titi_config::settings::Settings::load(
+                &self.agent_dir,
+                &crate::app::current_workspace(),
+                &[],
+            ) {
+                if let Ok(resolved) =
+                    titi_config::roles::resolve_model_role(&settings, role, &self.model)
+                {
+                    resolved
+                } else {
+                    base_query.to_owned()
+                }
+            } else {
+                base_query.to_owned()
+            }
+        } else {
+            base_query.to_owned()
+        };
+
+        fn is_subsequence(query: &str, target: &str) -> bool {
+            let mut target_chars = target.chars();
+            for q_c in query.chars() {
+                let mut matched = false;
+                while let Some(t_c) = target_chars.next() {
+                    if q_c.eq_ignore_ascii_case(&t_c) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return false;
+                }
+            }
+            true
+        }
+
+        let mut candidates = Vec::new();
+
+        for model in &models {
+            if model == &search_query {
+                candidates.push(model);
+                break;
+            }
+        }
+
+        if candidates.is_empty() {
+            for model in &models {
+                if model.rsplit('/').next() == Some(&search_query) {
+                    candidates.push(model);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            let query_lower = search_query.to_lowercase();
+            for model in &models {
+                if model.to_lowercase().contains(&query_lower) {
+                    candidates.push(model);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            for model in &models {
+                if is_subsequence(&search_query, model) {
+                    candidates.push(model);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            self.push(
+                LineKind::Error,
+                format!("no model matches \"{args}\"; try /model to see the list"),
+            );
+            return Applied::none();
+        }
+
+        if candidates.len() > 1 {
+            let top3: Vec<_> = candidates.into_iter().take(3).map(|s| s.as_str()).collect();
+            self.push(
+                LineKind::Note,
+                format!(
+                    "multiple models match \"{args}\", candidates: {}",
+                    top3.join(", ")
+                ),
+            );
+            return Applied::none();
+        }
+
+        let mut next = candidates[0].clone();
+        if let Some(lvl) = level {
+            next = format!("{next}:{lvl}");
+        }
+
+        self.model = next.clone();
+        self.push(LineKind::Note, format!("switched to {next}"));
+        Applied::send(EngineCommand::SwitchModel { model: next.into() }, None)
     }
 
     fn rewind(&mut self, args: &str) -> Applied {
@@ -1249,6 +1372,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "rewind",
         about: "cut back to a rewind point",
+    },
+    Command {
+        name: "switch",
+        about: "switch model with fuzzy search or role",
     },
     Command {
         name: "whoami",
@@ -2854,4 +2981,122 @@ mod tests {
         31, 132, 25, 96, 12, 0, 71, 202, 7, 249, 103, 89, 110, 183, 0, 0, 0, 0, 73, 69, 78, 68,
         174, 66, 96, 130,
     ];
+
+    #[test]
+    fn switch_with_no_args_prints_usage() {
+        let mut chat = chat();
+        type_text(&mut chat, "/switch");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        let view = frame_text(&mut chat);
+        assert!(view.contains("usage: /switch"), "{view}");
+    }
+
+    #[test]
+    fn switch_exact_id() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "anthropic/claude-opus-5".to_owned(),
+            "openai/gpt-4.1".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch anthropic/claude-opus-5");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+        let view = frame_text(&mut chat);
+        assert!(
+            view.contains("switched to anthropic/claude-opus-5"),
+            "{view}"
+        );
+    }
+
+    #[test]
+    fn switch_fuzzy_opus() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "anthropic/claude-opus-5".to_owned(),
+            "openai/gpt-4.1".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch opus");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn switch_with_level() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "anthropic/claude-opus-5".to_owned(),
+            "openai/gpt-4.1".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch opus:high");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5:high".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn switch_role_alias() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.catalog =
+            crate::engine::ModelCatalog::fixed(vec!["anthropic/claude-opus-5".to_owned()]);
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+        std::fs::write(
+            chat.agent_dir.join("config.yml"),
+            "modelRoles:\n  review: anthropic/claude-opus-5\n",
+        )
+        .unwrap();
+
+        type_text(&mut chat, "/switch @review");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn switch_multiple_matches_prints_candidates() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "anthropic/claude-opus-5".to_owned(),
+            "aws/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch opus");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("multiple models match"))
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("anthropic/claude-opus-5"))
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("aws/claude-opus-5"))
+        );
+    }
 }
