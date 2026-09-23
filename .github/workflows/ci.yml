@@ -40,3 +40,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+
+  tui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p titi-cli --locked
+      # Drives the real binary on a pty: ready frame, `/` listing, /help,
+      # Ctrl+D, then the terminal restore sequences. No provider key is used
+      # and no model turn runs; every wait is bounded, a hang fails the job.
+      - run: python3 scripts/tui-smoke.py --bin target/debug/titi
