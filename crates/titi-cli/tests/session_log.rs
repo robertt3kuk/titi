@@ -215,3 +215,56 @@ fn session_history_stops_at_the_tail_cap() {
         format!("turn {}", MAX_RESTORED_MESSAGES + 9)
     );
 }
+
+/// A tool round is the part of a turn a restart used to lose: the call the
+/// assistant made and the output it read back.
+#[test]
+fn a_restored_tool_round_is_the_one_the_live_session_had() {
+    use titi_cli::app::session_history;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let store = SessionStore::new(agent_dir).unwrap();
+    let session_id = store.create(SessionMeta::default()).unwrap();
+    let log = SessionLog::open(agent_dir, &session_id).unwrap();
+
+    let call = titi_providers::ToolCallRef {
+        call_id: "call-1".into(),
+        name: "read".into(),
+    };
+    // What the live turn sent: prompt, the call, its output, then the answer.
+    let live = vec![
+        message(titi_providers::Role::User, "what is in Cargo.toml?", &[]),
+        message(
+            titi_providers::Role::Assistant,
+            "let me look",
+            std::slice::from_ref(&call),
+        ),
+        message(
+            titi_providers::Role::Tool,
+            "[package]\nname = \"titi\"",
+            &[],
+        ),
+        message(titi_providers::Role::Assistant, "it is the workspace", &[]),
+    ];
+
+    log.user("what is in Cargo.toml?").unwrap();
+    log.assistant_tool_calls("let me look", vec![call.clone()])
+        .unwrap();
+    log.tool_result("[package]\nname = \"titi\"").unwrap();
+    log.assistant("it is the workspace").unwrap();
+
+    assert_eq!(session_history(agent_dir, &session_id).unwrap(), live);
+}
+
+fn message(
+    role: titi_providers::Role,
+    text: &str,
+    tool_calls: &[titi_providers::ToolCallRef],
+) -> titi_providers::ChatMessage {
+    titi_providers::ChatMessage {
+        role,
+        content: text.into(),
+        tool_calls: tool_calls.to_vec(),
+    }
+}

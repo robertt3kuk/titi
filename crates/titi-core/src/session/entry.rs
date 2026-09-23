@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use titi_providers::ToolCallRef;
 
 /// Author of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,13 +13,17 @@ pub enum Role {
     User,
     Assistant,
     System,
+    /// Output of one tool call, as the model sees it.
+    Tool,
 }
 
 /// One node of the append-only session tree.
 ///
 /// `parent_id` links to the entry this one was appended after (`None` for a
 /// root); forking moves only the leaf pointer, so history is never rewritten.
-/// `ts` is milliseconds since the Unix epoch.
+/// `ts` is milliseconds since the Unix epoch. `tool_calls` is what an
+/// assistant message asked for; a session written before tool traffic was
+/// persisted has no such field, so it deserializes as empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
@@ -26,6 +31,8 @@ pub struct Entry {
     pub role: Role,
     pub content: String,
     pub ts: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRef>,
 }
 
 static COUNTER: AtomicU16 = AtomicU16::new(0);
@@ -39,7 +46,14 @@ impl Entry {
             role,
             content: content.into(),
             ts: now_ms(),
+            tool_calls: Vec::new(),
         }
+    }
+
+    /// The same entry with the tool calls the assistant issued in it.
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ToolCallRef>) -> Self {
+        self.tool_calls = tool_calls;
+        self
     }
 }
 

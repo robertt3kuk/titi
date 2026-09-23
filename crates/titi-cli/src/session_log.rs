@@ -44,6 +44,33 @@ impl SessionLog {
         self.append(Role::Assistant, text)
     }
 
+    /// Records the assistant message that issued `tool_calls`.
+    ///
+    /// Unlike a plain reply this is written even with empty text: a model
+    /// that only calls a tool says nothing, and dropping the message would
+    /// leave the tool results that follow without the call they answer.
+    pub fn assistant_tool_calls(
+        &self,
+        text: &str,
+        tool_calls: Vec<titi_providers::ToolCallRef>,
+    ) -> Result<(), String> {
+        self.store
+            .append_with_tool_calls(&self.session_id, Role::Assistant, text, tool_calls)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Records one tool result, already masked by the engine.
+    ///
+    /// Written even when the tool printed nothing, for the same reason: the
+    /// call above it must keep its answer.
+    pub fn tool_result(&self, text: &str) -> Result<(), String> {
+        self.store
+            .append(&self.session_id, Role::Tool, text)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// Records a system note (compaction, a resumed-session marker).
     pub fn system(&self, text: &str) -> Result<(), String> {
         self.append(Role::System, text)

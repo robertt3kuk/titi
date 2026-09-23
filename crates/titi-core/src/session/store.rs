@@ -11,8 +11,9 @@ use super::index::{SearchHit, SessionIndex};
 use super::{SessionError, SessionMeta};
 
 /// Replays persisted entries as provider messages, so a restored session
-/// continues the conversation instead of starting blank. Tool messages are
-/// not persisted yet, so every restored entry is plain text.
+/// continues the conversation instead of starting blank — tool rounds
+/// included, because a restart that drops them makes the model re-run work
+/// it already did.
 pub fn entries_to_messages(entries: &[Entry]) -> Vec<titi_providers::ChatMessage> {
     entries
         .iter()
@@ -21,9 +22,10 @@ pub fn entries_to_messages(entries: &[Entry]) -> Vec<titi_providers::ChatMessage
                 Role::User => titi_providers::Role::User,
                 Role::Assistant => titi_providers::Role::Assistant,
                 Role::System => titi_providers::Role::System,
+                Role::Tool => titi_providers::Role::Tool,
             },
             content: entry.content.clone().into(),
-            tool_calls: Vec::new(),
+            tool_calls: entry.tool_calls.clone(),
         })
         .collect()
 }
@@ -68,11 +70,34 @@ impl SessionStore {
         role: Role,
         content: &str,
     ) -> Result<Entry, SessionError> {
+        self.append_entry(session_id, Entry::new(None, role, content))
+    }
+
+    /// Appends an assistant entry that issued `tool_calls`.
+    ///
+    /// Without the calls the following tool results are orphans, and a
+    /// request carrying an orphan result is rejected by the provider.
+    pub fn append_with_tool_calls(
+        &self,
+        session_id: &str,
+        role: Role,
+        content: &str,
+        tool_calls: Vec<titi_providers::ToolCallRef>,
+    ) -> Result<Entry, SessionError> {
+        self.append_entry(
+            session_id,
+            Entry::new(None, role, content).with_tool_calls(tool_calls),
+        )
+    }
+
+    fn append_entry(&self, session_id: &str, entry: Entry) -> Result<Entry, SessionError> {
         if !self.session_file(session_id).exists() {
             return Err(SessionError::NotFound(session_id.into()));
         }
-        let parent = self.current_leaf(session_id)?;
-        let e = Entry::new(parent, role, content);
+        let e = Entry {
+            parent_id: self.current_leaf(session_id)?,
+            ..entry
+        };
         let mut file = OpenOptions::new()
             .append(true)
             .open(self.session_file(session_id))
@@ -695,5 +720,54 @@ mod tests {
             Err(SessionError::NotFound(_))
         ));
         assert!(matches!(s.open("ghost"), Err(SessionError::NotFound(_))));
+    }
+
+    #[test]
+    fn tool_traffic_survives_the_file_and_old_lines_still_load() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        // A line written before tool traffic was persisted has no field.
+        let legacy = "{\"id\":\"0\",\"parent_id\":null,\"role\":\"user\",\
+                      \"content\":\"read Cargo.toml\",\"ts\":1}\n";
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(s.session_file(&sid))
+                .unwrap_or_else(|e| panic!("{e}"));
+            write!(file, "{legacy}").unwrap_or_else(|e| panic!("{e}"));
+        }
+        s.set_leaf(&sid, "0").unwrap_or_else(|e| panic!("{e}"));
+
+        let call = titi_providers::ToolCallRef {
+            call_id: "call-1".into(),
+            name: "read".into(),
+        };
+        s.append_with_tool_calls(&sid, Role::Assistant, "", vec![call.clone()])
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Tool, "[package]")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let entries = s.walk(&sid, None).unwrap_or_else(|e| panic!("{e}"));
+        let messages = entries_to_messages(&entries);
+        assert_eq!(
+            messages,
+            vec![
+                titi_providers::ChatMessage {
+                    role: titi_providers::Role::User,
+                    content: "read Cargo.toml".into(),
+                    tool_calls: Vec::new(),
+                },
+                titi_providers::ChatMessage {
+                    role: titi_providers::Role::Assistant,
+                    content: "".into(),
+                    tool_calls: vec![call],
+                },
+                titi_providers::ChatMessage {
+                    role: titi_providers::Role::Tool,
+                    content: "[package]".into(),
+                    tool_calls: Vec::new(),
+                },
+            ]
+        );
     }
 }

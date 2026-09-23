@@ -50,11 +50,33 @@ pub enum ChatEffect {
     Quit,
 }
 
+/// One conversation entry the screen hands to the session file.
+///
+/// A tool round is three entries — the call, its output, the answer — so the
+/// role alone no longer says what to write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogWrite {
+    pub role: Role,
+    pub text: String,
+    /// Tool calls this assistant message issued, if any.
+    pub tool_calls: Vec<titi_providers::ToolCallRef>,
+}
+
+impl LogWrite {
+    fn text(role: Role, text: String) -> Self {
+        Self {
+            role,
+            text,
+            tool_calls: Vec::new(),
+        }
+    }
+}
+
 /// A command for the engine, plus the transcript line that should be stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Applied {
     pub effect: Option<ChatEffect>,
-    pub log: Option<(Role, String)>,
+    pub log: Option<LogWrite>,
 }
 
 impl Applied {
@@ -72,7 +94,7 @@ impl Applied {
         }
     }
 
-    fn send(command: EngineCommand, log: Option<(Role, String)>) -> Self {
+    fn send(command: EngineCommand, log: Option<LogWrite>) -> Self {
         Self {
             effect: Some(ChatEffect::Send(command)),
             log,
@@ -114,6 +136,9 @@ pub struct Chat {
     paused: bool,
     context_percent: Option<u8>,
     reply: String,
+    /// Bytes of `reply` already written to the session file. A tool call
+    /// splits the turn's text into segments, and each is recorded once.
+    recorded_reply: usize,
     thinking: String,
     assistant_at: Option<usize>,
     thinking_at: Option<usize>,
@@ -151,6 +176,7 @@ impl Chat {
             paused: false,
             context_percent: None,
             reply: String::new(),
+            recorded_reply: 0,
             thinking: String::new(),
             assistant_at: None,
             thinking_at: None,
@@ -305,6 +331,7 @@ impl Chat {
                 self.turn_active = true;
                 self.model = model.to_string();
                 self.reply.clear();
+                self.recorded_reply = 0;
                 self.assistant_at = None;
                 self.drop_thinking();
                 Applied::none()
@@ -320,9 +347,19 @@ impl Chat {
                 self.show_thinking();
                 Applied::none()
             }
-            EngineEvent::ToolStarted { name, .. } => {
+            EngineEvent::ToolStarted { call_id, name, .. } => {
                 self.push(LineKind::Tool, format!("tool {name}"));
-                Applied::none()
+                // The call goes to the session file now, not at the end of
+                // the turn: the result below it has to follow its own call,
+                // or a restore replays an orphan.
+                Applied {
+                    effect: None,
+                    log: Some(LogWrite {
+                        role: Role::Assistant,
+                        text: self.unrecorded_reply(),
+                        tool_calls: vec![titi_providers::ToolCallRef { call_id, name }],
+                    }),
+                }
             }
             EngineEvent::ToolApprovalNeeded { call_id, name, .. } => {
                 self.approval = Some(PendingApproval {
@@ -349,7 +386,12 @@ impl Chat {
                     LineKind::Tool
                 };
                 self.push(kind, text);
-                Applied::none()
+                // `output` is what the engine masked before it emitted the
+                // event, so no secret reaches the session file here.
+                Applied {
+                    effect: None,
+                    log: Some(LogWrite::text(Role::Tool, output.to_string())),
+                }
             }
             EngineEvent::ContextUsage { tokens, window, .. } if window > 0 => {
                 let percent = tokens.saturating_mul(100) / window;
@@ -469,7 +511,7 @@ impl Chat {
         self.input.clear();
         self.disarm();
         self.push(LineKind::User, text.clone());
-        let log = Some((Role::User, text.clone()));
+        let log = Some(LogWrite::text(Role::User, text.clone()));
         if self.turn_active {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
         } else {
@@ -874,8 +916,21 @@ impl Chat {
         self.hint.clear();
     }
 
+    /// The reply text streamed since the last entry written for this turn.
+    fn unrecorded_reply(&mut self) -> String {
+        let text = self
+            .reply
+            .get(self.recorded_reply..)
+            .unwrap_or_default()
+            .to_owned();
+        self.recorded_reply = self.reply.len();
+        text
+    }
+
     fn finish_turn(&mut self) -> Applied {
-        let reply = std::mem::take(&mut self.reply);
+        let reply = self.unrecorded_reply();
+        self.reply.clear();
+        self.recorded_reply = 0;
         self.turn_active = false;
         self.approval = None;
         self.assistant_at = None;
@@ -885,7 +940,7 @@ impl Chat {
         } else {
             Applied {
                 effect: None,
-                log: Some((Role::Assistant, reply)),
+                log: Some(LogWrite::text(Role::Assistant, reply)),
             }
         }
     }
@@ -1860,17 +1915,19 @@ fn dispatch(
     }
 }
 
-fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<(Role, String)>) {
+fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<LogWrite>) {
     let Some(log) = session_log else {
         return;
     };
-    let Some((role, text)) = write else {
+    let Some(write) = write else {
         return;
     };
-    let result = match role {
-        Role::User => log.user(&text),
-        Role::Assistant => log.assistant(&text),
-        Role::System => log.system(&text),
+    let result = match write.role {
+        Role::User => log.user(&write.text),
+        Role::Assistant if write.tool_calls.is_empty() => log.assistant(&write.text),
+        Role::Assistant => log.assistant_tool_calls(&write.text, write.tool_calls),
+        Role::System => log.system(&write.text),
+        Role::Tool => log.tool_result(&write.text),
     };
     if let Err(reason) = result {
         chat.push(LineKind::Error, format!("session: not saved ({reason})"));
@@ -1919,7 +1976,10 @@ mod tests {
             applied.effect,
             Some(ChatEffect::Send(EngineCommand::SubmitPrompt { .. }))
         ));
-        assert_eq!(applied.log, Some((Role::User, "hi".to_owned())));
+        assert_eq!(
+            applied.log,
+            Some(LogWrite::text(Role::User, "hi".to_owned()))
+        );
         assert!(chat.turn_active);
     }
 
@@ -1939,7 +1999,10 @@ mod tests {
             other => panic!("expected steer, got {other:?}"),
         }
         assert!(chat.turn_active);
-        assert_eq!(applied.log, Some((Role::User, "look again".to_owned())));
+        assert_eq!(
+            applied.log,
+            Some(LogWrite::text(Role::User, "look again".to_owned()))
+        );
     }
 
     /// The user cancelled, so the prompt waiting behind that turn never ran.
@@ -2033,8 +2096,67 @@ mod tests {
             turn_id: TurnId(7),
             reason: StopReason::Stop,
         });
-        assert_eq!(applied.log, Some((Role::Assistant, "hello".to_owned())));
+        assert_eq!(
+            applied.log,
+            Some(LogWrite::text(Role::Assistant, "hello".to_owned()))
+        );
         assert!(!chat.turn_active);
+    }
+
+    /// A turn with a tool round is three entries, and the text before the
+    /// call is written once, not again at the end of the turn.
+    #[test]
+    fn a_tool_round_logs_the_call_its_output_and_the_answer() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(3),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(3),
+            text: "let me look".into(),
+        });
+        let call = chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(3),
+            call_id: "call-1".into(),
+            name: "read".into(),
+        });
+        assert_eq!(
+            call.log,
+            Some(LogWrite {
+                role: Role::Assistant,
+                text: "let me look".to_owned(),
+                tool_calls: vec![titi_providers::ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "read".into(),
+                }],
+            })
+        );
+        let result = chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(3),
+            call_id: "call-1".into(),
+            output: "[package]".into(),
+            is_error: false,
+        });
+        assert_eq!(
+            result.log,
+            Some(LogWrite::text(Role::Tool, "[package]".to_owned()))
+        );
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(3),
+            text: " it is the workspace".into(),
+        });
+        let finished = chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(3),
+            reason: StopReason::Stop,
+        });
+        assert_eq!(
+            finished.log,
+            Some(LogWrite::text(
+                Role::Assistant,
+                " it is the workspace".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -2236,7 +2358,10 @@ mod tests {
         );
         assert_eq!(
             applied.log,
-            Some((Role::User, "/code-review this diff".to_owned()))
+            Some(LogWrite::text(
+                Role::User,
+                "/code-review this diff".to_owned()
+            ))
         );
         assert!(
             !chat
