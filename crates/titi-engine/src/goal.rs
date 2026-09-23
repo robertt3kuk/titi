@@ -21,6 +21,114 @@ use tokio::sync::Notify;
 /// Rounds one goal may spend ("goal iterations" in the spec).
 pub const DEFAULT_GOAL_ROUNDS: u32 = 8;
 
+/// Consecutive failed rounds after which the loop stops asking the same
+/// question.
+///
+/// One failure is ordinary work: a review or a check found something and the
+/// next round fixes it. Two in a row mean the same inputs keep producing the
+/// same dead end, so the round after them changes a variable instead.
+pub const STUCK_AFTER_FAILURES: u32 = 2;
+
+/// The one variable a stuck round changes.
+///
+/// Exactly one per round, and never the same one two rounds running: a round
+/// that changed several things at once would not tell anyone which of them
+/// mattered. A [`Coder`] is handed nothing but a [`CodeRequest`], so this is
+/// what the loop can turn — the round's context, or the instruction that
+/// rides on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyChange {
+    /// Solve the goal another way instead of repairing the patch that keeps
+    /// failing.
+    Strategy,
+    /// Drop the accumulated review and check output: the round is asked with
+    /// the goal alone, the way the first round was.
+    FreshContext,
+    /// Spend a larger reasoning budget than the last round did.
+    Effort,
+}
+
+impl StrategyChange {
+    /// Wording for the round log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strategy => "strategy hint",
+            Self::FreshContext => "fresh context",
+            Self::Effort => "effort",
+        }
+    }
+
+    /// What the coder is told to do differently this round.
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Self::Strategy => {
+                "Changed variable: strategy. The previous approach failed twice in a row; \
+                 take a different one instead of patching it again."
+            }
+            Self::FreshContext => {
+                "Changed variable: fresh context. The earlier reviews and check logs are \
+                 withheld on purpose; work from the goal itself."
+            }
+            Self::Effort => {
+                "Changed variable: effort. Spend a larger reasoning budget on this round \
+                 than on the last one before writing the patch."
+            }
+        }
+    }
+
+    /// Cycles the knobs, so a stuck goal never changes the same one twice in
+    /// a row and comes back to the first only after all three were tried.
+    fn for_streak(failures: u32) -> Self {
+        match failures.saturating_sub(STUCK_AFTER_FAILURES) % 3 {
+            0 => Self::Strategy,
+            1 => Self::FreshContext,
+            _ => Self::Effort,
+        }
+    }
+
+    /// Turns this one knob on the round that is about to be asked.
+    ///
+    /// [`Self::FreshContext`] withholds what the last rounds produced; the
+    /// other two ride on whichever of the two inputs this round carries, last,
+    /// so the coder reads the failure first and the new instruction after it.
+    ///
+    /// Returns `false` when there was nothing to turn — a round with no
+    /// feedback and no check output is already the fresh one. The log then
+    /// records no change, because none happened.
+    fn apply(self, feedback: &mut Option<Review>, gate: &mut Option<SmolStr>) -> bool {
+        let carried = feedback.is_some() || gate.is_some();
+        match self {
+            Self::FreshContext => {
+                *feedback = None;
+                *gate = None;
+                carried
+            }
+            Self::Strategy | Self::Effort => {
+                let note = self.instruction();
+                if let Some(report) = gate.as_mut() {
+                    *report = format!("{report}\n{note}").into();
+                } else if let Some(review) = feedback.as_mut() {
+                    review.notes = format!("{}\n{note}", review.notes).into();
+                }
+                carried
+            }
+        }
+    }
+}
+
+/// One line of the round log: the round, and the single variable it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundChange {
+    pub round: u32,
+    pub change: StrategyChange,
+}
+
+impl RoundChange {
+    pub fn label(&self) -> String {
+        format!("round {} {}", self.round, self.change.as_str())
+    }
+}
+
 /// A coder's patch. Oscillation compares [`normalize_patch`], not this text
 /// and not the review that followed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +174,11 @@ pub fn normalize_patch(text: &str) -> String {
 /// review and `gate` the previous check failure; one round carries at most
 /// one of them, and the first round has neither. The reviewer is not given
 /// this struct.
+///
+/// Once a goal is stuck (see [`STUCK_AFTER_FAILURES`]) the loop changes one
+/// variable per round through these two fields: it either withholds them or
+/// appends its instruction to the one this round carries. The round log in
+/// [`GoalOutcome::changes`] says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeRequest {
     pub goal: SmolStr,
@@ -360,6 +473,18 @@ impl GoalCancel {
     }
 }
 
+/// What the loop has accumulated so far: the last patch, the last review, the
+/// last red check, and the round log. Every terminal outcome is built from
+/// one of these, so the loop carries the state in a single value instead of
+/// threading four parallel locals through a dozen early returns.
+#[derive(Debug, Default)]
+struct Trail {
+    patch: Option<Patch>,
+    review: Option<Review>,
+    gate: Option<SmolStr>,
+    changes: Vec<RoundChange>,
+}
+
 /// How one goal ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalOutcome {
@@ -374,59 +499,61 @@ pub struct GoalOutcome {
     pub review: Option<Review>,
     /// The last failing check's report, when a gate turned a round back.
     pub gate: Option<SmolStr>,
+    /// The round log of a stuck goal: which round changed which variable.
+    /// Empty while the goal is still making progress.
+    pub changes: Vec<RoundChange>,
     pub error: Option<SmolStr>,
 }
 
 impl GoalOutcome {
-    fn cancelled(
-        rounds: u32,
-        patch: Option<Patch>,
-        review: Option<Review>,
-        gate: Option<SmolStr>,
-    ) -> Self {
+    fn judged(stop: GoalStop, verdict: Verdict, rounds: u32, trail: Trail) -> Self {
         Self {
-            stop: GoalStop::Cancelled,
-            verdict: None,
+            stop,
+            verdict: Some(verdict),
             rounds,
-            patch,
-            review,
-            gate,
+            patch: trail.patch,
+            review: trail.review,
+            gate: trail.gate,
+            changes: trail.changes,
             error: None,
         }
     }
 
-    fn failed_call(
-        rounds: u32,
-        error: SmolStr,
-        patch: Option<Patch>,
-        review: Option<Review>,
-        gate: Option<SmolStr>,
-    ) -> Self {
+    fn cancelled(rounds: u32, trail: Trail) -> Self {
+        Self {
+            stop: GoalStop::Cancelled,
+            verdict: None,
+            rounds,
+            patch: trail.patch,
+            review: trail.review,
+            gate: trail.gate,
+            changes: trail.changes,
+            error: None,
+        }
+    }
+
+    fn failed_call(rounds: u32, error: SmolStr, trail: Trail) -> Self {
         Self {
             stop: GoalStop::Error,
             verdict: None,
             rounds,
-            patch,
-            review,
-            gate,
+            patch: trail.patch,
+            review: trail.review,
+            gate: trail.gate,
+            changes: trail.changes,
             error: Some(error),
         }
     }
 
-    fn gate_unavailable(
-        rounds: u32,
-        error: SmolStr,
-        patch: Option<Patch>,
-        review: Option<Review>,
-        gate: Option<SmolStr>,
-    ) -> Self {
+    fn gate_unavailable(rounds: u32, error: SmolStr, trail: Trail) -> Self {
         Self {
             stop: GoalStop::GateUnavailable,
             verdict: None,
             rounds,
-            patch,
-            review,
-            gate,
+            patch: trail.patch,
+            review: trail.review,
+            gate: trail.gate,
+            changes: trail.changes,
             error: Some(error),
         }
     }
@@ -478,19 +605,32 @@ impl GoalLoop {
 
     /// Runs `goal` to a terminal outcome. Always returns; it does not panic
     /// on a coder or reviewer error.
+    ///
+    /// A round that ends in a red check or a non-passing review is a failure.
+    /// After [`STUCK_AFTER_FAILURES`] of them in a row the loop stops handing
+    /// the same failure to the same request: every further round changes
+    /// exactly one variable ([`StrategyChange`]) and records it in
+    /// [`GoalOutcome::changes`]. A red check turning green is progress, so the
+    /// streak starts over there.
     pub async fn run(&self, goal: impl Into<SmolStr>) -> GoalOutcome {
         let goal = goal.into();
         let mut seen = Vec::<String>::new();
         let mut feedback = None;
         let mut gate = None;
-        let mut last_patch = None;
-        let mut last_review = None;
-        let mut last_gate = None;
+        let mut trail = Trail::default();
         let mut completed = 0u32;
+        let mut failures = 0u32;
+        let mut gate_was_red = false;
 
         for round in 1..=self.max_rounds {
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                return GoalOutcome::cancelled(completed, trail);
+            }
+            if failures >= STUCK_AFTER_FAILURES {
+                let change = StrategyChange::for_streak(failures);
+                if change.apply(&mut feedback, &mut gate) {
+                    trail.changes.push(RoundChange { round, change });
+                }
             }
             let request = CodeRequest {
                 goal: goal.clone(),
@@ -501,74 +641,61 @@ impl GoalLoop {
             let coded = tokio::select! {
                 biased;
                 () = wait_cancelled(&self.cancel) => {
-                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                    return GoalOutcome::cancelled(completed, trail);
                 }
                 result = self.coder.code(request) => result,
             };
             let patch = match coded {
                 Ok(patch) => patch,
                 Err(error) => {
-                    return GoalOutcome::failed_call(
-                        completed,
-                        error,
-                        last_patch,
-                        last_review,
-                        last_gate,
-                    );
+                    return GoalOutcome::failed_call(completed, error, trail);
                 }
             };
             completed = round;
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, Some(patch), last_review, last_gate);
+                trail.patch = Some(patch);
+                return GoalOutcome::cancelled(completed, trail);
             }
             let normalized = patch.normalized();
             if seen.iter().any(|previous| previous == &normalized) {
-                return GoalOutcome {
-                    stop: GoalStop::Oscillation,
-                    verdict: Some(Verdict::Fail),
-                    rounds: completed,
-                    patch: Some(patch),
-                    review: last_review,
-                    gate: last_gate,
-                    error: None,
-                };
+                trail.patch = Some(patch);
+                return GoalOutcome::judged(GoalStop::Oscillation, Verdict::Fail, completed, trail);
             }
             seen.push(normalized);
-            last_patch = Some(patch.clone());
+            trail.patch = Some(patch.clone());
 
             // The checks come before the reviewer: a review is a model call,
             // and a patch that does not build has nothing worth reviewing.
             let gated = tokio::select! {
                 biased;
                 () = wait_cancelled(&self.cancel) => {
-                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                    return GoalOutcome::cancelled(completed, trail);
                 }
                 verdict = self.gates.check(&patch) => verdict,
             };
             match gated {
-                GateVerdict::Green => {}
+                GateVerdict::Green => {
+                    if gate_was_red {
+                        // A patch that now builds is movement, not another
+                        // repetition: the streak starts over rather than
+                        // spending a variable on a goal that is unsticking.
+                        gate_was_red = false;
+                        failures = 0;
+                    }
+                }
                 GateVerdict::Red { report } => {
-                    last_gate = Some(report.clone());
+                    trail.gate = Some(report.clone());
                     gate = Some(report);
                     feedback = None;
+                    gate_was_red = true;
+                    failures += 1;
                     if self.cancel.is_cancelled() {
-                        return GoalOutcome::cancelled(
-                            completed,
-                            last_patch,
-                            last_review,
-                            last_gate,
-                        );
+                        return GoalOutcome::cancelled(completed, trail);
                     }
                     continue;
                 }
                 GateVerdict::Unavailable { error } => {
-                    return GoalOutcome::gate_unavailable(
-                        completed,
-                        error,
-                        last_patch,
-                        last_review,
-                        last_gate,
-                    );
+                    return GoalOutcome::gate_unavailable(completed, error, trail);
                 }
             }
 
@@ -576,33 +703,19 @@ impl GoalLoop {
             let reviewed = tokio::select! {
                 biased;
                 () = wait_cancelled(&self.cancel) => {
-                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                    return GoalOutcome::cancelled(completed, trail);
                 }
                 result = self.reviewer.review(review_request) => result,
             };
             let review = match reviewed {
                 Ok(review) => review,
                 Err(error) => {
-                    return GoalOutcome::failed_call(
-                        completed,
-                        error,
-                        last_patch,
-                        last_review,
-                        last_gate,
-                    );
+                    return GoalOutcome::failed_call(completed, error, trail);
                 }
             };
-            last_review = Some(review.clone());
+            trail.review = Some(review.clone());
             if review.verdict == Verdict::Pass {
-                return GoalOutcome {
-                    stop: GoalStop::Passed,
-                    verdict: Some(Verdict::Pass),
-                    rounds: completed,
-                    patch: last_patch,
-                    review: last_review,
-                    gate: last_gate,
-                    error: None,
-                };
+                return GoalOutcome::judged(GoalStop::Passed, Verdict::Pass, completed, trail);
             }
             // FAIL and PARTIAL both go back to the coder. A repeated sentence
             // is not oscillation; only a repeated patch is.
@@ -610,20 +723,13 @@ impl GoalLoop {
             // The next round answers this review; an older gate report is
             // about a patch that is already gone.
             gate = None;
+            failures += 1;
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                return GoalOutcome::cancelled(completed, trail);
             }
         }
 
-        GoalOutcome {
-            stop: GoalStop::RoundCap,
-            verdict: Some(Verdict::Fail),
-            rounds: completed,
-            patch: last_patch,
-            review: last_review,
-            gate: last_gate,
-            error: None,
-        }
+        GoalOutcome::judged(GoalStop::RoundCap, Verdict::Fail, completed, trail)
     }
 }
 
@@ -637,7 +743,8 @@ pub async fn run_goal(
     GoalLoop::new(coder, reviewer).run(goal).await
 }
 
-/// One transcript line: stop, rounds, and verdict when there is one.
+/// One transcript line: stop, rounds, the verdict when there is one, and the
+/// round log of a stuck goal — which round changed which variable.
 pub fn goal_report(outcome: &GoalOutcome) -> String {
     let stop = match outcome.stop {
         GoalStop::Passed => "passed",
@@ -656,6 +763,11 @@ pub fn goal_report(outcome: &GoalOutcome) -> String {
     if let Some(verdict) = outcome.verdict {
         line.push_str(" · verdict ");
         line.push_str(&verdict.as_str().to_ascii_lowercase());
+    }
+    if !outcome.changes.is_empty() {
+        let log: Vec<String> = outcome.changes.iter().map(RoundChange::label).collect();
+        line.push_str(" · changed: ");
+        line.push_str(&log.join(", "));
     }
     if let Some(gate) = &outcome.gate {
         line.push_str(" · gate red: ");
@@ -730,6 +842,307 @@ async fn wait_cancelled(cancel: &GoalCancel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Answers with a new patch every round and keeps the requests it saw.
+    struct RecordingCoder {
+        seen: Mutex<Vec<CodeRequest>>,
+    }
+
+    impl RecordingCoder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<CodeRequest> {
+            match self.seen.lock() {
+                Ok(seen) => seen.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Coder for RecordingCoder {
+        async fn code(&self, request: CodeRequest) -> Result<Patch, SmolStr> {
+            let round = request.round;
+            match self.seen.lock() {
+                Ok(mut seen) => seen.push(request),
+                Err(poisoned) => poisoned.into_inner().push(request),
+            }
+            Ok(Patch::new(format!("patch for round {round}")))
+        }
+    }
+
+    struct AlwaysFails;
+
+    #[async_trait]
+    impl Reviewer for AlwaysFails {
+        async fn review(&self, _request: ReviewRequest) -> Result<Review, SmolStr> {
+            Ok(Review {
+                verdict: Verdict::Fail,
+                notes: "still not there".into(),
+            })
+        }
+    }
+
+    /// Hands out scripted verdicts, then stays on the last one.
+    struct ScriptedGates {
+        verdicts: Mutex<std::collections::VecDeque<GateVerdict>>,
+        last: GateVerdict,
+    }
+
+    #[async_trait]
+    impl Gates for ScriptedGates {
+        async fn check(&self, _patch: &Patch) -> GateVerdict {
+            let mut verdicts = match self.verdicts.lock() {
+                Ok(verdicts) => verdicts,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            verdicts.pop_front().unwrap_or_else(|| self.last.clone())
+        }
+    }
+
+    fn notes(requests: &[CodeRequest]) -> Vec<Option<String>> {
+        requests
+            .iter()
+            .map(|request| {
+                request
+                    .feedback
+                    .as_ref()
+                    .map(|review| review.notes.to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stuck_goal_changes_one_variable_per_round_and_a_different_one_each_time() {
+        let coder = RecordingCoder::new();
+        let outcome = GoalLoop::new(Arc::clone(&coder) as Arc<dyn Coder>, Arc::new(AlwaysFails))
+            .with_max_rounds(5)
+            .run("ship it")
+            .await;
+
+        assert_eq!(outcome.stop, GoalStop::RoundCap);
+        assert_eq!(
+            outcome.changes,
+            vec![
+                RoundChange {
+                    round: 3,
+                    change: StrategyChange::Strategy,
+                },
+                RoundChange {
+                    round: 4,
+                    change: StrategyChange::FreshContext,
+                },
+                RoundChange {
+                    round: 5,
+                    change: StrategyChange::Effort,
+                },
+            ]
+        );
+
+        let seen = notes(&coder.requests());
+        // One failure is ordinary: round 2 answers it with the review alone.
+        assert_eq!(seen[0], None);
+        assert_eq!(seen[1].as_deref(), Some("still not there"));
+        let stuck = seen[2].clone().unwrap_or_default();
+        assert!(stuck.contains("still not there"), "{stuck}");
+        assert!(
+            stuck.contains(StrategyChange::Strategy.instruction()),
+            "{stuck}"
+        );
+        // Fresh context is the absence of the failure text, not a line about it.
+        assert_eq!(seen[3], None);
+        let effort = seen[4].clone().unwrap_or_default();
+        assert!(
+            effort.contains(StrategyChange::Effort.instruction()),
+            "{effort}"
+        );
+        // One variable per round: the previous round's hint is not carried on.
+        assert!(
+            !effort.contains(StrategyChange::Strategy.instruction()),
+            "{effort}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_round_log_names_the_round_and_the_variable_it_changed() {
+        let coder = RecordingCoder::new();
+        let outcome = GoalLoop::new(Arc::clone(&coder) as Arc<dyn Coder>, Arc::new(AlwaysFails))
+            .with_max_rounds(4)
+            .run("ship it")
+            .await;
+
+        let report = goal_report(&outcome);
+        assert!(
+            report.contains("changed: round 3 strategy hint, round 4 fresh context"),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_that_is_not_stuck_changes_nothing_and_logs_nothing() {
+        struct PassingReviewer;
+
+        #[async_trait]
+        impl Reviewer for PassingReviewer {
+            async fn review(&self, _request: ReviewRequest) -> Result<Review, SmolStr> {
+                Ok(Review {
+                    verdict: Verdict::Pass,
+                    notes: "good".into(),
+                })
+            }
+        }
+
+        let coder = RecordingCoder::new();
+        let outcome = GoalLoop::new(
+            Arc::clone(&coder) as Arc<dyn Coder>,
+            Arc::new(PassingReviewer),
+        )
+        .run("ship it")
+        .await;
+
+        assert_eq!(outcome.stop, GoalStop::Passed);
+        assert!(outcome.changes.is_empty());
+        let report = goal_report(&outcome);
+        assert!(!report.contains("changed"), "{report}");
+    }
+
+    /// A red check turning green is progress, so the goal is no longer stuck:
+    /// the next failure starts a new streak instead of burning a variable.
+    #[tokio::test]
+    async fn a_check_that_goes_green_again_restarts_the_streak() {
+        let coder = RecordingCoder::new();
+        let gates = Arc::new(ScriptedGates {
+            verdicts: std::collections::VecDeque::from(vec![
+                GateVerdict::Red {
+                    report: "check failed".into(),
+                },
+                GateVerdict::Red {
+                    report: "check failed".into(),
+                },
+            ])
+            .into(),
+            last: GateVerdict::Green,
+        });
+        let outcome = GoalLoop::new(Arc::clone(&coder) as Arc<dyn Coder>, Arc::new(AlwaysFails))
+            .with_gates(gates)
+            .with_max_rounds(4)
+            .run("ship it")
+            .await;
+
+        // Rounds 1 and 2 are red, so round 3 is stuck and changes a variable.
+        // Round 3's check is green — progress — so round 4 is back to plain
+        // repair of the one review that failed it.
+        assert_eq!(
+            outcome.changes,
+            vec![RoundChange {
+                round: 3,
+                change: StrategyChange::Strategy,
+            }]
+        );
+        let requests = coder.requests();
+        let stuck = requests[2].gate.clone().unwrap_or_default();
+        assert!(stuck.contains("check failed"), "{stuck}");
+        assert!(
+            stuck.contains(StrategyChange::Strategy.instruction()),
+            "{stuck}"
+        );
+        assert_eq!(outcome.stop, GoalStop::RoundCap);
+    }
+
+    #[test]
+    fn the_instruction_rides_on_whichever_input_the_round_carries() {
+        let mut feedback = None;
+        let mut gate = Some(SmolStr::new("check failed"));
+        assert!(StrategyChange::Effort.apply(&mut feedback, &mut gate));
+        let report = gate.clone().unwrap_or_default();
+        assert!(report.starts_with("check failed"), "{report}");
+        assert!(
+            report.ends_with(StrategyChange::Effort.instruction()),
+            "{report}"
+        );
+        assert!(feedback.is_none());
+
+        let mut feedback = Some(Review {
+            verdict: Verdict::Fail,
+            notes: "wrong layer".into(),
+        });
+        let mut gate = None;
+        assert!(StrategyChange::Strategy.apply(&mut feedback, &mut gate));
+        let notes = feedback
+            .map(|review| review.notes.to_string())
+            .unwrap_or_default();
+        assert!(notes.starts_with("wrong layer"), "{notes}");
+        assert!(
+            notes.ends_with(StrategyChange::Strategy.instruction()),
+            "{notes}"
+        );
+        assert!(gate.is_none());
+
+        // A round that already carries nothing is the fresh one: no change.
+        let mut feedback = None;
+        let mut gate = None;
+        assert!(!StrategyChange::FreshContext.apply(&mut feedback, &mut gate));
+    }
+
+    /// The coder is a model: the changed variable has to reach its prompt,
+    /// not only the request struct.
+    #[tokio::test]
+    async fn the_runner_coder_puts_the_changed_variable_in_the_prompt() {
+        struct CapturingRunner {
+            prompts: Mutex<Vec<SmolStr>>,
+        }
+
+        #[async_trait]
+        impl crate::AgentRunner for CapturingRunner {
+            async fn run(
+                &self,
+                request: crate::AgentRequest,
+                _context: crate::AgentContext,
+            ) -> Result<SmolStr, SmolStr> {
+                match self.prompts.lock() {
+                    Ok(mut prompts) => prompts.push(request.task),
+                    Err(poisoned) => poisoned.into_inner().push(request.task),
+                }
+                Ok("diff".into())
+            }
+        }
+
+        let mut feedback = Some(Review {
+            verdict: Verdict::Fail,
+            notes: "still not there".into(),
+        });
+        let mut gate = None;
+        assert!(StrategyChange::Strategy.apply(&mut feedback, &mut gate));
+
+        let runner = Arc::new(CapturingRunner {
+            prompts: Mutex::new(Vec::new()),
+        });
+        let coder = RunnerCoder::new(Arc::clone(&runner) as Arc<dyn crate::AgentRunner>);
+        let patch = coder
+            .code(CodeRequest {
+                goal: "ship it".into(),
+                round: 3,
+                feedback,
+                gate,
+            })
+            .await;
+
+        assert_eq!(patch, Ok(Patch::new("diff")));
+        let prompts = match runner.prompts.lock() {
+            Ok(prompts) => prompts.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let prompt = prompts.first().map(SmolStr::to_string).unwrap_or_default();
+        assert!(
+            prompt.contains(StrategyChange::Strategy.instruction()),
+            "{prompt}"
+        );
+    }
 
     #[test]
     fn the_named_bound_is_the_spec_goal_iterations() {
