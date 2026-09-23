@@ -144,11 +144,14 @@ pub fn resolve_compat(api: ApiKind, model: &ModelCompat, opts: &RequestOpts) -> 
 /// Clamp a requested effort to the model's ladder (Hermes-style: never 400 on
 /// `xhigh` against an endpoint that only knows low..max).
 pub fn clamp_effort(requested: Effort, model: &ModelCompat) -> Effort {
-    if model.efforts.is_empty() {
+    // One pass, and the empty ladder falls out of the same match instead of
+    // an is_empty guard the two lookups then have to assert again.
+    let (Some(max_supported), Some(min_supported)) = (
+        model.efforts.iter().max().copied(),
+        model.efforts.iter().min().copied(),
+    ) else {
         return requested;
-    }
-    let max_supported = *model.efforts.iter().max().expect("non-empty checked");
-    let min_supported = *model.efforts.iter().min().expect("non-empty checked");
+    };
     if requested > max_supported {
         max_supported
     } else if requested < min_supported {
