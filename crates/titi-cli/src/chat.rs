@@ -201,7 +201,6 @@ pub struct Chat {
     next_image_id: u32,
     /// Transmit and placement sequences to write before the next frame.
     kitty_flush: String,
-    skillful: bool,
     /// Background loops the engine reported, newest last.
     jobs: Vec<JobInfo>,
     /// Tokens the engine says this session has spent.
@@ -254,7 +253,6 @@ impl Chat {
             misses: HashSet::new(),
             next_image_id: 1,
             kitty_flush: String::new(),
-            skillful: false,
             jobs: Vec::new(),
             spent_tokens: 0,
             budget: None,
@@ -823,7 +821,6 @@ impl Chat {
             "pause" => self.toggle_pause(),
             "fork" => self.fork(),
             "export" => self.export(args),
-            "skillful" => self.toggle_skillful(),
             "btw" => self.btw(args),
             "switch" => self.switch(args),
             "settings" => self.settings(),
@@ -928,12 +925,6 @@ impl Chat {
             &self.session_id,
             path,
         ))
-    }
-
-    fn toggle_skillful(&mut self) -> Applied {
-        self.skillful = !self.skillful;
-        self.push(LineKind::Note, format!("skillful mode: {}", self.skillful));
-        Applied::none()
     }
 
     fn btw(&mut self, args: &str) -> Applied {
@@ -2145,10 +2136,6 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "export",
         about: "export session (usage: /export [path])",
-    },
-    Command {
-        name: "skillful",
-        about: "toggle skillful mode",
     },
     Command {
         name: "btw",
@@ -5269,20 +5256,6 @@ mod tests {
                 .contains("agent agent-1: all done")
         );
         assert_eq!(chat.lines.last().unwrap().kind, LineKind::Tool);
-    }
-
-    #[test]
-    fn toggle_skillful() {
-        let mut chat = chat();
-        type_text(&mut chat, "/skillful");
-        let applied = chat.on_key(Key::Enter, Instant::now());
-        assert!(applied.effect.is_none());
-        assert!(chat.skillful);
-
-        type_text(&mut chat, "/skillful");
-        let applied = chat.on_key(Key::Enter, Instant::now());
-        assert!(applied.effect.is_none());
-        assert!(!chat.skillful);
     }
 
     #[test]
