@@ -5,7 +5,8 @@
 //! the fact that a key existed is kept, because "the deploy token was rotated"
 //! is worth remembering and the token is not.
 
-use regex::Regex;
+use regex::{Captures, Regex};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -17,13 +18,36 @@ pub struct Redaction {
 }
 
 /// Replaces secret-shaped spans with a fixed mask.
+///
+/// This runs on every tool output of a session, and almost all of that text
+/// holds no credential at all. So the cheap literal check comes first: none
+/// of [`PATTERNS`] can match without one of [`MARKERS`] somewhere in the
+/// text, and text without a marker is returned as it came in, untouched by a
+/// regex. Text that does carry one pays a single pass per pattern — the
+/// replacement counts its own hits, so nothing is scanned twice to fill
+/// [`Redaction::removed`].
 pub fn redact(text: &str) -> Redaction {
+    if !has_marker(text) {
+        return Redaction {
+            text: text.to_owned(),
+            removed: 0,
+        };
+    }
     let mut out = text.to_owned();
     let mut removed = 0;
     for pattern in PATTERNS.iter() {
-        let count = pattern.find_iter(&out).count();
-        if count > 0 {
-            out = pattern.replace_all(&out, MASK).into_owned();
+        let mut count = 0;
+        // The borrow of `out` has to end before `out` is reassigned, so the
+        // replacement is reduced to an owned `Option` here and not inlined.
+        let replaced = match pattern.replace_all(&out, |_: &Captures<'_>| {
+            count += 1;
+            MASK
+        }) {
+            Cow::Owned(replaced) => Some(replaced),
+            Cow::Borrowed(_) => None,
+        };
+        if let Some(replaced) = replaced {
+            out = replaced;
             removed += count;
         }
     }
@@ -344,6 +368,69 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Literals no [`PATTERNS`] entry can match without.
+///
+/// In [`PATTERNS`] order, and deliberately looser than the pattern each one
+/// stands for: the prefilter may say "maybe" and pay for the regex, it may
+/// never say "no" to text a pattern would have matched. The last pattern is
+/// `(?i)`, so its markers are also listed in [`CASELESS_MARKERS`] — `TOKEN=…`
+/// is the same secret as `token=…`. They are kept in both lists because
+/// lowercase is the ordinary spelling and `str::contains` is much cheaper
+/// than folding case byte by byte.
+const MARKERS: [&str; 15] = [
+    // sk-… and sk-ant-…
+    "sk-",
+    // gh[pousr]_…
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    // xox[baprs]-…
+    "xox",
+    // (sk|rk)_(live|test)_…
+    "sk_",
+    "rk_",
+    "AKIA",
+    // The literal head of a PEM block, before its optional key type.
+    "-----BEGIN ",
+    // A JWT header always starts as base64 of `{"`.
+    "eyJ",
+    // Covers api_key, api-key and apikey.
+    "api",
+    "token",
+];
+
+/// The tail of [`MARKERS`] that is matched case-insensitively, because the
+/// pattern needing it is `(?i)`. Kept lowercase: [`contains_ignore_ascii_case`]
+/// lowercases only the text it compares against.
+const CASELESS_MARKERS: [&str; 4] = ["api", "token", "secret", "passw"];
+
+/// Whether any pattern could match at all.
+fn has_marker(text: &str) -> bool {
+    MARKERS.iter().any(|marker| text.contains(marker))
+        || CASELESS_MARKERS
+            .iter()
+            .any(|marker| contains_ignore_ascii_case(text, marker))
+}
+
+/// `haystack.to_lowercase().contains(needle)` without the copy. `needle` is
+/// already lowercase; only ASCII case is folded, which is all the `(?i)`
+/// pattern's own markers need.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(byte, wanted)| byte.to_ascii_lowercase() == *wanted)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +457,55 @@ mod tests {
         let redacted = redact("token: supersecretvalue12345");
         assert_eq!(redacted.removed, 1);
         assert!(!redacted.text.contains("supersecretvalue12345"));
+    }
+
+    /// The fast path has to be invisible: text no pattern could touch comes
+    /// back exactly as it went in.
+    #[test]
+    fn text_without_a_marker_passes_through_byte_for_byte() {
+        let prose = "refactored the parser, ran the suite, 42 green, 0 red \
+                     — see crates/titi-memory/src/redact.rs and the notes in \
+                     docs/BRAIN.md (commit deadbeefcafebabe0123456789abcdef)";
+        let redacted = redact(prose);
+        assert_eq!(redacted.text, prose);
+        assert_eq!(redacted.removed, 0);
+        assert!(!has_marker(prose));
+    }
+
+    /// The same text through the prefilter and through the patterns alone
+    /// must come out the same, mask and count included.
+    #[test]
+    fn a_marked_key_is_masked_exactly_as_the_patterns_would() {
+        let text = "export OPENAI_API_KEY=sk-test-0000000000000000 && deploy";
+        let redacted = redact(text);
+        assert!(has_marker(text));
+        // One span, not two: `OPENAI_API_KEY` has no word boundary before
+        // `API_KEY`, so only the `sk-` pattern fires.
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert_eq!(
+            redacted.text, "export OPENAI_API_KEY=[redacted] && deploy",
+            "{}",
+            redacted.text
+        );
+    }
+
+    /// The last pattern is `(?i)`: an upper-case assignment is the same
+    /// secret, and a case-sensitive prefilter would have swallowed it.
+    #[test]
+    fn an_upper_case_assignment_is_still_masked() {
+        for text in [
+            "TOKEN: supersecretvalue12345",
+            "Api-Key = supersecretvalue12345",
+            "PASSWORD=supersecretvalue12345",
+        ] {
+            let redacted = redact(text);
+            assert_eq!(redacted.removed, 1, "{text} -> {}", redacted.text);
+            assert!(
+                !redacted.text.contains("supersecretvalue12345"),
+                "{text} -> {}",
+                redacted.text
+            );
+        }
     }
 
     #[test]
