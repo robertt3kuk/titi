@@ -7,6 +7,7 @@ pub mod fs;
 pub mod hashline;
 pub mod pty;
 pub mod sensitive;
+pub mod web;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,12 +31,19 @@ pub use hashline::{HashlineEditTool, HashlineError, line_anchor};
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
+pub use web::{
+    FETCH_BYTE_CAP, FETCH_TIMEOUT, FetchTool, SearchProvider, WebError, WebSearchTool, web_tools,
+};
 
 /// How dangerous a tool is. Unknown tools are treated as [`ApprovalTier::Exec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalTier {
     Read,
+    /// Reaching an outside host. Its own tier because a network read is not a
+    /// filesystem read: the URL is a channel out of the machine, so `Write`
+    /// mode asks for it even though nothing on disk changes.
+    Network,
     Write,
     Exec,
 }
@@ -46,7 +54,7 @@ pub enum ApprovalTier {
 pub enum ApprovalMode {
     /// Prompt for every tool.
     AlwaysAsk,
-    /// Auto-approve read; ask for write/exec.
+    /// Auto-approve read; ask for network/write/exec.
     #[default]
     Write,
     /// Auto-approve everything.

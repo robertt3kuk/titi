@@ -494,7 +494,7 @@ pub fn workspace_tools_with_interrupt(
     interrupt: Interrupt,
 ) -> Vec<Box<dyn ToolHandler>> {
     let root = root.into();
-    vec![
+    let mut tools: Vec<Box<dyn ToolHandler>> = vec![
         Box::new(ReadFileTool {
             root: root.clone(),
             cache: cache.clone(),
@@ -520,7 +520,12 @@ pub fn workspace_tools_with_interrupt(
             policy,
         }),
         Box::new(BashTool { root, interrupt }),
-    ]
+    ];
+    // The search provider is read here, once per registry: `web_search`
+    // answers "no provider configured" for the whole session rather than
+    // re-reading the environment on every call.
+    tools.extend(crate::web::web_tools(crate::web::SearchProvider::from_env()));
+    tools
 }
 
 #[cfg(test)]
