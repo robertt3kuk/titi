@@ -208,14 +208,19 @@ fn slash_hub_toggles_the_roster_overlay() {
     assert!(!app.overlay_open());
 }
 
-/// Without a broker `/join` is a note on the alert line, not a crash.
+/// First-joiner-hosts: `/join` with no broker up starts one and joins it,
+/// so the surface lands on a roster with itself rather than reporting a
+/// missing broker.
 #[test]
-fn slash_join_without_a_broker_is_soft() {
+fn slash_join_without_a_broker_hosts_one() {
     let dir = tempfile::tempdir().expect("temp");
     let mut app = app();
     app.join_hub_in(dir.path(), "main");
     let joined = app.render().join("\n");
-    assert!(joined.contains("no hub broker running"), "{joined}");
+    assert!(!joined.contains("no hub broker running"), "{joined}");
+    let ids: Vec<&str> = app.hub_peers().iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"main"), "{ids:?}");
+    app.leave_hub();
     assert!(app.hub_peers().is_empty());
 }
 

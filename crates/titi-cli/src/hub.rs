@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use titi_core::hub::{HubClient, HubError, HubEvent};
+use titi_core::hub::{HubBroker, HubClient, HubEvent};
 
 /// Why a `/join` did not happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,10 @@ pub enum HubUpdate {
 #[derive(Debug, Default)]
 pub struct HubSession {
     client: Option<HubClient>,
+    /// The broker this surface started, when it was the first to join. Held
+    /// for the session's lifetime: dropping it removes the socket and
+    /// disconnects the peers, so it outlives every `client` that shares it.
+    broker: Option<HubBroker>,
     peers: Vec<String>,
 }
 
@@ -63,33 +67,33 @@ impl HubSession {
         if let Some(client) = &self.client {
             return Err(JoinError::AlreadyJoined(client.agent_id().to_owned()));
         }
-        match HubClient::connect(agent_dir, agent_id) {
-            Ok(client) => {
+        // First-joiner-hosts: a missing socket is not a refusal, it is this
+        // session's cue to start the broker and join it. `NoBroker` therefore
+        // no longer reaches a healthy `/join`; it stays only for a store that
+        // cannot be reached at all, surfaced through `Refused`.
+        match titi_core::hub::join_or_host(agent_dir, agent_id) {
+            Ok((client, broker)) => {
                 self.peers = client.peers().to_vec();
                 self.peers.sort();
                 self.client = Some(client);
+                self.broker = broker;
                 Ok(())
-            }
-            // A missing or dead socket is the ordinary "nobody is hosting"
-            // case, not a failure the user has to read a stack trace about.
-            Err(HubError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Err(JoinError::NoBroker)
             }
             Err(other) => Err(JoinError::Refused(other.to_string())),
         }
     }
 
     /// Leaves the hub, reporting whether there was anything to leave.
-    /// Dropping the client is what sends `Leave`.
+    ///
+    /// The client goes first: its `Drop` sends `Leave` and shuts the stream,
+    /// so a hosting session announces its own exit before the broker tears
+    /// the socket down. A peer that never hosted holds `broker == None`, so
+    /// clearing it is a no-op for them.
     pub fn leave(&mut self) -> Option<String> {
         let client = self.client.take()?;
         let id = client.agent_id().to_owned();
         drop(client);
+        self.broker = None;
         self.peers.clear();
         Some(id)
     }
@@ -165,13 +169,21 @@ impl HubSession {
 mod tests {
     use super::*;
 
+    /// First-joiner-hosts: with no broker up, `/join` starts one and joins
+    /// it, so the session lands on a roster with itself rather than bouncing
+    /// off a missing socket.
     #[test]
-    fn joining_without_a_broker_is_a_soft_refusal() {
+    fn joining_without_a_broker_hosts_one() {
         let dir = tempfile::tempdir().expect("temp");
         let mut hub = HubSession::default();
-        assert_eq!(hub.join(dir.path(), "titi"), Err(JoinError::NoBroker));
+        hub.join(dir.path(), "titi").expect("the first join hosts");
+        assert!(hub.joined());
+        assert_eq!(hub.peers(), ["titi"]);
+        // Leaving drops the client and then the broker, so the socket goes.
+        assert_eq!(hub.leave(), Some("titi".to_owned()));
         assert!(!hub.joined());
-        assert_eq!(JoinError::NoBroker.to_string(), "no hub broker running");
+        assert!(hub.peers().is_empty());
+        assert!(!dir.path().join(titi_core::hub::SOCKET_NAME).exists());
     }
 
     #[test]
