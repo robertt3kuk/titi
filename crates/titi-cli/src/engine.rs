@@ -157,6 +157,52 @@ pub fn prefer_available_models(
     if ready.is_empty() { models } else { ready }
 }
 
+/// The model list a surface offers.
+///
+/// The startup order comes first and never moves: it is the availability
+/// order, models with a key ahead of models without. Whatever the registry
+/// has learned since — a local server answers well after the first frame —
+/// follows, in the registry's own sorted order. Rows therefore never jump
+/// under the cursor while a listing arrives.
+#[derive(Clone)]
+pub struct ModelCatalog {
+    startup: Vec<String>,
+    registry: Option<Arc<ProviderRegistry>>,
+}
+
+impl ModelCatalog {
+    pub fn new(startup: Vec<String>, registry: Arc<ProviderRegistry>) -> Self {
+        Self {
+            startup,
+            registry: Some(registry),
+        }
+    }
+
+    /// A catalog that cannot grow, for surfaces and tests with no registry.
+    pub fn fixed(models: Vec<String>) -> Self {
+        Self {
+            startup: models,
+            registry: None,
+        }
+    }
+
+    /// Read when a picker opens or a command runs, never per frame: it takes
+    /// the registry's read lock.
+    pub fn ids(&self) -> Vec<String> {
+        let mut ids = self.startup.clone();
+        let Some(registry) = &self.registry else {
+            return ids;
+        };
+        for id in registry.model_ids() {
+            let id = id.to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+}
+
 /// Overlay `overlay` onto `base` by id.
 ///
 /// A user file that only names one provider used to replace the catalog, so
@@ -307,7 +353,7 @@ pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
 }
 
 /// Starts the engine with the default approval policy.
-pub fn start_engine() -> Result<(Engine, Vec<String>, String), String> {
+pub fn start_engine() -> Result<(Engine, ModelCatalog, String), String> {
     start_engine_with(ApprovalMode::Write)
 }
 
@@ -320,7 +366,7 @@ pub fn start_engine() -> Result<(Engine, Vec<String>, String), String> {
 /// flag rather than a constant.
 pub fn start_engine_with(
     approval_mode: ApprovalMode,
-) -> Result<(Engine, Vec<String>, String), String> {
+) -> Result<(Engine, ModelCatalog, String), String> {
     let config = load_registry_config();
     let models: Vec<String> = config
         .models
@@ -439,9 +485,10 @@ pub fn start_engine_with(
     engine_config.session_id = Some(session_id.clone());
     let recorder = titi_core::trajectory::TrajectoryRecorder::open(&agent_dir, &session_id).ok();
     let trajectory: TrajectorySink = std::sync::Arc::new(tokio::sync::Mutex::new(recorder));
+    let catalog = ModelCatalog::new(models, Arc::clone(&registry));
     Ok((
         EngineRuntime::start_with_session(engine_config, registry, None, tools, trajectory),
-        models,
+        catalog,
         session_id,
     ))
 }

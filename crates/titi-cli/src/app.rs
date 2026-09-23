@@ -84,8 +84,12 @@ pub struct App {
     keys: KeybindingsManager,
     /// Index into [`model_choices`] for cycleForward/cycleBackward.
     current_model: usize,
-    /// Runtime model catalog from the engine registry, if provided.
+    /// Model ids as of the last refresh. Kept as a snapshot because the
+    /// status line reads it every frame; the refresh itself happens when the
+    /// picker opens.
     available_models: Vec<String>,
+    /// Where a refresh reads from, when a registry is behind the surface.
+    model_catalog: Option<crate::engine::ModelCatalog>,
     /// Status-line `mode` segment (`app.plan.toggle`).
     plan_mode: bool,
     /// Status-line collab/`live` badge (`app.live.toggle`).
@@ -147,6 +151,7 @@ impl App {
             keys: load_keybindings_manager(),
             current_model: 0,
             available_models: Vec::new(),
+            model_catalog: None,
             plan_mode: false,
             live_mode: false,
             stt_enabled: false,
@@ -345,8 +350,15 @@ impl App {
         self.completion.hide();
     }
 
-    /// Show the model picker over the given model ids.
-    pub fn open_model_picker(&mut self, models: Vec<String>) {
+    /// Show the model picker over the ids the catalog holds right now.
+    ///
+    /// The list is read here rather than kept from startup: a local server
+    /// answers long after the first frame, and a picker that opens without
+    /// its models is the whole bug. It is read once per opening, never per
+    /// frame, because reading takes the registry's lock.
+    pub fn open_model_picker(&mut self) {
+        self.refresh_models();
+        let models = self.model_choices();
         let labels = models.to_vec();
         self.overlay = Some(ActiveOverlay::ModelPicker(SelectionPanel::new(
             "Model", models, labels,
@@ -918,6 +930,23 @@ impl App {
         }
     }
 
+    /// Point the surface at a live catalog; `open_model_picker` reads it.
+    pub fn set_model_catalog(&mut self, catalog: crate::engine::ModelCatalog) {
+        self.model_catalog = Some(catalog);
+        self.refresh_models();
+    }
+
+    fn refresh_models(&mut self) {
+        let Some(catalog) = &self.model_catalog else {
+            return;
+        };
+        let ids = catalog.ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.set_available_models(ids);
+    }
+
     fn model_choices(&self) -> Vec<String> {
         if self.available_models.is_empty() {
             model_choices()
@@ -1191,7 +1220,7 @@ impl App {
                 .keys
                 .matches_canonical(canonical, "app.model.selectTemporary")
         {
-            self.open_model_picker(self.model_choices());
+            self.open_model_picker();
             return Dispatch::Handled(None);
         }
 
@@ -1474,7 +1503,7 @@ impl App {
                 None
             }
             "model" => {
-                self.open_model_picker(self.model_choices());
+                self.open_model_picker();
                 None
             }
             "sessions" | "switch" => {

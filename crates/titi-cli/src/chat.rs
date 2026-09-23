@@ -129,7 +129,9 @@ pub struct Chat {
     input: String,
     turn_active: bool,
     model: String,
-    models: Vec<String>,
+    /// Live: a local server that answers after the first frame adds models,
+    /// so the list is read when `/model` runs, not captured at startup.
+    catalog: crate::engine::ModelCatalog,
     session_id: String,
     session_label: String,
     agent_dir: PathBuf,
@@ -169,7 +171,7 @@ impl Chat {
             input: String::new(),
             turn_active: false,
             model: model.clone(),
-            models: vec![model],
+            catalog: crate::engine::ModelCatalog::fixed(vec![model]),
             session_id: session_id.to_owned(),
             session_label: short_session(session_id),
             agent_dir: titi_config::agent_dir(),
@@ -532,19 +534,17 @@ impl Chat {
             return None;
         }
         let rest = raw.trim();
-        if self.models.is_empty() {
+        // Once per command, not per frame: a local server may have joined
+        // since the last time the list was looked at.
+        let models = self.catalog.ids();
+        if models.is_empty() {
             self.push(LineKind::Error, "no models".to_owned());
             return Some(Applied::none());
         }
         let next = if rest.is_empty() {
-            let index = self
-                .models
-                .iter()
-                .position(|id| id == &self.model)
-                .unwrap_or(0);
-            self.models[(index + 1) % self.models.len()].clone()
-        } else if let Some(found) = self
-            .models
+            let index = models.iter().position(|id| id == &self.model).unwrap_or(0);
+            models[(index + 1) % models.len()].clone()
+        } else if let Some(found) = models
             .iter()
             .find(|id| id.as_str() == rest || id.rsplit('/').next() == Some(rest))
         {
@@ -1078,17 +1078,16 @@ impl Chat {
 pub fn run(
     mut engine: Engine,
     session_log: Option<SessionLog>,
-    models: Vec<String>,
+    catalog: crate::engine::ModelCatalog,
     session_id: String,
 ) -> io::Result<()> {
+    let models = catalog.ids();
     let model = models
         .first()
         .cloned()
         .unwrap_or_else(|| "model".to_owned());
     let mut chat = Chat::new(model, &session_id);
-    if !models.is_empty() {
-        chat.models = models;
-    }
+    chat.catalog = catalog;
     chat.skills = discovered_skills(&chat.agent_dir);
     let detect = titi_tui::image::PlaceholderDetect::from_env();
     if detect.supported() {
@@ -2273,10 +2272,10 @@ mod tests {
     #[test]
     fn slash_model_cycles_without_sending_a_prompt() {
         let mut chat = chat();
-        chat.models = vec![
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
             "openai/gpt-4.1".to_owned(),
             "opencode-go/glm-5.3-flash".to_owned(),
-        ];
+        ]);
         type_text(&mut chat, "/model");
         let applied = chat.on_key(Key::Enter, Instant::now());
         match applied.effect {

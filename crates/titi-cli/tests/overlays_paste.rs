@@ -13,6 +13,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use titi_cli::app::{App, default_theme, delete_session_from, list_sessions_from, model_choices};
+use titi_cli::engine::ModelCatalog;
+use titi_engine::{
+    EnvCredentialSource, HttpTransportFactory, ProviderDescriptor, ProviderRegistry,
+    ProviderRegistryConfig,
+};
+use titi_providers::ApiKind;
 use titi_tui::composer::PASTE_INLINE_MAX_LINES;
 
 fn app() -> App {
@@ -68,7 +74,7 @@ fn paste_png_path_becomes_image_attachment() {
 #[test]
 fn model_picker_selects_with_enter() {
     let mut app = app();
-    app.open_model_picker(model_choices());
+    app.open_model_picker();
     assert!(app.overlay_open());
 
     // Down once, Enter → the second model is chosen.
@@ -86,7 +92,7 @@ fn model_picker_selects_with_enter() {
 #[test]
 fn model_picker_esc_cancels_without_effect() {
     let mut app = app();
-    app.open_model_picker(model_choices());
+    app.open_model_picker();
     assert_eq!(app.overlay_input("\x1b"), None, "Esc → no selection");
     assert!(!app.overlay_open());
 }
@@ -94,7 +100,7 @@ fn model_picker_esc_cancels_without_effect() {
 #[test]
 fn model_picker_type_to_filter_selects_glm() {
     let mut app = app();
-    app.open_model_picker(model_choices());
+    app.open_model_picker();
     assert_eq!(app.overlay_input("g"), None, "filter stays open");
     assert_eq!(app.overlay_input("l"), None);
     assert_eq!(app.overlay_input("m"), None);
@@ -111,7 +117,7 @@ fn model_picker_type_to_filter_selects_glm() {
 #[test]
 fn overlay_frame_composites_picker_rows() {
     let mut app = app();
-    app.open_model_picker(model_choices());
+    app.open_model_picker();
     let rows = app.plan_frame("", 20).viewport;
     let last = rows.last().unwrap();
     assert!(
@@ -129,7 +135,7 @@ fn overlay_frame_composites_picker_rows() {
 fn model_picker_fits_80x20_with_title_above_composer() {
     let mut app = app();
     app.set_size(80, 20);
-    app.open_model_picker(model_choices());
+    app.open_model_picker();
     let plan = app.plan_frame("", 20);
     assert_eq!(plan.viewport.len(), 20);
     let joined = plan.viewport.join("\n");
@@ -146,6 +152,85 @@ fn model_picker_fits_80x20_with_title_above_composer() {
         .position(|r| r.contains("Model"))
         .expect("title");
     assert!(title_i + 1 < plan.viewport.len(), "title above composer");
+}
+
+/// A model the registry learns about after the surface is built is
+/// selectable in the picker.
+///
+/// The picker used to be handed the ids once, at startup. A local server
+/// finishes listing well after the first frame, so its models stayed
+/// unreachable for the rest of the session.
+#[tokio::test]
+async fn picker_offers_a_model_the_registry_learned_after_startup() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = listener.local_addr().expect("bound address").port();
+    std::thread::spawn(move || {
+        let body = r#"{"object":"list","data":[{"id":"qwen3:8b"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for mut stream in listener.incoming().flatten() {
+            let _ = std::io::Read::read(&mut stream, &mut [0_u8; 1024]);
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+
+    let registry = Arc::new(
+        ProviderRegistry::new(
+            ProviderRegistryConfig {
+                providers: vec![ProviderDescriptor {
+                    id: "ollama".into(),
+                    api: ApiKind::OpenAiCompletions,
+                    base_url: format!("http://127.0.0.1:{port}/v1").into(),
+                    credential_env: None,
+                    credential_required: false,
+                }],
+                models: Vec::new(),
+            },
+            Arc::new(EnvCredentialSource),
+            Arc::new(HttpTransportFactory),
+        )
+        .expect("registry builds from one keyless provider"),
+    );
+
+    let mut app = app();
+    app.set_model_catalog(ModelCatalog::new(
+        vec!["openai/gpt-4.1".to_owned()],
+        Arc::clone(&registry),
+    ));
+
+    app.open_model_picker();
+    assert_eq!(
+        app.overlay_input("\r"),
+        Some(titi_cli::app::OverlayOutcome::ModelSelected(
+            "openai/gpt-4.1".to_owned()
+        )),
+        "before the server answers the picker offers the startup list alone"
+    );
+
+    registry.spawn_local_discovery();
+    for _ in 0..100 {
+        if !registry.model_ids().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !registry.model_ids().is_empty(),
+        "the local server listed its model"
+    );
+
+    app.open_model_picker();
+    for key in ["q", "w", "e", "n"] {
+        assert_eq!(app.overlay_input(key), None, "filter stays open");
+    }
+    match app.overlay_input("\r") {
+        Some(titi_cli::app::OverlayOutcome::ModelSelected(id)) => {
+            assert_eq!(id, "ollama/qwen3:8b", "the late model is selectable");
+        }
+        other => panic!("expected the discovered model, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
