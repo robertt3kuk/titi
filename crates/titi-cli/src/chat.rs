@@ -600,6 +600,22 @@ impl Chat {
                 self.push(LineKind::Note, format!("mode: {}", mode.label()));
                 Applied::none()
             }
+            EngineEvent::SessionNamed { title, .. } => {
+                self.session_label = title.to_string();
+                Applied::none()
+            }
+            EngineEvent::AgentStarted { name, .. } => {
+                self.push(LineKind::Tool, format!("tool agent {name}: started"));
+                Applied::none()
+            }
+            EngineEvent::AgentFinished { agent_id, summary, success, .. } => {
+                if success {
+                    self.push(LineKind::Tool, format!("tool done  agent {agent_id}: {summary}"));
+                } else {
+                    self.push(LineKind::Tool, format!("tool error agent {agent_id}: {summary}"));
+                }
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -3839,25 +3855,17 @@ mod tests {
         );
     }
 
-    /// A hub nobody is hosting is the ordinary case: `/join` says so and
-    /// the screen carries on.
+    /// With host-on-demand, joining an empty hub binds the broker automatically.
     #[test]
-    fn join_without_a_broker_is_a_note_not_a_failure() {
+    fn join_without_a_broker_hosts_on_demand() {
         let dir = tempfile::tempdir().expect("temp");
         let mut chat = chat();
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/join");
         let applied = chat.on_key(Key::Enter, Instant::now());
         assert!(applied.effect.is_none());
-        assert!(
-            chat.lines
-                .iter()
-                .any(|line| line.kind == LineKind::Note
-                    && line.text.contains("no hub broker running")),
-            "{:?}",
-            chat.lines
-        );
-        assert!(!chat.hub.joined());
+        assert!(chat.hub.joined());
+        assert!(chat.hub.peers().contains(&"session-123".to_string()));
     }
 
     #[test]
@@ -5084,6 +5092,36 @@ mod tests {
         });
         let view = frame_text(&mut chat);
         assert!(view.contains("memory data"), "{view}");
+    }
+
+    #[test]
+    fn session_named_updates_label() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::SessionNamed {
+            session_id: "session-123".into(),
+            title: "blue-otter".into(),
+        });
+        assert_eq!(chat.session_label, "blue-otter");
+    }
+
+    #[test]
+    fn agent_events_produce_transcript_lines() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::AgentStarted {
+            agent_id: "agent-1".into(),
+            name: "worker".into(),
+            parent_id: None,
+            kind: titi_engine::protocol::AgentKind::Subagent,
+        });
+        assert!(chat.lines.last().unwrap().text.contains("agent worker: started"));
+        
+        chat.on_event(EngineEvent::AgentFinished {
+            agent_id: "agent-1".into(),
+            summary: "all done".into(),
+            success: true,
+        });
+        assert!(chat.lines.last().unwrap().text.contains("agent agent-1: all done"));
+        assert_eq!(chat.lines.last().unwrap().kind, LineKind::Tool);
     }
 
     #[test]
