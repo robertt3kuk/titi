@@ -4,8 +4,9 @@
 //! keys and engine events. [`run`] is the only place that owns the screen.
 
 use std::collections::HashSet;
-use std::io::{self, Stdout, Write};
+use std::io::{self, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -30,6 +31,19 @@ use crate::session_log::SessionLog;
 
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
+
+/// Deadline for the `git` call behind `/git` and `/diagnose`. The screen is
+/// blocked while it runs, so it is far shorter than the git tool's own
+/// minute: a hook waiting on a terminal this process never gives it must
+/// not take the session with it.
+const SLASH_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the run loop looks at the child and the deadline.
+const GIT_POLL: Duration = Duration::from_millis(10);
+
+/// Most one slash command keeps from a git call. A diff longer than this is
+/// a file to read, not a transcript line.
+const GIT_OUTPUT_CAP: usize = 64 * 1024;
 
 /// One key the state machine understands. The terminal loop translates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,6 +774,8 @@ impl Chat {
             "login" => self.login(args),
             "logout" => self.logout(args),
             "keys" | "whoami" => self.keys(),
+            "git" => self.git(args),
+            "diagnose" => self.diagnose(args),
             _ => {
                 // A known skill is not a command: it goes to the model as a
                 // prompt, and the engine expands it there.
@@ -1275,6 +1291,125 @@ impl Chat {
             self.push(LineKind::Note, format!("{}  {status}", provider.id));
         }
         Applied::none()
+    }
+
+    /// `/git [status|diff]` puts the read-only git view in the transcript.
+    ///
+    /// Only the two read verbs exist here. Committing is a write, and a
+    /// write goes through the tool with its approval prompt; a slash command
+    /// has no such prompt, so it must not become the way around one.
+    fn git(&mut self, args: &str) -> Applied {
+        let argv: &[&str] = match args.trim() {
+            "" | "status" => &["status", "--short", "--branch", "--", "."],
+            "diff" => &["diff", "--", "."],
+            other => {
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "/git takes status or diff, not {other}: a commit or a push stays with \
+                         the tool, behind its approval"
+                    ),
+                );
+                return Applied::none();
+            }
+        };
+        let op = argv.first().copied().unwrap_or("status");
+        match run_git(&crate::app::current_workspace(), argv) {
+            Ok(output) => {
+                let body = output.trim_end();
+                let text = if body.is_empty() {
+                    format!("git {op}: nothing to show")
+                } else {
+                    format!("git {op}\n{}", redacted(body))
+                };
+                self.push(LineKind::Note, text);
+            }
+            Err(error) => self.push(LineKind::Error, format!("git {op}: {error}")),
+        }
+        Applied::none()
+    }
+
+    /// `/diagnose` prints, as one block to paste into a bug report, what a
+    /// report needs: version, model, providers, where the settings came
+    /// from, and the state of the repository.
+    ///
+    /// A provider is a name and whether a key is in reach; settings are
+    /// their sources, never their values. This block is written to be
+    /// pasted in public, so no stored value may enter it.
+    fn diagnose(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /diagnose (got {args})"));
+            return Applied::none();
+        }
+        let workspace = crate::app::current_workspace();
+        let mut rows = vec![
+            format!("titi {}", titi_tui::VERSION),
+            format!("model: {} · mode: {}", self.model, self.mode.label()),
+            format!("session: {}", self.session_id),
+            format!("workspace: {}", workspace.display()),
+            format!("agent dir: {}", self.agent_dir.display()),
+            format!("providers: {}", self.provider_status().join(", ")),
+        ];
+        match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[]) {
+            Ok(settings) => {
+                let mut sources: Vec<String> = Vec::new();
+                for (_, (source, _)) in settings.flatten() {
+                    if !sources.iter().any(|seen| seen == &source) {
+                        sources.push(source);
+                    }
+                }
+                let sources = if sources.is_empty() {
+                    "built-in defaults only".to_owned()
+                } else {
+                    sources.join(", ")
+                };
+                rows.push(format!("config: {sources}"));
+            }
+            Err(error) => rows.push(format!("config: unreadable ({error})")),
+        }
+        // The ranked map itself lives in the engine, behind its lock; what the
+        // screen can say without indexing the repo is whether it is on, and
+        // `/context` reports what this turn's map costs.
+        let genome = if std::env::var_os("TITI_NO_GENOME").is_none() {
+            "on"
+        } else {
+            "off (TITI_NO_GENOME)"
+        };
+        rows.push(format!("genome: {genome}"));
+        rows.push(format!(
+            "tokens: {} prompt + {} completion this session",
+            self.session_prompt_tokens, self.session_completion_tokens
+        ));
+        rows.push(format!("repo: {}", repo_state(&workspace)));
+        self.push(LineKind::Note, rows.join("\n"));
+        Applied::none()
+    }
+
+    /// Every known provider and whether a key is in reach — names and status
+    /// only, never a value.
+    fn provider_status(&self) -> Vec<String> {
+        let stored = crate::secrets::list_keys(&self.agent_dir)
+            .map(|rows| rows.into_iter().map(|row| row.provider).collect::<Vec<_>>())
+            .unwrap_or_default();
+        crate::engine::default_registry_config()
+            .providers
+            .into_iter()
+            .map(|provider| {
+                let status = if provider
+                    .credential_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    "env"
+                } else if stored.iter().any(|id| id == provider.id.as_str()) {
+                    "stored"
+                } else {
+                    "no key"
+                };
+                format!("{} ({status})", provider.id)
+            })
+            .collect()
     }
 
     /// `/goal` runs the coder/reviewer loop. It never becomes `SubmitPrompt`.
@@ -1982,6 +2117,14 @@ const COMMANDS: &[Command] = &[
         name: "graph",
         about: "run the orchestrator graph: council decides, goal loop works",
     },
+    Command {
+        name: "git",
+        about: "show git status or diff, read-only",
+    },
+    Command {
+        name: "diagnose",
+        about: "a diagnostics block to paste into a bug report",
+    },
 ];
 
 /// A skill the composer can complete, mirroring what the engine discovered.
@@ -2172,6 +2315,137 @@ fn known_provider(id: &str) -> bool {
         .providers
         .iter()
         .any(|provider| provider.id.as_str() == id)
+}
+
+/// Why a `/git` or `/diagnose` call produced nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitRunError {
+    Spawn { reason: String },
+    TimedOut { seconds: u64 },
+    Failed { output: String },
+}
+
+impl std::fmt::Display for GitRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitRunError::Spawn { reason } => write!(f, "git could not be run: {reason}"),
+            GitRunError::TimedOut { seconds } => {
+                write!(f, "timed out after {seconds}s and was killed")
+            }
+            GitRunError::Failed { output } => write!(f, "{output}"),
+        }
+    }
+}
+
+/// One read-only `git` call in `root`: no shell, no pager, no editor, and no
+/// credential prompt.
+///
+/// Both pipes are drained on their own threads because a diff larger than the
+/// pipe buffer would otherwise block the child forever and turn every big
+/// diff into a timeout.
+fn run_git(root: &Path, argv: &[&str]) -> Result<String, GitRunError> {
+    let mut child = std::process::Command::new("git")
+        .arg("--no-pager")
+        .args(argv)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| GitRunError::Spawn {
+            reason: error.to_string(),
+        })?;
+
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || out_pipe.map(drain_pipe).unwrap_or_default());
+    let err_reader = std::thread::spawn(move || err_pipe.map(drain_pipe).unwrap_or_default());
+
+    let deadline = Instant::now() + SLASH_GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GitRunError::Spawn {
+                    reason: error.to_string(),
+                });
+            }
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GitRunError::TimedOut {
+                seconds: SLASH_GIT_TIMEOUT.as_secs(),
+            });
+        }
+        std::thread::sleep(GIT_POLL);
+    };
+
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if status.success() {
+        return Ok(stdout);
+    }
+    let output = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    Err(GitRunError::Failed {
+        output: one_line(output.trim(), 200),
+    })
+}
+
+/// Reads a pipe to the end, keeping at most [`GIT_OUTPUT_CAP`] bytes. The
+/// tail is still read and dropped so the child never blocks on a full pipe.
+fn drain_pipe(mut source: impl Read) -> String {
+    let mut buffer = [0_u8; 4096];
+    let mut kept: Vec<u8> = Vec::new();
+    while let Ok(read) = source.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let room = GIT_OUTPUT_CAP.saturating_sub(kept.len());
+        let take = room.min(read);
+        kept.extend_from_slice(&buffer[..take]);
+    }
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// The masking the engine puts on tool output before it reaches this
+/// transcript. `/git` shells out on its own, so it applies the same pass by
+/// hand: a diff that touches a key reads `[redacted]` here too.
+fn redacted(text: &str) -> String {
+    titi_memory::redact::redact_for_model(text).text
+}
+
+/// Branch and cleanliness, the way the `diagnose` tool reports them.
+fn repo_state(root: &Path) -> String {
+    let branch = match run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(out) => out.trim().to_owned(),
+        Err(error) => return format!("unknown ({error})"),
+    };
+    match run_git(root, &["status", "--porcelain", "--", "."]) {
+        Ok(changes) => {
+            let changed = changes
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
+            let tree = if changed == 0 {
+                "clean".to_owned()
+            } else {
+                format!("dirty ({changed} changed)")
+            };
+            format!("branch {branch} · {tree}")
+        }
+        Err(error) => format!("branch {branch} · tree unknown ({error})"),
+    }
 }
 
 fn picker_height(chat: &Chat) -> u16 {
@@ -3381,6 +3655,8 @@ mod tests {
             "join",
             "leave",
             "whoami",
+            "git",
+            "diagnose",
         ] {
             assert!(
                 COMMANDS.iter().any(|command| command.name == name),
@@ -4348,6 +4624,107 @@ mod tests {
         });
         assert!(chat.lines.iter().any(|line| line.text.contains("verdict")));
         assert!(!chat.turn_active);
+    }
+
+    /// `/git` answers on the spot: nothing goes to the engine, and the git
+    /// view lands in the transcript under the op that produced it.
+    #[test]
+    fn git_status_reports_in_the_transcript() {
+        let mut chat = chat();
+        type_text(&mut chat, "/git");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none(), "/git never reaches the engine");
+        assert!(applied.log.is_none(), "/git is not a user prompt");
+        assert!(!chat.turn_active);
+        let last = chat.lines.last().expect("a transcript line");
+        assert!(last.text.starts_with("git status"), "{:?}", chat.lines);
+    }
+
+    /// The bare `/git` and `/git status` are the same view.
+    #[test]
+    fn git_status_is_the_default_op() {
+        let mut bare = chat();
+        type_text(&mut bare, "/git");
+        bare.on_key(Key::Enter, Instant::now());
+        let mut named = chat();
+        type_text(&mut named, "/git status");
+        named.on_key(Key::Enter, Instant::now());
+        assert_eq!(bare.lines.last(), named.lines.last());
+    }
+
+    /// A commit is a write, and writes stay behind the tool's approval
+    /// prompt. The slash command must not become the way around it.
+    #[test]
+    fn git_commit_is_refused_and_stays_tool_gated() {
+        let mut chat = chat();
+        type_text(&mut chat, "/git commit -m oops");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(!chat.turn_active);
+        let last = chat.lines.last().expect("a transcript line");
+        assert_eq!(last.kind, LineKind::Error);
+        assert!(
+            last.text.contains("status or diff") && last.text.contains("approval"),
+            "{:?}",
+            last
+        );
+    }
+
+    #[test]
+    fn git_push_is_refused_too() {
+        let mut chat = chat();
+        type_text(&mut chat, "/git push");
+        chat.on_key(Key::Enter, Instant::now());
+        let last = chat.lines.last().expect("a transcript line");
+        assert_eq!(last.kind, LineKind::Error);
+        assert!(last.text.contains("status or diff"), "{:?}", last);
+    }
+
+    /// The block exists to be pasted into a public bug report, so a stored
+    /// key must not be anywhere in it.
+    #[test]
+    fn diagnose_summarises_and_never_prints_a_key() {
+        let dir = tempfile::tempdir().expect("temp");
+        crate::secrets::store_key(dir.path(), "openai", "sk-test").expect("store");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/diagnose");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(
+            applied.effect.is_none(),
+            "/diagnose never reaches the engine"
+        );
+        assert!(applied.log.is_none());
+        let summary = chat.lines.last().expect("a transcript line");
+        assert_eq!(summary.kind, LineKind::Note);
+        for part in [
+            "titi ",
+            "model: openai/gpt-4.1",
+            "session: session-123",
+            "providers: ",
+            "openai (",
+            "config: ",
+            "genome: ",
+            "repo: ",
+        ] {
+            assert!(summary.text.contains(part), "{part} missing: {summary:?}");
+        }
+        assert!(
+            !chat.lines.iter().any(|line| line.text.contains("sk-test")),
+            "a stored key reached the diagnostics block: {:?}",
+            chat.lines
+        );
+    }
+
+    #[test]
+    fn diagnose_refuses_a_stray_argument() {
+        let mut chat = chat();
+        type_text(&mut chat, "/diagnose everything");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        let last = chat.lines.last().expect("a transcript line");
+        assert_eq!(last.kind, LineKind::Error);
+        assert!(last.text.contains("usage: /diagnose"), "{:?}", last);
     }
 
     /// 2×2 red PNG. Small enough to keep the kitty transmit in the test.
