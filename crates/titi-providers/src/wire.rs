@@ -81,16 +81,38 @@ fn leading_system(req: &WireRequest) -> (Option<String>, usize) {
     ((!joined.is_empty()).then_some(joined), folded)
 }
 
+/// Anthropic's cache breakpoint marker.
+///
+/// A breakpoint caches everything in front of it — `tools`, then `system`,
+/// then `messages`, in that order — and up to four may be set. Whether a
+/// block carries the marker is not part of what is hashed: a block cached
+/// under a breakpoint on one request still hits when the next request has
+/// moved its breakpoint further down, which is what makes the rolling
+/// breakpoint on the newest message work.
+fn ephemeral() -> Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Every message travels as a one-element block array rather than as a bare
+/// string: the breakpoint attaches to a block, and a shape that changed as
+/// the newest message aged into history would rewrite bytes the cache has
+/// already committed to.
 fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
+    let last = req.messages.len().saturating_sub(1);
     req.messages
         .iter()
+        .enumerate()
         .skip(folded)
-        .map(|m| {
+        .map(|(index, m)| {
             // A system message further down is a compaction digest, and it
             // belongs where it sits in the history. The role does not exist
             // in this API, so it travels as user text rather than vanishing.
             let role = m.role.anthropic_role().unwrap_or("user");
-            serde_json::json!({"role": role, "content": m.content.as_str()})
+            let mut block = serde_json::json!({"type": "text", "text": m.content.as_str()});
+            if index == last {
+                block["cache_control"] = ephemeral();
+            }
+            serde_json::json!({"role": role, "content": [block]})
         })
         .collect()
 }
@@ -128,15 +150,23 @@ fn openai_tools_wire(req: &WireRequest) -> Vec<Value> {
         .collect()
 }
 
+/// The breakpoint sits on the last tool: it caches the whole tool array,
+/// which the engine keeps in a stable order so the prefix holds.
 fn anthropic_tools_wire(req: &WireRequest) -> Vec<Value> {
+    let last = req.tools.len().saturating_sub(1);
     req.tools
         .iter()
-        .map(|t| {
-            serde_json::json!({
+        .enumerate()
+        .map(|(index, t)| {
+            let mut tool = serde_json::json!({
                 "name": t.name.as_str(),
                 "description": t.description.as_str(),
                 "input_schema": t.parameters,
-            })
+            });
+            if index == last {
+                tool["cache_control"] = ephemeral();
+            }
+            tool
         })
         .collect()
 }
@@ -225,14 +255,23 @@ pub fn build_http_request(
             ];
             auth_headers(&mut headers, api_key, "anthropic");
             let (system, folded) = leading_system(req);
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": req.model.as_str(),
                 "messages": anthropic_messages_wire(req, folded),
-                "system": system.unwrap_or_default(),
                 "stream": true,
                 "tools": anthropic_tools_wire(req),
                 "max_tokens": req.max_tokens.unwrap_or(4096),
             });
+            // The block form is what carries a breakpoint; with nothing to
+            // say the field is left out rather than sent as an empty block,
+            // which the API rejects.
+            if let Some(system) = system {
+                body["system"] = serde_json::json!([{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": ephemeral(),
+                }]);
+            }
             HttpRequest {
                 method: "POST".into(),
                 url: format!("{}/v1/messages", base_url.trim_end_matches('/')).into(),
@@ -531,7 +570,8 @@ mod tests {
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
         assert!(hr.url.ends_with("/v1/messages"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
-        assert_eq!(body["system"], "be brief");
+        assert_eq!(body["system"][0]["text"], "be brief");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["max_tokens"], 128);
         assert!(
             body["messages"]
@@ -587,7 +627,7 @@ mod tests {
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
-        assert_eq!(body["system"], "you are titi");
+        assert_eq!(body["system"][0]["text"], "you are titi");
         assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
     }
@@ -647,12 +687,12 @@ mod tests {
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
-        assert_eq!(body["system"], "you are titi");
+        assert_eq!(body["system"][0]["text"], "you are titi");
         let sent: Vec<&str> = body["messages"]
             .as_array()
             .expect("msgs")
             .iter()
-            .map(|m| m["content"].as_str().expect("content"))
+            .map(|m| m["content"][0]["text"].as_str().expect("text"))
             .collect();
         assert_eq!(sent, ["first", "3 earlier message(s) folded", "second"]);
     }
@@ -677,9 +717,12 @@ mod tests {
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
-        assert_eq!(body["system"], "you are titi");
+        assert_eq!(body["system"][0]["text"], "you are titi");
         assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
-        assert_eq!(body["messages"][0]["content"], "and nothing else was said");
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "and nothing else was said"
+        );
 
         let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, None);
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
@@ -700,10 +743,12 @@ mod tests {
         }];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
-        assert_eq!(body["system"], "");
+        // Nothing is left for the system field, and an empty block array is
+        // not a request Anthropic accepts, so the field is simply absent.
+        assert!(body.get("system").is_none(), "{body}");
         assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][0]["content"], "you are titi");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "you are titi");
     }
 
     #[test]
@@ -717,5 +762,131 @@ mod tests {
         let hr = build_http_request(ApiKind::OpenAiCompletions, "http://x", &r, None);
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert!(body.get("max_tokens").map(Value::is_null).unwrap_or(true));
+    }
+
+    fn tool(name: &str) -> crate::transport::ToolSpec {
+        crate::transport::ToolSpec {
+            name: name.into(),
+            description: "a tool".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn anthropic_body(r: &WireRequest) -> Value {
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", r, Some("k"));
+        serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json")
+    }
+
+    /// Strips every breakpoint marker. Anthropic hashes the blocks, not the
+    /// markers: a block cached behind a breakpoint on one request still hits
+    /// when the next request has moved its breakpoint further down. Without
+    /// that, a rolling breakpoint could never be compared across turns.
+    fn without_breakpoints(value: &Value) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(items.iter().map(without_breakpoints).collect()),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "cache_control")
+                    .map(|(key, item)| (key.clone(), without_breakpoints(item)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn turn(system: &str, tools: &[&str], history: &[(Role, &str)]) -> WireRequest {
+        let mut r = WireRequest::new("claude-test");
+        r.tools = tools.iter().map(|name| tool(name)).collect();
+        r.messages = std::iter::once(ChatMessage {
+            role: Role::System,
+            content: system.into(),
+            tool_calls: Vec::new(),
+        })
+        .chain(history.iter().map(|(role, text)| ChatMessage {
+            role: *role,
+            content: (*text).into(),
+            tool_calls: Vec::new(),
+        }))
+        .collect();
+        r
+    }
+
+    /// Three of the four breakpoints Anthropic allows: the last tool, the
+    /// system field, and the newest message. Everything in front of each one
+    /// is what gets cached.
+    #[test]
+    fn anthropic_marks_tools_system_and_the_newest_message() {
+        let r = turn(
+            "identity",
+            &["bash", "read"],
+            &[
+                (Role::User, "first"),
+                (Role::Assistant, "answer"),
+                (Role::User, "second"),
+            ],
+        );
+        let body = anthropic_body(&r);
+
+        let tools = body["tools"].as_array().expect("tools");
+        assert!(tools[0].get("cache_control").is_none(), "{body}");
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let messages = body["messages"].as_array().expect("msgs");
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        assert!(messages[1]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            messages[2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        let markers = body.to_string().matches("cache_control").count();
+        assert!(markers <= 4, "{markers} breakpoints, the cap is 4");
+    }
+
+    /// The whole point of the cascade: everything the previous turn sent is
+    /// still there, byte for byte, in front of the message this turn adds.
+    /// One changed byte anywhere behind the breakpoint and the provider
+    /// reprocesses the entire conversation at full price.
+    #[test]
+    fn a_turn_is_a_byte_prefix_of_the_next_one() {
+        let first = turn(
+            "identity",
+            &["bash", "read"],
+            &[(Role::User, "<recall/>\n\nfirst")],
+        );
+        let second = turn(
+            "identity",
+            &["bash", "read"],
+            &[
+                (Role::User, "<recall/>\n\nfirst"),
+                (Role::Assistant, "answer"),
+                (Role::User, "<recall rebuilt/>\n\nsecond"),
+            ],
+        );
+        let before = anthropic_body(&first);
+        let after = anthropic_body(&second);
+
+        // Tools and the system field are hashed before any message, so they
+        // have to match exactly, markers included.
+        assert_eq!(before["tools"], after["tools"]);
+        assert_eq!(before["system"], after["system"]);
+
+        let before_messages = without_breakpoints(&before["messages"]);
+        let after_messages = without_breakpoints(&after["messages"]);
+        let before_bytes = before_messages.to_string();
+        let after_bytes = after_messages.to_string();
+        let shared = before_bytes
+            .strip_suffix(']')
+            .expect("a serialized array ends with ]");
+        assert!(
+            after_bytes.starts_with(shared),
+            "the second turn rewrote the first one:\n{before_bytes}\n{after_bytes}"
+        );
+        // And the only thing behind that prefix is the new message.
+        assert_eq!(
+            after_messages.as_array().expect("msgs").len(),
+            before_messages.as_array().expect("msgs").len() + 2
+        );
     }
 }

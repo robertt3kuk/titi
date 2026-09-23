@@ -95,11 +95,17 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Sorted by name. The specs go out in every request in this order, and
+    /// a `HashMap` walk gives a different one in every process, which is
+    /// enough on its own to miss the provider's prompt cache on every turn.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let mut specs: Vec<ToolSpec> = self
+            .tools
             .values()
             .map(|handler| handler.definition().spec)
-            .collect()
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
     }
 
     pub fn approval_tier(&self, name: &str) -> ApprovalTier {
@@ -216,5 +222,50 @@ mod tests {
         assert!(!ApprovalMode::Write.auto_approves(ApprovalTier::Exec));
         assert!(ApprovalMode::Yolo.auto_approves(ApprovalTier::Exec));
         assert!(!ApprovalMode::AlwaysAsk.auto_approves(ApprovalTier::Read));
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl ToolHandler for NamedTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                spec: ToolSpec {
+                    name: self.0.into(),
+                    description: "test tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                approval: ApprovalTier::Read,
+            }
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+            ToolResult {
+                output: "".into(),
+                is_error: false,
+            }
+        }
+    }
+
+    /// The tool array is the first thing a provider hashes for its prompt
+    /// cache. A `HashMap` walk reorders it per process, so the order has to
+    /// come from the names and not from the registry's internals. Eight
+    /// tools make an accidental pass vanishingly unlikely.
+    #[test]
+    fn specs_come_out_sorted_by_name() {
+        let mut registry = ToolRegistry::new();
+        for name in [
+            "write", "read", "glob", "grep", "edit", "bash", "task", "hub",
+        ] {
+            registry.register(Arc::new(NamedTool(name)));
+        }
+        let specs = registry.specs();
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "bash", "edit", "glob", "grep", "hub", "read", "task", "write"
+            ]
+        );
     }
 }

@@ -36,6 +36,68 @@ async fn run_off_thread(
     tokio::task::spawn_blocking(work).await.ok().flatten()
 }
 
+/// The live repository index, shared by the command loop and its turns.
+type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
+
+/// The memories relevant to this turn, ranked against the files it has
+/// already touched. Off the runtime thread: the index is synchronous
+/// SQLite, and blocking the runtime thread panics.
+async fn recalled_memory(agent_dir: Option<PathBuf>, touched: &TouchedSink) -> Option<SmolStr> {
+    let agent_dir = agent_dir?;
+    let touched = Arc::clone(touched);
+    run_off_thread(move || {
+        let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
+        let touched = touched.blocking_lock().snapshot();
+        let recalled = index.recall("", &touched).ok()?;
+        let block = titi_memory::index::render_recall(&recalled);
+        if block.is_empty() {
+            None
+        } else {
+            Some(block.into())
+        }
+    })
+    .await
+}
+
+/// Refresh the live index off the async threads and render this turn's map.
+async fn genome_map(
+    root: Option<PathBuf>,
+    limit: usize,
+    genome: &GenomeIndex,
+    touched: &TouchedSink,
+) -> Option<SmolStr> {
+    let root = root?;
+    let genome = Arc::clone(genome);
+    let touched = Arc::clone(touched);
+    run_off_thread(move || {
+        let mut guard = genome.blocking_lock();
+        let index = guard.get_or_insert_with(Genome::default);
+        index.refresh(&root).ok()?;
+        let touched: Vec<String> = touched.blocking_lock().snapshot();
+        Some(SmolStr::from(index.project_with(limit, &touched)))
+    })
+    .await
+}
+
+/// The turn's moving context, pinned to the message it was built for.
+///
+/// Both blocks are rebuilt from scratch every turn. In the system prompt
+/// they sat in front of the entire conversation, so one re-ranked file cost
+/// the provider's cache every token behind them. Here they only ever
+/// precede the prompt they belong to, and they stay attached to it when it
+/// ages into history: everything the previous turn sent stays byte for byte
+/// where it was, which is the only thing a prefix cache asks for.
+fn prompt_with_context(prompt: &str, recalled: Option<&str>, genome: Option<&str>) -> SmolStr {
+    let mut parts = Vec::with_capacity(3);
+    parts.extend(recalled.filter(|block| !block.is_empty()));
+    parts.extend(genome.filter(|block| !block.is_empty()));
+    if parts.is_empty() {
+        return prompt.into();
+    }
+    parts.push(prompt);
+    parts.join("\n\n").into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +118,40 @@ mod tests {
     async fn a_successful_run_passes_the_map_through() {
         let map = run_off_thread(|| Some(SmolStr::new_inline("<genome>\n</genome>"))).await;
         assert_eq!(map.as_deref(), Some("<genome>\n</genome>"));
+    }
+
+    #[test]
+    fn the_volatile_blocks_sit_in_front_of_the_prompt() {
+        let built = prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"));
+        assert_eq!(built, "<recall/>\n\n<genome/>\n\nfix the parser");
+        assert_eq!(prompt_with_context("bare", None, None), "bare");
+        assert_eq!(prompt_with_context("bare", Some(""), None), "bare");
+    }
+
+    /// The reason the blocks moved out of the system prompt: what one turn
+    /// sent has to still be there, unchanged, when the next turn sends it
+    /// again. The volatile text stays welded to the message it was built
+    /// for instead of being rebuilt in front of the whole conversation.
+    #[test]
+    fn a_turn_leaves_the_previous_turns_messages_untouched() {
+        let system = SmolStr::new("identity, project rules, skills");
+        let first = prompt_with_context("first", Some("<recall v1/>"), Some("<genome v1/>"));
+        let turn_one = vec![
+            message(Role::System, &system),
+            message(Role::User, &first),
+            message(Role::Assistant, "an answer"),
+        ];
+
+        let history = visible_history(turn_one.clone(), Some(&system));
+        let second = prompt_with_context("second", Some("<recall v2/>"), Some("<genome v2/>"));
+        let mut turn_two = vec![message(Role::System, &system)];
+        turn_two.extend(history);
+        turn_two.push(message(Role::User, &second));
+
+        assert_eq!(turn_two[..turn_one.len()], turn_one[..]);
+        assert_eq!(turn_two.len(), turn_one.len() + 1);
+        assert!(turn_two[1].content.contains("<genome v1/>"));
+        assert!(turn_one[1].content.contains("<genome v1/>"));
     }
 
     fn message(role: Role, text: &str) -> ChatMessage {
@@ -317,7 +413,7 @@ pub struct EngineRuntime {
     approval_waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
     /// Live index, refreshed from `config.genome_root` before each turn.
-    genome: Arc<tokio::sync::Mutex<Option<Genome>>>,
+    genome: GenomeIndex,
     /// Files this session read or edited; boosts their rank in the projection.
     touched: TouchedSink,
     /// Per-file write claims shared by every agent in this runtime.
@@ -676,34 +772,28 @@ impl EngineRuntime {
         expanded.text.map(SmolStr::from).unwrap_or(text)
     }
 
-    /// Identity and personality, then project rules and skill names, then memory and the genome map.
+    /// Identity and personality, then project rules and skill names.
     ///
-    /// The model used to see only the map, so it had no identity and no
-    /// memory of earlier sessions. A missing agent directory degrades to the
-    /// map alone rather than failing the turn. Project rules and skills are
-    /// their own sections: they are not folded into `SOUL.md`. Skill bodies
-    /// are not injected.
+    /// Everything here is static for the life of the session, and that is
+    /// the point: this text sits in front of the whole conversation, so a
+    /// single byte moving in it invalidates the provider's cache for every
+    /// token behind it. The two parts that are rebuilt every turn — the
+    /// recalled memory and the genome map — ride on the newest user message
+    /// instead (see [`prompt_with_context`]).
+    ///
+    /// A missing agent directory degrades to whatever is left rather than
+    /// failing the turn. Project rules and skills are their own sections:
+    /// they are not folded into `SOUL.md`. Skill bodies are not injected.
     async fn system_prompt(&self) -> Option<SmolStr> {
-        let identity = self.identity_prompt();
-        let project = self.project_context();
-        let skills = self.skill_list();
-        let recalled = self.recalled_memory().await;
-        let genome = self.genome_system().await;
         let mut parts = Vec::new();
-        if let Some(identity) = identity {
+        if let Some(identity) = self.identity_prompt() {
             parts.push(identity.to_string());
         }
-        if let Some(project) = project {
+        if let Some(project) = self.project_context() {
             parts.push(project);
         }
-        if let Some(skills) = skills {
+        if let Some(skills) = self.skill_list() {
             parts.push(skills);
-        }
-        if let Some(recalled) = recalled {
-            parts.push(recalled.to_string());
-        }
-        if let Some(genome) = genome {
-            parts.push(genome.to_string());
         }
         let joined = parts.join("\n\n");
         if joined.is_empty() {
@@ -738,24 +828,10 @@ impl EngineRuntime {
         crate::skills::render(cwd, self.config.agent_dir.as_deref())
     }
 
-    /// The memories relevant to this turn, ranked against the files it has
-    /// already touched. Off the runtime thread: the index is synchronous
-    /// SQLite, and blocking the runtime thread panics.
+    /// The memories relevant to this turn. The turn itself builds the copy
+    /// the model sees; this one only measures.
     async fn recalled_memory(&self) -> Option<SmolStr> {
-        let agent_dir = self.config.agent_dir.clone()?;
-        let touched = Arc::clone(&self.touched);
-        run_off_thread(move || {
-            let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
-            let touched = touched.blocking_lock().snapshot();
-            let recalled = index.recall("", &touched).ok()?;
-            let block = titi_memory::index::render_recall(&recalled);
-            if block.is_empty() {
-                None
-            } else {
-                Some(block.into())
-            }
-        })
-        .await
+        recalled_memory(self.config.agent_dir.clone(), &self.touched).await
     }
 
     /// Soul and personality. Memory is no longer pasted in whole: the index
@@ -766,19 +842,15 @@ impl EngineRuntime {
         Some(built.render().into())
     }
 
-    /// Refresh the live index off the async threads and render this turn's map.
+    /// This turn's map. As with the recall, the turn builds the copy the
+    /// model sees and this one only measures.
     async fn genome_system(&self) -> Option<SmolStr> {
-        let root = self.config.genome_root.clone()?;
-        let genome = Arc::clone(&self.genome);
-        let touched = Arc::clone(&self.touched);
-        let limit = self.config.genome_limit;
-        run_off_thread(move || {
-            let mut guard = genome.blocking_lock();
-            let index = guard.get_or_insert_with(Genome::default);
-            index.refresh(&root).ok()?;
-            let touched: Vec<String> = touched.blocking_lock().snapshot();
-            Some(SmolStr::from(index.project_with(limit, &touched)))
-        })
+        genome_map(
+            self.config.genome_root.clone(),
+            self.config.genome_limit,
+            &self.genome,
+            &self.touched,
+        )
         .await
     }
 
@@ -834,6 +906,7 @@ impl EngineRuntime {
         let waiters = Arc::clone(&self.approval_waiters);
         let trajectory = Arc::clone(&self.trajectory);
         let touched = Arc::clone(&self.touched);
+        let genome = Arc::clone(&self.genome);
         let claims = self.claims.clone();
         let steering = self.steering.clone();
         tokio::spawn(async move {
@@ -850,6 +923,7 @@ impl EngineRuntime {
                 waiters,
                 trajectory,
                 touched,
+                genome,
                 claims,
                 steering,
             )
@@ -1003,6 +1077,7 @@ async fn run_turn(
     waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
     touched: TouchedSink,
+    genome: GenomeIndex,
     claims: Claims,
     steering: Steering,
 ) -> Option<Vec<ChatMessage>> {
@@ -1010,6 +1085,23 @@ async fn run_turn(
     models.push(primary_model);
     models.extend(config.fallback_models);
     let mut previous_model: Option<SmolStr> = None;
+    // Built once for the turn, in front of the prompt it belongs to. A
+    // fallback model reuses it: rebuilding per attempt would send two
+    // different requests for one question.
+    let contextual_prompt = prompt_with_context(
+        &prompt,
+        recalled_memory(config.agent_dir.clone(), &touched)
+            .await
+            .as_deref(),
+        genome_map(
+            config.genome_root.clone(),
+            config.genome_limit,
+            &genome,
+            &touched,
+        )
+        .await
+        .as_deref(),
+    );
 
     for model in models {
         if aborted.load(Ordering::SeqCst) {
@@ -1064,7 +1156,7 @@ async fn run_turn(
         messages.extend(config.restored_messages.iter().cloned());
         messages.push(ChatMessage {
             role: Role::User,
-            content: prompt.clone(),
+            content: contextual_prompt.clone(),
             tool_calls: Vec::new(),
         });
         let mut tool_rounds = 0;

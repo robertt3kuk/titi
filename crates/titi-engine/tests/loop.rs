@@ -48,10 +48,11 @@ async fn collect_until_terminal(engine: &mut titi_engine::Engine) -> Vec<EngineE
     events
 }
 
-/// The request the model sees starts with the agent's identity, not only the
-/// genome map. Memory reaches it through the index, not through a file.
+/// The request the model sees starts with the agent's identity. Memory is
+/// not part of that prefix: it is rebuilt every turn, so it rides the newest
+/// user message, where it cannot invalidate everything cached in front of it.
 #[tokio::test]
-async fn the_system_prompt_carries_identity_and_memory() {
+async fn identity_is_frozen_and_memory_rides_the_newest_message() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("SOUL.md"), "IDENTITY-MARKER").unwrap();
     titi_memory::index::MemoryIndex::open(dir.path())
@@ -86,10 +87,18 @@ async fn the_system_prompt_carries_identity_and_memory() {
         system.content
     );
     assert!(
-        system.content.contains("the user prefers terse answers"),
-        "memory is missing: {}",
+        !system.content.contains("the user prefers terse answers"),
+        "the recall must stay out of the frozen prefix: {}",
         system.content
     );
+    let prompt = requests[0].messages.last().expect("a prompt");
+    assert_eq!(prompt.role, Role::User);
+    assert!(
+        prompt.content.contains("the user prefers terse answers"),
+        "memory is missing: {}",
+        prompt.content
+    );
+    assert!(prompt.content.ends_with("hi"), "{}", prompt.content);
 }
 
 /// Project rules are their own section, after the soul and before the map.
@@ -203,10 +212,11 @@ async fn skill_names_enter_the_system_prompt_without_their_bodies() {
     assert!(!system.content.contains("OTHER-BODY"), "{}", system.content);
 }
 
-/// A memory stored earlier comes back in the next turn's system prompt,
-/// ranked above an unrelated one because the turn touched its file.
+/// A memory stored earlier comes back on the next turn, ranked above an
+/// unrelated one because the turn touched its file — and it arrives in front
+/// of the prompt, not in the system prompt the cache is keyed on.
 #[tokio::test]
-async fn recalled_memory_enters_the_system_prompt() {
+async fn recalled_memory_enters_the_newest_user_message() {
     let dir = tempfile::tempdir().unwrap();
     let index = titi_memory::index::MemoryIndex::open(dir.path()).unwrap();
     index
@@ -238,15 +248,17 @@ async fn recalled_memory_enters_the_system_prompt() {
     let _ = collect_until_terminal(&mut engine).await;
 
     let requests = captured.requests();
-    let system = &requests[0]
-        .messages
-        .iter()
-        .find(|m| m.role == Role::System)
-        .expect("a system message")
-        .content;
+    let prompt = &requests[0].messages.last().expect("a prompt").content;
     assert!(
-        system.contains("auth expires early"),
-        "recall missing: {system}"
+        prompt.contains("auth expires early"),
+        "recall missing: {prompt}"
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .all(|m| m.role != Role::System || !m.content.contains("auth expires early")),
+        "the recall must stay out of the frozen prefix"
     );
 }
 
@@ -325,8 +337,11 @@ fn workspace_with_hub_and_leaf() -> tempfile::TempDir {
     dir
 }
 
+/// The map is rebuilt every turn, so it travels with the message it was
+/// built for instead of sitting in the system prompt: everything in front
+/// of that message stays byte-identical from turn to turn.
 #[tokio::test]
-async fn genome_is_indexed_and_injected_as_system_message() {
+async fn genome_is_indexed_and_injected_ahead_of_the_prompt() {
     let workspace = workspace_with_hub_and_leaf();
     let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
         StreamEvent::TextDelta {
@@ -353,17 +368,22 @@ async fn genome_is_indexed_and_injected_as_system_message() {
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);
     let messages = &requests[0].messages;
-    assert_eq!(messages.len(), 2, "system + user");
-    assert_eq!(messages[0].role, Role::System);
+    let prompt = messages.last().expect("a prompt");
+    assert_eq!(prompt.role, Role::User);
     assert!(
-        messages[0].content.starts_with("<genome>\n"),
+        prompt.content.starts_with("<genome>\n"),
         "{}",
-        messages[0].content
+        prompt.content
     );
-    assert!(messages[0].content.contains("src/hub.rs"));
-    assert!(messages[0].content.contains("src/leaf.rs"));
-    assert_eq!(messages[1].role, Role::User);
-    assert_eq!(messages[1].content, "hi");
+    assert!(prompt.content.contains("src/hub.rs"));
+    assert!(prompt.content.contains("src/leaf.rs"));
+    assert!(prompt.content.ends_with("\n\nhi"), "{}", prompt.content);
+    assert!(
+        messages
+            .iter()
+            .all(|m| m.role != Role::System || !m.content.contains("<genome>")),
+        "the map must stay out of the frozen prefix"
+    );
 }
 
 #[tokio::test]
@@ -400,11 +420,12 @@ async fn genome_refreshes_between_turns() {
 
     let requests = transport.requests();
     assert_eq!(requests.len(), 2);
-    assert!(!requests[0].messages[0].content.contains("src/fresh.rs"));
+    let first = &requests[0].messages.last().expect("a prompt").content;
+    let second = &requests[1].messages.last().expect("a prompt").content;
+    assert!(!first.contains("src/fresh.rs"));
     assert!(
-        requests[1].messages[0].content.contains("src/fresh.rs"),
-        "second turn must see the new file: {}",
-        requests[1].messages[0].content
+        second.contains("src/fresh.rs"),
+        "second turn must see the new file: {second}"
     );
 }
 
@@ -620,21 +641,16 @@ async fn touched_file_leads_the_next_projection() {
     let second = requests
         .iter()
         .find(|request| {
-            request.messages.first().is_some_and(|message| {
-                message.role == Role::System && message.content.contains("src/leaf.rs")
-            }) && request
+            request
                 .messages
-                .iter()
-                .any(|message| message.content == "again")
+                .last()
+                .is_some_and(|message| message.content.ends_with("again"))
         })
         .expect("second turn reached the provider");
-    let system = &second.messages[0].content;
-    let leaf_at = system.find("src/leaf.rs").unwrap();
-    let hub_at = system.find("src/hub.rs").unwrap();
-    assert!(
-        leaf_at < hub_at,
-        "touched file must lead the map:\n{system}"
-    );
+    let map = &second.messages.last().expect("a prompt").content;
+    let leaf_at = map.find("src/leaf.rs").unwrap();
+    let hub_at = map.find("src/hub.rs").unwrap();
+    assert!(leaf_at < hub_at, "touched file must lead the map:\n{map}");
 }
 
 #[tokio::test]
@@ -723,12 +739,11 @@ async fn queued_prompts_each_get_a_well_formed_frame() {
     let requests = transport.requests();
     assert_eq!(requests.len(), 2, "both turns reached the provider");
     for request in &requests {
-        assert_eq!(request.messages[0].role, Role::System);
-        let frame = &request.messages[0].content;
-        assert!(frame.starts_with("<genome>\n"), "{frame}");
+        let prompt = &request.messages.last().expect("a prompt").content;
+        assert!(prompt.starts_with("<genome>\n"), "{prompt}");
         assert!(
-            frame.ends_with("</genome>"),
-            "frame must be closed: {frame}"
+            prompt.contains("</genome>\n\n"),
+            "the frame must be closed before the prompt: {prompt}"
         );
     }
 }
@@ -1260,5 +1275,152 @@ async fn a_refused_body_is_reported_and_the_turn_still_runs() {
         !user.content.contains("ignore previous"),
         "a flagged body reached the model: {}",
         user.content
+    );
+}
+
+/// Strips every cache breakpoint. Anthropic hashes the blocks, not the
+/// markers: what one request cached behind its breakpoint still hits when
+/// the next request has moved that breakpoint onto a later message.
+fn without_breakpoints(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(without_breakpoints).collect())
+        }
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, item)| (key.clone(), without_breakpoints(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn anthropic_body(request: &titi_providers::WireRequest) -> serde_json::Value {
+    let http = titi_providers::build_http_request(
+        titi_providers::ApiKind::AnthropicMessages,
+        "https://example.invalid",
+        request,
+        None,
+    );
+    serde_json::from_slice(&http.body.expect("body")).expect("json")
+}
+
+/// The point of the whole cache cascade: two turns in a row, and everything
+/// turn 1 sent is still there, byte for byte, in front of what turn 2 adds.
+/// That needs all three pieces at once — a tool array that does not depend
+/// on a `HashMap` walk, a system prompt with nothing volatile in it, and a
+/// genome map and recall welded to the message they were built for.
+#[tokio::test]
+async fn a_turns_request_is_a_byte_prefix_of_the_next_turns() {
+    use titi_tools::{ToolRegistry, workspace_tools};
+
+    let agent = tempfile::tempdir().unwrap();
+    std::fs::write(agent.path().join("SOUL.md"), "IDENTITY-MARKER").unwrap();
+    titi_memory::index::MemoryIndex::open(agent.path())
+        .unwrap()
+        .remember("pref", "the user prefers terse answers", "", &[])
+        .unwrap();
+    let workspace = workspace_with_hub_and_leaf();
+
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("b0"),
+                text: "the first answer".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut tools = ToolRegistry::new();
+    for tool in workspace_tools(workspace.path()) {
+        tools.register(Arc::from(tool));
+    }
+    let mut config = EngineConfig::new("primary");
+    config.agent_dir = Some(agent.path().to_path_buf());
+    config.genome_root = Some(workspace.path().to_path_buf());
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
+        tools,
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "the first question".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "the second question".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2, "both turns reached the provider");
+
+    let names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert!(
+        names.len() >= 4,
+        "too few tools to prove an order: {names:?}"
+    );
+    assert_eq!(names, sorted, "the tool order must not come from a HashMap");
+    assert_eq!(requests[0].tools, requests[1].tools);
+
+    let before = anthropic_body(&requests[0]);
+    let after = anthropic_body(&requests[1]);
+    // Tools and system are hashed ahead of every message, so they have to
+    // match exactly, breakpoints included.
+    assert_eq!(before["tools"], after["tools"]);
+    assert_eq!(before["system"], after["system"]);
+    assert!(
+        before["system"][0]["text"]
+            .as_str()
+            .expect("a system block")
+            .contains("IDENTITY-MARKER"),
+        "{}",
+        before["system"]
+    );
+
+    let before_messages = without_breakpoints(&before["messages"]);
+    let after_messages = without_breakpoints(&after["messages"]);
+    let before_bytes = before_messages.to_string();
+    let after_bytes = after_messages.to_string();
+    let shared = before_bytes
+        .strip_suffix(']')
+        .expect("a serialized array ends with ]");
+    assert!(
+        after_bytes.starts_with(shared),
+        "turn 2 rewrote turn 1's bytes:\n{before_bytes}\n{after_bytes}"
+    );
+    // Everything past that prefix is the new exchange: turn 1's answer and
+    // turn 2's prompt, nothing else.
+    assert_eq!(
+        after_messages.as_array().expect("msgs").len(),
+        before_messages.as_array().expect("msgs").len() + 2
+    );
+    assert_eq!(
+        after["messages"]
+            .as_array()
+            .expect("msgs")
+            .last()
+            .expect("a prompt")["content"][0]["cache_control"]["type"],
+        "ephemeral"
     );
 }
