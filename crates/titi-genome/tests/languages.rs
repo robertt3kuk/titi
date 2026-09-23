@@ -294,6 +294,55 @@ fn a_unique_name_resolves_to_its_single_definition() {
     );
 }
 
+/// Declarations a line-anchored pattern could not see now carry edges — an
+/// indented Python method, a member of an exported TS class — and ones it
+/// saw but should not have (a block-commented function, a `def` inside a
+/// docstring) no longer become symbols.
+#[test]
+fn nested_declarations_become_symbols_and_quoted_ones_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app/service.py",
+        "class Service:\n    def reconcile_ledger(self):\n        pass\n\n\
+         HELP = \"\"\"\ndef ghost_helper():\n    pass\n\"\"\"\n",
+    );
+    write(
+        root,
+        "app/caller.py",
+        "def run(store):\n    store.reconcile_ledger()\n",
+    );
+    write(
+        root,
+        "web/client.ts",
+        "export class Client {\n  dispatchEnvelope(body: string) {}\n}\n\
+         /*\nexport function ghostHandler() {}\n*/\n",
+    );
+    write(
+        root,
+        "web/page.ts",
+        "export function open(c: any) { c.dispatchEnvelope(\"x\"); }\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+
+    assert_eq!(genome.symbols["reconcile_ledger"].users, 1);
+    assert_eq!(
+        genome.symbols["reconcile_ledger"].files,
+        vec!["app/service.py"]
+    );
+    assert_eq!(genome.symbols["dispatchEnvelope"].users, 1);
+    assert_eq!(genome.dependents["app/service.py"], 1);
+    assert_eq!(genome.dependents["web/client.ts"], 1);
+    for ghost in ["ghostHandler", "ghost_helper"] {
+        assert!(
+            !genome.symbols.contains_key(ghost),
+            "{ghost} is text, not a declaration"
+        );
+    }
+}
+
 #[test]
 fn language_detection_covers_the_indexed_extensions() {
     use titi_genome::Language;

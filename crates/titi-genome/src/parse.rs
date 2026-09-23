@@ -4,9 +4,11 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
+
+use crate::symbols;
 
 /// Distinct identifiers recorded per file. Past this the file is mostly noise
 /// and the symbol lookup cost stops paying for itself.
@@ -611,26 +613,18 @@ fn resolve_suffix(spec: &str, exts: &[&str], files: &HashSet<String>) -> Option<
     None
 }
 
+/// Imports stay pattern-based: a `use` path is a module specifier, not a
+/// declaration, and resolving it needs the repo's file set rather than a
+/// syntax tree. Only the symbols moved to the grammar.
 fn parse_rust(path: &str, source: &str, files: &std::collections::HashSet<String>) -> ParsedFile {
-    static EXPORTS: OnceLock<Regex> = OnceLock::new();
-    static USES: OnceLock<Regex> = OnceLock::new();
-    static MODS: OnceLock<Regex> = OnceLock::new();
-    let exports_re = EXPORTS.get_or_init(|| {
-        Regex::new(
-            r"(?m)^\s*pub(?:\s*\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?(?:fn|struct|enum|trait|type|const|static|mod)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        )
-        .expect("exports regex")
-    });
-    let uses_re =
-        USES.get_or_init(|| Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;{]+)").expect("use regex"));
-    let mods_re = MODS.get_or_init(|| {
+    static USES: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;{]+)").expect("use regex"));
+    static MODS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)^\s*(?:pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").expect("mod regex")
     });
+    let (uses_re, mods_re) = (&*USES, &*MODS);
 
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
+    let exports = symbols::exports(path, source).unwrap_or_default();
 
     let mut imports = Vec::new();
     for cap in uses_re.captures_iter(source) {
@@ -653,21 +647,11 @@ fn parse_typescript(
     source: &str,
     files: &std::collections::HashSet<String>,
 ) -> ParsedFile {
-    static EXPORTS: OnceLock<Regex> = OnceLock::new();
-    static IMPORTS: OnceLock<Regex> = OnceLock::new();
-    let exports_re = EXPORTS.get_or_init(|| {
-        Regex::new(
-            r"(?m)^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|enum|type|interface)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        )
-        .expect("ts exports")
-    });
-    let imports_re = IMPORTS.get_or_init(|| {
+    static IMPORTS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?m)(?:from|import)\s+['"](\.[^'"]+)['"]"#).expect("ts imports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
+    let imports_re = &*IMPORTS;
+    let exports = symbols::exports(path, source).unwrap_or_default();
     let mut imports = Vec::new();
     for cap in imports_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -679,18 +663,11 @@ fn parse_typescript(
 }
 
 fn parse_python(path: &str, source: &str, files: &std::collections::HashSet<String>) -> ParsedFile {
-    static EXPORTS: OnceLock<Regex> = OnceLock::new();
-    static IMPORTS: OnceLock<Regex> = OnceLock::new();
-    let exports_re = EXPORTS.get_or_init(|| {
-        Regex::new(r"(?m)^(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)").expect("py exports")
-    });
-    let imports_re = IMPORTS.get_or_init(|| {
+    static IMPORTS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)^from\s+(\.+[A-Za-z0-9_\.]*)\s+import").expect("py imports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(2).map(|m| m.as_str().to_owned()))
-        .collect();
+    let imports_re = &*IMPORTS;
+    let exports = symbols::exports(path, source).unwrap_or_default();
     let mut imports = Vec::new();
     for cap in imports_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");

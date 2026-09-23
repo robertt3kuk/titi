@@ -17,6 +17,7 @@ mod graph;
 mod parse;
 mod project;
 mod scan;
+mod symbols;
 
 pub use parse::Language;
 pub use project::render;
@@ -92,32 +93,18 @@ impl Genome {
         let root = root.as_ref();
         let listed = scan::list_files(root)?;
         let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
+        let stale: Vec<&scan::ListedFile> = listed
+            .iter()
+            .filter(|file| {
+                !self
+                    .files
+                    .get(&file.path)
+                    .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
+            })
+            .collect();
         let mut parsed = 0;
-
-        for file in &listed {
-            let unchanged = self
-                .files
-                .get(&file.path)
-                .is_some_and(|record| record.size == file.size && record.mtime == file.mtime);
-            if unchanged {
-                continue;
-            }
-            let source = fs::read_to_string(&file.abs).unwrap_or_default();
-            let result = parse::parse(&file.path, &source, &known);
-            self.files.insert(
-                file.path.clone(),
-                FileRecord {
-                    language: Language::from_path(&file.path),
-                    path: file.path.clone(),
-                    exports: result.exports,
-                    imports: result.imports,
-                    // Resolved against the whole repo below, once every file
-                    // has been parsed.
-                    used_symbols: result.refs,
-                    size: file.size,
-                    mtime: file.mtime,
-                },
-            );
+        for record in parse_batch(&stale, &known) {
+            self.files.insert(record.path.clone(), record);
             parsed += 1;
         }
 
@@ -208,5 +195,59 @@ impl Genome {
     pub fn project_with(&self, limit: usize, touched: &[String]) -> String {
         let touched: HashSet<String> = touched.iter().cloned().collect();
         render(self, limit, &touched)
+    }
+}
+
+/// Parses the stale files, spreading them over the available cores.
+///
+/// Parsing is the only expensive step of a refresh and every file is
+/// independent of the others — they share nothing but the read-only set of
+/// known paths — so the work splits cleanly. A refresh that touches one file
+/// stays on the calling thread.
+fn parse_batch(stale: &[&scan::ListedFile], known: &HashSet<String>) -> Vec<FileRecord> {
+    let workers = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .min(stale.len());
+    if workers <= 1 {
+        return stale.iter().map(|file| parse_one(file, known)).collect();
+    }
+    let chunk = stale.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = stale
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|file| parse_one(file, known))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| match handle.join() {
+                Ok(records) => records,
+                // A parser panic is a bug in this crate, not a file-level
+                // condition to swallow: carry it to the caller's thread.
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+            .collect()
+    })
+}
+
+fn parse_one(file: &scan::ListedFile, known: &HashSet<String>) -> FileRecord {
+    let source = fs::read_to_string(&file.abs).unwrap_or_default();
+    let result = parse::parse(&file.path, &source, known);
+    FileRecord {
+        language: Language::from_path(&file.path),
+        path: file.path.clone(),
+        exports: result.exports,
+        imports: result.imports,
+        // Resolved against the whole repo once every file has been parsed.
+        used_symbols: result.refs,
+        size: file.size,
+        mtime: file.mtime,
     }
 }

@@ -9,6 +9,13 @@ workspace = true
 
 [dependencies]
 regex = "1"
+# Symbol extraction. The grammars are pinned to ABI 14, the range the
+# workspace's tree-sitter 0.24 accepts; newer grammar releases emit ABI 15 and
+# would need a core bump. `grammars_match_the_core_abi` guards this.
+tree-sitter = { workspace = true }
+tree-sitter-rust = "0.23.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.23.6"
 
 [dev-dependencies]
 tempfile = "3"
