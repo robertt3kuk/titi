@@ -468,6 +468,10 @@ impl Chat {
                 self.session_completion_tokens += completion_tokens;
                 Applied::none()
             }
+            EngineEvent::MemoryResult { output } => {
+                self.push(LineKind::Note, output.to_string());
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -618,6 +622,7 @@ impl Chat {
             "pause" => self.toggle_pause(),
             "switch" => self.switch(args),
             "goal" => self.goal(args),
+            "memory" => self.memory(args),
             "usage" => self.usage(),
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
@@ -656,6 +661,43 @@ impl Chat {
         self.push(LineKind::Note, text);
         Applied::none()
     }
+    fn memory(&mut self, args: &str) -> Applied {
+        if args.is_empty() || args == "list" {
+            return Applied::send(EngineCommand::MemoryList, None);
+        }
+        let (cmd, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        match cmd {
+            "search" => {
+                let query = rest.trim();
+                if query.is_empty() {
+                    self.push(LineKind::Error, "usage: /memory search <query>".to_owned());
+                    Applied::none()
+                } else {
+                    Applied::send(
+                        EngineCommand::MemorySearch {
+                            query: query.into(),
+                        },
+                        None,
+                    )
+                }
+            }
+            "forget" => {
+                let id_str = rest.trim();
+                match id_str.parse::<i64>() {
+                    Ok(id) => Applied::send(EngineCommand::MemoryForget { id }, None),
+                    Err(_) => {
+                        self.push(LineKind::Error, "usage: /memory forget <id>".to_owned());
+                        Applied::none()
+                    }
+                }
+            }
+            _ => {
+                self.push(LineKind::Error, format!("unknown memory command: {cmd}"));
+                Applied::none()
+            }
+        }
+    }
+
     fn switch(&mut self, args: &str) -> Applied {
         if args.is_empty() {
             self.push(
@@ -1364,6 +1406,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "pause",
         about: "hold input and stop the turn",
+    },
+    Command {
+        name: "memory",
+        about: "list, search, or forget memories",
     },
     Command {
         name: "recap",
@@ -3098,5 +3144,66 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("aws/claude-opus-5"))
         );
+    }
+
+    #[test]
+    fn memory_list() {
+        let mut chat = chat();
+        type_text(&mut chat, "/memory list");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::MemoryList))
+        );
+
+        type_text(&mut chat, "/memory");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::MemoryList))
+        );
+    }
+
+    #[test]
+    fn memory_search() {
+        let mut chat = chat();
+        type_text(&mut chat, "/memory search rust");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::MemorySearch {
+                query: "rust".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn memory_forget() {
+        let mut chat = chat();
+        type_text(&mut chat, "/memory forget 42");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::MemoryForget { id: 42 }))
+        );
+
+        type_text(&mut chat, "/memory forget not_an_id");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /memory forget <id>"))
+        );
+    }
+
+    #[test]
+    fn memory_result_prints_note() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::MemoryResult {
+            output: "memory data".into(),
+        });
+        let view = frame_text(&mut chat);
+        assert!(view.contains("memory data"), "{view}");
     }
 }

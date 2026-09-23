@@ -76,6 +76,13 @@ pub enum EngineCommand {
     Compact {
         focus: Option<SmolStr>,
     },
+    MemoryList,
+    MemorySearch {
+        query: SmolStr,
+    },
+    MemoryForget {
+        id: i64,
+    },
     Shutdown,
 }
 
@@ -211,6 +218,9 @@ pub enum EngineEvent {
     SessionNamed {
         session_id: SmolStr,
         title: SmolStr,
+    },
+    MemoryResult {
+        output: SmolStr,
     },
 }
 

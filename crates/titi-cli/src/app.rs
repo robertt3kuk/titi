@@ -857,6 +857,9 @@ impl App {
                 self.set_alert(format!("session: {title}"));
             }
             EngineEvent::TurnUsage { .. } => {}
+            EngineEvent::MemoryResult { output } => {
+                self.push_transcript(Section::Activity, output.to_string());
+            }
         }
     }
 

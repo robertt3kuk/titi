@@ -609,6 +609,70 @@ impl EngineRuntime {
                         EngineCommand::RunGoal { text } => {
                             self.spawn_goal(text, primary_model.clone());
                         }
+                        EngineCommand::MemoryList => {
+                            if let Some(agent_dir) = self.config.agent_dir.clone() {
+                                let output = run_off_thread(move || {
+                                    let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
+                                    let entries = index.recent(titi_memory::index::PAGE_MAX).unwrap_or_default();
+                                    if entries.is_empty() {
+                                        Some("no memories found".into())
+                                    } else {
+                                        let out = entries
+                                            .into_iter()
+                                            .map(|e| format!("{:>4} | {} | {} | {}", e.id, e.created_at, e.category, e.preview))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        Some(out.into())
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|| "memory index unavailable".into());
+                                let _ = self.events.send(EngineEvent::MemoryResult { output }).await;
+                            } else {
+                                let _ = self.events.send(EngineEvent::MemoryResult { output: "no agent directory".into() }).await;
+                            }
+                        }
+                        EngineCommand::MemorySearch { query } => {
+                            let q = query.to_string();
+                            if let Some(agent_dir) = self.config.agent_dir.clone() {
+                                let output = run_off_thread(move || {
+                                    let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
+                                    let entries = index.search(&q, titi_memory::index::PAGE_MAX).unwrap_or_default();
+                                    if entries.is_empty() {
+                                        Some("no memories found".into())
+                                    } else {
+                                        let out = entries
+                                            .into_iter()
+                                            .map(|e| format!("{:>4} | {} | {} | {}", e.id, e.created_at, e.category, e.preview))
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                        Some(out.into())
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|| "memory index unavailable".into());
+                                let _ = self.events.send(EngineEvent::MemoryResult { output }).await;
+                            } else {
+                                let _ = self.events.send(EngineEvent::MemoryResult { output: "no agent directory".into() }).await;
+                            }
+                        }
+                        EngineCommand::MemoryForget { id } => {
+                            if let Some(agent_dir) = self.config.agent_dir.clone() {
+                                let output = run_off_thread(move || {
+                                    let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
+                                    if index.forget(id).is_ok() {
+                                        Some(format!("forgot memory {id}").into())
+                                    } else {
+                                        Some(format!("failed to forget memory {id}").into())
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|| "memory index unavailable".into());
+                                let _ = self.events.send(EngineEvent::MemoryResult { output }).await;
+                            } else {
+                                let _ = self.events.send(EngineEvent::MemoryResult { output: "no agent directory".into() }).await;
+                            }
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
