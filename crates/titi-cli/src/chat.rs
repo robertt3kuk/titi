@@ -165,6 +165,7 @@ pub struct Chat {
     next_image_id: u32,
     /// Transmit and placement sequences to write before the next frame.
     kitty_flush: String,
+    skillful: bool,
 }
 
 impl Chat {
@@ -202,6 +203,7 @@ impl Chat {
             misses: HashSet::new(),
             next_image_id: 1,
             kitty_flush: String::new(),
+            skillful: false,
         }
     }
 
@@ -620,6 +622,10 @@ impl Chat {
             "rewind" => self.rewind(args),
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
+            "fork" => self.fork(),
+            "export" => self.export(args),
+            "skillful" => self.toggle_skillful(),
+            "btw" => self.btw(args),
             "switch" => self.switch(args),
             "settings" => self.settings(),
             "goal" => self.goal(args),
@@ -696,6 +702,40 @@ impl Chat {
                 self.push(LineKind::Error, format!("unknown memory command: {cmd}"));
                 Applied::none()
             }
+        }
+    }
+    fn fork(&mut self) -> Applied {
+        self.session_note(crate::app::fork_session(&self.agent_dir, &self.session_id))
+    }
+
+    fn export(&mut self, args: &str) -> Applied {
+        let path = args.trim();
+        self.session_note(crate::app::export_session(
+            &self.agent_dir,
+            &self.session_id,
+            path,
+        ))
+    }
+
+    fn toggle_skillful(&mut self) -> Applied {
+        self.skillful = !self.skillful;
+        self.push(LineKind::Note, format!("skillful mode: {}", self.skillful));
+        Applied::none()
+    }
+
+    fn btw(&mut self, args: &str) -> Applied {
+        if args.is_empty() {
+            self.push(LineKind::Error, "usage: /btw <message>".to_owned());
+            return Applied::none();
+        }
+        let text = format!("btw: {args}");
+        self.push(LineKind::Note, text.clone());
+        let log = None; // Do not log it into history
+        if self.turn_active {
+            Applied::send(EngineCommand::Steer { text: text.into() }, log)
+        } else {
+            self.turn_active = true;
+            Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
     }
 
@@ -1443,6 +1483,22 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "rewind",
         about: "cut back to a rewind point",
+    },
+    Command {
+        name: "fork",
+        about: "fork current session into a new one",
+    },
+    Command {
+        name: "export",
+        about: "export session (usage: /export [path])",
+    },
+    Command {
+        name: "skillful",
+        about: "toggle skillful mode",
+    },
+    Command {
+        name: "btw",
+        about: "send a prompt without recording it in history",
     },
     Command {
         name: "settings",
@@ -3234,5 +3290,33 @@ mod tests {
         });
         let view = frame_text(&mut chat);
         assert!(view.contains("memory data"), "{view}");
+    }
+
+    #[test]
+    fn toggle_skillful() {
+        let mut chat = chat();
+        type_text(&mut chat, "/skillful");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.skillful);
+
+        type_text(&mut chat, "/skillful");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(!chat.skillful);
+    }
+
+    #[test]
+    fn btw_sends_without_log() {
+        let mut chat = chat();
+        type_text(&mut chat, "/btw hello there");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt { text })) => {
+                assert_eq!(text.as_str(), "btw: hello there");
+            }
+            _ => panic!("expected SubmitPrompt"),
+        }
+        assert!(applied.log.is_none());
     }
 }

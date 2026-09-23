@@ -1932,6 +1932,40 @@ pub fn new_session(agent_dir: &std::path::Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn fork_session(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    store
+        .fork_session(session_id, titi_core::session::SessionMeta::default())
+        .map_err(|e| e.to_string())
+}
+
+pub fn export_session(
+    agent_dir: &std::path::Path,
+    session_id: &str,
+    path: &str,
+) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+
+    // Default to markdown if not specified in path
+    let format = if path.ends_with(".jsonl") {
+        titi_core::session::export::ExportFormat::Jsonl
+    } else {
+        titi_core::session::export::ExportFormat::Markdown
+    };
+
+    let path_val = std::path::PathBuf::from(if path.is_empty() {
+        format!("{session_id}.md")
+    } else {
+        path.to_owned()
+    });
+
+    store
+        .export_to_file(session_id, format, &path_val)
+        .map_err(|e| e.to_string())?;
+
+    Ok(format!("exported to {}", path_val.display()))
+}
+
 /// The conversation a resumed session replays: the path to its current leaf,
 /// capped at a boundary that keeps every tool round whole, so an old
 /// transcript cannot crowd out the workspace map or replay an orphan call.
