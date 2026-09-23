@@ -462,6 +462,10 @@ impl Chat {
                 self.push(LineKind::Note, report.to_string());
                 Applied::none()
             }
+            EngineEvent::GraphFinished { report } => {
+                self.push(LineKind::Note, report.to_string());
+                Applied::none()
+            }
             EngineEvent::Notice { message } => {
                 self.push(LineKind::Note, one_line(&message, TOOL_PREVIEW));
                 Applied::none()
@@ -725,6 +729,8 @@ impl Chat {
             "plan" => self.plan(args),
             "done" => self.done(args),
             "goal" => self.goal(args),
+            "council" => self.council(args),
+            "graph" => self.graph(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
             "context" => self.describe_context(args),
@@ -1260,6 +1266,34 @@ impl Chat {
         self.push(LineKind::Note, format!("goal: {text}"));
         Applied::effect(ChatEffect::Send(EngineCommand::RunGoal {
             text: text.into(),
+        }))
+    }
+
+    /// `/council` puts a question to a council of briefs. Like `/goal`, it
+    /// never becomes `SubmitPrompt`.
+    fn council(&mut self, args: &str) -> Applied {
+        let question = args.trim();
+        if question.is_empty() {
+            self.push(LineKind::Error, "usage: /council <question>".to_owned());
+            return Applied::none();
+        }
+        self.push(LineKind::Note, format!("council: {question}"));
+        Applied::effect(ChatEffect::Send(EngineCommand::RunCouncil {
+            question: question.into(),
+        }))
+    }
+
+    /// `/graph` runs the orchestrator graph over a task. Like `/goal`, it
+    /// never becomes `SubmitPrompt`.
+    fn graph(&mut self, args: &str) -> Applied {
+        let task = args.trim();
+        if task.is_empty() {
+            self.push(LineKind::Error, "usage: /graph <task>".to_owned());
+            return Applied::none();
+        }
+        self.push(LineKind::Note, format!("graph: {task}"));
+        Applied::effect(ChatEffect::Send(EngineCommand::RunGraph {
+            task: task.into(),
         }))
     }
 
@@ -1901,6 +1935,14 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "whoami",
         about: "which providers have a key",
+    },
+    Command {
+        name: "council",
+        about: "put a question to a council of briefs",
+    },
+    Command {
+        name: "graph",
+        about: "run the orchestrator graph: council decides, goal loop works",
     },
 ];
 
@@ -3199,6 +3241,8 @@ mod tests {
             "recap",
             "pause",
             "goal",
+            "council",
+            "graph",
             "loop",
             "jobs",
             "help",
@@ -4110,6 +4154,76 @@ mod tests {
             report: "goal: passed · 1 round · verdict pass".into(),
         });
         assert!(chat.lines.iter().any(|line| line.text.contains("passed")));
+        assert!(!chat.turn_active);
+    }
+
+    #[test]
+    fn council_is_reserved_and_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/council do we rewrite the parser?");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::RunCouncil { question })) => {
+                assert_eq!(question.as_str(), "do we rewrite the parser?");
+            }
+            other => panic!("expected RunCouncil, got {other:?}"),
+        }
+        assert!(applied.log.is_none(), "a council is not a user prompt");
+        assert!(!chat.turn_active);
+    }
+
+    #[test]
+    fn council_without_a_question_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/council");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /council")),
+            "{:?}",
+            chat.lines
+        );
+    }
+
+    #[test]
+    fn graph_is_reserved_and_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/graph ship the release");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::RunGraph { task })) => {
+                assert_eq!(task.as_str(), "ship the release");
+            }
+            other => panic!("expected RunGraph, got {other:?}"),
+        }
+        assert!(applied.log.is_none(), "a graph is not a user prompt");
+        assert!(!chat.turn_active);
+    }
+
+    #[test]
+    fn graph_without_a_task_does_not_submit() {
+        let mut chat = chat();
+        type_text(&mut chat, "/graph");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /graph")),
+            "{:?}",
+            chat.lines
+        );
+    }
+
+    #[test]
+    fn a_graph_report_lands_on_the_transcript() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::GraphFinished {
+            report: "graph: council → goal · verdict pass".into(),
+        });
+        assert!(chat.lines.iter().any(|line| line.text.contains("verdict")));
         assert!(!chat.turn_active);
     }
 
