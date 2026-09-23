@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use titi_engine::protocol::SessionMode;
 use titi_engine::{AgentKind as EngineAgentKind, AgentStatus as EngineAgentStatus, EngineEvent};
 use titi_tui::caps::{MousePreset, Rgb};
 use titi_tui::component::Component as _;
@@ -908,6 +909,10 @@ impl App {
                 );
                 self.set_alert(format!("budget reached: {spent} of {limit} tokens"));
             }
+            EngineEvent::ModeChanged { mode } => {
+                self.plan_mode = mode == SessionMode::Plan;
+                self.set_alert(format!("mode: {}", mode.label()));
+            }
         }
     }
 
@@ -1321,10 +1326,15 @@ impl App {
         }
 
         if self.keys.matches_canonical(canonical, "app.plan.toggle") {
-            self.plan_mode = !self.plan_mode;
-            let label = if self.plan_mode { "plan" } else { "agent" };
-            self.set_alert(format!("mode: {label}"));
-            return Dispatch::Handled(None);
+            // The badge is not flipped here: it follows the engine's
+            // ModeChanged, so it can never claim a mode the turns are not
+            // actually running in.
+            let mode = if self.plan_mode {
+                SessionMode::Agent
+            } else {
+                SessionMode::Plan
+            };
+            return Dispatch::Handled(Some(SubmitEffect::SetMode(mode)));
         }
 
         if self.keys.matches_canonical(canonical, "app.live.toggle") {
@@ -2152,6 +2162,9 @@ pub enum SubmitEffect {
     DisplayReset,
     /// Open `$VISUAL` / `$EDITOR` on the draft.
     ExternalEditor,
+    /// `app.plan.toggle`: ask the engine for a mode; the badge follows its
+    /// answer.
+    SetMode(SessionMode),
 }
 
 fn load_keybindings_manager() -> KeybindingsManager {

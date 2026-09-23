@@ -104,18 +104,39 @@ fn frame_has_one_box_composer_not_double_status() {
     assert_eq!(status_hits, 0, "no Hermes starting bar: {joined}");
 }
 
+/// The badge follows the engine, so the keypress only asks for the mode.
+/// It used to flip the badge locally, which claimed a plan mode no turn
+/// was actually running in.
 #[test]
-fn plan_toggle_sets_mode_badge() {
+fn plan_toggle_asks_the_engine_and_the_badge_follows_it() {
+    use titi_cli::app::SubmitEffect;
+    use titi_engine::EngineEvent;
+    use titi_engine::protocol::SessionMode;
+
     let mut app = app();
     let mut input = String::new();
     assert!(!app.plan_mode());
     assert_eq!(
         app.handle_canonical("shift+alt+p", &mut input),
-        Dispatch::Handled(None)
+        Dispatch::Handled(Some(SubmitEffect::SetMode(SessionMode::Plan)))
     );
+    assert!(!app.plan_mode(), "the badge moved before the engine agreed");
+
+    app.ingest_engine_event(EngineEvent::ModeChanged {
+        mode: SessionMode::Plan,
+    });
     assert!(app.plan_mode());
     let joined = app.render().join("\n");
     assert!(joined.contains("plan"), "plan badge in status: {joined}");
+
+    assert_eq!(
+        app.handle_canonical("shift+alt+p", &mut input),
+        Dispatch::Handled(Some(SubmitEffect::SetMode(SessionMode::Agent)))
+    );
+    app.ingest_engine_event(EngineEvent::ModeChanged {
+        mode: SessionMode::Agent,
+    });
+    assert!(!app.plan_mode());
 }
 
 #[test]

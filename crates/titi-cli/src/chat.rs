@@ -20,7 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
-use titi_engine::protocol::JobInfo;
+use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -173,6 +173,8 @@ pub struct Chat {
     spent_tokens: u64,
     /// The cap `/budget` set, as the engine confirmed it.
     budget: Option<u64>,
+    /// The mode the engine confirmed it is in.
+    mode: SessionMode,
 }
 
 impl Chat {
@@ -214,6 +216,7 @@ impl Chat {
             jobs: Vec::new(),
             spent_tokens: 0,
             budget: None,
+            mode: SessionMode::Agent,
         }
     }
 
@@ -539,6 +542,11 @@ impl Chat {
                 );
                 Applied::none()
             }
+            EngineEvent::ModeChanged { mode } => {
+                self.mode = mode;
+                self.push(LineKind::Note, format!("mode: {}", mode.label()));
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -697,6 +705,8 @@ impl Chat {
             "jobs" => self.jobs(args),
             "advisor" => self.advisor(args),
             "budget" => self.budget(args),
+            "plan" => self.plan(args),
+            "done" => self.done(args),
             "goal" => self.goal(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
@@ -1296,6 +1306,37 @@ impl Chat {
         }
     }
 
+    /// `/plan` hands the engine a read-only mode: the next turns can look
+    /// at the repository but not change it.
+    fn plan(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /plan (got {args})"));
+            return Applied::none();
+        }
+        if self.mode == SessionMode::Plan {
+            self.push(LineKind::Note, "already planning · /done exits".to_owned());
+            return Applied::none();
+        }
+        Applied::effect(ChatEffect::Send(EngineCommand::SetMode {
+            mode: SessionMode::Plan,
+        }))
+    }
+
+    /// `/done` leaves plan mode, so the plan can be carried out.
+    fn done(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /done (got {args})"));
+            return Applied::none();
+        }
+        if self.mode == SessionMode::Agent {
+            self.push(LineKind::Note, "already in agent mode".to_owned());
+            return Applied::none();
+        }
+        Applied::effect(ChatEffect::Send(EngineCommand::SetMode {
+            mode: SessionMode::Agent,
+        }))
+    }
+
     /// `/advisor [question]` asks a toolless second opinion about this
     /// conversation. It is not a turn: nothing it says is acted on.
     fn advisor(&mut self, args: &str) -> Applied {
@@ -1719,6 +1760,14 @@ const COMMANDS: &[Command] = &[
         about: "cap the tokens this session may spend (usage: /budget 200k|off)",
     },
     Command {
+        name: "plan",
+        about: "plan mode: read the repo, change nothing",
+    },
+    Command {
+        name: "done",
+        about: "leave plan mode and act again",
+    },
+    Command {
         name: "whoami",
         about: "which providers have a key",
     },
@@ -2069,7 +2118,13 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
     } else {
         format!("  {} loop(s)", chat.jobs.len())
     };
-    let mid = format!("  {state}{loops}");
+    // The badge is the engine's mode, not a local toggle: it says what the
+    // next turn may actually do.
+    let mode = match chat.mode {
+        SessionMode::Agent => String::new(),
+        other => format!("  {}", other.label()),
+    };
+    let mid = format!("  {state}{mode}{loops}");
     let mut right = format!("{}{ctx}  {} ", chat.model, chat.session_label);
     let fixed = titi_tui::width::visible_width(left) + titi_tui::width::visible_width(&mid) + 2;
     let room = (width as usize).saturating_sub(fixed);
@@ -2975,6 +3030,8 @@ mod tests {
             "keys",
             "advisor",
             "budget",
+            "plan",
+            "done",
             "whoami",
         ] {
             assert!(
@@ -2982,6 +3039,63 @@ mod tests {
                 "/{name} dispatches but is not listed"
             );
         }
+    }
+
+    /// The badge is the engine's answer, not the keystroke: a mode the
+    /// engine never entered must not show as entered.
+    #[test]
+    fn plan_mode_enters_on_the_engines_word_and_done_leaves() {
+        /// The masthead row, where the badge lives. The transcript below it
+        /// also says "mode: plan", and that line is not the badge; the test
+        /// backend is 80 columns wide, so the first row is the first 80
+        /// characters of the frame.
+        fn badge(chat: &mut Chat) -> String {
+            frame_text(chat).chars().take(80).collect()
+        }
+
+        let mut chat = chat();
+        type_text(&mut chat, "/plan");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMode {
+                mode: SessionMode::Plan
+            }))
+        );
+        assert_eq!(chat.mode, SessionMode::Agent);
+        assert!(!badge(&mut chat).contains("plan"), "badge moved too early");
+
+        chat.on_event(EngineEvent::ModeChanged {
+            mode: SessionMode::Plan,
+        });
+        assert_eq!(chat.mode, SessionMode::Plan);
+        let shown = badge(&mut chat);
+        assert!(shown.contains("plan"), "{shown}");
+
+        type_text(&mut chat, "/done");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMode {
+                mode: SessionMode::Agent
+            }))
+        );
+        chat.on_event(EngineEvent::ModeChanged {
+            mode: SessionMode::Agent,
+        });
+        assert_eq!(chat.mode, SessionMode::Agent);
+        let shown = badge(&mut chat);
+        assert!(!shown.contains("plan"), "{shown}");
+    }
+
+    #[test]
+    fn done_outside_plan_mode_says_so_and_sends_nothing() {
+        let mut chat = chat();
+        type_text(&mut chat, "/done");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("already in agent mode"))
+        );
     }
 
     #[test]

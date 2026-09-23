@@ -24,6 +24,31 @@ pub enum AgentStatus {
     Failed,
 }
 
+/// What a session lets the agent reach for.
+///
+/// The mode picks the tools a turn is given, so a mode is not advice the
+/// model may ignore: in plan mode nothing that writes is registered, and a
+/// call it cannot make is a call it cannot make by mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Everything the surface registered: read, write, exec.
+    #[default]
+    Agent,
+    /// Read-only tools. The turn answers with a plan, not with a change.
+    Plan,
+}
+
+impl SessionMode {
+    /// The word the status bar shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Plan => "plan",
+        }
+    }
+}
+
 /// Commands accepted by every engine surface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EngineCommand {
@@ -110,6 +135,10 @@ pub enum EngineCommand {
     /// warned would be a budget that was already spent.
     SetBudget {
         tokens: Option<u64>,
+    },
+    /// Switch what the next turns are allowed to do.
+    SetMode {
+        mode: SessionMode,
     },
     Shutdown,
 }
@@ -284,6 +313,11 @@ pub enum EngineEvent {
     BudgetExceeded {
         spent: u64,
         limit: u64,
+    },
+    /// The mode the engine is now in. A surface badge follows this, never
+    /// its own keypress: the mode that matters is the one the turns run in.
+    ModeChanged {
+        mode: SessionMode,
     },
 }
 

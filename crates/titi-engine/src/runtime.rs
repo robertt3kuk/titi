@@ -61,6 +61,24 @@ async fn advisor_model(
     .await
 }
 
+/// The standing instruction a mode adds to the system prompt, if any.
+///
+/// The tools already enforce the mode; this only tells the model what the
+/// missing tools mean, so it answers with a plan instead of apologising for
+/// an edit tool it cannot find.
+fn mode_brief(mode: crate::protocol::SessionMode) -> Option<&'static str> {
+    match mode {
+        crate::protocol::SessionMode::Agent => None,
+        crate::protocol::SessionMode::Plan => Some(
+            "You are in plan mode. You can read the repository but you cannot \
+change it: no write, edit, or shell tool is available to you this turn, and \
+that is deliberate. Investigate, then answer with a plan — the files to \
+change, what changes in each, and what could go wrong. Do not ask for the \
+missing tools and do not pretend to have made the change.",
+        ),
+    }
+}
+
 /// The live repository index, shared by the command loop and its turns.
 type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
 
@@ -488,6 +506,8 @@ pub struct EngineRuntime {
     /// The cap has already been reported as reached, so the surface is not
     /// told again for every prompt that is refused afterwards.
     budget_tripped: bool,
+    /// What the next turns are allowed to do.
+    mode: crate::protocol::SessionMode,
 }
 
 impl EngineRuntime {
@@ -621,6 +641,7 @@ impl EngineRuntime {
             spent: Arc::new(AtomicU64::new(0)),
             budget: None,
             budget_tripped: false,
+            mode: crate::protocol::SessionMode::default(),
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -780,6 +801,12 @@ impl EngineRuntime {
                                     let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
                                 }
                             }
+                        }
+                        EngineCommand::SetMode { mode } => {
+                            // The running turn keeps the tools it started
+                            // with; the mode picks the tools of the next one.
+                            self.mode = mode;
+                            let _ = self.events.send(EngineEvent::ModeChanged { mode }).await;
                         }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
@@ -1093,12 +1120,28 @@ impl EngineRuntime {
         if let Some(skills) = self.skill_list() {
             parts.push(skills);
         }
+        if let Some(brief) = mode_brief(self.mode) {
+            parts.push(brief.to_owned());
+        }
         let joined = parts.join("\n\n");
         if joined.is_empty() {
             None
         } else {
             Some(joined.into())
         }
+    }
+
+    /// The registry this mode's turns get.
+    ///
+    /// Plan mode keeps read-tier tools only, so the turn cannot write,
+    /// patch, or run anything: the plan is the whole output, and a tool the
+    /// model was never handed is one it cannot reach for by mistake.
+    fn mode_tools(&self) -> ToolRegistry {
+        let mut tools = self.tools.clone();
+        if self.mode == crate::protocol::SessionMode::Plan {
+            tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
+        }
+        tools
     }
 
     /// `AGENTS.md` from the workspace and the agent directory. Flagged files
@@ -1200,7 +1243,7 @@ impl EngineRuntime {
         let config = self.config.clone();
         let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
-        let tools = self.tools.clone();
+        let tools = self.mode_tools();
         let waiters = Arc::clone(&self.approval_waiters);
         let trajectory = Arc::clone(&self.trajectory);
         let touched = Arc::clone(&self.touched);
