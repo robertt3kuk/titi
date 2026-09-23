@@ -169,6 +169,10 @@ pub fn prefer_available_models(
 pub struct ModelCatalog {
     startup: Vec<String>,
     registry: Option<Arc<ProviderRegistry>>,
+    /// Why a provider offered nothing, for surfaces with no registry behind
+    /// them (tests, embedded). A real catalog reads the registry's own list
+    /// live, because discovery answers long after this is built.
+    failures: Vec<titi_providers::DiscoveryError>,
 }
 
 impl ModelCatalog {
@@ -176,6 +180,7 @@ impl ModelCatalog {
         Self {
             startup,
             registry: Some(registry),
+            failures: Vec::new(),
         }
     }
 
@@ -184,6 +189,19 @@ impl ModelCatalog {
         Self {
             startup: models,
             registry: None,
+            failures: Vec::new(),
+        }
+    }
+
+    /// A fixed catalog that also carries the reasons it is short.
+    pub fn fixed_with_failures(
+        models: Vec<String>,
+        failures: Vec<titi_providers::DiscoveryError>,
+    ) -> Self {
+        Self {
+            startup: models,
+            registry: None,
+            failures,
         }
     }
 
@@ -201,6 +219,34 @@ impl ModelCatalog {
             }
         }
         ids
+    }
+
+    /// Why the list is short.
+    ///
+    /// A provider that refused the key looks exactly like a provider that has
+    /// no models, and the difference is the only one the user can do anything
+    /// about. Read at the same moments as [`ModelCatalog::ids`], and only
+    /// ever failures worth acting on — a local server that is not running
+    /// says nothing here.
+    pub fn discovery_failures(&self) -> Vec<titi_providers::DiscoveryError> {
+        let mut failures = self.failures.clone();
+        if let Some(registry) = &self.registry {
+            failures.extend(registry.discovery_errors());
+        }
+        failures
+    }
+}
+
+/// A refusal short enough for a one-line header, where the full sentence
+/// would be truncated away. The provider and the status are the two things
+/// the user needs; the rest is in the transcript line beside it.
+pub fn short_discovery_reason(error: &titi_providers::DiscoveryError) -> String {
+    match error.status() {
+        Some(status) => format!(
+            "{}: HTTP {status} — check the key with `titi --set-key`",
+            error.provider()
+        ),
+        None => format!("{}: no model list", error.provider()),
     }
 }
 

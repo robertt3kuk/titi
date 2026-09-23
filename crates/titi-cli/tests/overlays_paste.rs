@@ -233,6 +233,82 @@ async fn picker_offers_a_model_the_registry_learned_after_startup() {
     }
 }
 
+/// A gateway that refuses the key contributes no models, which on its own
+/// looks exactly like a gateway with nothing to offer. The picker has to say
+/// which it was, or the empty row is a dead end the user cannot act on.
+#[tokio::test]
+async fn picker_says_why_a_provider_refused_to_list() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = listener.local_addr().expect("bound address").port();
+    std::thread::spawn(move || {
+        let body = r#"{"error":{"message":"invalid api key"}}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for mut stream in listener.incoming().flatten() {
+            let _ = std::io::Read::read(&mut stream, &mut [0_u8; 1024]);
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+
+    let registry = Arc::new(
+        ProviderRegistry::new(
+            ProviderRegistryConfig {
+                providers: vec![ProviderDescriptor {
+                    id: "gatewayd".into(),
+                    api: ApiKind::OpenAiCompletions,
+                    base_url: format!("http://127.0.0.1:{port}/v1").into(),
+                    credential_env: None,
+                    credential_required: false,
+                }],
+                models: Vec::new(),
+            },
+            Arc::new(EnvCredentialSource),
+            Arc::new(HttpTransportFactory),
+        )
+        .expect("registry builds from one keyless provider"),
+    );
+
+    let mut app = app();
+    app.set_model_catalog(ModelCatalog::new(
+        vec!["openai/gpt-4.1".to_owned()],
+        Arc::clone(&registry),
+    ));
+
+    registry.spawn_local_discovery();
+    for _ in 0..100 {
+        if !registry.discovery_errors().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !registry.discovery_errors().is_empty(),
+        "the refusal never reached the registry"
+    );
+
+    app.open_model_picker();
+    let shown = app.render().join("\n");
+    assert!(
+        shown.contains("gatewayd") && shown.contains("401"),
+        "the picker opened without saying why the list is short: {shown}"
+    );
+    assert!(
+        shown.contains("titi --set-key"),
+        "the user is not told what to do about it: {shown}"
+    );
+
+    // The provider that refused costs only its own models: what the catalog
+    // already had is still selectable.
+    match app.overlay_input("\r") {
+        Some(titi_cli::app::OverlayOutcome::ModelSelected(id)) => {
+            assert_eq!(id, "openai/gpt-4.1");
+        }
+        other => panic!("expected the startup model, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session switcher
 // ---------------------------------------------------------------------------

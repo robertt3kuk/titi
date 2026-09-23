@@ -365,13 +365,39 @@ impl App {
     /// answers long after the first frame, and a picker that opens without
     /// its models is the whole bug. It is read once per opening, never per
     /// frame, because reading takes the registry's lock.
+    ///
+    /// A provider that refused the key is missing from the list for a reason
+    /// the user can fix, so the reason goes on the alert line as the picker
+    /// opens: a short list with no explanation is the bug this answers.
     pub fn open_model_picker(&mut self) {
         self.refresh_models();
         let models = self.model_choices();
         let labels = models.to_vec();
+        let failures = self.model_failures();
+        // The header is the only line inside the box, so it carries the
+        // short form; the full sentence, with what to do about it, goes to
+        // the transcript and the alert beside it.
+        let title = match failures.as_slice() {
+            [] => "Model".to_owned(),
+            [only] => format!("Model · {}", crate::engine::short_discovery_reason(only)),
+            many => format!("Model · {} providers refused the key", many.len()),
+        };
         self.overlay = Some(ActiveOverlay::ModelPicker(SelectionPanel::new(
-            "Model", models, labels,
+            &title, models, labels,
         )));
+        for failure in failures {
+            let reason = failure.to_string();
+            self.push_transcript(Section::Activity, reason.clone());
+            self.set_alert(reason);
+        }
+    }
+
+    /// Providers that refused to list, empty when nothing did.
+    fn model_failures(&self) -> Vec<titi_providers::DiscoveryError> {
+        self.model_catalog
+            .as_ref()
+            .map(crate::engine::ModelCatalog::discovery_failures)
+            .unwrap_or_default()
     }
 
     /// Show the session switcher: the live session first, then the ids

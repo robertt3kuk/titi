@@ -652,6 +652,12 @@ impl Chat {
         // Once per command, not per frame: a local server may have joined
         // since the last time the list was looked at.
         let models = self.catalog.ids();
+        // A provider that refused the key contributes nothing and looks
+        // exactly like a provider that has nothing — say which it was, or
+        // the user re-runs `/model` waiting for models that will never come.
+        for failure in self.catalog.discovery_failures() {
+            self.push(LineKind::Error, failure.to_string());
+        }
         if models.is_empty() {
             self.push(LineKind::Error, "no models".to_owned());
             return Some(Applied::none());
@@ -3173,6 +3179,58 @@ mod tests {
         }
         assert!(applied.log.is_none());
         assert!(!chat.turn_active);
+    }
+
+    /// A provider that refused the key contributes no models and looks
+    /// exactly like a provider that has none. `/model` has to say which.
+    #[test]
+    fn slash_model_shows_why_a_provider_listed_nothing() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed_with_failures(
+            vec!["openai/gpt-4.1".to_owned()],
+            vec![titi_providers::DiscoveryError::Unauthorized {
+                provider: "opencode-go".into(),
+                status: 401,
+            }],
+        );
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+
+        let reason = chat
+            .lines
+            .iter()
+            .find(|line| line.text.contains("opencode-go"))
+            .unwrap_or_else(|| panic!("no reason in the transcript: {:?}", chat.lines));
+        assert_eq!(reason.kind, LineKind::Error);
+        assert!(reason.text.contains("401"), "{}", reason.text);
+        assert!(
+            reason.text.contains("titi --set-key"),
+            "the user is not told what to do: {}",
+            reason.text
+        );
+    }
+
+    /// An empty list with a reason behind it must not read as "no models"
+    /// alone: that is the case the reason exists for.
+    #[test]
+    fn slash_model_with_nothing_left_still_names_the_refusal() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed_with_failures(
+            Vec::new(),
+            vec![titi_providers::DiscoveryError::Forbidden {
+                provider: "openai".into(),
+                status: 403,
+            }],
+        );
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+
+        let texts: Vec<&str> = chat.lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|text| text.contains("openai")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|text| *text == "no models"), "{texts:?}");
     }
 
     #[test]

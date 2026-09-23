@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use titi_providers::{
-    ApiKind, CredKind, Credential, FamilyTransport, HttpFetch, HttpRequest, LadderLevel, Transport,
-    TransportError,
+    ApiKind, CredKind, Credential, DiscoveryError, FamilyTransport, HttpFetch, LadderLevel,
+    Transport, TransportError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,9 +63,6 @@ const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// otherwise bury the paid models in `/model` and in the prompt.
 pub const MAX_DISCOVERED_MODELS: usize = 64;
 
-/// Most bytes read from a model listing before giving up on it.
-const MAX_DISCOVERY_BODY: usize = 256 * 1024;
-
 /// Longest model id accepted from a server.
 const MAX_MODEL_ID: usize = 96;
 
@@ -81,49 +78,24 @@ fn is_usable_model_id(id: &str) -> bool {
         })
 }
 
-/// Model ids an OpenAI-compatible server lists at `GET <base_url>/models`.
+/// Model ids an OpenAI-compatible server lists, as this catalog names them.
 ///
-/// Every failure — refused connection, error status, body that is not the
-/// OpenAI model list — means "this server has nothing to offer right now",
-/// never a hard error: an absent local server must cost a missing entry in
-/// `/model`, not a failed start.
+/// The listing itself belongs to [`titi_providers::list_models`], which keeps
+/// *why* it failed; this function adds the catalog's own policy on top — which
+/// ids are printable, and how many a single server may contribute.
+///
+/// Discovery only ever runs for providers that need no credential, so no key
+/// is sent. A server that still answers 401 or 403 is one the user has to fix,
+/// and the error says so rather than reading as an empty catalog.
 pub async fn discover_models(
     provider: &ProviderDescriptor,
     fetch: &dyn HttpFetch,
-) -> Vec<ModelDescriptor> {
-    let request = HttpRequest {
-        method: "GET".into(),
-        url: format!("{}/models", provider.base_url.trim_end_matches('/')).into(),
-        headers: vec![("accept".into(), "application/json".into())],
-        body: None,
-    };
-    let Ok(response) = fetch.fetch(request).await else {
-        return Vec::new();
-    };
-    if response.status >= 400 {
-        return Vec::new();
-    }
-    let mut body = Vec::new();
-    let mut chunks = response.body;
-    while let Some(chunk) = futures::StreamExt::next(&mut chunks).await {
-        let Ok(bytes) = chunk else {
-            return Vec::new();
-        };
-        if body.len() + bytes.len() > MAX_DISCOVERY_BODY {
-            return Vec::new();
-        }
-        body.extend_from_slice(&bytes);
-    }
-    let Ok(listing) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return Vec::new();
-    };
-    let Some(entries) = listing.get("data").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
-    };
-    entries
+) -> Result<Vec<ModelDescriptor>, DiscoveryError> {
+    let wire_models =
+        titi_providers::list_models(&provider.id, &provider.base_url, None, fetch).await?;
+    Ok(wire_models
         .iter()
-        .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-        .map(str::trim)
+        .map(|wire| wire.as_str())
         .filter(|wire| is_usable_model_id(wire))
         .take(MAX_DISCOVERED_MODELS)
         .map(|wire| ModelDescriptor {
@@ -132,7 +104,7 @@ pub async fn discover_models(
             wire_model: wire.into(),
             context_window: None,
         })
-        .collect()
+        .collect())
 }
 
 pub struct ResolvedModel {
@@ -257,6 +229,11 @@ pub struct ProviderRegistry {
     /// Late-filling: a local server's models are only known once it answers,
     /// and the start path must not wait for that.
     models: std::sync::RwLock<HashMap<SmolStr, ModelDescriptor>>,
+    /// Why a provider contributed nothing, when the reason is the user's to
+    /// act on. Keyed by provider, so a refresh replaces its own last word
+    /// instead of stacking duplicates, and ordered so a surface lists them
+    /// the same way twice.
+    discovery_errors: std::sync::RwLock<BTreeMap<SmolStr, DiscoveryError>>,
     credentials: Arc<dyn CredentialSource>,
 }
 
@@ -303,6 +280,7 @@ impl ProviderRegistry {
         Ok(Self {
             providers,
             models: std::sync::RwLock::new(models),
+            discovery_errors: std::sync::RwLock::new(BTreeMap::new()),
             credentials,
         })
     }
@@ -314,6 +292,19 @@ impl ProviderRegistry {
         let mut ids: Vec<_> = models.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Discovery failures worth telling the user about, by provider.
+    ///
+    /// Only the ones a key change would fix. A provider that is simply not
+    /// running, answers 404, or returns something that is not a listing has
+    /// nothing to offer and nothing to say — that is its normal state, and
+    /// reporting it would make every session start with a warning.
+    pub fn discovery_errors(&self) -> Vec<DiscoveryError> {
+        let Ok(errors) = self.discovery_errors.read() else {
+            return Vec::new();
+        };
+        errors.values().cloned().collect()
     }
 
     /// Asks every credential-free provider what it can serve, in the
@@ -358,14 +349,45 @@ impl ProviderRegistry {
             .collect()
     }
 
-    /// Folds one provider's current model list into the catalog.
+    /// Folds one provider's current model list into the catalog, and keeps
+    /// the reason when there is no list.
+    ///
+    /// One provider's refusal is its own: the listing runs per provider, so a
+    /// gateway that rejects the key costs that gateway's models and nothing
+    /// else. The others keep filling the catalog around it.
     async fn refresh_models(&self, provider: &ProviderDescriptor, fetch: &dyn HttpFetch) {
         // Bounds a task rather than a person: a socket that accepts and never
         // answers must not pin a listing future for the life of the process.
-        if let Ok(models) =
+        let Ok(listing) =
             tokio::time::timeout(DISCOVERY_TIMEOUT, discover_models(provider, fetch)).await
-        {
-            self.add_models(models);
+        else {
+            return;
+        };
+        match listing {
+            Ok(models) => {
+                self.clear_discovery_error(&provider.id);
+                self.add_models(models);
+            }
+            // The credential is what has to change, and only the user can
+            // change it, so this one is kept for the surface to show.
+            Err(error) if error.is_auth() => self.record_discovery_error(error),
+            // Not running, no such endpoint, not a listing: this provider
+            // has nothing to offer right now, which is not news.
+            Err(_) => {}
+        }
+    }
+
+    fn record_discovery_error(&self, error: DiscoveryError) {
+        if let Ok(mut errors) = self.discovery_errors.write() {
+            errors.insert(error.provider().into(), error);
+        }
+    }
+
+    /// A listing that arrives clears the provider's last complaint: the key
+    /// the user fixed must not keep warning them.
+    fn clear_discovery_error(&self, provider: &str) {
+        if let Ok(mut errors) = self.discovery_errors.write() {
+            errors.remove(provider);
         }
     }
 
@@ -719,7 +741,9 @@ mod tests {
         ]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
-        let found = discover_models(&provider, &fetch).await;
+        let found = discover_models(&provider, &fetch)
+            .await
+            .expect("a listing the server answered");
 
         let ids: Vec<&str> = found.iter().map(|model| model.id.as_str()).collect();
         assert_eq!(ids, vec!["ollama/qwen3:8b", "ollama/llama3.2"]);
@@ -729,6 +753,8 @@ mod tests {
         assert_eq!(requests[0].url.as_str(), "http://127.0.0.1:11434/v1/models");
     }
 
+    /// A server that is simply not running has nothing to offer, and that is
+    /// its normal state: an empty list, not a reason anyone has to read.
     #[tokio::test]
     async fn discovery_is_silent_when_nothing_answers() {
         let fetch = titi_providers::MockFetch::new(vec![Err(TransportError::Retryable {
@@ -737,7 +763,52 @@ mod tests {
         })]);
         let provider = gateway("lmstudio", "http://127.0.0.1:1234/v1", None);
 
-        assert!(discover_models(&provider, &fetch).await.is_empty());
+        let error = discover_models(&provider, &fetch)
+            .await
+            .expect_err("an unreachable server is reported, not invented");
+        assert!(!error.is_auth(), "{error}");
+        assert_eq!(error.provider(), "lmstudio");
+    }
+
+    /// A key the provider refuses is the one failure a user can act on, so
+    /// it must survive the call instead of reading as an empty catalog.
+    #[tokio::test]
+    async fn discovery_keeps_the_reason_a_key_was_refused() {
+        for (status, label) in [(401u16, "unauthorized"), (403, "forbidden")] {
+            let fetch =
+                titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
+                    status,
+                    chunks: vec![r#"{"error":{"message":"invalid api key"}}"#.to_owned()],
+                })]);
+            let provider = gateway("openai", "https://api.openai.com/v1", None);
+
+            let error = discover_models(&provider, &fetch)
+                .await
+                .expect_err("a refused key is not an empty listing");
+
+            assert!(error.is_auth(), "{label}: {error}");
+            assert_eq!(error.provider(), "openai");
+            assert_eq!(error.status(), Some(status));
+            let shown = error.to_string();
+            assert!(shown.contains("openai"), "{shown}");
+            assert!(shown.contains(&status.to_string()), "{shown}");
+        }
+    }
+
+    /// A provider with no listing endpoint at all is not a problem to report.
+    #[tokio::test]
+    async fn a_missing_listing_endpoint_is_not_an_auth_failure() {
+        let fetch = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
+            status: 404,
+            chunks: vec!["not found".to_owned()],
+        })]);
+        let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
+
+        let error = discover_models(&provider, &fetch)
+            .await
+            .expect_err("404 is still an answer, not a listing");
+        assert!(!error.is_auth(), "{error}");
+        assert_eq!(error.status(), Some(404));
     }
 
     /// The listing is untrusted input: a thousand pulled tags must not bury
@@ -755,7 +826,9 @@ mod tests {
         let fetch = titi_providers::MockFetch::sse(vec![body]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
-        let found = discover_models(&provider, &fetch).await;
+        let found = discover_models(&provider, &fetch)
+            .await
+            .expect("the flood still parses");
 
         assert_eq!(found.len(), MAX_DISCOVERED_MODELS);
         assert!(
@@ -822,6 +895,91 @@ mod tests {
 
         assert_eq!(registry.model_ids(), vec![SmolStr::from("ollama/qwen3:8b")]);
         assert!(registry.resolve("ollama/qwen3:8b").is_ok());
+    }
+
+    /// One refused key costs that provider's models and nothing else: the
+    /// rest of the catalog still fills, and the reason is kept where a
+    /// surface can read it.
+    #[tokio::test]
+    async fn a_refused_key_is_reported_without_stopping_the_other_providers() {
+        let config = ProviderRegistryConfig {
+            providers: vec![
+                gateway("gatewayd", "http://127.0.0.1:8080/v1", None),
+                gateway("ollama", "http://127.0.0.1:11434/v1", None),
+            ],
+            models: Vec::new(),
+        };
+        let registry = ProviderRegistry::new(
+            config,
+            Arc::new(NoCredentials),
+            Arc::new(RecordingFactory::default()),
+        )
+        .expect("registry builds");
+
+        let refusing = gateway("gatewayd", "http://127.0.0.1:8080/v1", None);
+        let refused = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
+            status: 401,
+            chunks: vec![r#"{"error":"invalid api key"}"#.to_owned()],
+        })]);
+        registry.refresh_models(&refusing, &refused).await;
+
+        let answering = gateway("ollama", "http://127.0.0.1:11434/v1", None);
+        let listing =
+            titi_providers::MockFetch::sse(vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()]);
+        registry.refresh_models(&answering, &listing).await;
+
+        assert_eq!(registry.model_ids(), vec![SmolStr::from("ollama/qwen3:8b")]);
+        let reported = registry.discovery_errors();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].provider(), "gatewayd");
+        assert!(reported[0].is_auth());
+        assert!(
+            reported[0].to_string().contains("401"),
+            "{}",
+            reported[0].to_string()
+        );
+    }
+
+    /// A provider that is only quiet is not worth a warning, and a key the
+    /// user fixed must stop warning them.
+    #[tokio::test]
+    async fn only_auth_failures_are_kept_and_a_good_listing_clears_them() {
+        let config = ProviderRegistryConfig {
+            providers: vec![gateway("ollama", "http://127.0.0.1:11434/v1", None)],
+            models: Vec::new(),
+        };
+        let registry = ProviderRegistry::new(
+            config,
+            Arc::new(NoCredentials),
+            Arc::new(RecordingFactory::default()),
+        )
+        .expect("registry builds");
+        let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
+
+        let unreachable = titi_providers::MockFetch::new(vec![Err(TransportError::Retryable {
+            status: None,
+            message: "connection refused".into(),
+        })]);
+        registry.refresh_models(&provider, &unreachable).await;
+        assert!(
+            registry.discovery_errors().is_empty(),
+            "a server that is not running is not news"
+        );
+
+        let refused = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
+            status: 403,
+            chunks: vec!["forbidden".to_owned()],
+        })]);
+        registry.refresh_models(&provider, &refused).await;
+        assert_eq!(registry.discovery_errors().len(), 1);
+
+        let listing =
+            titi_providers::MockFetch::sse(vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()]);
+        registry.refresh_models(&provider, &listing).await;
+        assert!(
+            registry.discovery_errors().is_empty(),
+            "the fixed key kept warning"
+        );
     }
 
     /// A late answer joins the catalog; it never overwrites what the user
