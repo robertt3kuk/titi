@@ -102,6 +102,8 @@ pub struct App {
     space_hold: SpaceHold,
     /// In-memory Agent Hub roster (Main is filtered at paint time).
     hub_peers: Vec<HubPeer>,
+    /// Membership in the local hub broker, when `/join` connected.
+    hub: crate::hub::HubSession,
     /// Submitted prompts for `app.history.search` / `app.retry`.
     prompt_history: Vec<String>,
     last_prompt: Option<String>,
@@ -160,6 +162,7 @@ impl App {
             stt_state: SttState::Idle,
             space_hold: SpaceHold::new(),
             hub_peers: Vec::new(),
+            hub: crate::hub::HubSession::default(),
             prompt_history: Vec::new(),
             last_prompt: None,
             history_next_id: 1,
@@ -245,6 +248,9 @@ impl App {
         );
         registry.register_builtin("recap", "Session recap: turns, tools, files, problems");
         registry.register_builtin("goal", "Run the coder/reviewer goal loop");
+        registry.register_builtin("hub", "Show or hide the hub roster");
+        registry.register_builtin("join", "Join the local hub (usage: /join [name])");
+        registry.register_builtin("leave", "Leave the local hub");
         registry
     }
 
@@ -456,6 +462,112 @@ impl App {
             self.hub_peers.clone(),
             Arc::clone(&self.theme),
         )));
+    }
+
+    /// `/hub` — open the roster overlay, or close it if it is already up.
+    pub fn toggle_agents_hub(&mut self) {
+        if matches!(self.overlay, Some(ActiveOverlay::Hub(_))) {
+            self.overlay = None;
+            return;
+        }
+        self.open_agents_hub();
+    }
+
+    /// `/join [name]` — put this surface on the local hub roster.
+    ///
+    /// A missing broker is reported as a note, not an error: running
+    /// without one is the ordinary case.
+    pub fn join_hub(&mut self, name: &str) {
+        self.join_hub_in(&titi_config::agent_dir(), name);
+    }
+
+    /// `/join` against a given agent directory. Tests point this at a
+    /// temporary broker instead of the user's own.
+    pub fn join_hub_in(&mut self, agent_dir: &std::path::Path, name: &str) {
+        let name = match (name.trim(), self.session_id.as_deref()) {
+            ("", Some(session)) => session.to_owned(),
+            ("", None) => "titi".to_owned(),
+            (given, _) => given.to_owned(),
+        };
+        match self.hub.join(agent_dir, &name) {
+            Ok(()) => {
+                self.sync_hub_roster();
+                self.set_alert(format!("hub: joined as {name}"));
+            }
+            Err(reason) => self.set_alert(format!("hub: {reason}")),
+        }
+    }
+
+    /// `/leave` — drop the hub connection, which unregisters this peer.
+    pub fn leave_hub(&mut self) {
+        match self.hub.leave() {
+            Some(id) => {
+                self.sync_hub_roster();
+                self.set_alert(format!("hub: left as {id}"));
+            }
+            None => self.set_alert("hub: not joined"),
+        }
+    }
+
+    /// Drains the broker's pushed events. Never blocks: the caller runs
+    /// this on the same tick as everything else.
+    pub fn poll_hub(&mut self) {
+        for update in self.hub.poll() {
+            match update {
+                crate::hub::HubUpdate::Roster => self.sync_hub_roster(),
+                crate::hub::HubUpdate::Message { from, to, message } => {
+                    let scope = if to.is_some() { "" } else { " (all)" };
+                    self.push_transcript(
+                        Section::Activity,
+                        format!("hub {from}{scope}: {message}"),
+                    );
+                    self.set_alert(format!("hub {from}: {message}"));
+                }
+                crate::hub::HubUpdate::Refused(reason) => {
+                    self.set_alert(format!("hub: {reason}"));
+                }
+                crate::hub::HubUpdate::Disconnected => {
+                    self.sync_hub_roster();
+                    self.set_alert("hub: the broker went away");
+                }
+            }
+        }
+    }
+
+    /// Mirrors the broker's roster into the overlay's rows.
+    ///
+    /// Broker peers are separate processes, so their rows are replaced
+    /// wholesale rather than merged — a peer that left has to leave the
+    /// roster with it. This session's own subagents are not the broker's
+    /// to remove: they carry a `parent_id` and are kept as they were.
+    fn sync_hub_roster(&mut self) {
+        let mine = self.hub.agent_id().unwrap_or_default().to_owned();
+        let mut rows: Vec<HubPeer> = self
+            .hub_peers
+            .iter()
+            .filter(|peer| peer.parent_id.is_some())
+            .cloned()
+            .collect();
+        for id in self.hub.peers() {
+            if rows.iter().any(|row| &row.id == id) {
+                continue;
+            }
+            rows.push(HubPeer {
+                id: id.clone(),
+                display_name: id.clone(),
+                kind: if id == &mine {
+                    AgentKind::Main
+                } else {
+                    AgentKind::Sub
+                },
+                parent_id: None,
+                status: AgentStatus::Idle,
+            });
+        }
+        self.set_hub_peers(rows);
+        if let Some(ActiveOverlay::Hub(roster)) = &mut self.overlay {
+            *roster = HubRoster::with_theme(self.hub_peers.clone(), Arc::clone(&self.theme));
+        }
     }
 
     /// Replace the in-memory hub roster (tests / future broker ingest).
@@ -1661,6 +1773,18 @@ impl App {
                         }
                     }
                 }
+                None
+            }
+            "hub" => {
+                self.toggle_agents_hub();
+                None
+            }
+            "join" => {
+                self.join_hub(args);
+                None
+            }
+            "leave" => {
+                self.leave_hub();
                 None
             }
             "mouse" => {

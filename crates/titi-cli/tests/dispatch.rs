@@ -155,6 +155,70 @@ fn live_toggle_and_hub_overlay() {
     assert!(app.overlay_open());
 }
 
+/// The roster is the broker's, not a hand-written list: joining fills it,
+/// a peer leaving empties its row, and a message lands in the transcript.
+#[test]
+fn the_broker_drives_the_hub_roster_and_the_transcript() {
+    let dir = tempfile::tempdir().expect("temp");
+    let broker = titi_core::hub::HubBroker::bind(dir.path()).expect("broker");
+    let peer = titi_core::hub::HubClient::connect(dir.path(), "scout").expect("peer");
+
+    let mut app = app();
+    app.join_hub_in(dir.path(), "main");
+    let ids: Vec<&str> = app.hub_peers().iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"main"), "{ids:?}");
+    assert!(ids.contains(&"scout"), "{ids:?}");
+
+    peer.broadcast("ci is red").expect("broadcast");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut heard = false;
+    while std::time::Instant::now() < deadline && !heard {
+        app.poll_hub();
+        // The activity section may be collapsed; the alert line is what the
+        // user sees either way.
+        heard = app.render().join("\n").contains("ci is red");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(heard, "the broadcast never reached the transcript");
+
+    // A peer that drops leaves the roster with it.
+    drop(peer);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && app.hub_peers().iter().any(|p| p.id == "scout") {
+        app.poll_hub();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let ids: Vec<&str> = app.hub_peers().iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, vec!["main"], "{ids:?}");
+
+    app.leave_hub();
+    assert!(app.hub_peers().is_empty());
+    broker.shutdown();
+}
+
+/// `/hub` opens the roster overlay and closes it again.
+#[test]
+fn slash_hub_toggles_the_roster_overlay() {
+    let mut app = app();
+    let mut input = "/hub".to_owned();
+    app.handle_canonical("enter", &mut input);
+    assert!(app.overlay_open());
+    let mut input = "/hub".to_owned();
+    app.handle_canonical("enter", &mut input);
+    assert!(!app.overlay_open());
+}
+
+/// Without a broker `/join` is a note on the alert line, not a crash.
+#[test]
+fn slash_join_without_a_broker_is_soft() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut app = app();
+    app.join_hub_in(dir.path(), "main");
+    let joined = app.render().join("\n");
+    assert!(joined.contains("no hub broker running"), "{joined}");
+    assert!(app.hub_peers().is_empty());
+}
+
 #[test]
 fn history_search_picks_prompt() {
     let mut app = app();

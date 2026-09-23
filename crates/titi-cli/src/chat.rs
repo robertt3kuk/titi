@@ -25,6 +25,7 @@ use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::herdr::{self, AgentState};
+use crate::hub::{HubSession, HubUpdate};
 use crate::session_log::SessionLog;
 
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
@@ -175,6 +176,10 @@ pub struct Chat {
     budget: Option<u64>,
     /// The mode the engine confirmed it is in.
     mode: SessionMode,
+    /// Membership in the local hub, when `/join` connected.
+    hub: HubSession,
+    /// Whether the roster panel is shown (`/hub`).
+    hub_open: bool,
 }
 
 impl Chat {
@@ -217,6 +222,8 @@ impl Chat {
             spent_tokens: 0,
             budget: None,
             mode: SessionMode::Agent,
+            hub: HubSession::default(),
+            hub_open: false,
         }
     }
 
@@ -702,6 +709,9 @@ impl Chat {
             "switch" => self.switch(args),
             "settings" => self.settings(),
             "duck" => self.duck(args),
+            "hub" => self.toggle_hub(args),
+            "join" => self.join_hub(args),
+            "leave" => self.leave_hub(args),
             "loop" => self.start_loop(args),
             "jobs" => self.jobs(args),
             "advisor" => self.advisor(args),
@@ -1353,6 +1363,89 @@ impl Chat {
         }))
     }
 
+    /// `/join [name]` puts this session on the local hub roster. The name
+    /// defaults to the session id, which is what other peers address.
+    fn join_hub(&mut self, args: &str) -> Applied {
+        let name = args.trim();
+        let name = if name.is_empty() {
+            self.session_id.clone()
+        } else {
+            name.to_owned()
+        };
+        let agent_dir = self.agent_dir.clone();
+        match self.hub.join(&agent_dir, &name) {
+            Ok(()) => {
+                let peers = self.hub.peers().len();
+                self.hub_open = true;
+                self.push(
+                    LineKind::Note,
+                    format!("joined the hub as {name} · {peers} on the roster"),
+                );
+            }
+            // A missing broker is the ordinary case, not a broken screen.
+            Err(reason) => self.push(LineKind::Note, format!("hub: {reason}")),
+        }
+        Applied::none()
+    }
+
+    /// `/leave` drops the hub connection, which unregisters this peer.
+    fn leave_hub(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /leave (got {args})"));
+            return Applied::none();
+        }
+        match self.hub.leave() {
+            Some(id) => {
+                self.hub_open = false;
+                self.push(LineKind::Note, format!("left the hub as {id}"));
+            }
+            None => self.push(LineKind::Note, "hub: not joined".to_owned()),
+        }
+        Applied::none()
+    }
+
+    /// `/hub` shows or hides the roster panel.
+    fn toggle_hub(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /hub (got {args})"));
+            return Applied::none();
+        }
+        self.hub_open = !self.hub_open;
+        if self.hub_open && !self.hub.joined() {
+            self.push(
+                LineKind::Note,
+                "hub: not joined · /join connects".to_owned(),
+            );
+        }
+        Applied::none()
+    }
+
+    /// Drains whatever the broker pushed since the last frame.
+    ///
+    /// Always `try_recv`: the hub is a convenience, and the chat loop must
+    /// not wait on a socket that may have no one behind it.
+    pub fn poll_hub(&mut self) {
+        for update in self.hub.poll() {
+            match update {
+                HubUpdate::Roster => {}
+                HubUpdate::Message { from, to, message } => {
+                    let scope = if to.is_some() { "" } else { " (all)" };
+                    self.push(
+                        LineKind::Note,
+                        format!("hub {from}{scope}: {}", one_line(&message, TOOL_PREVIEW)),
+                    );
+                }
+                HubUpdate::Refused(reason) => {
+                    self.push(LineKind::Error, format!("hub: {reason}"));
+                }
+                HubUpdate::Disconnected => {
+                    self.hub_open = false;
+                    self.push(LineKind::Error, "hub: the broker went away".to_owned());
+                }
+            }
+        }
+    }
+
     /// `/advisor [question]` asks a toolless second opinion about this
     /// conversation. It is not a turn: nothing it says is acted on.
     fn advisor(&mut self, args: &str) -> Applied {
@@ -1780,6 +1873,18 @@ const COMMANDS: &[Command] = &[
         about: "duck mode: talk it through, repo-blind and toolless",
     },
     Command {
+        name: "hub",
+        about: "show or hide the hub roster",
+    },
+    Command {
+        name: "join",
+        about: "join the local hub (usage: /join [name])",
+    },
+    Command {
+        name: "leave",
+        about: "leave the local hub",
+    },
+    Command {
         name: "plan",
         about: "plan mode: read the repo, change nothing",
     },
@@ -2045,25 +2150,68 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
         return;
     }
     let picker_h = picker_height(chat);
+    let roster_h = roster_height(chat, area.height);
     let cols = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(roster_h),
         Constraint::Min(1),
         Constraint::Length(picker_h),
         Constraint::Length(4),
     ])
     .split(area);
     frame.render_widget(masthead(chat, cols[0].width, &ink), cols[0]);
-    let (body, photos) = if chat.lines.is_empty() {
-        (empty_state(cols[1].height, &ink), Vec::new())
-    } else {
-        transcript(chat, cols[1].width, cols[1].height, &ink)
-    };
-    frame.render_widget(body, cols[1]);
-    paint_photos(frame, cols[1], &photos, &ink);
-    if picker_h > 0 {
-        frame.render_widget(command_picker(chat, cols[2].width, &ink), cols[2]);
+    if roster_h > 0 {
+        frame.render_widget(roster(chat, &ink), cols[1]);
     }
-    frame.render_widget(composer(chat, cols[3].width, &ink), cols[3]);
+    let (body, photos) = if chat.lines.is_empty() {
+        (empty_state(cols[2].height, &ink), Vec::new())
+    } else {
+        transcript(chat, cols[2].width, cols[2].height, &ink)
+    };
+    frame.render_widget(body, cols[2]);
+    paint_photos(frame, cols[2], &photos, &ink);
+    if picker_h > 0 {
+        frame.render_widget(command_picker(chat, cols[3].width, &ink), cols[3]);
+    }
+    frame.render_widget(composer(chat, cols[4].width, &ink), cols[4]);
+}
+
+/// Rows the roster panel takes: one per peer plus its heading, capped so a
+/// crowded hub cannot squeeze the conversation off the screen.
+fn roster_height(chat: &Chat, total: u16) -> u16 {
+    if !chat.hub_open {
+        return 0;
+    }
+    let rows = chat.hub.peers().len().max(1) + 1;
+    let cap = (total / 3).max(2);
+    (rows as u16).min(cap)
+}
+
+/// Who is on the hub right now, this session marked as itself.
+fn roster(chat: &Chat, ink: &Ink) -> Paragraph<'static> {
+    let mine = chat.hub.agent_id().unwrap_or_default().to_owned();
+    let mut rows = vec![Line::from(Span::styled(
+        format!(" hub · {} peer(s)", chat.hub.peers().len()),
+        ink.fg(ink.accent).add_modifier(Modifier::BOLD),
+    ))];
+    if chat.hub.peers().is_empty() {
+        rows.push(Line::from(Span::styled(
+            "  nobody here · /join connects",
+            ink.fg(ink.dim),
+        )));
+    }
+    for peer in chat.hub.peers() {
+        let (mark, color) = if peer == &mine {
+            ("you", ink.gold)
+        } else {
+            ("·", ink.muted)
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("  {mark} "), ink.fg(color)),
+            Span::styled(peer.clone(), ink.fg(ink.text)),
+        ]));
+    }
+    Paragraph::new(rows).style(ink.page())
 }
 
 /// Dark red. Body text stays warm white so a long reply is still readable.
@@ -2664,6 +2812,9 @@ fn pump(
             }
         }
     }
+    // Same tick as the engine, and just as non-blocking: an unhosted hub
+    // costs one `try_recv` that returns nothing.
+    chat.poll_hub();
     Ok(false)
 }
 
@@ -3053,6 +3204,9 @@ mod tests {
             "plan",
             "done",
             "duck",
+            "hub",
+            "join",
+            "leave",
             "whoami",
         ] {
             assert!(
@@ -3141,6 +3295,121 @@ mod tests {
             Some(ChatEffect::Send(EngineCommand::SetMode {
                 mode: SessionMode::Agent
             }))
+        );
+    }
+
+    /// A hub nobody is hosting is the ordinary case: `/join` says so and
+    /// the screen carries on.
+    #[test]
+    fn join_without_a_broker_is_a_note_not_a_failure() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/join");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Note
+                    && line.text.contains("no hub broker running")),
+            "{:?}",
+            chat.lines
+        );
+        assert!(!chat.hub.joined());
+    }
+
+    #[test]
+    fn presence_fills_the_roster_panel_and_hub_toggles_it() {
+        let mut chat = chat();
+        chat.hub.ingest(titi_core::hub::HubEvent::Presence {
+            agents: vec!["session-123".into(), "scout".into()],
+        });
+        // The panel is hidden until /hub asks for it.
+        assert!(!frame_text(&mut chat).contains("scout"));
+
+        type_text(&mut chat, "/hub");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        let view = frame_text(&mut chat);
+        assert!(view.contains("scout"), "{view}");
+        assert!(view.contains("2 peer(s)"), "{view}");
+
+        type_text(&mut chat, "/hub");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(!frame_text(&mut chat).contains("scout"));
+    }
+
+    /// A peer that leaves has to leave the roster too.
+    #[test]
+    fn a_peer_leaving_drops_off_the_roster() {
+        let mut chat = chat();
+        chat.hub.ingest(titi_core::hub::HubEvent::Presence {
+            agents: vec!["scout".into(), "builder".into()],
+        });
+        chat.hub.ingest(titi_core::hub::HubEvent::Left {
+            agent_id: "scout".into(),
+        });
+        chat.hub_open = true;
+        let view = frame_text(&mut chat);
+        assert!(view.contains("builder"), "{view}");
+        assert!(!view.contains("scout"), "{view}");
+    }
+
+    /// The whole path against a real broker: `/join` registers, the roster
+    /// fills, and a peer's broadcast reaches the transcript through the same
+    /// non-blocking poll the pump runs.
+    #[test]
+    fn a_joined_session_hears_its_peers() {
+        let dir = tempfile::tempdir().expect("temp");
+        let broker = titi_core::hub::HubBroker::bind(dir.path()).expect("broker");
+        let peer = titi_core::hub::HubClient::connect(dir.path(), "scout").expect("peer");
+
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/join");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(chat.hub.joined());
+        assert_eq!(chat.hub.agent_id(), Some("session-123"));
+        let view = frame_text(&mut chat);
+        assert!(view.contains("scout"), "{view}");
+
+        peer.broadcast("ci is red").expect("broadcast");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            chat.poll_hub();
+            if chat
+                .lines
+                .iter()
+                .any(|line| line.text.contains("ci is red"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            chat.lines.iter().any(
+                |line| line.kind == LineKind::Note && line.text == "hub scout (all): ci is red"
+            ),
+            "{:?}",
+            chat.lines
+        );
+
+        type_text(&mut chat, "/leave");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(!chat.hub.joined());
+        drop(peer);
+        broker.shutdown();
+    }
+
+    #[test]
+    fn leave_without_a_hub_says_so() {
+        let mut chat = chat();
+        type_text(&mut chat, "/leave");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("hub: not joined"))
         );
     }
 
