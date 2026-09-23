@@ -263,3 +263,112 @@ async fn a_session_can_start_in_duck_mode() {
         "a duck session started with tools"
     );
 }
+
+/// A network-tier tool named like the real one, so the duck registry keeps
+/// it and the tier that used to park the turn is the tier under test.
+struct FakeSearchTool(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl titi_tools::ToolHandler for FakeSearchTool {
+    fn definition(&self) -> titi_tools::ToolDefinition {
+        titi_tools::ToolDefinition {
+            spec: titi_providers::ToolSpec {
+                name: "web_search".into(),
+                description: "Search the web".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                }),
+            },
+            approval: titi_tools::ApprovalTier::Network,
+        }
+    }
+
+    async fn invoke(&self, _args: serde_json::Value) -> titi_tools::ToolResult {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        titi_tools::ToolResult {
+            output: "one result".into(),
+            is_error: false,
+        }
+    }
+}
+
+/// Duck mode is a conversation, and searching is the one thing it can do.
+/// Under the session's own `Write` mode a network call would park on an
+/// approval — which is a prompt nobody asked for on a TUI and a hang in
+/// headless — so the duck turn runs its allowlist without asking.
+#[tokio::test]
+async fn duck_mode_searches_without_asking_for_approval() {
+    use titi_providers::{BlockId, StreamEvent, ToolCallRef};
+
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "web_search".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: r#"{"query":"what is a rubber duck"}"#.into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: titi_providers::StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "here is what I found".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(FakeSearchTool(Arc::clone(&searches))));
+    tools.register(Arc::new(ShellProbeTool));
+    let mut config = EngineConfig::new("primary");
+    config.mode = SessionMode::Duck;
+    // The session asks for everything above read tier. The duck turn is the
+    // exception, and only for what its allowlist kept.
+    config.approval_mode = titi_tools::ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "look something up for me".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut asked = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = engine.recv().await {
+            match event {
+                EngineEvent::ToolApprovalNeeded { .. } => asked = true,
+                EngineEvent::TurnFinished { .. } => return,
+                _ => {}
+            }
+        }
+        panic!("the engine stopped before the turn finished");
+    })
+    .await
+    .expect("a duck turn that parks on approval never finishes");
+
+    assert!(!asked, "duck mode asked to approve its own search");
+    assert_eq!(
+        searches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the search never ran"
+    );
+}

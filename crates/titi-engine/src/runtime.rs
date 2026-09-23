@@ -1300,6 +1300,14 @@ impl EngineRuntime {
             // No ranked file list rides the prompt: a duck that can quote
             // the repository is not repo-blind, whatever the brief says.
             config.genome_root = None;
+            // The duck registry is an allowlist, not a filter: `mode_tools`
+            // keeps only [`DUCK_TOOLS`], every one of which is a tool that
+            // cannot reach this machine. Asking the user to approve a search
+            // the mode exists to make is noise on a surface that can show the
+            // prompt, and a hang on one that cannot, so this turn approves
+            // what it was handed. Only this clone is loosened; the session's
+            // own approval mode is untouched and an agent turn still asks.
+            config.approval_mode = ApprovalMode::Yolo;
         }
         let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
