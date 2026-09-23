@@ -3783,39 +3783,94 @@ mod tests {
     /// A command that dispatches but is missing from the listing works yet
     /// cannot be discovered; /goal shipped that way once.
     #[test]
-    fn every_dispatched_command_is_listed() {
-        for name in [
+    fn guard_every_listed_command_dispatches_and_does_something() {
+        let dispatched = [
             "checkpoint",
             "checkpoints",
             "compact",
             "context",
-            "rewind",
-            "recap",
-            "pause",
             "goal",
-            "council",
-            "graph",
-            "loop",
-            "jobs",
             "help",
+            "keys",
+            "usage",
             "login",
             "logout",
-            "keys",
+            "model",
+            "pause",
+            "memory",
             "advisor",
+            "loop",
+            "jobs",
+            "recap",
+            "rewind",
+            "fork",
+            "export",
+            "btw",
+            "settings",
+            "switch",
             "budget",
-            "plan",
-            "done",
             "duck",
             "hub",
             "join",
             "leave",
+            "plan",
+            "done",
             "whoami",
+            "council",
+            "graph",
             "git",
             "diagnose",
-        ] {
+        ];
+
+        for name in dispatched {
             assert!(
                 COMMANDS.iter().any(|command| command.name == name),
                 "/{name} dispatches but is not listed"
+            );
+        }
+
+        for command in COMMANDS {
+            let mut chat = chat();
+            let arg = match command.name {
+                "loop" => "90s ping",
+                "budget" => "200k",
+                "goal" | "council" | "graph" | "btw" => "task",
+                "rewind" => "1",
+                "login" | "logout" => "openai",
+                "switch" => "openai/gpt-4.1",
+                "memory" => "list",
+                "export" => "path.md",
+                "git" => "status",
+                "jobs" => "list",
+                _ => "",
+            };
+
+            let text = if arg.is_empty() {
+                format!("/{}", command.name)
+            } else {
+                format!("/{} {}", command.name, arg)
+            };
+
+            let lines_before = chat.lines.len();
+            let applied = chat.slash(&text).expect("failed to parse slash command");
+
+            let is_unknown = chat.lines.iter().any(|l| {
+                l.text
+                    .contains(&format!("unknown command /{}", command.name))
+            });
+            assert!(
+                !is_unknown,
+                "/{} is listed but not dispatched",
+                command.name
+            );
+
+            let did_something = applied.effect.is_some()
+                || applied.log.is_some()
+                || chat.lines.len() > lines_before;
+            assert!(
+                did_something,
+                "/{} does nothing (no effect, no log, no output)",
+                command.name
             );
         }
     }
