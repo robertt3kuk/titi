@@ -2157,9 +2157,10 @@ pub fn new_session(agent_dir: &std::path::Path) -> Result<String, String> {
 
 pub fn fork_session(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
     let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    store
+    let new_id = store
         .fork_session(session_id, titi_core::session::SessionMeta::default())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(format!("forked to {new_id} · restart to resume it"))
 }
 
 pub fn export_session(
@@ -2176,11 +2177,13 @@ pub fn export_session(
         titi_core::session::export::ExportFormat::Markdown
     };
 
-    let path_val = std::path::PathBuf::from(if path.is_empty() {
-        format!("{session_id}.md")
+    let path_val = if path.is_empty() {
+        let exports_dir = agent_dir.join("exports");
+        let _ = std::fs::create_dir_all(&exports_dir);
+        exports_dir.join(format!("{session_id}.md"))
     } else {
-        path.to_owned()
-    });
+        std::path::PathBuf::from(path.to_owned())
+    };
 
     store
         .export_to_file(session_id, format, &path_val)

@@ -5368,4 +5368,42 @@ mod tests {
                 .any(|line| line.text.contains("roles: 0 user, 0 assistant, 0 system"))
         );
     }
+    #[test]
+    fn fork_creates_a_new_session_and_says_so() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).unwrap();
+        let session_id = store
+            .create(titi_core::session::SessionMeta::default())
+            .unwrap();
+        chat.session_id = session_id;
+
+        type_text(&mut chat, "/fork");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines.iter().any(|line| line.text.contains("forked to")
+                && line.text.contains("restart to resume it"))
+        );
+    }
+
+    #[test]
+    fn export_defaults_to_agent_dir_exports() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).unwrap();
+        let session_id = store
+            .create(titi_core::session::SessionMeta::default())
+            .unwrap();
+        chat.session_id = session_id;
+
+        type_text(&mut chat, "/export");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.lines.iter().any(|line| line.text.contains("exports")));
+    }
 }
