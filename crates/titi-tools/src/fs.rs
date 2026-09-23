@@ -8,6 +8,7 @@ use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
 use crate::hashline::HashlineEditTool;
+use crate::pty::{self, Interrupt, Options as PtyOptions};
 use crate::sensitive::SensitivePolicy;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
 
@@ -15,6 +16,10 @@ pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|value| value.as_str())
         .map(str::to_owned)
+}
+
+pub(crate) fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    args.get(key).and_then(Value::as_bool)
 }
 
 fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
@@ -291,6 +296,10 @@ impl ToolHandler for GrepTool {
 
 pub struct BashTool {
     pub root: PathBuf,
+    /// Raised to stop the command a `pty` run is waiting on. Held by the
+    /// surface that owns the cancel key; the pipe path below cannot be
+    /// interrupted, which is half of why `pty` exists.
+    pub interrupt: Interrupt,
 }
 
 #[async_trait]
@@ -302,7 +311,20 @@ impl ToolHandler for BashTool {
                 description: "Run a shell command in the workspace".into(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "command": { "type": "string" } },
+                    "properties": {
+                        "command": { "type": "string" },
+                        "pty": {
+                            "type": "boolean",
+                            "description": "Run under a terminal, so the command sees a tty \
+                                            and can be timed out and interrupted. Default false: \
+                                            without it output comes back unwrapped and uncoloured."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Deadline for a pty run, 1..3600, default 300. \
+                                            Past it the command is killed and the call is an error."
+                        }
+                    },
                     "required": ["command"]
                 }),
             },
@@ -314,6 +336,9 @@ impl ToolHandler for BashTool {
         let Some(command) = arg_str(&args, "command") else {
             return err("missing command");
         };
+        if arg_bool(&args, "pty").unwrap_or(false) {
+            return self.run_on_pty(&command, &args);
+        }
         match Command::new("sh")
             .arg("-c")
             .arg(&command)
@@ -329,6 +354,36 @@ impl ToolHandler for BashTool {
                     err(text)
                 }
             }
+            Err(error) => err(error.to_string()),
+        }
+    }
+}
+
+impl BashTool {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            interrupt: Interrupt::new(),
+        }
+    }
+
+    /// The pty path: bounded by a deadline, by [`pty::OUTPUT_CAP`], and by
+    /// [`Interrupt`]. Every one of those ends the call with `is_error`, output
+    /// included, so the model sees how far the command got.
+    fn run_on_pty(&self, command: &str, args: &Value) -> ToolResult {
+        let options = PtyOptions {
+            timeout: args
+                .get("timeout_secs")
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || pty::clamp_timeout(pty::DEFAULT_TIMEOUT_SECS),
+                    pty::clamp_timeout,
+                ),
+            ..PtyOptions::default()
+        };
+        match pty::run(command, &self.root, &options, &self.interrupt) {
+            Ok(run) if run.success => ok(run.output.to_string()),
+            Ok(run) => err(format!("exit {}\n{}", run.exit_code, run.output)),
             Err(error) => err(error.to_string()),
         }
     }
@@ -426,6 +481,18 @@ pub fn workspace_tools_with_policy(
     cache: ReadCache,
     policy: SensitivePolicy,
 ) -> Vec<Box<dyn ToolHandler>> {
+    workspace_tools_with_interrupt(root, cache, policy, Interrupt::new())
+}
+
+/// The workspace tools sharing the caller's [`Interrupt`], so whoever owns
+/// the cancel key can stop a `bash` command running on a pty. `invoke` takes
+/// no cancellation argument, so this handle is the only seam for it.
+pub fn workspace_tools_with_interrupt(
+    root: impl Into<PathBuf>,
+    cache: ReadCache,
+    policy: SensitivePolicy,
+    interrupt: Interrupt,
+) -> Vec<Box<dyn ToolHandler>> {
     let root = root.into();
     vec![
         Box::new(ReadFileTool {
@@ -452,7 +519,7 @@ pub fn workspace_tools_with_policy(
             root: root.clone(),
             policy,
         }),
-        Box::new(BashTool { root }),
+        Box::new(BashTool { root, interrupt }),
     ]
 }
 
@@ -740,5 +807,73 @@ mod tests {
         }
         assert!(registry.get("read").is_some());
         assert!(registry.get("bash").is_some());
+    }
+
+    #[tokio::test]
+    async fn bash_runs_on_a_pty_when_asked() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        let result = tool
+            .invoke(serde_json::json!({
+                "command": "test -t 1 && echo on-a-tty", "pty": true
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output.trim_end(), "on-a-tty");
+
+        // Without `pty` the same probe runs on a pipe, as it always has.
+        let piped = tool
+            .invoke(serde_json::json!({"command": "test -t 1 && echo on-a-tty"}))
+            .await;
+        assert!(piped.is_error, "{}", piped.output);
+    }
+
+    #[tokio::test]
+    async fn a_pty_command_past_its_deadline_is_an_error_that_keeps_the_output() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        let result = tool
+            .invoke(serde_json::json!({
+                "command": "echo working; sleep 5", "pty": true, "timeout_secs": 1
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("timed out"), "{}", result.output);
+        assert!(result.output.contains("working"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn the_shared_interrupt_stops_a_running_pty_command() {
+        let root = temp_root();
+        let interrupt = Interrupt::new();
+        let tools = workspace_tools_with_interrupt(
+            &root,
+            ReadCache::default(),
+            SensitivePolicy::default(),
+            interrupt.clone(),
+        );
+        let bash = tools
+            .into_iter()
+            .find(|tool| tool.definition().spec.name == "bash")
+            .unwrap_or_else(|| panic!("no bash tool in the workspace set"));
+
+        let armed = interrupt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            armed.raise();
+        });
+        let started = std::time::Instant::now();
+        let result = bash
+            .invoke(serde_json::json!({
+                "command": "sleep 30", "pty": true, "timeout_secs": 30
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("interrupted"), "{}", result.output);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

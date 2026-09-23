@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod fs;
 pub mod hashline;
+pub mod pty;
 pub mod sensitive;
 
 use std::collections::HashMap;
@@ -23,9 +24,10 @@ pub mod settings;
 pub use cache::{READ_CACHE_CAPACITY, ReadCache};
 pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
-    workspace_tools_with_cache, workspace_tools_with_policy,
+    workspace_tools_with_cache, workspace_tools_with_interrupt, workspace_tools_with_policy,
 };
 pub use hashline::{HashlineEditTool, HashlineError, line_anchor};
+pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
 
