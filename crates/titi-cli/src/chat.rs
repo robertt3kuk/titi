@@ -1220,7 +1220,7 @@ impl Chat {
             self.push(LineKind::Error, "usage: /login <provider> [key]".to_owned());
             return Applied::none();
         }
-        if !known_provider(provider) {
+        if !self.known_provider(provider) {
             self.push(
                 LineKind::Error,
                 format!("login: unknown provider {provider}"),
@@ -1256,7 +1256,7 @@ impl Chat {
             self.push(LineKind::Error, "usage: /logout <provider>".to_owned());
             return Applied::none();
         }
-        if !known_provider(provider) {
+        if !self.known_provider(provider) {
             self.push(
                 LineKind::Error,
                 format!("logout: unknown provider {provider}"),
@@ -1271,11 +1271,26 @@ impl Chat {
         Applied::none()
     }
 
+    /// The providers the engine actually runs on: the builtins with this
+    /// agent directory's `providers` config merged over them. A provider the
+    /// user declared must be one `/login` accepts, or the key for a model
+    /// the engine will call cannot be stored from the screen at all.
+    fn registry_providers(&self) -> Vec<titi_engine::ProviderDescriptor> {
+        crate::engine::registry_config_for(&self.agent_dir, &crate::app::current_workspace())
+            .providers
+    }
+
+    fn known_provider(&self, id: &str) -> bool {
+        self.registry_providers()
+            .iter()
+            .any(|provider| provider.id.as_str() == id)
+    }
+
     fn keys(&mut self) -> Applied {
         let stored = crate::secrets::list_keys(&self.agent_dir)
             .map(|rows| rows.into_iter().map(|row| row.provider).collect::<Vec<_>>())
             .unwrap_or_default();
-        for provider in crate::engine::default_registry_config().providers {
+        for provider in self.registry_providers() {
             let status = if provider
                 .credential_env
                 .as_deref()
@@ -1391,8 +1406,7 @@ impl Chat {
         let stored = crate::secrets::list_keys(&self.agent_dir)
             .map(|rows| rows.into_iter().map(|row| row.provider).collect::<Vec<_>>())
             .unwrap_or_default();
-        crate::engine::default_registry_config()
-            .providers
+        self.registry_providers()
             .into_iter()
             .map(|provider| {
                 let status = if provider
@@ -2308,13 +2322,6 @@ fn share(part: u64, whole: u64) -> u64 {
     } else {
         (part.saturating_mul(100) / whole).min(100)
     }
-}
-
-fn known_provider(id: &str) -> bool {
-    crate::engine::default_registry_config()
-        .providers
-        .iter()
-        .any(|provider| provider.id.as_str() == id)
 }
 
 /// Why a `/git` or `/diagnose` call produced nothing.
@@ -4384,6 +4391,86 @@ mod tests {
             crate::secrets::list_keys(dir.path()).unwrap()[0].provider,
             "openai"
         );
+    }
+
+    /// An agent directory whose config declares a provider the builtin table
+    /// does not know — how a user adds a gateway of their own.
+    fn agent_dir_with_extra_provider() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            dir.path().join("config.yml"),
+            "providers:\n  \
+             - id: zai\n    \
+             api: openai-completions\n    \
+             base_url: https://api.example.invalid/v1\n    \
+             credential_env: ZAI_API_KEY\n    \
+             credential_required: true\n\
+             models:\n  \
+             - id: zai/glm-4.6\n    \
+             provider: zai\n    \
+             wire_model: glm-4.6\n",
+        )
+        .expect("config");
+        dir
+    }
+
+    /// The engine runs on the merged registry, so the screen must too: a
+    /// provider the user declared is one `/login` has to take a key for.
+    #[test]
+    fn login_accepts_a_provider_the_config_declares() {
+        let dir = agent_dir_with_extra_provider();
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/login zai");
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.login_for.as_deref(), Some("zai"));
+        assert!(
+            !chat
+                .lines
+                .iter()
+                .any(|line| line.text.contains("unknown provider")),
+            "{:?}",
+            chat.lines
+        );
+        type_text(&mut chat, "sk-test");
+        chat.on_key(Key::Enter, Instant::now());
+        let keys = crate::secrets::list_keys(dir.path()).expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].provider, "zai");
+    }
+
+    #[test]
+    fn keys_lists_a_provider_the_config_declares() {
+        let dir = agent_dir_with_extra_provider();
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/keys");
+        chat.on_key(Key::Enter, Instant::now());
+        for provider in ["zai ", "openai "] {
+            assert!(
+                chat.lines
+                    .iter()
+                    .any(|line| line.text.starts_with(provider)),
+                "{provider}missing: {:?}",
+                chat.lines
+            );
+        }
+    }
+
+    #[test]
+    fn diagnose_lists_a_provider_the_config_declares() {
+        let dir = agent_dir_with_extra_provider();
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/diagnose");
+        chat.on_key(Key::Enter, Instant::now());
+        let summary = chat.lines.last().expect("a transcript line");
+        for provider in ["zai (", "openai ("] {
+            assert!(
+                summary.text.contains(provider),
+                "{provider} missing: {summary:?}"
+            );
+        }
     }
 
     #[test]

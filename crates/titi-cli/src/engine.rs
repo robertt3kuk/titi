@@ -280,16 +280,29 @@ pub fn merge_registry_config(
     base
 }
 
-pub fn load_registry_config() -> ProviderRegistryConfig {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+/// The effective provider registry: the builtins with the user's
+/// `providers`/`models` from `agent_dir` and `cwd` merged over them.
+///
+/// Surfaces must validate against this, not against the builtin table: a
+/// provider the user declared is one the engine will happily run, so a
+/// screen that only knows the builtins refuses keys for models it is about
+/// to call.
+pub fn registry_config_for(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> ProviderRegistryConfig {
     let defaults = default_registry_config();
-    if let Ok(settings) =
-        titi_config::settings::Settings::load(&titi_config::agent_dir(), &cwd, &[])
+    if let Ok(settings) = titi_config::settings::Settings::load(agent_dir, cwd, &[])
         && let Some(parsed) = ProviderRegistryConfig::from_settings_value(&settings.effective())
     {
         return merge_registry_config(defaults, parsed);
     }
     defaults
+}
+
+pub fn load_registry_config() -> ProviderRegistryConfig {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    registry_config_for(&titi_config::agent_dir(), &cwd)
 }
 
 /// Starts the engine, returning it with the model catalog and the session id
