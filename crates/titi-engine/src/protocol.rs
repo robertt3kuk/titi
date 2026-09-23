@@ -83,6 +83,20 @@ pub enum EngineCommand {
     MemoryForget {
         id: i64,
     },
+    /// Repeat `prompt` as a background turn every `interval_secs`.
+    ///
+    /// The engine owns the timer: a surface that dies does not take the loop
+    /// with it, and a loop turn queues behind the live one like any other
+    /// prompt instead of interrupting it.
+    StartLoop {
+        interval_secs: u64,
+        prompt: SmolStr,
+    },
+    /// Report the background jobs running right now.
+    ListJobs,
+    CancelJob {
+        job_id: SmolStr,
+    },
     Shutdown,
 }
 
@@ -222,6 +236,18 @@ pub enum EngineEvent {
     MemoryResult {
         output: SmolStr,
     },
+    /// A background loop started and is now the engine's to run.
+    JobStarted {
+        job: JobInfo,
+    },
+    /// Every background job alive when [`EngineCommand::ListJobs`] arrived.
+    JobList {
+        jobs: Vec<JobInfo>,
+    },
+    /// A background job stopped and will not fire again.
+    JobFinished {
+        job_id: SmolStr,
+    },
 }
 
 /// One labelled slice of the request a turn would send, with the estimated
@@ -231,4 +257,14 @@ pub enum EngineEvent {
 pub struct ContextPart {
     pub label: SmolStr,
     pub tokens: u64,
+}
+
+/// One background loop the engine repeats on its own timer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobInfo {
+    pub id: SmolStr,
+    pub prompt: SmolStr,
+    pub interval_secs: u64,
+    /// Turns this job has already submitted.
+    pub runs: u64,
 }

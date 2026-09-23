@@ -860,6 +860,34 @@ impl App {
             EngineEvent::MemoryResult { output } => {
                 self.push_transcript(Section::Activity, output.to_string());
             }
+            EngineEvent::JobStarted { job } => {
+                self.push_transcript(
+                    Section::Activity,
+                    format!(
+                        "job {} · every {}s · {}",
+                        job.id, job.interval_secs, job.prompt
+                    ),
+                );
+                self.set_alert(format!("{} started", job.id));
+            }
+            EngineEvent::JobList { jobs } => {
+                if jobs.is_empty() {
+                    self.push_transcript(Section::Activity, "no background jobs".to_owned());
+                }
+                for job in jobs {
+                    self.push_transcript(
+                        Section::Activity,
+                        format!(
+                            "job {} · every {}s · ran {} · {}",
+                            job.id, job.interval_secs, job.runs, job.prompt
+                        ),
+                    );
+                }
+            }
+            EngineEvent::JobFinished { job_id } => {
+                self.push_transcript(Section::Activity, format!("job {job_id} stopped"));
+                self.set_alert(format!("{job_id} stopped"));
+            }
         }
     }
 

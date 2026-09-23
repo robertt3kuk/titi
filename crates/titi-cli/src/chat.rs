@@ -20,6 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
+use titi_engine::protocol::JobInfo;
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -166,6 +167,8 @@ pub struct Chat {
     /// Transmit and placement sequences to write before the next frame.
     kitty_flush: String,
     skillful: bool,
+    /// Background loops the engine reported, newest last.
+    jobs: Vec<JobInfo>,
 }
 
 impl Chat {
@@ -204,6 +207,7 @@ impl Chat {
             next_image_id: 1,
             kitty_flush: String::new(),
             skillful: false,
+            jobs: Vec::new(),
         }
     }
 
@@ -474,6 +478,25 @@ impl Chat {
                 self.push(LineKind::Note, output.to_string());
                 Applied::none()
             }
+            EngineEvent::JobStarted { job } => {
+                self.push(
+                    LineKind::Note,
+                    format!("{} started · every {}s", job.id, job.interval_secs),
+                );
+                self.jobs.retain(|known| known.id != job.id);
+                self.jobs.push(job);
+                Applied::none()
+            }
+            EngineEvent::JobList { jobs } => {
+                self.show_jobs(&jobs);
+                self.jobs = jobs;
+                Applied::none()
+            }
+            EngineEvent::JobFinished { job_id } => {
+                self.jobs.retain(|job| job.id != job_id);
+                self.push(LineKind::Note, format!("{job_id} stopped"));
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -628,6 +651,8 @@ impl Chat {
             "btw" => self.btw(args),
             "switch" => self.switch(args),
             "settings" => self.settings(),
+            "loop" => self.start_loop(args),
+            "jobs" => self.jobs(args),
             "goal" => self.goal(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
@@ -1167,6 +1192,66 @@ impl Chat {
         }))
     }
 
+    /// `/loop <interval> <prompt>` hands a repeating prompt to the engine.
+    ///
+    /// Nothing is scheduled here: the screen may be closed and reopened, and
+    /// a timer living in the composer would die with it.
+    fn start_loop(&mut self, args: &str) -> Applied {
+        let (interval, prompt) = match parse_loop(args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.push(LineKind::Error, error.to_string());
+                return Applied::none();
+            }
+        };
+        self.push(LineKind::Note, format!("loop every {interval}s: {prompt}"));
+        Applied::effect(ChatEffect::Send(EngineCommand::StartLoop {
+            interval_secs: interval,
+            prompt: prompt.into(),
+        }))
+    }
+
+    /// `/jobs` lists the engine's background loops, `/jobs cancel <id>`
+    /// stops one.
+    fn jobs(&mut self, args: &str) -> Applied {
+        if args.is_empty() || args == "list" {
+            return Applied::effect(ChatEffect::Send(EngineCommand::ListJobs));
+        }
+        let (cmd, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        let id = rest.trim();
+        if cmd != "cancel" && cmd != "stop" {
+            self.push(LineKind::Error, format!("unknown jobs command: {cmd}"));
+            return Applied::none();
+        }
+        if id.is_empty() {
+            self.push(LineKind::Error, "usage: /jobs cancel <id>".to_owned());
+            return Applied::none();
+        }
+        Applied::effect(ChatEffect::Send(EngineCommand::CancelJob {
+            job_id: id.into(),
+        }))
+    }
+
+    /// Renders what the engine reported for `/jobs`.
+    fn show_jobs(&mut self, jobs: &[JobInfo]) {
+        if jobs.is_empty() {
+            self.push(LineKind::Note, "no background jobs".to_owned());
+            return;
+        }
+        for job in jobs {
+            self.push(
+                LineKind::Note,
+                format!(
+                    "{}  every {}s  ran {}  ·  {}",
+                    job.id,
+                    job.interval_secs,
+                    job.runs,
+                    one_line(&job.prompt, TOOL_PREVIEW)
+                ),
+            );
+        }
+    }
+
     /// `/context` asks the engine what fills the window. It takes no
     /// argument: the breakdown is the whole answer, and quietly ignoring a
     /// stray word would hide the typo behind a plausible screen.
@@ -1477,6 +1562,14 @@ const COMMANDS: &[Command] = &[
         about: "list, search, or forget memories",
     },
     Command {
+        name: "loop",
+        about: "repeat a prompt in the background (usage: /loop 5m <prompt>)",
+    },
+    Command {
+        name: "jobs",
+        about: "list background loops, or /jobs cancel <id>",
+    },
+    Command {
         name: "recap",
         about: "what this session did",
     },
@@ -1555,6 +1648,64 @@ fn slash_token(input: &str) -> Option<(usize, &str)> {
         return None;
     }
     Some((start, name))
+}
+
+/// Why `/loop` could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopArgError {
+    Missing,
+    BadInterval(String),
+    ZeroInterval,
+    NoPrompt,
+}
+
+impl std::fmt::Display for LoopArgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing | Self::NoPrompt => {
+                f.write_str("usage: /loop <interval> <prompt>  (interval: 90s, 5m, 2h)")
+            }
+            Self::BadInterval(word) => write!(f, "loop: {word} is not an interval (90s, 5m, 2h)"),
+            Self::ZeroInterval => f.write_str("loop: the interval must be at least one second"),
+        }
+    }
+}
+
+/// `<interval> <prompt>` as seconds and the prompt behind it.
+///
+/// A bare number means seconds; `s`, `m`, and `h` suffixes are the same
+/// number scaled. An unreadable interval is refused instead of defaulted:
+/// a loop that fires on a guessed schedule is worse than one that never
+/// started.
+fn parse_loop(args: &str) -> Result<(u64, &str), LoopArgError> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Err(LoopArgError::Missing);
+    }
+    let (head, rest) = args
+        .split_once(char::is_whitespace)
+        .ok_or(LoopArgError::NoPrompt)?;
+    let prompt = rest.trim();
+    if prompt.is_empty() {
+        return Err(LoopArgError::NoPrompt);
+    }
+    let interval =
+        parse_interval(head).ok_or_else(|| LoopArgError::BadInterval(head.to_owned()))?;
+    if interval == 0 {
+        return Err(LoopArgError::ZeroInterval);
+    }
+    Ok((interval, prompt))
+}
+
+/// `90`, `90s`, `5m`, `2h` in seconds. `None` for anything else.
+fn parse_interval(word: &str) -> Option<u64> {
+    let (digits, scale) = match word.as_bytes().last()? {
+        b's' => (&word[..word.len() - 1], 1),
+        b'm' => (&word[..word.len() - 1], 60),
+        b'h' => (&word[..word.len() - 1], 3_600),
+        _ => (word, 1),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 /// Commands first, then skills. A command only counts at the start of the
@@ -1749,7 +1900,14 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         None => String::new(),
     };
     let left = " titi";
-    let mid = format!("  {state}");
+    // Beside the state, not on the right: the right half is what gets
+    // truncated first, and a loop running unseen is the whole problem.
+    let loops = if chat.jobs.is_empty() {
+        String::new()
+    } else {
+        format!("  {} loop(s)", chat.jobs.len())
+    };
+    let mid = format!("  {state}{loops}");
     let mut right = format!("{}{ctx}  {} ", chat.model, chat.session_label);
     let fixed = titi_tui::width::visible_width(left) + titi_tui::width::visible_width(&mid) + 2;
     let room = (width as usize).saturating_sub(fixed);
@@ -2647,6 +2805,8 @@ mod tests {
             "recap",
             "pause",
             "goal",
+            "loop",
+            "jobs",
             "help",
             "login",
             "logout",
@@ -2658,6 +2818,111 @@ mod tests {
                 "/{name} dispatches but is not listed"
             );
         }
+    }
+
+    #[test]
+    fn loop_hands_the_interval_and_prompt_to_the_engine() {
+        let mut chat = chat();
+        type_text(&mut chat, "/loop 5m check the CI run");
+        match chat.on_key(Key::Enter, Instant::now()).effect {
+            Some(ChatEffect::Send(EngineCommand::StartLoop {
+                interval_secs,
+                prompt,
+            })) => {
+                assert_eq!(interval_secs, 300);
+                assert_eq!(prompt.as_str(), "check the CI run");
+            }
+            other => panic!("expected a loop, got {other:?}"),
+        }
+    }
+
+    /// A guessed schedule is worse than none: an unreadable interval has to
+    /// refuse instead of falling back to a default.
+    #[test]
+    fn loop_refuses_an_unreadable_interval_and_a_missing_prompt() {
+        let mut chat = chat();
+        type_text(&mut chat, "/loop soon do the thing");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text.contains("soon"))
+        );
+
+        type_text(&mut chat, "/loop 30s");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /loop"))
+        );
+
+        type_text(&mut chat, "/loop 0s tick");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("at least one second"))
+        );
+    }
+
+    #[test]
+    fn jobs_lists_and_cancels() {
+        let mut chat = chat();
+        type_text(&mut chat, "/jobs");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::ListJobs))
+        );
+
+        type_text(&mut chat, "/jobs cancel job-2");
+        match chat.on_key(Key::Enter, Instant::now()).effect {
+            Some(ChatEffect::Send(EngineCommand::CancelJob { job_id })) => {
+                assert_eq!(job_id.as_str(), "job-2");
+            }
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+
+        type_text(&mut chat, "/jobs cancel");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /jobs cancel"))
+        );
+    }
+
+    /// A background loop the user cannot see is a loop they cannot stop.
+    #[test]
+    fn a_running_loop_shows_in_the_status_bar_until_it_stops() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::JobStarted {
+            job: JobInfo {
+                id: "job-1".into(),
+                prompt: "watch CI".into(),
+                interval_secs: 60,
+                runs: 0,
+            },
+        });
+        let view = frame_text(&mut chat);
+        assert!(view.contains("1 loop(s)"), "{view}");
+
+        chat.on_event(EngineEvent::JobFinished {
+            job_id: "job-1".into(),
+        });
+        let view = frame_text(&mut chat);
+        assert!(!view.contains("loop(s)"), "{view}");
+    }
+
+    #[test]
+    fn an_empty_job_list_says_so() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::JobList { jobs: Vec::new() });
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("no background jobs"))
+        );
     }
 
     /// The tokens of one breakdown line, `None` for anything else.

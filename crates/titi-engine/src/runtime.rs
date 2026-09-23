@@ -401,6 +401,32 @@ impl Engine {
     }
 }
 
+/// The background loops a runtime is currently running, by job id.
+type JobTable = std::collections::HashMap<SmolStr, LoopJob>;
+
+/// One `/loop` job: what it sends, how often, and the timer sending it.
+struct LoopJob {
+    /// Order the job was started in, so `/jobs` lists job-10 after job-9.
+    seq: u64,
+    prompt: SmolStr,
+    interval_secs: u64,
+    /// Bumped by the timer task after every prompt it queued, so `/jobs`
+    /// reports what actually ran rather than what was scheduled.
+    runs: Arc<AtomicU64>,
+    timer: tokio::task::JoinHandle<()>,
+}
+
+impl LoopJob {
+    fn info(&self, id: &SmolStr) -> crate::protocol::JobInfo {
+        crate::protocol::JobInfo {
+            id: id.clone(),
+            prompt: self.prompt.clone(),
+            interval_secs: self.interval_secs,
+            runs: self.runs.load(Ordering::SeqCst),
+        }
+    }
+}
+
 /// UI-independent command loop and turn scheduler.
 pub struct EngineRuntime {
     config: EngineConfig,
@@ -423,6 +449,13 @@ pub struct EngineRuntime {
     /// Bumped by every `RestoreHistory`. A turn that started before the
     /// rewind must not write its stale history back over the replacement.
     history_epoch: u64,
+    /// Loop prompts the engine re-submits to itself on a timer.
+    loops: JobTable,
+    /// Number the next `/loop` job is named after.
+    next_job: u64,
+    /// A clone of the surface's command sender, so a background job can
+    /// queue its prompt through the same door every other prompt uses.
+    self_commands: mpsc::Sender<EngineCommand>,
 }
 
 impl EngineRuntime {
@@ -550,6 +583,9 @@ impl EngineRuntime {
             claims: claims.clone(),
             steering: Steering::default(),
             history_epoch: 0,
+            loops: JobTable::new(),
+            next_job: 1,
+            self_commands: command_tx.clone(),
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -673,9 +709,30 @@ impl EngineRuntime {
                                 let _ = self.events.send(EngineEvent::MemoryResult { output: "no agent directory".into() }).await;
                             }
                         }
+                        EngineCommand::StartLoop { interval_secs, prompt } => {
+                            self.start_loop(interval_secs, prompt).await;
+                        }
+                        EngineCommand::ListJobs => {
+                            let jobs = self.job_list();
+                            let _ = self.events.send(EngineEvent::JobList { jobs }).await;
+                        }
+                        EngineCommand::CancelJob { job_id } => {
+                            match self.loops.remove(&job_id) {
+                                Some(job) => {
+                                    job.timer.abort();
+                                    let _ = self.events.send(EngineEvent::JobFinished { job_id }).await;
+                                }
+                                None => self.emit_control_failure(&format!("no such job: {job_id}")).await,
+                            }
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
+                            }
+                            // The timers hold a command sender, so leaving
+                            // them alive keeps the channel open forever.
+                            for (_, job) in self.loops.drain() {
+                                job.timer.abort();
                             }
                             break;
                         }
@@ -757,6 +814,68 @@ impl EngineRuntime {
                 }
             }
         }
+    }
+
+    /// Starts a background loop and reports it, or refuses it.
+    ///
+    /// The timer only ever queues a prompt; it never spawns a turn itself,
+    /// so a loop firing during a live turn waits its place in the queue
+    /// instead of racing the user.
+    async fn start_loop(&mut self, interval_secs: u64, prompt: SmolStr) {
+        if interval_secs == 0 {
+            self.emit_control_failure("loop interval must be at least one second")
+                .await;
+            return;
+        }
+        if prompt.trim().is_empty() {
+            self.emit_control_failure("loop needs a prompt").await;
+            return;
+        }
+        let seq = self.next_job;
+        let id = SmolStr::from(format!("job-{seq}"));
+        self.next_job += 1;
+        let runs = Arc::new(AtomicU64::new(0));
+        let timer = {
+            let commands = self.self_commands.clone();
+            let prompt = prompt.clone();
+            let runs = Arc::clone(&runs);
+            tokio::spawn(async move {
+                let period = std::time::Duration::from_secs(interval_secs);
+                loop {
+                    tokio::time::sleep(period).await;
+                    if commands
+                        .send(EngineCommand::FollowUp {
+                            text: prompt.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    runs.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let job = LoopJob {
+            seq,
+            prompt,
+            interval_secs,
+            runs,
+            timer,
+        };
+        let info = job.info(&id);
+        self.loops.insert(id, job);
+        let _ = self
+            .events
+            .send(EngineEvent::JobStarted { job: info })
+            .await;
+    }
+
+    /// Every live job, in a stable order so the listing does not shuffle.
+    fn job_list(&self) -> Vec<crate::protocol::JobInfo> {
+        let mut jobs: Vec<_> = self.loops.iter().collect();
+        jobs.sort_by_key(|(_, job)| job.seq);
+        jobs.into_iter().map(|(id, job)| job.info(id)).collect()
     }
 
     /// Hands a finished turn to the session namer.
