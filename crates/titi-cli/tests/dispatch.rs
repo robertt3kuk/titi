@@ -381,22 +381,27 @@ fn observe_opens_hub_and_filters_main() {
     );
 }
 
+/// Auto-theme is decided by a process-global registry, and these tests share
+/// one process, so a sibling that already moved it would make the first probe
+/// a no-op. Anchoring on dark first makes the transition the assertion, not
+/// the state the test happened to start in.
 #[test]
 fn osc11_probe_reply_feeds_auto_theme() {
     use titi_cli::app::AppearanceIngest;
     let mut app = app();
+    let dark = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
     let light = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\";
-    let first = app.ingest_probe_reply(light);
-    assert_ne!(first, AppearanceIngest::Unchanged);
+    let _ = app.ingest_probe_reply(dark);
+    assert_eq!(
+        app.ingest_probe_reply(light),
+        AppearanceIngest::ThemeChanged
+    );
     assert_eq!(app.ingest_probe_reply(light), AppearanceIngest::Unchanged);
     assert_eq!(
         app.ingest_probe_reply(b"\x1b[?997;1n"),
         AppearanceIngest::NeedOsc11Query
     );
-    assert_eq!(
-        app.ingest_probe_reply(b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
-        AppearanceIngest::ThemeChanged
-    );
+    assert_eq!(app.ingest_probe_reply(dark), AppearanceIngest::ThemeChanged);
 }
 
 #[test]
