@@ -738,6 +738,9 @@ impl EngineRuntime {
                         EngineCommand::RunCouncil { question } => {
                             self.spawn_council(question, primary_model.clone());
                         }
+                        EngineCommand::RunGraph { task } => {
+                            self.spawn_graph(task, primary_model.clone());
+                        }
                         EngineCommand::MemoryList => {
                             if let Some(agent_dir) = self.config.agent_dir.clone() {
                                 let output = run_off_thread(move || {
@@ -1424,6 +1427,87 @@ impl EngineRuntime {
             };
             let _ = events
                 .send(EngineEvent::CouncilFinished {
+                    report: report.into(),
+                })
+                .await;
+        });
+    }
+
+    /// The built-in graph: a council decides the approach, the goal loop does
+    /// the work, and a goal that does not pass goes round once more before
+    /// the cap stops it. Like `/goal` and `/council` it runs beside the turn
+    /// rather than replacing it.
+    fn spawn_graph(&self, task: SmolStr, model: SmolStr) {
+        let events = self.events.clone();
+        let task = task.trim().to_owned();
+        if task.is_empty() {
+            tokio::spawn(async move {
+                let _ = events
+                    .send(EngineEvent::GraphFinished {
+                        report: "usage: /graph <task>".into(),
+                    })
+                    .await;
+            });
+            return;
+        }
+        let runner = |model: SmolStr| {
+            Arc::new(crate::StreamingAgentRunner::new(
+                Arc::clone(&self.resolver),
+                model,
+            ))
+        };
+        let members = crate::DEFAULT_BRIEFS
+            .iter()
+            .map(|(name, brief, effort)| {
+                crate::CouncilMember::new(
+                    *name,
+                    *brief,
+                    model.clone(),
+                    *effort,
+                    runner(model.clone()),
+                )
+            })
+            .collect();
+        let coder = Arc::new(crate::RunnerCoder::new(runner(model.clone())));
+        let reviewer = Arc::new(crate::AgentReviewer::new(runner(model.clone()), "reviewer"));
+        let gates = crate::CommandGates::new(self.config.goal_gates.clone());
+        let gates: Arc<dyn crate::Gates> = Arc::new(match &self.config.workspace_root {
+            Some(root) => gates.in_dir(root.clone()),
+            None => gates,
+        });
+        let nodes = vec![
+            crate::Node::new(
+                "council",
+                crate::Job::Council {
+                    members,
+                    synthesizer: runner(model.clone()),
+                    question: format!(
+                        "How should this be done, and what is the first step?\n\n{task}"
+                    )
+                    .into(),
+                },
+            )
+            .then("goal"),
+            crate::Node::new(
+                "goal",
+                crate::Job::Goal {
+                    coder,
+                    reviewer,
+                    gates: Some(gates),
+                    goal: task.into(),
+                },
+            )
+            .with_max_runs(2)
+            .on(crate::Gate::On(crate::Verdict::Pass), crate::Step::Done)
+            .on(crate::Gate::NotPass, crate::Step::To("goal".into())),
+        ];
+        tokio::spawn(async move {
+            let report = match crate::run_graph(nodes).await {
+                Ok(run) => crate::graph_report(&run),
+                Err(error) => format!("graph: {error}"),
+            };
+            let _ = events
+                .send(EngineEvent::GraphFinished {
                     report: report.into(),
                 })
                 .await;

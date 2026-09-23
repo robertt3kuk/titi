@@ -9,6 +9,7 @@ pub mod findings;
 pub mod goal;
 pub mod judgment;
 pub mod naming;
+pub mod orchestrator;
 pub mod project_context;
 pub mod protocol;
 pub mod registry;
@@ -35,6 +36,10 @@ pub use judgment::{
     RoleJudgmentModel,
 };
 pub use naming::{SessionNamer, first_user_message};
+pub use orchestrator::{
+    DEFAULT_NODE_RUNS, Edge, Gate, Graph, GraphError, GraphRun, GraphStop, Job, Node, NodeVisit,
+    Step, graph_report, run_graph,
+};
 pub use protocol::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 pub use registry::{
     CredentialSource, EnvCredentialSource, HttpTransportFactory, LayeredCredentialSource,

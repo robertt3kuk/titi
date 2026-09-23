@@ -102,6 +102,11 @@ pub enum EngineCommand {
     RunCouncil {
         question: SmolStr,
     },
+    /// Run the built-in orchestrator graph over a task: a council decides the
+    /// approach, then the goal loop does the work. This is not a chat turn.
+    RunGraph {
+        task: SmolStr,
+    },
     /// Report what currently fills the context window, part by part.
     DescribeContext,
     /// Fold the history now, whatever the threshold says. `focus` is free
@@ -262,6 +267,11 @@ pub enum EngineEvent {
     },
     /// `/council` finished. `report` is the block the surface shows.
     CouncilFinished {
+        report: SmolStr,
+    },
+    /// An orchestrator graph finished. `report` is the block the surface
+    /// shows: one line per node entered, then the final verdict.
+    GraphFinished {
         report: SmolStr,
     },
     /// Something the user asked for was not done, without failing the turn.

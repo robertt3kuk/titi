@@ -962,6 +962,12 @@ impl App {
                 self.push_transcript(Section::Activity, report.to_string());
                 self.set_alert("council answered");
             }
+            EngineEvent::GraphFinished { report } => {
+                // Like the council's: a block of one line per node visited,
+                // so it belongs in the transcript rather than an alert line.
+                self.push_transcript(Section::Activity, report.to_string());
+                self.set_alert("graph finished");
+            }
             EngineEvent::Notice { message } => {
                 self.push_transcript(Section::Activity, message.to_string());
                 self.set_alert(message.to_string());
