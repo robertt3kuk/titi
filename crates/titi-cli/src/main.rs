@@ -15,6 +15,9 @@ usage: titi [options]
   --approval <mode>           always-ask | write | yolo (default: write)
   --mode <mode>               agent | plan | duck (default: agent)
                               plan: read-only tools; duck: repo-blind chat
+  --record <path.ompcast>     record this session's events to a cast file
+  --replay <path.ompcast>     play a recorded session and exit; no model runs
+  --replay-fast               with --replay: no pauses between records
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
   --list-keys                 list stored providers (never the keys)
@@ -32,6 +35,9 @@ fn main() -> io::Result<()> {
     let mut goal: Option<String> = None;
     let mut set_key: Option<(String, String)> = None;
     let mut list_keys = false;
+    let mut record: Option<std::path::PathBuf> = None;
+    let mut replay: Option<std::path::PathBuf> = None;
+    let mut replay_fast = false;
     let mut approval = titi_tools::ApprovalMode::Write;
     let mut mode = titi_engine::protocol::SessionMode::Agent;
     let mut args = std::env::args().skip(1);
@@ -72,6 +78,20 @@ fn main() -> io::Result<()> {
             }
         } else if arg == "--list-keys" {
             list_keys = true;
+        } else if arg == "--record" {
+            let Some(path) = args.next() else {
+                eprintln!("usage: titi --record <path.ompcast>");
+                std::process::exit(2);
+            };
+            record = Some(std::path::PathBuf::from(path));
+        } else if arg == "--replay" {
+            let Some(path) = args.next() else {
+                eprintln!("usage: titi --replay <path.ompcast>");
+                std::process::exit(2);
+            };
+            replay = Some(std::path::PathBuf::from(path));
+        } else if arg == "--replay-fast" {
+            replay_fast = true;
         } else if arg == "--approval" {
             let Some(raw) = args.next() else {
                 eprintln!("usage: titi --approval <always-ask|write|yolo>");
@@ -143,6 +163,23 @@ fn main() -> io::Result<()> {
             }
         };
     }
+    // A replay is a file and a screen: it never starts the engine, so it runs
+    // with no key, no network and no tools.
+    if let Some(path) = replay {
+        let pace = if replay_fast {
+            titi_cli::ompcast::Pace::Fast
+        } else {
+            titi_cli::ompcast::Pace::Realtime
+        };
+        let mut out = io::stdout();
+        return match titi_cli::ompcast::replay(&path, pace, &mut out) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                eprintln!("replay failed: {error}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -157,6 +194,13 @@ fn main() -> io::Result<()> {
     if session_log.is_none() {
         eprintln!("session: transcript writes are off (store unavailable)");
     }
+    if headless && record.is_some() {
+        // A cast is what a screen showed; a headless run has no screen, and
+        // silently writing an empty file would read as a recording.
+        eprintln!(
+            "record: --record needs the chat screen; this run is headless and is not recorded"
+        );
+    }
     if headless {
         let code = match (goal, prompt) {
             (Some(text), _) => {
@@ -170,5 +214,20 @@ fn main() -> io::Result<()> {
         std::process::exit(code);
     }
 
-    titi_cli::chat::run(engine, session_log, models, session_id)
+    let cast = match record {
+        Some(path) => match titi_cli::ompcast::CastWriter::create(&path) {
+            Ok(writer) => {
+                eprintln!("recording to {}", path.display());
+                Some(writer)
+            }
+            Err(error) => {
+                // A recording is a convenience; refusing to start the session
+                // over it would not be.
+                eprintln!("record: {error} · this session is not being recorded");
+                None
+            }
+        },
+        None => None,
+    };
+    titi_cli::chat::run(engine, session_log, models, session_id, cast)
 }

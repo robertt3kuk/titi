@@ -104,8 +104,10 @@ impl Applied {
     }
 }
 
+/// Who a transcript line belongs to. Public because a cast replay renders
+/// the same lines outside this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineKind {
+pub enum LineKind {
     User,
     Assistant,
     Tool,
@@ -113,10 +115,23 @@ enum LineKind {
     Note,
 }
 
+impl LineKind {
+    /// The word a surface without colour puts in front of the line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineKind::User => "you",
+            LineKind::Assistant => "titi",
+            LineKind::Tool => "tool",
+            LineKind::Error => "error",
+            LineKind::Note => "note",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptLine {
-    kind: LineKind,
-    text: String,
+pub struct TranscriptLine {
+    pub kind: LineKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1714,6 +1729,19 @@ impl Chat {
         self.lines.push(TranscriptLine { kind, text });
     }
 
+    /// The transcript as it stands. A cast replay renders these lines; the
+    /// live screen draws them.
+    pub fn transcript(&self) -> &[TranscriptLine] {
+        &self.lines
+    }
+
+    /// Puts a line in the transcript as if the user had typed and sent it.
+    /// Replay has no keyboard, and a cast without its prompts is half a
+    /// conversation.
+    pub fn push_user(&mut self, text: &str) {
+        self.push(LineKind::User, text.to_owned());
+    }
+
     fn agent_state(&self) -> AgentState {
         if self.approval.is_some() || self.quit_armed.is_some() || self.login_for.is_some() {
             AgentState::Blocked
@@ -1726,11 +1754,15 @@ impl Chat {
 }
 
 /// Draws the chat until the user quits. Restores the terminal on the way out.
+///
+/// `cast` is where `--record` writes the session: every engine event and
+/// every prompt the user sends, in the order the screen saw them.
 pub fn run(
     mut engine: Engine,
     session_log: Option<SessionLog>,
     catalog: crate::engine::ModelCatalog,
     session_id: String,
+    mut cast: Option<crate::ompcast::CastWriter>,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -1768,7 +1800,7 @@ pub fn run(
             backend.flush()?;
             screen.terminal.draw(|frame| draw(frame, &mut chat))?;
         }
-        if pump(&mut engine, &mut chat, &session_log)? {
+        if pump(&mut engine, &mut chat, &session_log, &mut cast)? {
             break Ok(());
         }
     };
@@ -2838,13 +2870,14 @@ fn pump(
     engine: &mut Engine,
     chat: &mut Chat,
     session_log: &Option<SessionLog>,
+    cast: &mut Option<crate::ompcast::CastWriter>,
 ) -> io::Result<bool> {
     if event::poll(Duration::from_millis(50))? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if let Some(mapped) = map_key(key.code, key.modifiers) {
                     let applied = chat.on_key(mapped, Instant::now());
-                    if dispatch(engine, chat, session_log, applied) {
+                    if dispatch(engine, chat, session_log, cast, applied) {
                         return Ok(true);
                     }
                 }
@@ -2856,6 +2889,9 @@ fn pump(
     loop {
         match engine.try_recv() {
             Ok(event) => {
+                // Recorded before the screen folds it into lines: the cast is
+                // the stream the surface received, and it is already masked.
+                cast_write(chat, cast, |writer| writer.event(&event));
                 let applied = chat.on_event(event);
                 record(chat, session_log, applied.log);
             }
@@ -2872,12 +2908,41 @@ fn pump(
     Ok(false)
 }
 
+/// Writes one cast record, and stops recording if the file has gone bad.
+///
+/// A recording is a convenience; a session that dies because a disk filled
+/// up is not. The failure is said once, in the transcript, and the writer is
+/// dropped so the next event costs nothing.
+fn cast_write(
+    chat: &mut Chat,
+    cast: &mut Option<crate::ompcast::CastWriter>,
+    write: impl FnOnce(&mut crate::ompcast::CastWriter) -> Result<(), crate::ompcast::CastError>,
+) {
+    let Some(writer) = cast.as_mut() else {
+        return;
+    };
+    if let Err(error) = write(writer) {
+        chat.push(
+            LineKind::Error,
+            format!("record: {error} · recording stopped"),
+        );
+        *cast = None;
+    }
+}
+
 fn dispatch(
     engine: &mut Engine,
     chat: &mut Chat,
     session_log: &Option<SessionLog>,
+    cast: &mut Option<crate::ompcast::CastWriter>,
     applied: Applied,
 ) -> bool {
+    if let Some(write) = &applied.log
+        && write.role == Role::User
+    {
+        let text = write.text.clone();
+        cast_write(chat, cast, |writer| writer.input(&text));
+    }
     record(chat, session_log, applied.log);
     match applied.effect {
         Some(ChatEffect::Quit) => {
