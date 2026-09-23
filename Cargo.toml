@@ -31,6 +31,9 @@ titi-secrets = { path = "crates/titi-secrets" }
 titi-tools = { path = "crates/titi-tools" }
 titi-genome = { path = "crates/titi-genome" }
 titi-tui = { path = "crates/titi-tui" }
+tree-sitter = "0.24"
+portable-pty = "0.8"
+reqwest = { version = "0.11", features = ["json"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
