@@ -382,6 +382,25 @@ impl Chat {
                 self.push(LineKind::Note, one_line(&message, TOOL_PREVIEW));
                 Applied::none()
             }
+            EngineEvent::PromptReturned { text } => {
+                // The cancel stopped this prompt before it ran. Dropping it
+                // loses what the user typed; pasting it over a composer they
+                // have already started filling loses that instead. So the
+                // composer takes it only when it is empty, and the transcript
+                // records it either way — the text is never gone silently.
+                let preview = one_line(&text, TOOL_PREVIEW);
+                if self.input.is_empty() && self.approval.is_none() {
+                    self.input = text.to_string();
+                    self.picker = 0;
+                    self.push(
+                        LineKind::Note,
+                        format!("not sent, back in the composer: {preview}"),
+                    );
+                } else {
+                    self.push(LineKind::Note, format!("not sent: {preview}"));
+                }
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -1921,6 +1940,44 @@ mod tests {
         }
         assert!(chat.turn_active);
         assert_eq!(applied.log, Some((Role::User, "look again".to_owned())));
+    }
+
+    /// The user cancelled, so the prompt waiting behind that turn never ran.
+    /// It has to come back somewhere the user can see it.
+    #[test]
+    fn a_returned_prompt_lands_in_an_empty_composer() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::PromptReturned {
+            text: "the question nobody asked".into(),
+        });
+        assert_eq!(chat.input, "the question nobody asked");
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("the question nobody asked"),
+            "the returned prompt is on screen: {frame}"
+        );
+    }
+
+    /// The user already started typing something else. Overwriting that is
+    /// the same silent loss the event exists to prevent, so the composer is
+    /// left alone and the text goes to the transcript instead.
+    #[test]
+    fn a_returned_prompt_never_overwrites_what_the_user_is_typing() {
+        let mut chat = chat();
+        type_text(&mut chat, "already typing this");
+        chat.on_event(EngineEvent::PromptReturned {
+            text: "the question nobody asked".into(),
+        });
+        assert_eq!(chat.input, "already typing this");
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("already typing this"),
+            "what the user typed survives: {frame}"
+        );
+        assert!(
+            frame.contains("the question nobody asked"),
+            "the returned prompt is still shown: {frame}"
+        );
     }
 
     #[test]
