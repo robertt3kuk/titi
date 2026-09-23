@@ -2,10 +2,12 @@
 
 pub mod compaction;
 pub mod context_files;
+pub mod hub;
 pub mod prewalk;
 pub mod session;
 pub mod trajectory;
 
+pub use hub::{HubBroker, HubClient, HubError, HubEvent, HubRequest, SOCKET_NAME};
 pub use session::{SessionMeta, SessionStore};
 pub use trajectory::{EventKind, TrajectoryRecorder};
 
