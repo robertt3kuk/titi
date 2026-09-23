@@ -832,6 +832,18 @@ impl App {
                 self.push_transcript(Section::Activity, message.to_string());
                 self.set_alert(message.to_string());
             }
+            EngineEvent::ContextBreakdown { parts, window } => {
+                let total: u64 = parts.iter().map(|part| part.tokens).sum();
+                let mut body = String::from("context · token estimates, not provider counts");
+                for part in &parts {
+                    body.push_str(&format!("\n{} · ~{} tokens", part.label, part.tokens));
+                }
+                body.push_str(&format!("\ntotal · ~{total} of {window} tokens"));
+                self.push_transcript(Section::Activity, body);
+            }
+            EngineEvent::SessionNamed { title, .. } => {
+                self.set_alert(format!("session: {title}"));
+            }
         }
     }
 

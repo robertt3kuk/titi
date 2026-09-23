@@ -8,6 +8,8 @@
 //! iterations: 8). Oscillation is a repeated patch, not a repeated review
 //! sentence — the same FAIL prose with a new diff is still progress.
 
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,12 +63,17 @@ pub fn normalize_patch(text: &str) -> String {
 }
 
 /// What the coder is asked to do on one round. `feedback` is the previous
-/// review; the first round has none. The reviewer is not given this struct.
+/// review and `gate` the previous check failure; one round carries at most
+/// one of them, and the first round has neither. The reviewer is not given
+/// this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeRequest {
     pub goal: SmolStr,
     pub round: u32,
     pub feedback: Option<Review>,
+    /// Output of the checks that stopped the previous patch before it reached
+    /// a reviewer, trimmed to [`GATE_OUTPUT_CAP`].
+    pub gate: Option<SmolStr>,
 }
 
 /// Produces the next patch. Implementations own models and tools; the loop
@@ -74,6 +81,238 @@ pub struct CodeRequest {
 #[async_trait]
 pub trait Coder: Send + Sync + 'static {
     async fn code(&self, request: CodeRequest) -> Result<Patch, SmolStr>;
+}
+
+/// One configured check: a program and its arguments, never a shell line, so
+/// nothing is word-split or expanded behind the user's back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCommand {
+    pub program: SmolStr,
+    pub args: Vec<SmolStr>,
+}
+
+impl GateCommand {
+    pub fn new(
+        program: impl Into<SmolStr>,
+        args: impl IntoIterator<Item = impl Into<SmolStr>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// The command as one line, for feedback and transcripts.
+    pub fn label(&self) -> String {
+        let mut line = self.program.to_string();
+        for arg in &self.args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        line
+    }
+}
+
+/// What the checks concluded about one patch.
+///
+/// [`Self::Red`] and [`Self::Unavailable`] are deliberately not the same
+/// outcome: red means the patch is bad and the coder can fix it, unavailable
+/// means there was nothing to check it with. Feeding the second one back as
+/// feedback would spin the coder through every remaining round over a machine
+/// it cannot change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// Every configured check exited zero, or nothing was configured.
+    Green,
+    /// A check ran and failed. `report` is what the coder is told.
+    Red { report: SmolStr },
+    /// A check could not be run at all: missing binary, no permission.
+    Unavailable { error: SmolStr },
+}
+
+/// Runs the configured checks on a patch before a reviewer is paid for.
+#[async_trait]
+pub trait Gates: Send + Sync + 'static {
+    async fn check(&self, patch: &Patch) -> GateVerdict;
+}
+
+/// How much of a failing check's output goes back to the coder. A full test
+/// log on a large workspace is tens of thousands of tokens.
+pub const GATE_OUTPUT_CAP: usize = 4_000;
+
+/// The checks as commands — `cargo check`, `pytest -q`, `npm test`, whatever
+/// the project is; the loop itself knows no language. An empty list is the
+/// default and means "no gates": the coder's patch goes straight to the
+/// reviewer.
+#[derive(Debug, Clone, Default)]
+pub struct CommandGates {
+    commands: Vec<GateCommand>,
+    dir: Option<PathBuf>,
+}
+
+impl CommandGates {
+    pub fn new(commands: Vec<GateCommand>) -> Self {
+        Self {
+            commands,
+            dir: None,
+        }
+    }
+
+    /// Directory the checks run in. Default is the process's own.
+    pub fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.dir = Some(dir.into());
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
+#[async_trait]
+impl Gates for CommandGates {
+    /// The checks read the workspace the coder just edited; the patch text is
+    /// evidence for the reviewer, not an input to a build.
+    async fn check(&self, _patch: &Patch) -> GateVerdict {
+        if self.commands.is_empty() {
+            return GateVerdict::Green;
+        }
+        let commands = self.commands.clone();
+        let dir = self.dir.clone();
+        // A check is a whole build: never on a runtime thread.
+        match tokio::task::spawn_blocking(move || run_gates(&commands, dir.as_deref())).await {
+            Ok(verdict) => verdict,
+            Err(error) => GateVerdict::Unavailable {
+                error: format!("gate runner stopped: {error}").into(),
+            },
+        }
+    }
+}
+
+/// First failure wins: a later check would only report fallout from this one.
+fn run_gates(commands: &[GateCommand], dir: Option<&Path>) -> GateVerdict {
+    for command in commands {
+        let mut process = Command::new(command.program.as_str());
+        process.args(command.args.iter().map(SmolStr::as_str));
+        if let Some(dir) = dir {
+            process.current_dir(dir);
+        }
+        let output = match process.output() {
+            Ok(output) => output,
+            Err(error) => {
+                return GateVerdict::Unavailable {
+                    error: format!("gate `{}` did not run: {error}", command.label()).into(),
+                };
+            }
+        };
+        if !output.status.success() {
+            return GateVerdict::Red {
+                report: gate_failure(command, &output),
+            };
+        }
+    }
+    GateVerdict::Green
+}
+
+fn gate_failure(command: &GateCommand, output: &std::process::Output) -> SmolStr {
+    let status = match output.status.code() {
+        Some(code) => format!("exit {code}"),
+        None => "killed by signal".to_owned(),
+    };
+    let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    let mut report = format!("`{}` failed ({status}).", command.label());
+    let excerpt = gate_excerpt(body.trim());
+    if !excerpt.is_empty() {
+        report.push('\n');
+        report.push_str(&excerpt);
+    }
+    report.into()
+}
+
+/// The part of a check's output worth spending prompt on: the tail, where
+/// runners print their summary, plus the lines that name a failure, which the
+/// summary does not. Dropped stretches are marked with an ellipsis line.
+fn gate_excerpt(text: &str) -> String {
+    if text.len() <= GATE_OUTPUT_CAP {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = vec![false; lines.len()];
+    let mut spent = 0usize;
+    for (index, line) in lines.iter().enumerate().rev() {
+        let cost = line.len() + 1;
+        if spent + cost > GATE_OUTPUT_CAP / 2 {
+            break;
+        }
+        spent += cost;
+        kept[index] = true;
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if kept[index] || !names_a_failure(line) {
+            continue;
+        }
+        let cost = line.len() + 1;
+        if spent + cost > GATE_OUTPUT_CAP {
+            break;
+        }
+        spent += cost;
+        kept[index] = true;
+    }
+    if !kept.iter().any(|keep| *keep) {
+        // One enormous line: no whole line fits, so cut bytes rather than
+        // hand the coder nothing.
+        return format!("…\n{}", tail_bytes(text, GATE_OUTPUT_CAP));
+    }
+    let mut out = String::with_capacity(spent + lines.len());
+    let mut gap = false;
+    for (index, line) in lines.iter().enumerate() {
+        if !kept[index] {
+            gap = true;
+            continue;
+        }
+        if gap {
+            out.push_str("…\n");
+            gap = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Markers the runners a project is likely to gate on print on failure:
+/// rustc and cargo, pytest, npm, go test.
+fn names_a_failure(line: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "error",
+        "err!",
+        "panicked",
+        "failed",
+        "failure",
+        "assertion",
+    ];
+    let bytes = line.as_bytes();
+    MARKERS.iter().any(|marker| {
+        let marker = marker.as_bytes();
+        bytes
+            .windows(marker.len())
+            .any(|window| window.eq_ignore_ascii_case(marker))
+    })
+}
+
+/// The last `cap` bytes, cut on a character boundary.
+fn tail_bytes(text: &str, cap: usize) -> &str {
+    let mut start = text.len().saturating_sub(cap);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// Why the loop stopped.
@@ -90,6 +329,10 @@ pub enum GoalStop {
     /// The coder or the reviewer returned an error. This loop does not pick
     /// another model; the turn loop already owns fallback.
     Error,
+    /// A configured check could not be run at all. The patch was never
+    /// judged, so the coder is not asked again: nothing it writes would fix
+    /// a missing binary.
+    GateUnavailable,
 }
 
 /// A shared cancel flag. Setting it wakes a parked waiter; the loop does not
@@ -129,17 +372,25 @@ pub struct GoalOutcome {
     pub rounds: u32,
     pub patch: Option<Patch>,
     pub review: Option<Review>,
+    /// The last failing check's report, when a gate turned a round back.
+    pub gate: Option<SmolStr>,
     pub error: Option<SmolStr>,
 }
 
 impl GoalOutcome {
-    fn cancelled(rounds: u32, patch: Option<Patch>, review: Option<Review>) -> Self {
+    fn cancelled(
+        rounds: u32,
+        patch: Option<Patch>,
+        review: Option<Review>,
+        gate: Option<SmolStr>,
+    ) -> Self {
         Self {
             stop: GoalStop::Cancelled,
             verdict: None,
             rounds,
             patch,
             review,
+            gate,
             error: None,
         }
     }
@@ -149,6 +400,7 @@ impl GoalOutcome {
         error: SmolStr,
         patch: Option<Patch>,
         review: Option<Review>,
+        gate: Option<SmolStr>,
     ) -> Self {
         Self {
             stop: GoalStop::Error,
@@ -156,15 +408,36 @@ impl GoalOutcome {
             rounds,
             patch,
             review,
+            gate,
+            error: Some(error),
+        }
+    }
+
+    fn gate_unavailable(
+        rounds: u32,
+        error: SmolStr,
+        patch: Option<Patch>,
+        review: Option<Review>,
+        gate: Option<SmolStr>,
+    ) -> Self {
+        Self {
+            stop: GoalStop::GateUnavailable,
+            verdict: None,
+            rounds,
+            patch,
+            review,
+            gate,
             error: Some(error),
         }
     }
 }
 
-/// Runs coder then reviewer until pass, cap, oscillation, cancel, or error.
+/// Runs coder, then the configured checks, then reviewer until pass, cap,
+/// oscillation, cancel, or error.
 pub struct GoalLoop {
     coder: Arc<dyn Coder>,
     reviewer: Arc<dyn Reviewer>,
+    gates: Arc<dyn Gates>,
     max_rounds: u32,
     cancel: GoalCancel,
 }
@@ -174,6 +447,7 @@ impl GoalLoop {
         Self {
             coder,
             reviewer,
+            gates: Arc::new(CommandGates::default()),
             max_rounds: DEFAULT_GOAL_ROUNDS,
             cancel: GoalCancel::new(),
         }
@@ -191,6 +465,13 @@ impl GoalLoop {
         self
     }
 
+    /// Checks that must pass before a reviewer is called. The default is
+    /// none, which is the loop's original shape: coder, then reviewer.
+    pub fn with_gates(mut self, gates: Arc<dyn Gates>) -> Self {
+        self.gates = gates;
+        self
+    }
+
     pub fn max_rounds(&self) -> u32 {
         self.max_rounds
     }
@@ -201,35 +482,44 @@ impl GoalLoop {
         let goal = goal.into();
         let mut seen = Vec::<String>::new();
         let mut feedback = None;
+        let mut gate = None;
         let mut last_patch = None;
         let mut last_review = None;
+        let mut last_gate = None;
         let mut completed = 0u32;
 
         for round in 1..=self.max_rounds {
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, last_patch, last_review);
+                return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
             }
             let request = CodeRequest {
                 goal: goal.clone(),
                 round,
                 feedback,
+                gate,
             };
             let coded = tokio::select! {
                 biased;
                 () = wait_cancelled(&self.cancel) => {
-                    return GoalOutcome::cancelled(completed, last_patch, last_review);
+                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
                 }
                 result = self.coder.code(request) => result,
             };
             let patch = match coded {
                 Ok(patch) => patch,
                 Err(error) => {
-                    return GoalOutcome::failed_call(completed, error, last_patch, last_review);
+                    return GoalOutcome::failed_call(
+                        completed,
+                        error,
+                        last_patch,
+                        last_review,
+                        last_gate,
+                    );
                 }
             };
             completed = round;
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, Some(patch), last_review);
+                return GoalOutcome::cancelled(completed, Some(patch), last_review, last_gate);
             }
             let normalized = patch.normalized();
             if seen.iter().any(|previous| previous == &normalized) {
@@ -239,24 +529,67 @@ impl GoalLoop {
                     rounds: completed,
                     patch: Some(patch),
                     review: last_review,
+                    gate: last_gate,
                     error: None,
                 };
             }
             seen.push(normalized);
             last_patch = Some(patch.clone());
 
+            // The checks come before the reviewer: a review is a model call,
+            // and a patch that does not build has nothing worth reviewing.
+            let gated = tokio::select! {
+                biased;
+                () = wait_cancelled(&self.cancel) => {
+                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
+                }
+                verdict = self.gates.check(&patch) => verdict,
+            };
+            match gated {
+                GateVerdict::Green => {}
+                GateVerdict::Red { report } => {
+                    last_gate = Some(report.clone());
+                    gate = Some(report);
+                    feedback = None;
+                    if self.cancel.is_cancelled() {
+                        return GoalOutcome::cancelled(
+                            completed,
+                            last_patch,
+                            last_review,
+                            last_gate,
+                        );
+                    }
+                    continue;
+                }
+                GateVerdict::Unavailable { error } => {
+                    return GoalOutcome::gate_unavailable(
+                        completed,
+                        error,
+                        last_patch,
+                        last_review,
+                        last_gate,
+                    );
+                }
+            }
+
             let review_request = ReviewRequest::new(goal.clone(), patch.text);
             let reviewed = tokio::select! {
                 biased;
                 () = wait_cancelled(&self.cancel) => {
-                    return GoalOutcome::cancelled(completed, last_patch, last_review);
+                    return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
                 }
                 result = self.reviewer.review(review_request) => result,
             };
             let review = match reviewed {
                 Ok(review) => review,
                 Err(error) => {
-                    return GoalOutcome::failed_call(completed, error, last_patch, last_review);
+                    return GoalOutcome::failed_call(
+                        completed,
+                        error,
+                        last_patch,
+                        last_review,
+                        last_gate,
+                    );
                 }
             };
             last_review = Some(review.clone());
@@ -267,14 +600,18 @@ impl GoalLoop {
                     rounds: completed,
                     patch: last_patch,
                     review: last_review,
+                    gate: last_gate,
                     error: None,
                 };
             }
             // FAIL and PARTIAL both go back to the coder. A repeated sentence
             // is not oscillation; only a repeated patch is.
             feedback = Some(review);
+            // The next round answers this review; an older gate report is
+            // about a patch that is already gone.
+            gate = None;
             if self.cancel.is_cancelled() {
-                return GoalOutcome::cancelled(completed, last_patch, last_review);
+                return GoalOutcome::cancelled(completed, last_patch, last_review, last_gate);
             }
         }
 
@@ -284,6 +621,7 @@ impl GoalLoop {
             rounds: completed,
             patch: last_patch,
             review: last_review,
+            gate: last_gate,
             error: None,
         }
     }
@@ -307,6 +645,7 @@ pub fn goal_report(outcome: &GoalOutcome) -> String {
         GoalStop::Oscillation => "oscillation",
         GoalStop::Cancelled => "cancelled",
         GoalStop::Error => "error",
+        GoalStop::GateUnavailable => "gate unavailable",
     };
     let rounds = if outcome.rounds == 1 {
         "1 round".to_owned()
@@ -317,6 +656,10 @@ pub fn goal_report(outcome: &GoalOutcome) -> String {
     if let Some(verdict) = outcome.verdict {
         line.push_str(" · verdict ");
         line.push_str(&verdict.as_str().to_ascii_lowercase());
+    }
+    if let Some(gate) = &outcome.gate {
+        line.push_str(" · gate red: ");
+        line.push_str(gate.lines().next().unwrap_or_default());
     }
     if let Some(error) = &outcome.error {
         line.push_str(" · ");
@@ -342,7 +685,11 @@ impl RunnerCoder {
 impl Coder for RunnerCoder {
     async fn code(&self, request: CodeRequest) -> Result<Patch, SmolStr> {
         let mut task = format!("Goal:\n{}\n\nRound {}.\n", request.goal, request.round);
-        if let Some(review) = &request.feedback {
+        if let Some(gate) = &request.gate {
+            task.push_str("The project checks failed on your last patch, before any review:\n");
+            task.push_str(gate);
+            task.push_str("\nMake the checks pass, then produce the patch.\n");
+        } else if let Some(review) = &request.feedback {
             task.push_str("Previous review (");
             task.push_str(review.verdict.as_str());
             task.push_str("):\n");
@@ -401,5 +748,36 @@ mod tests {
         );
         // An internal blank line is part of the patch.
         assert_ne!(normalize_patch("a\n\nb\n"), normalize_patch("a\nb\n"));
+    }
+
+    #[test]
+    fn a_short_output_is_handed_over_whole() {
+        let log = "error[E0308]: mismatched types\n  --> src/main.rs:3:5";
+        assert_eq!(gate_excerpt(log), log);
+    }
+
+    #[test]
+    fn a_huge_log_keeps_the_failure_lines_and_the_tail() {
+        let mut log = String::from("error[E0433]: cannot find `frobnicate`\n");
+        for index in 0..4_000 {
+            log.push_str(&format!("   Compiling crate-{index} v0.1.0\n"));
+        }
+        log.push_str("error: could not compile `titi-engine`\n");
+
+        let excerpt = gate_excerpt(&log);
+        assert!(excerpt.len() < log.len() / 4);
+        assert!(excerpt.len() <= GATE_OUTPUT_CAP + 8);
+        // The first error is what to fix; the last line is the summary.
+        assert!(excerpt.contains("error[E0433]: cannot find `frobnicate`"));
+        assert!(excerpt.contains("error: could not compile `titi-engine`"));
+        assert!(excerpt.contains('…'));
+    }
+
+    #[test]
+    fn one_enormous_line_is_cut_on_a_character_boundary() {
+        let log = "ошибка ".repeat(GATE_OUTPUT_CAP);
+        let excerpt = gate_excerpt(&log);
+        assert!(excerpt.len() <= GATE_OUTPUT_CAP + 8);
+        assert!(excerpt.ends_with("ошибка "));
     }
 }

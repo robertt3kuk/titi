@@ -69,6 +69,13 @@ pub enum EngineCommand {
     RunGoal {
         text: SmolStr,
     },
+    /// Report what currently fills the context window, part by part.
+    DescribeContext,
+    /// Fold the history now, whatever the threshold says. `focus` is free
+    /// text that biases what the digest keeps.
+    Compact {
+        focus: Option<SmolStr>,
+    },
     Shutdown,
 }
 
@@ -184,4 +191,29 @@ pub enum EngineEvent {
     Notice {
         message: SmolStr,
     },
+    /// What fills the context window right now, part by part.
+    ///
+    /// The answer to [`EngineCommand::DescribeContext`]. There is no total
+    /// field: the total is the sum of the parts, and two numbers that can
+    /// disagree are worse than one the surface adds up itself.
+    ContextBreakdown {
+        parts: Vec<ContextPart>,
+        window: u64,
+    },
+    /// A session that had no name of its own got one, generated after a
+    /// finished turn. A name the user chose is never replaced, so this never
+    /// overwrites what the user typed.
+    SessionNamed {
+        session_id: SmolStr,
+        title: SmolStr,
+    },
+}
+
+/// One labelled slice of the request a turn would send, with the estimated
+/// tokens it costs. The estimate is the project's own (~4 chars per token),
+/// not a count any provider reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPart {
+    pub label: SmolStr,
+    pub tokens: u64,
 }

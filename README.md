@@ -53,6 +53,8 @@ titi --headless --approval yolo
 | `/checkpoints` | Lists this session's rewind points |
 | `/rewind` | Cuts the session back to the newest point. `/rewind 2` picks one |
 | `/recap` | Prints what the session did: turns, tools, files, problems |
+| `/context` | What fills the context window now: system prompt, project rules, skills, recalled memory, genome map, history, tool specs, each with its estimated tokens and share. The numbers are estimates, not provider counts |
+| `/compact` | Folds the history now instead of waiting for the threshold. `/compact auth` keeps the folded lines that mention `auth` in the digest |
 | `/pause` | Holds the composer and stops the running turn. `/pause` again resumes |
 | `/help` | Lists these commands |
 | `/login` | `/login` lists providers. `/login openai` asks for the key and stores it masked. `/login openai <key>` stores it in one step |
@@ -180,6 +182,8 @@ titi --headless --approval yolo
 | `/checkpoints` | Список точек отката этой сессии |
 | `/rewind` | Откат к последней точке. `/rewind 2` выбирает номер |
 | `/recap` | Что было в сессии: ходы, инструменты, файлы, ошибки |
+| `/context` | Что сейчас занимает окно: системный промпт, правила проекта, скиллы, вспомненная память, карта репозитория, история, описания инструментов — у каждого оценка в токенах и доля. Это оценка, а не счёт провайдера |
+| `/compact` | Сворачивает историю сразу, не дожидаясь порога. `/compact auth` оставляет в дайджесте свёрнутые строки, где упомянут `auth` |
 | `/pause` | Держит ввод и останавливает ход. Ещё раз `/pause` продолжает |
 | `/help` | Список этих команд |
 | `/login` | `/login` показывает провайдеров. `/login openai` просит ключ и прячет его. `/login openai <ключ>` сохраняет сразу |

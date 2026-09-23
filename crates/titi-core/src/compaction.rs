@@ -305,6 +305,56 @@ fn structured_digest(strategy: Strategy, messages: &[Entry]) -> String {
     out
 }
 
+/// How many focused lines the digest keeps.
+pub const FOCUS_LINE_LIMIT: usize = 8;
+
+/// How much of one focused line survives.
+const FOCUS_LINE_CHARS: usize = 160;
+
+/// The lines of the folded prefix that mention `focus`, for a compaction the
+/// user asked for by name.
+///
+/// `/compact auth` means "fold, but not that part": the structural digest
+/// keeps only the first line of each dropped prompt, so the thread the user
+/// named is exactly what would vanish. Appended to the digest, these lines
+/// are the part of the prefix that survives it.
+pub fn focus_digest(focus: &str, folded: &[&str]) -> String {
+    let needle = focus.to_lowercase();
+    let mut out = format!("Kept for the requested focus ({focus}):\n");
+    let mut kept = 0usize;
+    let mut extra = 0usize;
+    for line in folded.iter().flat_map(|text| text.lines()) {
+        let line = line.trim();
+        if line.is_empty() || !line.to_lowercase().contains(&needle) {
+            continue;
+        }
+        if kept == FOCUS_LINE_LIMIT {
+            extra += 1;
+            continue;
+        }
+        out.push_str("· ");
+        out.push_str(&clamp_chars(line, FOCUS_LINE_CHARS));
+        out.push('\n');
+        kept += 1;
+    }
+    if kept == 0 {
+        out.push_str("· nothing in the folded messages mentioned it\n");
+    }
+    if extra > 0 {
+        out.push_str(&format!("· … and {extra} more\n"));
+    }
+    out
+}
+
+fn clamp_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +532,41 @@ mod tests {
         let t = policy.compute_target(&[], 100);
         assert_eq!(t.first_kept, 0);
         assert_eq!(t.total_tokens, 0);
+    }
+
+    #[test]
+    fn focus_digest_keeps_the_lines_that_mention_the_focus() {
+        let first = "we moved the auth guard\nthis line is about pagination";
+        let second = "AUTH is still case-insensitive here\nnothing to see";
+        let out = focus_digest("auth", &[first, second]);
+
+        assert!(out.contains("we moved the auth guard"), "{out}");
+        assert!(out.contains("AUTH is still case-insensitive here"), "{out}");
+        assert!(!out.contains("pagination"), "{out}");
+        assert!(!out.contains("nothing to see"), "{out}");
+    }
+
+    #[test]
+    fn focus_digest_counts_what_it_could_not_keep() {
+        let folded: Vec<String> = (0..FOCUS_LINE_LIMIT + 3)
+            .map(|i| format!("auth line {i}"))
+            .collect();
+        let borrowed: Vec<&str> = folded.iter().map(String::as_str).collect();
+
+        let out = focus_digest("auth", &borrowed);
+
+        assert_eq!(out.matches("· auth line").count(), FOCUS_LINE_LIMIT);
+        assert!(out.contains("· … and 3 more"), "{out}");
+    }
+
+    /// A focus nothing matched must say so: an empty tail would read as "the
+    /// folded messages were about this", which is the opposite of the truth.
+    #[test]
+    fn focus_digest_reports_a_focus_nothing_matched() {
+        let out = focus_digest("auth", &["a note about pagination"]);
+        assert!(
+            out.contains("nothing in the folded messages mentioned it"),
+            "{out}"
+        );
     }
 }

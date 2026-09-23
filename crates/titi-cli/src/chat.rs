@@ -20,7 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
-use titi_engine::{Engine, EngineCommand, EngineEvent};
+use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::herdr::{self, AgentState};
@@ -407,6 +407,10 @@ impl Chat {
                 self.push(LineKind::Note, format!("folded {folded} earlier messages"));
                 Applied::none()
             }
+            EngineEvent::ContextBreakdown { parts, window } => {
+                self.show_context(&parts, window);
+                Applied::none()
+            }
             EngineEvent::Failed { message, .. } => {
                 self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
                 self.finish_turn()
@@ -594,6 +598,8 @@ impl Chat {
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
             "goal" => self.goal(args),
+            "context" => self.describe_context(args),
+            "compact" => self.compact(args),
             "help" => self.help(),
             "login" => self.login(args),
             "logout" => self.logout(args),
@@ -900,6 +906,70 @@ impl Chat {
         }))
     }
 
+    /// `/context` asks the engine what fills the window. It takes no
+    /// argument: the breakdown is the whole answer, and quietly ignoring a
+    /// stray word would hide the typo behind a plausible screen.
+    fn describe_context(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /context (got {args})"));
+            return Applied::none();
+        }
+        Applied::effect(ChatEffect::Send(EngineCommand::DescribeContext))
+    }
+
+    /// `/compact [focus]` folds the history now instead of waiting for the
+    /// threshold. The focus is free text: it biases what the digest keeps.
+    fn compact(&mut self, args: &str) -> Applied {
+        let focus = args.trim();
+        let note = if focus.is_empty() {
+            "compacting the context".to_owned()
+        } else {
+            format!("compacting the context · focus: {focus}")
+        };
+        self.push(LineKind::Note, note);
+        Applied::effect(ChatEffect::Send(EngineCommand::Compact {
+            focus: (!focus.is_empty()).then(|| focus.into()),
+        }))
+    }
+
+    /// The context breakdown, part by part. The share is of what is in the
+    /// window now, so the parts add up to the total on the last line, and
+    /// that total is what is reported against the window.
+    fn show_context(&mut self, parts: &[ContextPart], window: u64) {
+        let total: u64 = parts.iter().map(|part| part.tokens).sum();
+        let width = parts
+            .iter()
+            .map(|part| part.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.push(
+            LineKind::Note,
+            "context · token estimates, not provider counts".to_owned(),
+        );
+        for part in parts {
+            let label = &part.label;
+            let pad = width.saturating_sub(label.chars().count());
+            self.push(
+                LineKind::Note,
+                format!(
+                    "{label}{:pad$}  {} tokens · {}%",
+                    "",
+                    part.tokens,
+                    share(part.tokens, total)
+                ),
+            );
+        }
+        let pad = width.saturating_sub("total".chars().count());
+        self.push(
+            LineKind::Note,
+            format!(
+                "total{:pad$}  {total} tokens · {}% of {window}",
+                "",
+                share(total, window)
+            ),
+        );
+    }
+
     fn arm_quit(&mut self, now: Instant) -> Applied {
         if let Some(armed) = self.quit_armed
             && now.saturating_duration_since(armed) <= QUIT_WINDOW
@@ -1103,6 +1173,14 @@ const COMMANDS: &[Command] = &[
         about: "list rewind points",
     },
     Command {
+        name: "compact",
+        about: "fold the history now, optionally around a focus",
+    },
+    Command {
+        name: "context",
+        about: "what fills the context window",
+    },
+    Command {
         name: "goal",
         about: "run coder and reviewer until the goal passes",
     },
@@ -1213,6 +1291,15 @@ fn picker_rows(chat: &Chat) -> Vec<PickRow> {
             .map(|(index, _)| PickRow::Skill(index)),
     );
     rows
+}
+
+/// `part` as a whole percent of `whole`. An empty whole is 0%, not a panic.
+fn share(part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        0
+    } else {
+        (part.saturating_mul(100) / whole).min(100)
+    }
 }
 
 fn known_provider(id: &str) -> bool {
@@ -2259,6 +2346,8 @@ mod tests {
         for name in [
             "checkpoint",
             "checkpoints",
+            "compact",
+            "context",
             "rewind",
             "recap",
             "pause",
@@ -2274,6 +2363,108 @@ mod tests {
                 "/{name} dispatches but is not listed"
             );
         }
+    }
+
+    /// The tokens of one breakdown line, `None` for anything else.
+    fn tokens_in(line: &str) -> Option<u64> {
+        line.split(" tokens")
+            .next()?
+            .split_whitespace()
+            .next_back()?
+            .parse()
+            .ok()
+    }
+
+    /// A breakdown whose parts do not add up to its total is worse than no
+    /// breakdown: it reads as if something were hiding in the window.
+    #[test]
+    fn context_renders_parts_that_sum_to_the_reported_total() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::ContextBreakdown {
+            parts: vec![
+                ContextPart {
+                    label: "system prompt".into(),
+                    tokens: 300,
+                },
+                ContextPart {
+                    label: "genome map".into(),
+                    tokens: 500,
+                },
+                ContextPart {
+                    label: "history".into(),
+                    tokens: 200,
+                },
+            ],
+            window: 10_000,
+        });
+
+        let rendered: Vec<String> = chat.lines.iter().map(|line| line.text.clone()).collect();
+        let Some(total) = rendered.iter().find(|line| line.starts_with("total")) else {
+            panic!("no total line: {rendered:?}");
+        };
+        let summed: u64 = rendered
+            .iter()
+            .filter(|line| !line.starts_with("total"))
+            .filter_map(|line| tokens_in(line))
+            .sum();
+
+        assert_eq!(tokens_in(total), Some(summed), "{rendered:?}");
+        assert_eq!(summed, 1000, "{rendered:?}");
+        assert!(total.contains("10% of 10000"), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|line| line.contains("estimates")),
+            "the numbers are estimates and must say so: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("genome map") && line.contains("50%")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn context_takes_no_argument() {
+        let mut chat = chat();
+        type_text(&mut chat, "/context");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::DescribeContext))
+        );
+
+        type_text(&mut chat, "/context now");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none(), "{:?}", applied.effect);
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("usage: /context")),
+            "a stray argument was swallowed"
+        );
+    }
+
+    #[test]
+    fn compact_dispatches_with_and_without_a_focus() {
+        let mut chat = chat();
+        type_text(&mut chat, "/compact");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::Compact { focus: None }))
+        );
+
+        type_text(&mut chat, "/compact the auth refactor");
+        match chat.on_key(Key::Enter, Instant::now()).effect {
+            Some(ChatEffect::Send(EngineCommand::Compact { focus: Some(focus) })) => {
+                assert_eq!(focus.as_str(), "the auth refactor");
+            }
+            other => panic!("expected a focused compaction, got {other:?}"),
+        }
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("focus: the auth refactor")),
+            "the focus never reached the transcript"
+        );
     }
 
     #[test]

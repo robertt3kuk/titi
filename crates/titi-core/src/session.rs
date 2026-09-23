@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod entry;
 pub mod index;
+pub mod namer;
 pub mod store;
 
 pub use checkpoint::Checkpoint;

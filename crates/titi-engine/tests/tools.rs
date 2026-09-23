@@ -596,3 +596,57 @@ async fn session_trajectory_records_user_tools_and_turn_end() {
     );
     assert!(kinds.iter().any(|kind| matches!(kind, EventKind::TurnEnd)));
 }
+
+/// Masking runs on the tool result the whole turn shares, before the trajectory
+/// records the round and before the model reads it — not as a provider-only
+/// transform. The address is gone, the surrounding words are verbatim, the port
+/// stays, and the trajectory holds a result for this very call so the check
+/// cannot pass on an empty output.
+#[tokio::test]
+async fn tool_output_is_masked_before_the_trajectory_records_it() {
+    use titi_core::trajectory::{EventKind, TrajectoryRecorder};
+    use titi_engine::TrajectorySink;
+    use tokio::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = TrajectoryRecorder::open(dir.path(), "sess").unwrap();
+    let trajectory: TrajectorySink = Arc::new(Mutex::new(Some(recorder)));
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events(
+            "echo",
+            r#"{"text":"api at [2001:db8::1]:443 stays reachable"}"#,
+        )),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut engine = EngineRuntime::start_with_session(
+        EngineConfig::new("primary"),
+        resolver(transport),
+        None,
+        echo_registry(),
+        trajectory,
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let (call_id, output) = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished {
+                call_id, output, ..
+            } => Some((call_id.to_string(), output.to_string())),
+            _ => None,
+        })
+        .expect("the echo call finished");
+    assert_eq!(output, "api at [[ip]]:443 stays reachable", "{output}");
+
+    let replay = TrajectoryRecorder::open(dir.path(), "sess").unwrap();
+    let recorded = replay.tail(16).into_iter().any(
+        |event| matches!(event.kind, EventKind::ToolResult { id, ok: true, .. } if id == call_id),
+    );
+    assert!(recorded, "the trajectory recorded this call's result");
+}

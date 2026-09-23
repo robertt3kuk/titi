@@ -1,7 +1,10 @@
 use titi_cli::engine::{
     default_registry_config, merge_registry_config, parse_approval, prefer_available_models,
 };
-use titi_engine::ProviderRegistryConfig;
+use titi_engine::{
+    CredentialSource, HttpTransportFactory, ProviderDescriptor, ProviderRegistry,
+    ProviderRegistryConfig,
+};
 use titi_tools::ApprovalMode;
 
 #[test]
@@ -33,33 +36,88 @@ fn approval_modes_parse_and_reject_typos() {
     );
 }
 
+/// Any key at all, so the check is about the catalog rather than about what
+/// this machine happens to have configured.
+struct AlwaysKeyed;
+
+impl CredentialSource for AlwaysKeyed {
+    fn resolve(&self, _provider: &ProviderDescriptor) -> Option<titi_providers::Credential> {
+        Some(titi_providers::Credential {
+            access: "sk-test".into(),
+            kind: titi_providers::CredKind::ApiKey,
+            level: titi_providers::LadderLevel::Env,
+        })
+    }
+}
+
+/// The catalog grows with every provider, so pinning its contents would only
+/// buy a test to update. What has to hold is that it is internally sound: a
+/// typo in a provider id, a duplicated model or an endpoint the transport
+/// layer refuses would each strand a model that the model picker offers.
 #[test]
-fn default_registry_has_the_builtin_providers() {
+fn every_builtin_model_resolves_through_its_own_provider() {
     let config = default_registry_config();
-    let models: Vec<_> = config
-        .models
-        .iter()
-        .map(|model| model.id.as_str())
-        .collect();
-    assert_eq!(
-        models,
-        vec![
-            "openai/gpt-4.1",
-            "openrouter/gpt-4.1",
-            "opencode-go/glm-5.3-flash",
-            "opencode-go/deepseek-v4-flash",
-            "anthropic/claude-sonnet-4-5",
-        ]
-    );
-    let providers: Vec<_> = config
-        .providers
-        .iter()
-        .map(|provider| provider.id.as_str())
-        .collect();
-    assert_eq!(
-        providers,
-        vec!["openai", "openrouter", "opencode-go", "anthropic"]
-    );
+    let registry = ProviderRegistry::new(
+        config.clone(),
+        std::sync::Arc::new(AlwaysKeyed),
+        std::sync::Arc::new(HttpTransportFactory),
+    )
+    .expect("the built-in catalog builds a registry");
+
+    for model in &config.models {
+        let resolved = registry
+            .resolve(model.id.as_str())
+            .unwrap_or_else(|error| panic!("{} does not resolve: {error}", model.id));
+        assert_eq!(resolved.wire_model, model.wire_model);
+    }
+}
+
+/// A provider that needs no key must not claim to need one, and a provider
+/// that does must name the variable it reads: the message for a missing key
+/// is the only instruction the user gets.
+#[test]
+fn a_provider_asks_for_a_key_exactly_when_it_has_one_to_ask_for() {
+    for provider in default_registry_config().providers {
+        assert_eq!(
+            provider.credential_required,
+            provider.credential_env.is_some(),
+            "{} disagrees with itself about needing a key",
+            provider.id
+        );
+    }
+}
+
+/// Endpoints are the one thing a registry entry cannot get approximately
+/// right: a wrong base URL is a silent failure that only shows up as a
+/// request into nowhere.
+#[test]
+fn the_new_providers_point_at_their_documented_endpoints() {
+    let config = default_registry_config();
+    let provider = |id: &str| -> ProviderDescriptor {
+        config
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .unwrap_or_else(|| panic!("{id} is missing from the built-in catalog"))
+            .clone()
+    };
+
+    let clinepass = provider("clinepass");
+    assert_eq!(clinepass.base_url.as_str(), "https://api.cline.bot/api/v1");
+    assert_eq!(clinepass.credential_env.as_deref(), Some("CLINE_API_KEY"));
+
+    let bai = provider("bai");
+    assert_eq!(bai.base_url.as_str(), "https://api.b.ai/v1");
+    assert_eq!(bai.credential_env.as_deref(), Some("BAI_API_KEY"));
+
+    // Local servers: the default ports of Ollama and LM Studio, and no key.
+    let ollama = provider("ollama");
+    assert_eq!(ollama.base_url.as_str(), "http://127.0.0.1:11434/v1");
+    assert!(!ollama.credential_required);
+
+    let lmstudio = provider("lmstudio");
+    assert_eq!(lmstudio.base_url.as_str(), "http://127.0.0.1:1234/v1");
+    assert!(!lmstudio.credential_required);
 }
 
 #[test]

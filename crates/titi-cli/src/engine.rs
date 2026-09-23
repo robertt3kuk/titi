@@ -38,6 +38,41 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 credential_env: Some("ANTHROPIC_API_KEY".into()),
                 credential_required: true,
             },
+            // Cheap OpenAI-compatible gateways: plain Chat Completions, so
+            // they reuse the compat transport and add no provider branch.
+            ProviderDescriptor {
+                id: "clinepass".into(),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "https://api.cline.bot/api/v1".into(),
+                credential_env: Some("CLINE_API_KEY".into()),
+                credential_required: true,
+            },
+            ProviderDescriptor {
+                id: "bai".into(),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "https://api.b.ai/v1".into(),
+                credential_env: Some("BAI_API_KEY".into()),
+                credential_required: true,
+            },
+            // Local servers. No key, and no built-in models: what is loaded
+            // is whatever the user pulled, so the ids come from their config
+            // (or, later, from the endpoint itself). Nothing here contacts
+            // the server, so an absent one costs a failed request, not a
+            // failed start.
+            ProviderDescriptor {
+                id: "ollama".into(),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                credential_env: None,
+                credential_required: false,
+            },
+            ProviderDescriptor {
+                id: "lmstudio".into(),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "http://127.0.0.1:1234/v1".into(),
+                credential_env: None,
+                credential_required: false,
+            },
         ],
         models: vec![
             ModelDescriptor {
@@ -69,6 +104,42 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 provider: "anthropic".into(),
                 wire_model: "claude-sonnet-4-5".into(),
                 context_window: Some(200_000),
+            },
+            ModelDescriptor {
+                id: "clinepass/glm-5.3".into(),
+                provider: "clinepass".into(),
+                wire_model: "glm-5.3".into(),
+                context_window: None,
+            },
+            ModelDescriptor {
+                id: "clinepass/deepseek-v4-flash".into(),
+                provider: "clinepass".into(),
+                wire_model: "deepseek-v4-flash".into(),
+                context_window: None,
+            },
+            ModelDescriptor {
+                id: "clinepass/deepseek-v4-pro".into(),
+                provider: "clinepass".into(),
+                wire_model: "deepseek-v4-pro".into(),
+                context_window: None,
+            },
+            ModelDescriptor {
+                id: "bai/glm-5.3-flash".into(),
+                provider: "bai".into(),
+                wire_model: "glm-5.3-flash".into(),
+                context_window: None,
+            },
+            ModelDescriptor {
+                id: "bai/qwen3.8-flash".into(),
+                provider: "bai".into(),
+                wire_model: "qwen3.8-flash".into(),
+                context_window: None,
+            },
+            ModelDescriptor {
+                id: "bai/qwen3.8-max".into(),
+                provider: "bai".into(),
+                wire_model: "qwen3.8-max".into(),
+                context_window: None,
             },
         ],
     }
@@ -276,6 +347,10 @@ pub fn start_engine_with(
         )
         .map_err(|error| error.to_string())?,
     );
+    // Local servers introduce themselves on their own time. The catalog is
+    // already complete without them, so this is fire-and-forget: whatever
+    // answers joins the registry, and whatever does not is simply absent.
+    registry.spawn_local_discovery();
     // A missing key fails the turn immediately, so a keyless model must not
     // sit in front of one that can actually run. If none have a key, keep the
     // catalog order and let the first request say which credential is missing.
@@ -359,6 +434,9 @@ pub fn start_engine_with(
         Err(_) => "session".into(),
     };
     engine_config.restored_messages = restored;
+    // The engine names this session once the first turn finishes; without the
+    // id it has nothing to name.
+    engine_config.session_id = Some(session_id.clone());
     let recorder = titi_core::trajectory::TrajectoryRecorder::open(&agent_dir, &session_id).ok();
     let trajectory: TrajectorySink = std::sync::Arc::new(tokio::sync::Mutex::new(recorder));
     Ok((

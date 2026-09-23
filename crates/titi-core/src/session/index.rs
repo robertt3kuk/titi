@@ -22,13 +22,18 @@ pub struct SessionIndex {
     conn: Connection,
 }
 
+/// `title_source` records who named a session: `user` for a title the user
+/// chose, `auto` for one the session namer generated, `NULL` for a session
+/// nobody has named yet. The placeholder a surface writes at creation time
+/// counts as unnamed, so a fresh session can still be given a real title.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
-    id         TEXT PRIMARY KEY,
-    title      TEXT,
-    created_at INTEGER NOT NULL,
-    bot_id     TEXT,
-    source     TEXT
+    id           TEXT PRIMARY KEY,
+    title        TEXT,
+    created_at   INTEGER NOT NULL,
+    bot_id       TEXT,
+    source       TEXT,
+    title_source TEXT
 );
 CREATE TABLE IF NOT EXISTS entries (
     session_id TEXT NOT NULL,
@@ -49,10 +54,37 @@ impl SessionIndex {
             std::fs::create_dir_all(parent).map_err(SessionError::Io)?;
         }
         let conn = Connection::open(path).map_err(SessionError::Db)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
+        // Two handles now write here: the store on the surface's thread and
+        // the session namer from its own task. A busy timeout makes the
+        // loser of that race wait instead of failing the write.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .map_err(SessionError::Db)?;
         conn.execute_batch(SCHEMA).map_err(SessionError::Db)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Adds what a database from an earlier release is missing.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it
+    /// was, so without this every title write against an already-created
+    /// `state.db` would fail on an unknown column.
+    fn migrate(conn: &Connection) -> Result<(), SessionError> {
+        let mut columns = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(SessionError::Db)?;
+        let has_title_source = columns
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(SessionError::Db)?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(SessionError::Db)?
+            .iter()
+            .any(|name| name == "title_source");
+        if !has_title_source {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN title_source TEXT;")
+                .map_err(SessionError::Db)?;
+        }
+        Ok(())
     }
 
     /// Records a session in the catalog.
@@ -155,6 +187,62 @@ impl SessionIndex {
             .optional()
             .map_err(SessionError::Db)
     }
+
+    /// The session's title, if it has one.
+    pub fn title(&self, session_id: &str) -> Result<Option<String>, SessionError> {
+        self.conn
+            .query_row(
+                "SELECT title FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(SessionError::Db)
+            .map(Option::flatten)
+    }
+
+    /// Records a title the user chose. The session namer never replaces it.
+    pub fn set_title(&self, session_id: &str, title: &str) -> Result<(), SessionError> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET title = ?2, title_source = 'user' WHERE id = ?1",
+                params![session_id, title],
+            )
+            .map_err(SessionError::Db)?;
+        Ok(())
+    }
+
+    /// Records a generated title, and reports whether it was taken.
+    ///
+    /// The condition lives in the statement rather than in a read followed by
+    /// a write, so a `/rename` that lands while the namer is talking to the
+    /// model cannot be undone by the answer arriving a moment later.
+    pub fn set_auto_title(&self, session_id: &str, title: &str) -> Result<bool, SessionError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE sessions SET title = ?2, title_source = 'auto'
+                 WHERE id = ?1 AND title_source IS NULL",
+                params![session_id, title],
+            )
+            .map_err(SessionError::Db)?;
+        Ok(updated > 0)
+    }
+
+    /// Whether this session is still waiting for a generated title. Answers
+    /// "is it worth calling a model at all" before one is called.
+    pub fn needs_auto_title(&self, session_id: &str) -> Result<bool, SessionError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1 AND title_source IS NULL",
+                params![session_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(SessionError::Db)?
+            .is_some())
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +332,98 @@ mod tests {
                 .search("safe\" OR (1=1) AND \"", None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .is_empty()
+        );
+    }
+
+    /// A session nobody named takes a generated title once, and only once.
+    #[test]
+    fn a_generated_title_lands_on_an_unnamed_session_and_never_twice() {
+        let (_dir, index) = tmp_index();
+        index
+            .insert_session("s1", 1, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            index
+                .needs_auto_title("s1")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert!(
+            index
+                .set_auto_title("s1", "fix the parser")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert_eq!(
+            index.title("s1").unwrap_or_else(|e| panic!("{e}")),
+            Some("fix the parser".to_owned())
+        );
+        assert!(
+            !index
+                .needs_auto_title("s1")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert!(
+            !index
+                .set_auto_title("s1", "something else")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert_eq!(
+            index.title("s1").unwrap_or_else(|e| panic!("{e}")),
+            Some("fix the parser".to_owned())
+        );
+    }
+
+    /// A name the user typed is never replaced by a generated one.
+    #[test]
+    fn a_user_chosen_title_survives_the_namer() {
+        let (_dir, index) = tmp_index();
+        index
+            .insert_session("s1", 1, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .set_title("s1", "ship the release")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !index
+                .needs_auto_title("s1")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert!(
+            !index
+                .set_auto_title("s1", "fix the parser")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert_eq!(
+            index.title("s1").unwrap_or_else(|e| panic!("{e}")),
+            Some("ship the release".to_owned())
+        );
+    }
+
+    /// A `state.db` written before titles had provenance keeps working: the
+    /// column is added on open instead of every title write failing.
+    #[test]
+    fn an_index_from_an_earlier_release_gains_the_title_column() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("state.db");
+        let old = Connection::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        old.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL,
+                 bot_id TEXT, source TEXT
+             );
+             INSERT INTO sessions (id, title, created_at) VALUES ('s1', 'titi', 1);",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(old);
+
+        let index = SessionIndex::open(&path).unwrap_or_else(|e| panic!("open: {e}"));
+        assert!(
+            index
+                .set_auto_title("s1", "fix the parser")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert_eq!(
+            index.title("s1").unwrap_or_else(|e| panic!("{e}")),
+            Some("fix the parser".to_owned())
         );
     }
 }

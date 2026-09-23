@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::claims::Claims;
 use crate::findings::Findings;
-use crate::protocol::{EngineCommand, EngineEvent, TurnId};
+use crate::protocol::{ContextPart, EngineCommand, EngineEvent, TurnId};
 use crate::registry::{RegistryError, ResolvedModel};
 use crate::steering::Steering;
 use crate::tool_loop::{
@@ -56,6 +56,95 @@ mod tests {
     async fn a_successful_run_passes_the_map_through() {
         let map = run_off_thread(|| Some(SmolStr::new_inline("<genome>\n</genome>"))).await;
         assert_eq!(map.as_deref(), Some("<genome>\n</genome>"));
+    }
+
+    fn message(role: Role, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: text.into(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn folding_config() -> EngineConfig {
+        let mut config = EngineConfig::new("primary");
+        // Far below the 80% threshold: the automatic fold would not fire,
+        // which is the whole reason `/compact` exists.
+        config.context_window = 100_000;
+        config.compaction.keep_recent_tokens = 4;
+        config
+    }
+
+    #[test]
+    fn manual_compaction_folds_below_the_threshold() {
+        let mut config = folding_config();
+        config.restored_messages = vec![
+            message(Role::User, "the first question, long enough to fold"),
+            message(Role::Assistant, "the first answer"),
+            message(Role::User, "now"),
+        ];
+
+        let event = compact_history(&mut config, None, false, TurnId(7));
+
+        match event {
+            EngineEvent::Compacted {
+                turn_id, folded, ..
+            } => {
+                assert_eq!(turn_id, TurnId(7));
+                assert_eq!(folded, 2);
+            }
+            other => panic!("expected a compaction, got {other:?}"),
+        }
+        assert_eq!(config.restored_messages.len(), 2);
+        assert_eq!(config.restored_messages[0].role, Role::System);
+        assert_eq!(config.restored_messages[1].content, "now");
+    }
+
+    /// The digest keeps only the first line of each folded prompt, so a
+    /// focus has to pull the rest of its thread back in or naming it does
+    /// nothing.
+    #[test]
+    fn a_focused_compaction_keeps_the_lines_it_names() {
+        let mut config = folding_config();
+        config.restored_messages = vec![
+            message(
+                Role::User,
+                "please review the diff\nthe auth guard moved to the middleware",
+            ),
+            message(
+                Role::User,
+                "another question\nabout pagination internals instead",
+            ),
+            message(Role::User, "now"),
+        ];
+
+        let event = compact_history(&mut config, Some("auth"), false, TurnId(1));
+
+        assert!(matches!(event, EngineEvent::Compacted { .. }), "{event:?}");
+        let digest = config.restored_messages[0].content.to_string();
+        assert!(
+            digest.contains("the auth guard moved to the middleware"),
+            "{digest}"
+        );
+        assert!(!digest.contains("pagination internals"), "{digest}");
+    }
+
+    /// A running turn hands its own history back when it ends. Folding
+    /// underneath it would be overwritten, or cost that turn its answer.
+    #[test]
+    fn manual_compaction_waits_for_a_running_turn() {
+        let mut config = folding_config();
+        config.restored_messages = vec![
+            message(Role::User, "the first question, long enough to fold"),
+            message(Role::Assistant, "the first answer"),
+            message(Role::User, "now"),
+        ];
+        let before = config.restored_messages.clone();
+
+        let event = compact_history(&mut config, None, true, TurnId(1));
+
+        assert!(matches!(event, EngineEvent::Notice { .. }), "{event:?}");
+        assert_eq!(config.restored_messages, before);
     }
 }
 
@@ -119,6 +208,13 @@ pub struct EngineConfig {
     /// Mask IPv4 addresses in tool output (`privacy.maskIps`). Keys are
     /// masked regardless.
     pub mask_ips: bool,
+    /// Checks run against the coder's patch before a reviewer is called
+    /// (`goal.gates`). Each entry is a program and its arguments; an empty
+    /// list sends every patch straight to the reviewer.
+    pub goal_gates: Vec<crate::goal::GateCommand>,
+    /// Session the turns are recorded under, so a finished turn can name it.
+    /// `None` (headless one-shots, tests) simply never names anything.
+    pub session_id: Option<String>,
 }
 
 impl EngineConfig {
@@ -145,6 +241,8 @@ impl EngineConfig {
             embedding_model: None,
             sensitive: titi_tools::SensitivePolicy::default(),
             mask_ips: true,
+            goal_gates: Vec::new(),
+            session_id: None,
         }
     }
 }
@@ -450,6 +548,17 @@ impl EngineRuntime {
                                 self.emit_control_failure("agent is not available").await;
                             }
                         }
+                        EngineCommand::DescribeContext => {
+                            let parts = self.context_parts().await;
+                            let window = self.config.context_window;
+                            let _ = self.events.send(EngineEvent::ContextBreakdown { parts, window }).await;
+                        }
+                        EngineCommand::Compact { focus } => {
+                            let turn_id = TurnId(self.next_turn.load(Ordering::SeqCst));
+                            let running = active.is_some();
+                            let event = compact_history(&mut self.config, focus.as_deref(), running, turn_id);
+                            let _ = self.events.send(event).await;
+                        }
                     }
                 }
                 completed = done_rx.recv() => {
@@ -465,6 +574,10 @@ impl EngineRuntime {
                         {
                             self.config.restored_messages = history;
                         }
+                        // The name comes from the finished turn, never from
+                        // inside it: this returns before the namer has talked
+                        // to anything.
+                        self.name_session(primary_model.clone());
                         if let Some(text) = queued.pop_front() {
                             let text = self.expand_skills(text).await;
                             let system = self.system_prompt().await;
@@ -474,6 +587,40 @@ impl EngineRuntime {
                 }
             }
         }
+    }
+
+    /// Hands a finished turn to the session namer.
+    ///
+    /// Everything here is a cheap local check — is there a session, is there
+    /// anything to name it after — and the attempt itself lives in its own
+    /// task. No model is called and no database is opened on this thread, so
+    /// a slow, keyless or failing namer costs the command loop nothing.
+    fn name_session(&self, model: SmolStr) {
+        let (Some(agent_dir), Some(session_id)) = (
+            self.config.agent_dir.clone(),
+            self.config.session_id.clone(),
+        ) else {
+            return;
+        };
+        let Some(first_message) = crate::naming::first_user_message(&self.config.restored_messages)
+        else {
+            return;
+        };
+        let workspace = self
+            .config
+            .workspace_root
+            .clone()
+            .or_else(|| self.config.genome_root.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        crate::naming::SessionNamer::new(
+            Arc::clone(&self.resolver),
+            self.events.clone(),
+            agent_dir,
+            session_id,
+            workspace,
+            model,
+        )
+        .spawn(first_message);
     }
 
     async fn emit_control_failure(&self, message: &str) {
@@ -625,6 +772,40 @@ impl EngineRuntime {
         .await
     }
 
+    /// What fills the context window right now, one part per piece a turn
+    /// assembles, measured with the estimator that feeds `ContextUsage`.
+    ///
+    /// The genome map and the recalled memory are their own parts on
+    /// purpose: they are rebuilt every turn, so they are both the largest
+    /// moving weight and the reason a prompt cache misses.
+    async fn context_parts(&self) -> Vec<ContextPart> {
+        let tools = self
+            .tools
+            .specs()
+            .iter()
+            .map(|spec| {
+                titi_core::compaction::estimate_tokens(&spec.name)
+                    + titi_core::compaction::estimate_tokens(&spec.description)
+                    + titi_core::compaction::estimate_tokens(&spec.parameters.to_string())
+            })
+            .sum();
+        vec![
+            context_part("system prompt", self.identity_prompt().as_deref()),
+            context_part("project rules", self.project_context().as_deref()),
+            context_part("skills", self.skill_list().as_deref()),
+            context_part("recalled memory", self.recalled_memory().await.as_deref()),
+            context_part("genome map", self.genome_system().await.as_deref()),
+            ContextPart {
+                label: "history".into(),
+                tokens: crate::compaction::estimate_request(&self.config.restored_messages),
+            },
+            ContextPart {
+                label: "tool specs".into(),
+                tokens: tools,
+            },
+        ]
+    }
+
     fn spawn_turn(
         &self,
         prompt: SmolStr,
@@ -699,8 +880,16 @@ impl EngineRuntime {
             )),
             "reviewer",
         ));
+        let gates = crate::CommandGates::new(self.config.goal_gates.clone());
+        let gates: Arc<dyn crate::Gates> = Arc::new(match &self.config.workspace_root {
+            Some(root) => gates.in_dir(root.clone()),
+            None => gates,
+        });
         tokio::spawn(async move {
-            let outcome = crate::run_goal(coder, reviewer, text).await;
+            let outcome = crate::GoalLoop::new(coder, reviewer)
+                .with_gates(gates)
+                .run(text)
+                .await;
             let _ = events
                 .send(EngineEvent::GoalFinished {
                     report: crate::goal_report(&outcome).into(),
@@ -714,6 +903,69 @@ fn process_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+fn context_part(label: &str, text: Option<&str>) -> ContextPart {
+    ContextPart {
+        label: label.into(),
+        tokens: text
+            .map(titi_core::compaction::estimate_tokens)
+            .unwrap_or(0),
+    }
+}
+
+/// Manual compaction: fold the replayed history now, whatever the threshold
+/// says, and report what happened.
+///
+/// A running turn built its request on this history and hands its own copy
+/// back when it ends, so folding underneath it would either be overwritten
+/// or cost that turn its answer. Manual compaction waits for it instead.
+///
+/// `focus` is what the user asked to keep: the lines of the folded prefix
+/// that mention it are appended to the digest, so the thread they named is
+/// not the part the fold takes away.
+fn compact_history(
+    config: &mut EngineConfig,
+    focus: Option<&str>,
+    turn_running: bool,
+    turn_id: TurnId,
+) -> EngineEvent {
+    if turn_running {
+        return EngineEvent::Notice {
+            message: "compact: a turn is running, try again when it finishes".into(),
+        };
+    }
+    let forced = titi_core::compaction::CompactionPolicy {
+        threshold_percent: 0.0,
+        ..config.compaction.clone()
+    };
+    let before = focus.map(|_| config.restored_messages.clone());
+    let Some(done) = crate::compaction::compact(
+        &mut config.restored_messages,
+        &forced,
+        config.context_window.max(1),
+    ) else {
+        return EngineEvent::Notice {
+            message: "compact: nothing to fold yet".into(),
+        };
+    };
+    if let (Some(focus), Some(before)) = (focus, before)
+        && let Some(digest) = config.restored_messages.first_mut()
+    {
+        let folded: Vec<&str> = before
+            .iter()
+            .take(done.folded)
+            .map(|message| message.content.as_str())
+            .collect();
+        let kept = titi_core::compaction::focus_digest(focus, &folded);
+        digest.content = format!("{}\n{kept}", digest.content).into();
+    }
+    EngineEvent::Compacted {
+        turn_id,
+        folded: done.folded as u32,
+        tokens_before: done.tokens_before,
+        strategy: done.strategy,
+    }
 }
 
 /// What a finished turn hands back to the command loop.
