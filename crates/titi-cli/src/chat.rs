@@ -925,8 +925,11 @@ impl Chat {
                 for (key, (source, val)) in settings.flatten() {
                     lines.push(format!("{key} = {val} ({source})"));
                 }
-                if lines.is_empty() {
-                    self.push(LineKind::Note, "no settings found".to_owned());
+                if settings.is_empty() {
+                    self.push(
+                        LineKind::Note,
+                        titi_config::settings::NO_SETTINGS_NOTE.to_owned(),
+                    );
                 } else {
                     self.push(LineKind::Note, lines.join("\n"));
                 }
@@ -1399,8 +1402,8 @@ impl Chat {
                         sources.push(source);
                     }
                 }
-                let sources = if sources.is_empty() {
-                    "built-in defaults only".to_owned()
+                let sources = if settings.is_empty() {
+                    titi_config::settings::NO_SETTINGS_NOTE.to_owned()
                 } else {
                     sources.join(", ")
                 };
@@ -2052,7 +2055,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "usage",
-        about: "show token usage and estimated cost",
+        about: "show token usage",
     },
     Command {
         name: "login",
@@ -2148,7 +2151,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "whoami",
-        about: "which providers have a key",
+        about: "show your signed-in providers (alias of /keys)",
     },
     Command {
         name: "council",
@@ -3730,7 +3733,7 @@ mod tests {
         let view = frame_text(&mut chat);
         assert!(view.contains("/usage"), "{view}");
         assert!(
-            view.contains("show token usage and estimated cost"),
+            view.contains("show token usage"),
             "{view}"
         );
     }
