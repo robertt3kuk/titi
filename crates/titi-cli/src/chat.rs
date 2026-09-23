@@ -169,6 +169,10 @@ pub struct Chat {
     skillful: bool,
     /// Background loops the engine reported, newest last.
     jobs: Vec<JobInfo>,
+    /// Tokens the engine says this session has spent.
+    spent_tokens: u64,
+    /// The cap `/budget` set, as the engine confirmed it.
+    budget: Option<u64>,
 }
 
 impl Chat {
@@ -208,6 +212,8 @@ impl Chat {
             kitty_flush: String::new(),
             skillful: false,
             jobs: Vec::new(),
+            spent_tokens: 0,
+            budget: None,
         }
     }
 
@@ -514,6 +520,25 @@ impl Chat {
                 self.push(LineKind::Error, format!("failed consult: {reason}"));
                 Applied::none()
             }
+            EngineEvent::BudgetUpdated { spent, limit } => {
+                self.spent_tokens = spent;
+                self.budget = limit;
+                Applied::none()
+            }
+            EngineEvent::BudgetExceeded { spent, limit } => {
+                // The engine has already stopped starting turns; the screen
+                // says so in the one state the user knows how to leave.
+                self.spent_tokens = spent;
+                self.budget = Some(limit);
+                self.paused = true;
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "budget reached: {spent} of {limit} tokens · paused · /budget <amount> raises it"
+                    ),
+                );
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -671,6 +696,7 @@ impl Chat {
             "loop" => self.start_loop(args),
             "jobs" => self.jobs(args),
             "advisor" => self.advisor(args),
+            "budget" => self.budget(args),
             "goal" => self.goal(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
@@ -1287,6 +1313,54 @@ impl Chat {
         }))
     }
 
+    /// `/budget [amount|off]` caps what this session may spend.
+    ///
+    /// The cap is counted in tokens. Money is not offered: nothing in the
+    /// project knows what a model costs, and a dollar figure derived from a
+    /// made-up rate would be a number the user could not act on.
+    fn budget(&mut self, args: &str) -> Applied {
+        let args = args.trim();
+        if args.is_empty() {
+            self.show_budget();
+            return Applied::none();
+        }
+        if matches!(args, "off" | "none" | "clear") {
+            self.push(LineKind::Note, "budget: no cap".to_owned());
+            return Applied::send(EngineCommand::SetBudget { tokens: None }, None);
+        }
+        match parse_budget(args) {
+            Ok(tokens) => {
+                self.push(LineKind::Note, format!("budget: {tokens} tokens"));
+                Applied::send(
+                    EngineCommand::SetBudget {
+                        tokens: Some(tokens),
+                    },
+                    None,
+                )
+            }
+            Err(error) => {
+                self.push(LineKind::Error, error.to_string());
+                Applied::none()
+            }
+        }
+    }
+
+    /// What has been spent, against the cap if there is one.
+    fn show_budget(&mut self) {
+        let text = match self.budget {
+            Some(limit) => format!(
+                "budget: {} of {limit} tokens spent ({}%), estimated",
+                self.spent_tokens,
+                share(self.spent_tokens, limit)
+            ),
+            None => format!(
+                "budget: no cap · {} tokens spent (estimated)",
+                self.spent_tokens
+            ),
+        };
+        self.push(LineKind::Note, text);
+    }
+
     /// `/context` asks the engine what fills the window. It takes no
     /// argument: the breakdown is the whole answer, and quietly ignoring a
     /// stray word would hide the typo behind a plausible screen.
@@ -1641,6 +1715,10 @@ const COMMANDS: &[Command] = &[
         about: "switch model with fuzzy search or role",
     },
     Command {
+        name: "budget",
+        about: "cap the tokens this session may spend (usage: /budget 200k|off)",
+    },
+    Command {
         name: "whoami",
         about: "which providers have a key",
     },
@@ -1745,6 +1823,51 @@ fn parse_interval(word: &str) -> Option<u64> {
         _ => (word, 1),
     };
     digits.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+/// Why `/budget` could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BudgetArgError {
+    /// A cap in money, which nothing here can convert into tokens.
+    Money,
+    Unreadable(String),
+    Zero,
+}
+
+impl std::fmt::Display for BudgetArgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Money => f.write_str(
+                "budget: no price table, so a cap in money cannot be enforced — cap tokens instead (e.g. /budget 200k)",
+            ),
+            Self::Unreadable(word) => {
+                write!(f, "budget: {word} is not an amount (200000, 200k, 1.5m, off)")
+            }
+            Self::Zero => f.write_str("budget: the cap must be at least one token"),
+        }
+    }
+}
+
+/// `200000`, `200k`, `1.5m` as tokens.
+fn parse_budget(word: &str) -> Result<u64, BudgetArgError> {
+    if word.starts_with('$') {
+        return Err(BudgetArgError::Money);
+    }
+    let unreadable = || BudgetArgError::Unreadable(word.to_owned());
+    let (digits, scale) = match word.as_bytes().last().ok_or_else(unreadable)? {
+        b'k' | b'K' => (&word[..word.len() - 1], 1_000.0),
+        b'm' | b'M' => (&word[..word.len() - 1], 1_000_000.0),
+        _ => (word, 1.0),
+    };
+    let amount: f64 = digits.parse().map_err(|_| unreadable())?;
+    if !amount.is_finite() || amount < 0.0 {
+        return Err(unreadable());
+    }
+    let tokens = (amount * scale).round() as u64;
+    if tokens == 0 {
+        return Err(BudgetArgError::Zero);
+    }
+    Ok(tokens)
 }
 
 /// Commands first, then skills. A command only counts at the start of the
@@ -2851,6 +2974,7 @@ mod tests {
             "logout",
             "keys",
             "advisor",
+            "budget",
             "whoami",
         ] {
             assert!(
@@ -2858,6 +2982,90 @@ mod tests {
                 "/{name} dispatches but is not listed"
             );
         }
+    }
+
+    #[test]
+    fn budget_sets_clears_and_reports_a_cap() {
+        let mut chat = chat();
+        type_text(&mut chat, "/budget 200k");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetBudget {
+                tokens: Some(200_000)
+            }))
+        );
+
+        type_text(&mut chat, "/budget off");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetBudget { tokens: None }))
+        );
+
+        chat.on_event(EngineEvent::BudgetUpdated {
+            spent: 1_200,
+            limit: Some(4_000),
+        });
+        type_text(&mut chat, "/budget");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("1200 of 4000 tokens spent (30%)")),
+            "{:?}",
+            chat.lines.last()
+        );
+    }
+
+    /// A cap in money cannot be enforced without a price table, so it is
+    /// refused instead of being converted from a guess.
+    #[test]
+    fn budget_refuses_money_and_nonsense() {
+        let mut chat = chat();
+        type_text(&mut chat, "/budget $5");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text.contains("no price table"))
+        );
+
+        type_text(&mut chat, "/budget plenty");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text.contains("plenty"))
+        );
+    }
+
+    /// Hitting the cap pauses: the next prompt is held instead of sent.
+    #[test]
+    fn a_reached_budget_pauses_the_screen() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::BudgetExceeded {
+            spent: 4_100,
+            limit: 4_000,
+        });
+        assert!(chat.paused);
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text.contains("budget reached"))
+        );
+
+        type_text(&mut chat, "carry on then");
+        let blocked = chat.on_key(Key::Enter, Instant::now());
+        assert!(blocked.effect.is_none());
+        assert!(blocked.log.is_none());
+
+        // Raising the cap is the way out, and it goes to the engine.
+        type_text(&mut chat, "/budget 1m");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetBudget {
+                tokens: Some(1_000_000)
+            }))
+        );
     }
 
     #[test]

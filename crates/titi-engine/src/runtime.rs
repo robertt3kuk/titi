@@ -481,6 +481,13 @@ pub struct EngineRuntime {
     /// A clone of the surface's command sender, so a background job can
     /// queue its prompt through the same door every other prompt uses.
     self_commands: mpsc::Sender<EngineCommand>,
+    /// Tokens this session has spent, summed by the turns themselves.
+    spent: Arc<AtomicU64>,
+    /// The cap `/budget` set, if any.
+    budget: Option<u64>,
+    /// The cap has already been reported as reached, so the surface is not
+    /// told again for every prompt that is refused afterwards.
+    budget_tripped: bool,
 }
 
 impl EngineRuntime {
@@ -611,6 +618,9 @@ impl EngineRuntime {
             loops: JobTable::new(),
             next_job: 1,
             self_commands: command_tx.clone(),
+            spent: Arc::new(AtomicU64::new(0)),
+            budget: None,
+            budget_tripped: false,
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -633,7 +643,11 @@ impl EngineRuntime {
                     let Some(command) = command else { break };
                     match command {
                         EngineCommand::SubmitPrompt { text } | EngineCommand::FollowUp { text } => {
-                            if active.is_some() {
+                            if self.over_budget().await {
+                                // Nothing is queued: the prompt would only
+                                // wait for a cap that nothing lifts on its own.
+                                let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                            } else if active.is_some() {
                                 queued.push_back(text);
                             } else {
                                 let text = self.expand_skills(text).await;
@@ -753,6 +767,20 @@ impl EngineRuntime {
                         EngineCommand::Consult { question } => {
                             self.spawn_consult(question, primary_model.clone());
                         }
+                        EngineCommand::SetBudget { tokens } => {
+                            self.budget = tokens;
+                            // A raised cap is a fresh start: the surface is
+                            // free to spend again, and the next trip has to
+                            // be reported again to mean anything.
+                            self.budget_tripped = false;
+                            let spent = self.spent.load(Ordering::SeqCst);
+                            let _ = self.events.send(EngineEvent::BudgetUpdated { spent, limit: self.budget }).await;
+                            if self.over_budget().await {
+                                while let Some(text) = queued.pop_front() {
+                                    let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                                }
+                            }
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
@@ -833,7 +861,16 @@ impl EngineRuntime {
                         // inside it: this returns before the namer has talked
                         // to anything.
                         self.name_session(primary_model.clone());
-                        if let Some(text) = queued.pop_front() {
+                        let spent = self.spent.load(Ordering::SeqCst);
+                        let _ = self.events.send(EngineEvent::BudgetUpdated { spent, limit: self.budget }).await;
+                        if self.over_budget().await {
+                            // What was waiting behind this turn is handed
+                            // back rather than run: the cap is reached, and
+                            // a queue that drains anyway is not a cap.
+                            while let Some(text) = queued.pop_front() {
+                                let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                            }
+                        } else if let Some(text) = queued.pop_front() {
                             let text = self.expand_skills(text).await;
                             let system = self.system_prompt().await;
                             active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
@@ -842,6 +879,26 @@ impl EngineRuntime {
                 }
             }
         }
+    }
+
+    /// Whether the session has spent its cap, reporting the first time it
+    /// has. A capless session is never over budget.
+    async fn over_budget(&mut self) -> bool {
+        let Some(limit) = self.budget else {
+            return false;
+        };
+        let spent = self.spent.load(Ordering::SeqCst);
+        if spent < limit {
+            return false;
+        }
+        if !self.budget_tripped {
+            self.budget_tripped = true;
+            let _ = self
+                .events
+                .send(EngineEvent::BudgetExceeded { spent, limit })
+                .await;
+        }
+        true
     }
 
     /// Starts a background loop and reports it, or refuses it.
@@ -1150,6 +1207,7 @@ impl EngineRuntime {
         let genome = Arc::clone(&self.genome);
         let claims = self.claims.clone();
         let steering = self.steering.clone();
+        let spent = Arc::clone(&self.spent);
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -1167,6 +1225,7 @@ impl EngineRuntime {
                 genome,
                 claims,
                 steering,
+                spent,
             )
             .await;
             let _ = done
@@ -1321,6 +1380,8 @@ async fn run_turn(
     genome: GenomeIndex,
     claims: Claims,
     steering: Steering,
+    // Session-wide token meter the turn adds its own spend to.
+    spent: Arc<AtomicU64>,
 ) -> Option<Vec<ChatMessage>> {
     let mut models = Vec::with_capacity(1 + config.fallback_models.len());
     models.push(primary_model);
@@ -1455,6 +1516,7 @@ async fn run_turn(
                     events.clone(),
                     Arc::clone(&aborted),
                     &tools,
+                    &spent,
                 )
                 .await
                 {
@@ -1565,6 +1627,8 @@ async fn stream_attempt(
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
+    // Session meter this request's estimated tokens are added to.
+    spent: &Arc<AtomicU64>,
 ) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
     // Every request the turn makes goes through here, including each transient
     // retry, so this is the one place that can be the last look at the flag
@@ -1609,12 +1673,19 @@ async fn stream_attempt(
             }
             StreamEvent::Done { reason } => {
                 let calls = collector.take();
+                // Every round is paid for, tool rounds included, so the
+                // meter is bumped here rather than once per turn. These are
+                // the project's own estimates: no provider on the wire
+                // reports usage back through this transport.
+                let prompt_tokens = crate::compaction::estimate_request(messages);
+                let completion_tokens = titi_core::compaction::estimate_tokens(&answer);
+                spent.fetch_add(prompt_tokens + completion_tokens, Ordering::SeqCst);
                 if calls.is_empty() {
                     let _ = events
                         .send(EngineEvent::TurnUsage {
                             turn_id,
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
+                            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+                            completion_tokens: u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                         })
                         .await;
                     let _ = events

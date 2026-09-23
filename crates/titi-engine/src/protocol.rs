@@ -104,6 +104,13 @@ pub enum EngineCommand {
     Consult {
         question: Option<SmolStr>,
     },
+    /// Cap the tokens this session may spend. `None` lifts the cap.
+    ///
+    /// Reaching the cap stops the engine starting turns: a budget that only
+    /// warned would be a budget that was already spent.
+    SetBudget {
+        tokens: Option<u64>,
+    },
     Shutdown,
 }
 
@@ -263,6 +270,20 @@ pub enum EngineEvent {
     /// The consult produced no opinion, and why.
     AdvisorFailed {
         reason: SmolStr,
+    },
+    /// What this session has spent, and against what cap.
+    ///
+    /// `spent` is the engine's own estimate (~4 characters per token) of
+    /// everything sent and received, not a count a provider reported.
+    BudgetUpdated {
+        spent: u64,
+        limit: Option<u64>,
+    },
+    /// The cap was reached. No further turn starts until it is raised or
+    /// lifted, and anything queued behind it was returned.
+    BudgetExceeded {
+        spent: u64,
+        limit: u64,
     },
 }
 

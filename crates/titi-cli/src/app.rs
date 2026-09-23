@@ -899,6 +899,15 @@ impl App {
                 self.push_transcript(Section::Activity, format!("failed consult: {reason}"));
                 self.set_alert(format!("failed consult: {reason}"));
             }
+            EngineEvent::BudgetUpdated { .. } => {}
+            EngineEvent::BudgetExceeded { spent, limit } => {
+                self.turn_active = false;
+                self.push_transcript(
+                    Section::Activity,
+                    format!("budget reached: {spent} of {limit} tokens"),
+                );
+                self.set_alert(format!("budget reached: {spent} of {limit} tokens"));
+            }
         }
     }
 
