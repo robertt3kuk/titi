@@ -264,17 +264,17 @@ async fn a_session_can_start_in_duck_mode() {
     );
 }
 
-/// A network-tier tool named like the real one, so the duck registry keeps
-/// it and the tier that used to park the turn is the tier under test.
-struct FakeSearchTool(Arc<std::sync::atomic::AtomicUsize>);
+/// A network-tier tool under a name the caller picks, so a test can show
+/// that what decides a mode's registry is the tier and not the name.
+struct FakeNetworkTool(&'static str, Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait::async_trait]
-impl titi_tools::ToolHandler for FakeSearchTool {
+impl titi_tools::ToolHandler for FakeNetworkTool {
     fn definition(&self) -> titi_tools::ToolDefinition {
         titi_tools::ToolDefinition {
             spec: titi_providers::ToolSpec {
-                name: "web_search".into(),
-                description: "Search the web".into(),
+                name: self.0.into(),
+                description: "Reach an outside host".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": { "query": { "type": "string" } },
@@ -286,7 +286,7 @@ impl titi_tools::ToolHandler for FakeSearchTool {
     }
 
     async fn invoke(&self, _args: serde_json::Value) -> titi_tools::ToolResult {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         titi_tools::ToolResult {
             output: "one result".into(),
             is_error: false,
@@ -294,10 +294,10 @@ impl titi_tools::ToolHandler for FakeSearchTool {
     }
 }
 
-/// Duck mode is a conversation, and searching is the one thing it can do.
-/// Under the session's own `Write` mode a network call would park on an
+/// Duck mode is a conversation, and reaching outside is the one thing it can
+/// do. Under the session's own `Write` mode a network call would park on an
 /// approval — which is a prompt nobody asked for on a TUI and a hang in
-/// headless — so the duck turn runs its allowlist without asking.
+/// headless — so the duck turn runs what its tier table kept without asking.
 #[tokio::test]
 async fn duck_mode_searches_without_asking_for_approval() {
     use titi_providers::{BlockId, StreamEvent, ToolCallRef};
@@ -335,12 +335,15 @@ async fn duck_mode_searches_without_asking_for_approval() {
     ]));
 
     let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(FakeSearchTool(Arc::clone(&searches))));
+    tools.register(Arc::new(FakeNetworkTool(
+        "web_search",
+        Arc::clone(&searches),
+    )));
     tools.register(Arc::new(ShellProbeTool));
     let mut config = EngineConfig::new("primary");
     config.mode = SessionMode::Duck;
     // The session asks for everything above read tier. The duck turn is the
-    // exception, and only for what its allowlist kept.
+    // exception, and only for the network tier its table kept.
     config.approval_mode = titi_tools::ApprovalMode::Write;
     let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
 
@@ -371,4 +374,145 @@ async fn duck_mode_searches_without_asking_for_approval() {
         1,
         "the search never ran"
     );
+}
+
+/// Duck mode picks by tier, not by the name `web_search`: a second network
+/// tool is in the mode's reach for the same reason the first one is.
+#[tokio::test]
+async fn duck_mode_keeps_any_network_tool_whatever_it_is_called() {
+    use titi_providers::{BlockId, StreamEvent, ToolCallRef};
+
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "fetch".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: r#"{"query":"https://example.invalid/page"}"#.into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: titi_providers::StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "read the page".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+    let captured = Arc::clone(&transport);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(FakeNetworkTool("fetch", Arc::clone(&fetches))));
+    tools.register(Arc::new(EchoTool));
+    tools.register(Arc::new(ShellProbeTool));
+    let mut config = EngineConfig::new("primary");
+    config.mode = SessionMode::Duck;
+    config.approval_mode = titi_tools::ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "go look that up".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut asked = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = engine.recv().await {
+            match event {
+                EngineEvent::ToolApprovalNeeded { .. } => asked = true,
+                EngineEvent::TurnFinished { .. } => return,
+                _ => {}
+            }
+        }
+        panic!("the engine stopped before the turn finished");
+    })
+    .await
+    .expect("the duck turn never finished");
+
+    let offered: Vec<String> = captured.requests()[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.to_string())
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["fetch".to_owned()],
+        "duck mode is the network tier, no more and no less: {offered:?}"
+    );
+    assert!(!asked, "duck mode asked to approve a network call");
+    assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Plan mode does not research. A mode narrows what a turn may do and never
+/// widens it: a plan turn keeps the read tools, so adding the network tier
+/// would make it the one turn that can read this repository and post it
+/// somewhere — and it would have to do so unprompted, since `--mode plan`
+/// runs headless where no approval arrives. The network tier stays with the
+/// agent turn, where the user is asked.
+#[tokio::test]
+async fn plan_mode_leaves_the_network_tier_out() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = Arc::new(MockTransport::new(vec![done()]));
+    let captured = Arc::clone(&transport);
+
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    tools.register(Arc::new(ShellProbeTool));
+    tools.register(Arc::new(FakeNetworkTool("web_search", Arc::clone(&calls))));
+    let mut config = EngineConfig::new("primary");
+    config.mode = SessionMode::Plan;
+    config.approval_mode = titi_tools::ApprovalMode::Write;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "how would you fix the parser".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut asked = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = engine.recv().await {
+            match event {
+                EngineEvent::ToolApprovalNeeded { .. } => asked = true,
+                EngineEvent::TurnFinished { .. } => return,
+                _ => {}
+            }
+        }
+        panic!("the engine stopped before the turn finished");
+    })
+    .await
+    .expect("the plan turn never finished");
+
+    let offered: Vec<String> = captured.requests()[0]
+        .tools
+        .iter()
+        .map(|spec| spec.name.to_string())
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["echo".to_owned()],
+        "a plan turn was handed something above read tier: {offered:?}"
+    );
+    // Nothing above read tier is offered, so nothing above read tier can
+    // park the turn on an approval this surface may not be able to show.
+    assert!(!asked, "a plan turn parked on an approval");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

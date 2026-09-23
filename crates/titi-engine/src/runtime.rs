@@ -9,7 +9,7 @@ use titi_genome::Genome;
 use titi_providers::{
     ChatMessage, ErrorReason, RequestCtx, Role, StreamEvent, Transport, TransportError, WireRequest,
 };
-use titi_tools::{ApprovalMode, ToolRegistry};
+use titi_tools::{ApprovalMode, ApprovalTier, ToolRegistry};
 use tokio::sync::mpsc;
 
 use crate::claims::Claims;
@@ -86,14 +86,28 @@ and reason out loud with them.",
     }
 }
 
-/// The only tools a duck-mode turn may be handed: an allowlist, not a
-/// filter by tier, because duck mode is about reach and not about danger —
-/// a read tool is harmless and still shows it the repository.
+/// Tiers a plan turn keeps.
 ///
-/// Web search is the one thing a repo-blind partner can usefully call. No
-/// surface registers such a tool yet, so today a duck turn goes out with no
-/// tools at all, which is exactly the behaviour the mode promises.
-const DUCK_TOOLS: &[&str] = &["web_search"];
+/// Reads, and nothing else. [`ApprovalTier::Network`] is deliberately absent
+/// rather than merely unlisted: a mode narrows what a turn may do, it never
+/// widens it. Plan mode keeps the read tools, so a plan turn that could also
+/// reach an outside host would be the one turn in the engine that can read
+/// this repository and post it somewhere — and to do that without hanging in
+/// headless it would have to auto-approve the call, which the agent turn it
+/// precedes does not. A mode meant to be the careful one must not be the
+/// loose one. Research belongs to the agent turn, where the user is asked.
+const PLAN_TIERS: &[ApprovalTier] = &[ApprovalTier::Read];
+
+/// Tiers a duck turn keeps.
+///
+/// The network tier and nothing else, which is the mode's promise stated as
+/// a tier: a partner that cannot touch this machine. A read tool is harmless
+/// but still shows it the repository, so reads stay out; the network tier is
+/// the only one whose reach stops outside. Chosen by tier rather than by
+/// tool name, so the mode does not depend on a list written when
+/// `web_search` happened to be the only network tool, and a duck turn with
+/// no network tool registered still goes out with no tools at all.
+const DUCK_TIERS: &[ApprovalTier] = &[ApprovalTier::Network];
 
 /// The live repository index, shared by the command loop and its turns.
 type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
@@ -625,7 +639,7 @@ impl EngineRuntime {
             let approval = if config.agent_writes {
                 ApprovalMode::Yolo
             } else {
-                tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
+                tools.retain_tiers(&[ApprovalTier::Read]);
                 ApprovalMode::Write
             };
             Some(Arc::new(
@@ -1183,27 +1197,18 @@ impl EngineRuntime {
 
     /// The registry this mode's turns get.
     ///
-    /// Plan mode keeps read-tier tools only, so the turn cannot write,
-    /// patch, or run anything: the plan is the whole output, and a tool the
-    /// model was never handed is one it cannot reach for by mistake. Duck
-    /// mode goes further and keeps only what cannot reach the machine at
-    /// all — see [`DUCK_TOOLS`].
+    /// Both restricted modes pick by tier, so every tier — the network one
+    /// included — is a decision one of the two tables made on purpose,
+    /// rather than whatever a "not a read" catch-all happened to do. See
+    /// [`PLAN_TIERS`] and [`DUCK_TIERS`] for which tier each keeps and why.
+    /// A tool the model was never handed is one it cannot reach for by
+    /// mistake.
     fn mode_tools(&self) -> ToolRegistry {
         let mut tools = self.tools.clone();
         match self.mode {
             crate::protocol::SessionMode::Agent => {}
-            crate::protocol::SessionMode::Plan => {
-                tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
-            }
-            crate::protocol::SessionMode::Duck => {
-                let mut kept = ToolRegistry::new();
-                for name in DUCK_TOOLS {
-                    if let Some(handler) = tools.get(name) {
-                        kept.register(handler);
-                    }
-                }
-                tools = kept;
-            }
+            crate::protocol::SessionMode::Plan => tools.retain_tiers(PLAN_TIERS),
+            crate::protocol::SessionMode::Duck => tools.retain_tiers(DUCK_TIERS),
         }
         tools
     }
@@ -1309,11 +1314,11 @@ impl EngineRuntime {
             // No ranked file list rides the prompt: a duck that can quote
             // the repository is not repo-blind, whatever the brief says.
             config.genome_root = None;
-            // The duck registry is an allowlist, not a filter: `mode_tools`
-            // keeps only [`DUCK_TOOLS`], every one of which is a tool that
-            // cannot reach this machine. Asking the user to approve a search
-            // the mode exists to make is noise on a surface that can show the
-            // prompt, and a hang on one that cannot, so this turn approves
+            // `mode_tools` left this turn [`DUCK_TIERS`] and nothing else, so
+            // everything it can call is network tier: reach that stops
+            // outside this machine. Asking the user to approve the one thing
+            // the mode exists to do is noise on a surface that can show the
+            // prompt and a hang on one that cannot, so this turn approves
             // what it was handed. Only this clone is loosened; the session's
             // own approval mode is untouched and an agent turn still asks.
             config.approval_mode = ApprovalMode::Yolo;
