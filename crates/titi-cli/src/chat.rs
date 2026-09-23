@@ -159,6 +159,7 @@ pub struct Chat {
     lines: Vec<TranscriptLine>,
     input: String,
     turn_active: bool,
+    active_turn_id: Option<titi_engine::TurnId>,
     model: String,
     /// Live: a local server that answers after the first frame adds models,
     /// so the list is read when `/model` runs, not captured at startup.
@@ -218,6 +219,7 @@ impl Chat {
             lines: Vec::new(),
             input: String::new(),
             turn_active: false,
+            active_turn_id: None,
             model: model.clone(),
             catalog: crate::engine::ModelCatalog::fixed(vec![model]),
             session_id: session_id.to_owned(),
@@ -388,8 +390,9 @@ impl Chat {
 
     pub fn on_event(&mut self, event: EngineEvent) -> Applied {
         match event {
-            EngineEvent::TurnStarted { model, .. } => {
+            EngineEvent::TurnStarted { turn_id, model, .. } => {
                 self.turn_active = true;
+                self.active_turn_id = Some(turn_id);
                 self.model = model.to_string();
                 self.reply.clear();
                 self.recorded_reply = 0;
@@ -472,9 +475,13 @@ impl Chat {
                 self.show_context(&parts, window);
                 Applied::none()
             }
-            EngineEvent::Failed { message, .. } => {
+            EngineEvent::Failed { turn_id, message, .. } => {
                 self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
-                self.finish_turn()
+                if turn_id.is_some() && turn_id == self.active_turn_id {
+                    self.finish_turn()
+                } else {
+                    Applied::none()
+                }
             }
             EngineEvent::Cancelled { .. } => {
                 self.push(LineKind::Note, "cancelled".to_owned());
@@ -1817,6 +1824,7 @@ impl Chat {
         self.reply.clear();
         self.recorded_reply = 0;
         self.turn_active = false;
+        self.active_turn_id = None;
         self.approval = None;
         self.assistant_at = None;
         self.drop_thinking();
@@ -3431,6 +3439,52 @@ mod tests {
             }
             other => panic!("expected refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_event_without_turn_id_does_not_finish_turn() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.approval = Some(PendingApproval {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+        });
+        
+        chat.on_event(EngineEvent::Failed {
+            turn_id: None,
+            reason: titi_providers::ErrorReason::Rejected,
+            message: "nope".into(),
+        });
+        
+        assert!(chat.turn_active);
+        assert!(chat.approval.is_some());
+        assert!(chat.lines.iter().any(|line| line.kind == LineKind::Error && line.text == "nope"));
+    }
+
+    #[test]
+    fn failed_event_with_matching_turn_id_finishes_turn() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.approval = Some(PendingApproval {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+        });
+        
+        chat.on_event(EngineEvent::Failed {
+            turn_id: Some(TurnId(1)),
+            reason: titi_providers::ErrorReason::Rejected,
+            message: "nope".into(),
+        });
+        
+        assert!(!chat.turn_active);
+        assert!(chat.approval.is_none());
+        assert!(chat.lines.iter().any(|line| line.kind == LineKind::Error && line.text == "nope"));
     }
 
     #[test]
