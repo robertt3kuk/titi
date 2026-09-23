@@ -97,6 +97,13 @@ pub enum EngineCommand {
     CancelJob {
         job_id: SmolStr,
     },
+    /// Ask a toolless advisor what it thinks of the conversation so far.
+    ///
+    /// `question` is what the user typed after the command; without one the
+    /// advisor is asked about the conversation as a whole.
+    Consult {
+        question: Option<SmolStr>,
+    },
     Shutdown,
 }
 
@@ -247,6 +254,15 @@ pub enum EngineEvent {
     /// A background job stopped and will not fire again.
     JobFinished {
         job_id: SmolStr,
+    },
+    /// The advisor's second opinion. Never empty: an advisor with nothing
+    /// to say is a failed consult, not a silent one.
+    AdvisorAnswer {
+        text: SmolStr,
+    },
+    /// The consult produced no opinion, and why.
+    AdvisorFailed {
+        reason: SmolStr,
     },
 }
 

@@ -497,6 +497,23 @@ impl Chat {
                 self.push(LineKind::Note, format!("{job_id} stopped"));
                 Applied::none()
             }
+            EngineEvent::AdvisorAnswer { text } if text.trim().is_empty() => {
+                // An advisor that said nothing must not read as one that had
+                // no objection.
+                self.push(
+                    LineKind::Error,
+                    "failed consult: the advisor answered with nothing".to_owned(),
+                );
+                Applied::none()
+            }
+            EngineEvent::AdvisorAnswer { text } => {
+                self.push(LineKind::Note, format!("advisor · {}", text.trim()));
+                Applied::none()
+            }
+            EngineEvent::AdvisorFailed { reason } => {
+                self.push(LineKind::Error, format!("failed consult: {reason}"));
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -653,6 +670,7 @@ impl Chat {
             "settings" => self.settings(),
             "loop" => self.start_loop(args),
             "jobs" => self.jobs(args),
+            "advisor" => self.advisor(args),
             "goal" => self.goal(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
@@ -1252,6 +1270,23 @@ impl Chat {
         }
     }
 
+    /// `/advisor [question]` asks a toolless second opinion about this
+    /// conversation. It is not a turn: nothing it says is acted on.
+    fn advisor(&mut self, args: &str) -> Applied {
+        let question = args.trim();
+        self.push(
+            LineKind::Note,
+            if question.is_empty() {
+                "consulting the advisor".to_owned()
+            } else {
+                format!("consulting the advisor: {question}")
+            },
+        );
+        Applied::effect(ChatEffect::Send(EngineCommand::Consult {
+            question: (!question.is_empty()).then(|| question.into()),
+        }))
+    }
+
     /// `/context` asks the engine what fills the window. It takes no
     /// argument: the breakdown is the whole answer, and quietly ignoring a
     /// stray word would hide the typo behind a plausible screen.
@@ -1560,6 +1595,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "memory",
         about: "list, search, or forget memories",
+    },
+    Command {
+        name: "advisor",
+        about: "a toolless second opinion on this conversation",
     },
     Command {
         name: "loop",
@@ -2811,6 +2850,7 @@ mod tests {
             "login",
             "logout",
             "keys",
+            "advisor",
             "whoami",
         ] {
             assert!(
@@ -2864,6 +2904,66 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("at least one second"))
         );
+    }
+
+    #[test]
+    fn advisor_consults_with_and_without_a_question() {
+        let mut chat = chat();
+        type_text(&mut chat, "/advisor");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::Consult { question: None }))
+        );
+
+        type_text(&mut chat, "/advisor is the migration safe?");
+        match chat.on_key(Key::Enter, Instant::now()).effect {
+            Some(ChatEffect::Send(EngineCommand::Consult {
+                question: Some(question),
+            })) => assert_eq!(question.as_str(), "is the migration safe?"),
+            other => panic!("expected a consult, got {other:?}"),
+        }
+    }
+
+    /// The advisor answers, it never acts: a consult is not a turn and
+    /// nothing it says is logged as the assistant's.
+    #[test]
+    fn an_advisor_answer_is_shown_without_starting_a_turn() {
+        let mut chat = chat();
+        let applied = chat.on_event(EngineEvent::AdvisorAnswer {
+            text: "  you skipped the migration  ".into(),
+        });
+        assert!(applied.effect.is_none());
+        assert!(applied.log.is_none());
+        assert!(!chat.turn_active);
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "advisor · you skipped the migration")
+        );
+    }
+
+    /// Silence from an advisor reads like agreement, so it is reported as a
+    /// failure instead.
+    #[test]
+    fn an_empty_or_failed_consult_is_reported_as_a_failure() {
+        let mut silent = chat();
+        silent.on_event(EngineEvent::AdvisorAnswer { text: "  ".into() });
+        assert!(
+            silent
+                .lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text.contains("failed consult"))
+        );
+
+        let mut broken = chat();
+        broken.on_event(EngineEvent::AdvisorFailed {
+            reason: "advisor model gpt-x is unavailable: no key".into(),
+        });
+        assert!(broken.lines.iter().any(|line| {
+            line.kind == LineKind::Error
+                && line.text.contains("failed consult")
+                && line.text.contains("no key")
+        }));
     }
 
     #[test]

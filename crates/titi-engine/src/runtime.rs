@@ -36,6 +36,31 @@ async fn run_off_thread(
     tokio::task::spawn_blocking(work).await.ok().flatten()
 }
 
+/// Model role a `/advisor` consult runs on.
+const ADVISOR_ROLE: &str = "advisor";
+
+/// The model behind the `advisor` role, when the settings name one.
+///
+/// A second opinion from the turn's own model is still a second opinion, so
+/// an absent or unreadable role map is not a failure: the caller keeps the
+/// model it already has.
+async fn advisor_model(
+    agent_dir: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    current: SmolStr,
+) -> Option<SmolStr> {
+    let agent_dir = agent_dir?;
+    let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
+    let current = current.to_string();
+    run_off_thread(move || {
+        let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok()?;
+        titi_config::roles::resolve_model_role(&settings, ADVISOR_ROLE, &current)
+            .ok()
+            .map(SmolStr::from)
+    })
+    .await
+}
+
 /// The live repository index, shared by the command loop and its turns.
 type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
 
@@ -725,6 +750,9 @@ impl EngineRuntime {
                                 None => self.emit_control_failure(&format!("no such job: {job_id}")).await,
                             }
                         }
+                        EngineCommand::Consult { question } => {
+                            self.spawn_consult(question, primary_model.clone());
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
@@ -876,6 +904,36 @@ impl EngineRuntime {
         let mut jobs: Vec<_> = self.loops.iter().collect();
         jobs.sort_by_key(|(_, job)| job.seq);
         jobs.into_iter().map(|(id, job)| job.info(id)).collect()
+    }
+
+    /// Asks the advisor about the conversation, off the command loop.
+    ///
+    /// The consult is not a turn: it holds no history, takes no tools, and
+    /// cannot queue behind or ahead of the user's work. Whatever comes back
+    /// — an opinion or a reason there is none — reaches the surface.
+    fn spawn_consult(&self, question: Option<SmolStr>, current_model: SmolStr) {
+        let conversation = self.config.restored_messages.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let events = self.events.clone();
+        let agent_dir = self.config.agent_dir.clone();
+        let workspace = self
+            .config
+            .workspace_root
+            .clone()
+            .or_else(|| self.config.genome_root.clone());
+        tokio::spawn(async move {
+            let model = advisor_model(agent_dir, workspace, current_model.clone())
+                .await
+                .unwrap_or(current_model);
+            let advisor = crate::advisor::Advisor::new(resolver, model);
+            let event = match advisor.consult(&conversation, question.as_deref()).await {
+                Ok(text) => EngineEvent::AdvisorAnswer { text },
+                Err(error) => EngineEvent::AdvisorFailed {
+                    reason: error.to_string().into(),
+                },
+            };
+            let _ = events.send(event).await;
+        });
     }
 
     /// Hands a finished turn to the session namer.

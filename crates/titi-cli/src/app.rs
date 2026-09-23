@@ -888,6 +888,17 @@ impl App {
                 self.push_transcript(Section::Activity, format!("job {job_id} stopped"));
                 self.set_alert(format!("{job_id} stopped"));
             }
+            EngineEvent::AdvisorAnswer { text } if text.trim().is_empty() => {
+                self.set_alert("failed consult: the advisor answered with nothing");
+            }
+            EngineEvent::AdvisorAnswer { text } => {
+                self.push_transcript(Section::Activity, format!("advisor · {}", text.trim()));
+                self.set_alert("advisor answered");
+            }
+            EngineEvent::AdvisorFailed { reason } => {
+                self.push_transcript(Section::Activity, format!("failed consult: {reason}"));
+                self.set_alert(format!("failed consult: {reason}"));
+            }
         }
     }
 
