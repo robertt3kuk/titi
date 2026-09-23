@@ -1125,10 +1125,12 @@ impl Chat {
                     self.push(LineKind::Note, "recap: empty".to_owned());
                 }
                 for section in sections {
-                    self.push(
-                        LineKind::Note,
-                        format!("{} · {}", section.title, section.summary),
-                    );
+                    let mut text = format!("{} · {}", section.title, section.summary);
+                    if !section.lines.is_empty() {
+                        text.push_str("\n  ");
+                        text.push_str(&section.lines.join("\n  "));
+                    }
+                    self.push(LineKind::Note, text);
                 }
             }
             Err(reason) => self.push(LineKind::Error, format!("recap: {reason}")),
@@ -3732,10 +3734,7 @@ mod tests {
         type_text(&mut chat, "/");
         let view = frame_text(&mut chat);
         assert!(view.contains("/usage"), "{view}");
-        assert!(
-            view.contains("show token usage"),
-            "{view}"
-        );
+        assert!(view.contains("show token usage"), "{view}");
     }
 
     #[test]
@@ -5344,6 +5343,29 @@ mod tests {
         assert!(
             at[0] < at[1] && at[1] < at[2],
             "the three lines share a row: {at:?} {rows:?}"
+        );
+    }
+    #[test]
+    fn recap_reports_sections() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).unwrap();
+        let session_id = store
+            .create(titi_core::session::SessionMeta::default())
+            .unwrap();
+        chat.session_id = session_id;
+
+        type_text(&mut chat, "/recap");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.lines.iter().any(|line| line.text.contains("Session")));
+        assert!(chat.lines.iter().any(|line| line.text.contains("Turns")));
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("roles: 0 user, 0 assistant, 0 system"))
         );
     }
 }
