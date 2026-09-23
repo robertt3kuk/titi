@@ -1,12 +1,13 @@
 //! Skill metadata for the system prompt, and `/name` expansion in a prompt.
 //!
-//! Discovers `SKILL.md` one level under `<agent_dir>/skills/<name>/` and
-//! `<cwd>/.titi/skills/<name>/`. The system prompt still names skills only:
-//! `name` and `description`. A body reaches the model only when the user
-//! writes `/name` in a message, and only after the same screening the
-//! metadata gets. Scripts are never executed.
-//! A duplicate name keeps the project skill. The list is capped so a huge
-//! directory cannot fill the prompt.
+//! Discovers `SKILL.md` one level under `<agent_dir>/skills/<name>/`,
+//! `<cwd>/.agents/skills/<name>/` and `<cwd>/.titi/skills/<name>/`. The
+//! system prompt still names skills only: `name` and `description`. A body
+//! reaches the model only when the user writes `/name` in a message, and
+//! only after the same screening the metadata gets. Scripts are never
+//! executed.
+//! A duplicate name keeps the project skill, and `.titi` wins over
+//! `.agents`. The list is capped so a huge directory cannot fill the prompt.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,10 +62,17 @@ pub fn catalog(cwd: Option<&Path>, agent_dir: Option<&Path>) -> Vec<Skill> {
             by_name.insert(skill.name.clone(), skill);
         }
     }
-    // Project skills replace an agent skill of the same name.
+    // Project skills replace an agent skill of the same name. `.agents` is
+    // the shared cross-agent directory, `.titi` is this tool's own, so the
+    // narrower one is applied last and wins.
     if let Some(cwd) = cwd {
-        for skill in discover(&cwd.join(".titi").join("skills"), cwd) {
-            by_name.insert(skill.name.clone(), skill);
+        for root in [
+            cwd.join(".agents").join("skills"),
+            cwd.join(".titi").join("skills"),
+        ] {
+            for skill in discover(&root, cwd) {
+                by_name.insert(skill.name.clone(), skill);
+            }
         }
     }
     by_name.into_values().take(SKILL_LIST_CAP).collect()
@@ -394,6 +402,72 @@ mod tests {
         let block = render(Some(project.path()), Some(agent.path())).unwrap();
         assert!(block.contains("- review: Project copy"), "{block}");
         assert!(!block.contains("Agent copy"), "{block}");
+    }
+
+    /// The shared `.agents/skills` directory is read, and when one name sits
+    /// in all three roots the order is agent dir, then `.agents`, then
+    /// `.titi`.
+    #[test]
+    fn the_project_roots_win_over_the_agent_dir_and_titi_wins_over_agents() {
+        let agent = tempfile::tempdir().unwrap();
+        write(
+            &agent.path().join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Agent copy\n---\n",
+        );
+        let project = tempfile::tempdir().unwrap();
+        write(
+            &project.path().join(".agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Shared copy\n---\n",
+        );
+        write(
+            &project.path().join(".agents/skills/shared-only/SKILL.md"),
+            "---\nname: shared-only\ndescription: Only in .agents\n---\n",
+        );
+
+        let block = render(Some(project.path()), Some(agent.path())).unwrap();
+        assert!(block.contains("- review: Shared copy"), "{block}");
+        assert!(!block.contains("Agent copy"), "{block}");
+        assert!(block.contains("- shared-only: Only in .agents"), "{block}");
+
+        write(
+            &project.path().join(".titi/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Native copy\n---\n",
+        );
+        let block = render(Some(project.path()), Some(agent.path())).unwrap();
+        assert!(block.contains("- review: Native copy"), "{block}");
+        assert!(!block.contains("Shared copy"), "{block}");
+    }
+
+    /// A body under `.agents/skills` expands like any other, and a SKILL.md
+    /// linked out of the workspace is refused there too.
+    #[test]
+    fn a_shared_skill_expands_and_a_linked_one_does_not() {
+        let project = tempfile::tempdir().unwrap();
+        write(
+            &project.path().join(".agents/skills/ship/SKILL.md"),
+            "---\nname: ship\ndescription: Cut a release\n---\nTag, then publish.\n",
+        );
+        let expanded = expand("do /ship", Some(project.path()), None);
+        let text = expanded.text.unwrap();
+        assert!(text.contains("Tag, then publish."), "{text}");
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let secret = outside.path().join("credentials");
+            write(
+                &secret,
+                "---\nname: leak\ndescription: Leak\n---\nsk-test-not-a-real-key\n",
+            );
+            let home = project.path().join(".agents/skills/leak");
+            fs::create_dir_all(&home).unwrap();
+            std::os::unix::fs::symlink(&secret, home.join("SKILL.md")).unwrap();
+
+            let expanded = expand("run /leak", Some(project.path()), None);
+            assert_eq!(expanded.text, None);
+            let notice = expanded.notices.first().unwrap();
+            assert!(notice.contains("outside"), "{notice}");
+        }
     }
 
     #[test]
