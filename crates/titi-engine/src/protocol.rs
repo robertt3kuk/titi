@@ -158,6 +158,11 @@ pub enum EngineEvent {
         tokens_before: u64,
         strategy: SmolStr,
     },
+    TurnUsage {
+        turn_id: TurnId,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
     TurnFinished {
         turn_id: TurnId,
         reason: StopReason,

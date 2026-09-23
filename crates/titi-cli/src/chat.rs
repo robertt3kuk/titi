@@ -145,6 +145,10 @@ pub struct Chat {
     assistant_at: Option<usize>,
     thinking_at: Option<usize>,
     approval: Option<PendingApproval>,
+    session_prompt_tokens: u32,
+    session_completion_tokens: u32,
+    last_prompt_tokens: u32,
+    last_completion_tokens: u32,
     quit_armed: Option<Instant>,
     hint: String,
     /// Provider waiting for a key. The composer masks whatever is typed.
@@ -183,6 +187,10 @@ impl Chat {
             assistant_at: None,
             thinking_at: None,
             approval: None,
+            session_prompt_tokens: 0,
+            session_completion_tokens: 0,
+            last_prompt_tokens: 0,
+            last_completion_tokens: 0,
             quit_armed: None,
             hint: String::new(),
             login_for: None,
@@ -449,6 +457,17 @@ impl Chat {
                 }
                 Applied::none()
             }
+            EngineEvent::TurnUsage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                self.last_prompt_tokens = prompt_tokens;
+                self.last_completion_tokens = completion_tokens;
+                self.session_prompt_tokens += prompt_tokens;
+                self.session_completion_tokens += completion_tokens;
+                Applied::none()
+            }
             _ => Applied::none(),
         }
     }
@@ -598,6 +617,7 @@ impl Chat {
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
             "goal" => self.goal(args),
+            "usage" => self.usage(),
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
             "help" => self.help(),
@@ -622,6 +642,17 @@ impl Chat {
             Ok(summary) => self.push(LineKind::Note, summary),
             Err(reason) => self.push(LineKind::Error, reason),
         }
+        Applied::none()
+    }
+    fn usage(&mut self) -> Applied {
+        let text = format!(
+            "Turn: {} prompt + {} completion. Session: {} / {}.",
+            self.last_prompt_tokens,
+            self.last_completion_tokens,
+            self.session_prompt_tokens,
+            self.session_completion_tokens
+        );
+        self.push(LineKind::Note, text);
         Applied::none()
     }
 
@@ -1190,6 +1221,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "keys",
         about: "which providers have a key",
+    },
+    Command {
+        name: "usage",
+        about: "show token usage and estimated cost",
     },
     Command {
         name: "login",
@@ -2325,8 +2360,11 @@ mod tests {
         let mut chat = chat();
         type_text(&mut chat, "/");
         let view = frame_text(&mut chat);
-        assert!(view.contains("/login"), "{view}");
-        assert!(view.contains("store a provider key"), "{view}");
+        assert!(view.contains("/usage"), "{view}");
+        assert!(
+            view.contains("show token usage and estimated cost"),
+            "{view}"
+        );
     }
 
     #[test]
@@ -2765,6 +2803,23 @@ mod tests {
         }
         assert!(applied.log.is_none(), "a goal is not a user prompt");
         assert!(!chat.turn_active);
+    }
+
+    #[test]
+    fn usage_command_prints_tokens() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+        });
+        type_text(&mut chat, "/usage");
+        chat.on_key(Key::Enter, Instant::now());
+        let view = frame_text(&mut chat);
+        assert!(
+            view.contains("Turn: 100 prompt + 50 completion. Session: 100 / 50."),
+            "View: {view}"
+        );
     }
 
     #[test]

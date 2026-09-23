@@ -1370,6 +1370,13 @@ async fn stream_attempt(
                 let calls = collector.take();
                 if calls.is_empty() {
                     let _ = events
+                        .send(EngineEvent::TurnUsage {
+                            turn_id,
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                        })
+                        .await;
+                    let _ = events
                         .send(EngineEvent::TurnFinished { turn_id, reason })
                         .await;
                 }

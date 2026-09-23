@@ -856,6 +856,7 @@ impl App {
             EngineEvent::SessionNamed { title, .. } => {
                 self.set_alert(format!("session: {title}"));
             }
+            EngineEvent::TurnUsage { .. } => {}
         }
     }
 
