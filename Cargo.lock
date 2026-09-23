@@ -2520,6 +2520,7 @@ dependencies = [
  "serde_json",
  "smol_str",
  "tempfile",
+ "titi-config",
  "titi-providers",
  "tokio",
 ]

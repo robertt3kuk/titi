@@ -46,6 +46,7 @@ pub struct Settings {
     pub overlays: Vec<Value>,
     pub runtime: Value,
     pub global_path: PathBuf,
+    pub project_path: PathBuf,
 }
 
 /// Canonical file names, in resolution order.
@@ -138,6 +139,7 @@ impl Settings {
             global,
             project,
             overlays,
+            project_path: project_dir.join(PROJECT_SUBPATH),
             runtime: Value::Object(Map::new()),
             global_path,
         })
@@ -201,6 +203,61 @@ impl Settings {
             .collect()
     }
 
+    /// Returns the active value for a key and the name of the layer providing it.
+    pub fn resolve_source(&self, key: &str) -> Option<(&'static str, Value)> {
+        if let Some(v) = lookup(&self.runtime, key) {
+            return Some(("runtime", v));
+        }
+        for overlay in self.overlays.iter().rev() {
+            if let Some(v) = lookup(overlay, key) {
+                return Some(("overlay", v));
+            }
+        }
+        if let Some(v) = lookup(&self.project, key) {
+            return Some(("project", v));
+        }
+        if let Some(v) = lookup(&self.global, key) {
+            return Some(("agent", v));
+        }
+        if let Some(v) = lookup(&self.defaults, key) {
+            return Some(("default", v));
+        }
+        None
+    }
+
+    /// Returns all effective keys with their source layer and value.
+    pub fn flatten(&self) -> std::collections::BTreeMap<String, (String, Value)> {
+        fn walk(value: &Value, prefix: &str, map: &mut std::collections::BTreeMap<String, Value>) {
+            match value {
+                Value::Object(obj) => {
+                    for (k, v) in obj {
+                        let new_prefix = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        walk(v, &new_prefix, map);
+                    }
+                }
+                _ => {
+                    map.insert(prefix.to_owned(), value.clone());
+                }
+            }
+        }
+        let mut effective = std::collections::BTreeMap::new();
+        walk(&self.effective(), "", &mut effective);
+
+        let mut out = std::collections::BTreeMap::new();
+        for (k, v) in effective {
+            let source = self
+                .resolve_source(&k)
+                .map(|(s, _)| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            out.insert(k, (source, v));
+        }
+        out
+    }
+
     /// Write a dotted key into the **global** layer and persist it (the only
     /// persistent write path through this API).
     pub fn set(&mut self, key: &str, value: Value) -> Result<(), SettingsError> {
@@ -211,6 +268,14 @@ impl Settings {
         self.save_global()
     }
 
+    pub fn set_project(&mut self, key: &str, value: Value) -> Result<(), SettingsError> {
+        set_nested(&mut self.project, key, value).map_err(|reason| SettingsError::Key {
+            key: key.into(),
+            reason,
+        })?;
+        self.save_project()
+    }
+
     /// Remove a dotted key from the global layer, restoring the next layer's
     /// (or default) value at read time.
     pub fn reset(&mut self, key: &str) -> Result<(), SettingsError> {
@@ -219,6 +284,14 @@ impl Settings {
             reason,
         })?;
         self.save_global()
+    }
+
+    pub fn reset_project(&mut self, key: &str) -> Result<(), SettingsError> {
+        remove_nested(&mut self.project, key).map_err(|reason| SettingsError::Key {
+            key: key.into(),
+            reason,
+        })?;
+        self.save_project()
     }
 
     /// In-memory override for this process; never persisted.
@@ -240,6 +313,21 @@ impl Settings {
             })?;
             fs::write(&tmp, yaml)?;
             fs::rename(&tmp, &self.global_path)?;
+            Ok(())
+        })
+    }
+
+    fn save_project(&self) -> Result<(), SettingsError> {
+        if let Some(parent) = self.project_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        with_file_lock(&self.project_path, || {
+            let tmp = self.project_path.with_extension("yml.tmp");
+            let yaml = serde_yaml::to_string(&self.project).map_err(|e| {
+                SettingsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            fs::write(&tmp, yaml)?;
+            fs::rename(&tmp, &self.project_path)?;
             Ok(())
         })
     }

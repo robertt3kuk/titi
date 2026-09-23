@@ -621,6 +621,7 @@ impl Chat {
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
             "switch" => self.switch(args),
+            "settings" => self.settings(),
             "goal" => self.goal(args),
             "memory" => self.memory(args),
             "usage" => self.usage(),
@@ -696,6 +697,30 @@ impl Chat {
                 Applied::none()
             }
         }
+    }
+
+    fn settings(&mut self) -> Applied {
+        match titi_config::settings::Settings::load(
+            &self.agent_dir,
+            &crate::app::current_workspace(),
+            &[],
+        ) {
+            Ok(settings) => {
+                let mut lines = Vec::new();
+                for (key, (source, val)) in settings.flatten() {
+                    lines.push(format!("{key} = {val} ({source})"));
+                }
+                if lines.is_empty() {
+                    self.push(LineKind::Note, "no settings found".to_owned());
+                } else {
+                    self.push(LineKind::Note, lines.join("\n"));
+                }
+            }
+            Err(e) => {
+                self.push(LineKind::Error, format!("failed to load settings: {e}"));
+            }
+        }
+        Applied::none()
     }
 
     fn switch(&mut self, args: &str) -> Applied {
@@ -1418,6 +1443,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "rewind",
         about: "cut back to a rewind point",
+    },
+    Command {
+        name: "settings",
+        about: "show configuration settings",
     },
     Command {
         name: "switch",

@@ -450,6 +450,37 @@ pub fn start_engine_with(
     tools.register(std::sync::Arc::new(
         titi_memory::tool::MemoryTool::with_providers(agent_dir.clone(), provider_ids),
     ));
+    struct CliSettingsBackend {
+        agent_dir: std::path::PathBuf,
+        workspace: std::path::PathBuf,
+    }
+    impl titi_tools::settings::SettingsBackend for CliSettingsBackend {
+        fn resolve_source(&self, key: &str) -> Result<Option<(String, serde_json::Value)>, String> {
+            let settings =
+                titi_config::settings::Settings::load(&self.agent_dir, &self.workspace, &[])
+                    .map_err(|e| e.to_string())?;
+            Ok(settings
+                .resolve_source(key)
+                .map(|(s, v)| (s.to_string(), v)))
+        }
+        fn set(&self, key: &str, value: serde_json::Value, scope: &str) -> Result<(), String> {
+            let mut settings =
+                titi_config::settings::Settings::load(&self.agent_dir, &self.workspace, &[])
+                    .map_err(|e| e.to_string())?;
+            if scope == "global" {
+                settings.set(key, value).map_err(|e| e.to_string())
+            } else {
+                settings.set_project(key, value).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    tools.register(std::sync::Arc::new(titi_tools::SettingsTool::new(
+        std::sync::Arc::new(CliSettingsBackend {
+            agent_dir: agent_dir.clone(),
+            workspace: workspace.clone(),
+        }),
+    )));
     // `memory.embeddingModel` picks the vector space. Empty or "local" keeps
     // the trigram embedder; a model id is resolved through the registry.
     if let Some(settings) = &settings {

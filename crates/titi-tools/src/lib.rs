@@ -18,6 +18,8 @@ use titi_providers::ToolSpec;
 /// Crate version, mirrors the workspace release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod settings;
+
 pub use cache::{READ_CACHE_CAPACITY, ReadCache};
 pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
@@ -25,6 +27,7 @@ pub use fs::{
 };
 pub use hashline::{HashlineEditTool, HashlineError, line_anchor};
 pub use sensitive::SensitivePolicy;
+pub use settings::SettingsTool;
 
 /// How dangerous a tool is. Unknown tools are treated as [`ApprovalTier::Exec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
