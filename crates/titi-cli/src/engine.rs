@@ -137,16 +137,19 @@ pub const MAX_RESTORED_MESSAGES: usize = 40;
 /// Trims a replayed conversation to at most `limit` messages, cutting only
 /// where no tool round is split.
 ///
-/// A tool result whose call was cut away — or a call whose results a crash
-/// never recorded — is a request Anthropic and OpenAI both reject, so the
-/// cut skips forward over orphaned results and stops short of an unanswered
-/// call. The window is therefore sometimes shorter than `limit`, never
-/// inconsistent.
+/// A tool result whose call was cut away — or a call whose result was never
+/// recorded — is a request Anthropic and OpenAI both reject. A call goes to
+/// the session file the moment it starts (`chat.rs`, `ToolStarted`), so a
+/// cancel or a crash mid-round leaves one behind, and it can sit anywhere in
+/// the file rather than only at its end. Such a round is repaired in place:
+/// dropping everything after it would silently lose the rest of the session,
+/// which is the larger loss. The window is therefore sometimes shorter than
+/// `limit`, never inconsistent.
 pub fn restore_window(
     mut messages: Vec<titi_providers::ChatMessage>,
     limit: usize,
 ) -> Vec<titi_providers::ChatMessage> {
-    messages.truncate(unanswered_call(&messages));
+    repair_rounds(&mut messages);
     let mut start = messages.len().saturating_sub(limit);
     start += messages[start..]
         .iter()
@@ -156,9 +159,10 @@ pub fn restore_window(
     messages
 }
 
-/// Index of the first tool call left without its result, or `messages.len()`
-/// when every call was answered.
-fn unanswered_call(messages: &[titi_providers::ChatMessage]) -> usize {
+/// Drops every tool call that has no result, and the partial results that
+/// referenced it. The assistant's prose is kept: what it said still belongs
+/// to the conversation even when the call it opened never came back.
+fn repair_rounds(messages: &mut Vec<titi_providers::ChatMessage>) {
     let mut index = 0;
     while index < messages.len() {
         let calls = messages[index].tool_calls.len();
@@ -171,11 +175,18 @@ fn unanswered_call(messages: &[titi_providers::ChatMessage]) -> usize {
             .take_while(|message| message.role == titi_providers::Role::Tool)
             .count();
         if results < calls {
-            return index;
+            messages[index].tool_calls.clear();
+            messages.drain(index + 1..index + 1 + results);
+            index += 1;
+            continue;
         }
         index += 1 + results;
     }
-    messages.len()
+    messages.retain(|message| {
+        message.role != titi_providers::Role::Assistant
+            || !message.content.is_empty()
+            || !message.tool_calls.is_empty()
+    });
 }
 
 /// Parses `--approval <always-ask|write|yolo>`.

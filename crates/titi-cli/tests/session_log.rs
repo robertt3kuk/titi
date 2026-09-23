@@ -318,6 +318,62 @@ fn a_truncated_restore_never_splits_a_tool_round() {
     assert_eq!(open_calls, 0, "the last call has no result: {history:#?}");
 }
 
+/// A call is written the moment it starts, so a cancel or a crash mid-round
+/// leaves one unanswered wherever it happened to be — including the middle of
+/// a long session. Dropping everything after it would lose the conversation
+/// the user actually kept having.
+#[test]
+fn a_broken_round_in_the_middle_does_not_erase_what_came_after() {
+    use titi_cli::app::session_history;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path();
+    let store = SessionStore::new(agent_dir).unwrap();
+    let session_id = store.create(SessionMeta::default()).unwrap();
+    let log = SessionLog::open(agent_dir, &session_id).unwrap();
+
+    log.user("first question").unwrap();
+    // Cancelled while the tool ran: the call was logged, the result never was.
+    log.assistant_tool_calls(
+        "let me check",
+        vec![titi_providers::ToolCallRef {
+            call_id: "call-abandoned".into(),
+            name: "bash".into(),
+        }],
+    )
+    .unwrap();
+    log.user("never mind, different question").unwrap();
+    log.assistant("here is the answer").unwrap();
+
+    let history = session_history(agent_dir, &session_id).unwrap();
+    let shape: Vec<(titi_providers::Role, String)> = history
+        .iter()
+        .map(|message| (message.role, message.content.to_string()))
+        .collect();
+    assert!(
+        shape.contains(&(
+            titi_providers::Role::User,
+            "never mind, different question".to_owned()
+        )),
+        "the session after the broken round was erased: {shape:#?}"
+    );
+    assert!(
+        shape.contains(&(
+            titi_providers::Role::Assistant,
+            "here is the answer".to_owned()
+        )),
+        "the session after the broken round was erased: {shape:#?}"
+    );
+    assert!(
+        shape.contains(&(titi_providers::Role::Assistant, "let me check".to_owned())),
+        "what the assistant said is part of the conversation: {shape:#?}"
+    );
+    assert!(
+        history.iter().all(|message| message.tool_calls.is_empty()),
+        "the unanswered call must not reach the provider: {history:#?}"
+    );
+}
+
 fn message(
     role: titi_providers::Role,
     text: &str,
