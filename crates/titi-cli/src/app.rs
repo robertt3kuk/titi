@@ -91,8 +91,9 @@ pub struct App {
     available_models: Vec<String>,
     /// Where a refresh reads from, when a registry is behind the surface.
     model_catalog: Option<crate::engine::ModelCatalog>,
-    /// Status-line `mode` segment (`app.plan.toggle`).
-    plan_mode: bool,
+    /// Status-line `mode` segment. Set from the engine's `ModeChanged`, so
+    /// it can only ever show a mode the turns are really running in.
+    mode: SessionMode,
     /// Status-line collab/`live` badge (`app.live.toggle`).
     live_mode: bool,
     /// omp `stt.enabled` — gates hold-Space. Default false.
@@ -153,7 +154,7 @@ impl App {
             current_model: 0,
             available_models: Vec::new(),
             model_catalog: None,
-            plan_mode: false,
+            mode: SessionMode::Agent,
             live_mode: false,
             stt_enabled: false,
             stt_state: SttState::Idle,
@@ -290,8 +291,9 @@ impl App {
         &self.keys
     }
 
+    /// Whether the engine put this session in plan mode.
     pub fn plan_mode(&self) -> bool {
-        self.plan_mode
+        self.mode == SessionMode::Plan
     }
 
     pub fn live_mode(&self) -> bool {
@@ -910,7 +912,7 @@ impl App {
                 self.set_alert(format!("budget reached: {spent} of {limit} tokens"));
             }
             EngineEvent::ModeChanged { mode } => {
-                self.plan_mode = mode == SessionMode::Plan;
+                self.mode = mode;
                 self.set_alert(format!("mode: {}", mode.label()));
             }
         }
@@ -1048,8 +1050,8 @@ impl App {
             .unwrap_or_else(|| "session".to_owned());
         let mut snap = live_snapshot(&self.model(), &session_label);
         snap.context_pct = self.context_pct;
-        if self.plan_mode {
-            snap.mode = Some("plan".to_owned());
+        if self.mode != SessionMode::Agent {
+            snap.mode = Some(self.mode.label().to_owned());
         }
         if self.live_mode {
             snap.collab = Some("live".to_owned());
@@ -1329,7 +1331,7 @@ impl App {
             // The badge is not flipped here: it follows the engine's
             // ModeChanged, so it can never claim a mode the turns are not
             // actually running in.
-            let mode = if self.plan_mode {
+            let mode = if self.mode == SessionMode::Plan {
                 SessionMode::Agent
             } else {
                 SessionMode::Plan

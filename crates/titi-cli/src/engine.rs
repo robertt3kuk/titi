@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use titi_engine::protocol::SessionMode;
 use titi_engine::{
     Engine, EngineConfig, EngineRuntime, HttpTransportFactory, LayeredCredentialSource,
     ModelDescriptor, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig, TrajectorySink,
@@ -352,20 +353,24 @@ pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
     }
 }
 
-/// Starts the engine with the default approval policy.
+/// Starts the engine with the default approval policy, in agent mode.
 pub fn start_engine() -> Result<(Engine, ModelCatalog, String), String> {
-    start_engine_with(ApprovalMode::Write)
+    start_engine_with(ApprovalMode::Write, SessionMode::Agent)
 }
 
-/// Starts the engine with an explicit approval policy.
+/// Starts the engine with an explicit approval policy and session mode.
 ///
 /// A surface that cannot show an approval prompt must not leave a write-tier
 /// call waiting for one: under `always-ask` and `write` the engine emits
 /// `ToolApprovalNeeded` and blocks until an `ApproveTool` arrives. Headless
 /// scripts that never answer hang there forever, which is why the policy is a
 /// flag rather than a constant.
+///
+/// `mode` is what `--mode plan|duck` starts the session in; the surface can
+/// change it later with `SetMode`.
 pub fn start_engine_with(
     approval_mode: ApprovalMode,
+    mode: SessionMode,
 ) -> Result<(Engine, ModelCatalog, String), String> {
     let config = load_registry_config();
     let models: Vec<String> = config
@@ -411,6 +416,7 @@ pub fn start_engine_with(
         .ok_or_else(|| "no models configured".to_owned())?;
     let mut engine_config = EngineConfig::new(primary.clone());
     engine_config.approval_mode = approval_mode;
+    engine_config.mode = mode;
     // The model declares its window; compaction folds at a share of it.
     if let Some(window) = context_window {
         engine_config.context_window = window;

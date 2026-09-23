@@ -37,6 +37,9 @@ pub enum SessionMode {
     Agent,
     /// Read-only tools. The turn answers with a plan, not with a change.
     Plan,
+    /// A repo-blind chat partner: no tool that can reach the filesystem or
+    /// a shell is registered at all, and no repository map is sent.
+    Duck,
 }
 
 impl SessionMode {
@@ -45,6 +48,7 @@ impl SessionMode {
         match self {
             Self::Agent => "agent",
             Self::Plan => "plan",
+            Self::Duck => "duck",
         }
     }
 }

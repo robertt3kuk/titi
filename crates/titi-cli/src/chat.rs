@@ -701,6 +701,7 @@ impl Chat {
             "btw" => self.btw(args),
             "switch" => self.switch(args),
             "settings" => self.settings(),
+            "duck" => self.duck(args),
             "loop" => self.start_loop(args),
             "jobs" => self.jobs(args),
             "advisor" => self.advisor(args),
@@ -1322,7 +1323,22 @@ impl Chat {
         }))
     }
 
-    /// `/done` leaves plan mode, so the plan can be carried out.
+    /// `/duck` is the repo-blind partner: no file or shell tool at all.
+    fn duck(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Error, format!("usage: /duck (got {args})"));
+            return Applied::none();
+        }
+        if self.mode == SessionMode::Duck {
+            self.push(LineKind::Note, "already ducking · /done exits".to_owned());
+            return Applied::none();
+        }
+        Applied::effect(ChatEffect::Send(EngineCommand::SetMode {
+            mode: SessionMode::Duck,
+        }))
+    }
+
+    /// `/done` leaves plan or duck mode and acts again.
     fn done(&mut self, args: &str) -> Applied {
         if !args.is_empty() {
             self.push(LineKind::Error, format!("usage: /done (got {args})"));
@@ -1760,12 +1776,16 @@ const COMMANDS: &[Command] = &[
         about: "cap the tokens this session may spend (usage: /budget 200k|off)",
     },
     Command {
+        name: "duck",
+        about: "duck mode: talk it through, repo-blind and toolless",
+    },
+    Command {
         name: "plan",
         about: "plan mode: read the repo, change nothing",
     },
     Command {
         name: "done",
-        about: "leave plan mode and act again",
+        about: "leave plan or duck mode and act again",
     },
     Command {
         name: "whoami",
@@ -3032,6 +3052,7 @@ mod tests {
             "budget",
             "plan",
             "done",
+            "duck",
             "whoami",
         ] {
             assert!(
@@ -3095,6 +3116,31 @@ mod tests {
             chat.lines
                 .iter()
                 .any(|line| line.text.contains("already in agent mode"))
+        );
+    }
+
+    #[test]
+    fn duck_enters_its_own_mode_and_done_leaves_it() {
+        let mut chat = chat();
+        type_text(&mut chat, "/duck");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMode {
+                mode: SessionMode::Duck
+            }))
+        );
+        chat.on_event(EngineEvent::ModeChanged {
+            mode: SessionMode::Duck,
+        });
+        let badge: String = frame_text(&mut chat).chars().take(80).collect();
+        assert!(badge.contains("duck"), "{badge}");
+
+        type_text(&mut chat, "/done");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMode {
+                mode: SessionMode::Agent
+            }))
         );
     }
 

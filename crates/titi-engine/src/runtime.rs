@@ -76,8 +76,24 @@ that is deliberate. Investigate, then answer with a plan — the files to \
 change, what changes in each, and what could go wrong. Do not ask for the \
 missing tools and do not pretend to have made the change.",
         ),
+        crate::protocol::SessionMode::Duck => Some(
+            "You are in duck mode: a thinking partner, not an agent. You cannot \
+see this repository — no file, search, or shell tool is available to you, and \
+no repository map is in this request. Do not guess at file contents or claim \
+to have looked. Ask the user for anything you need to know about their code, \
+and reason out loud with them.",
+        ),
     }
 }
+
+/// The only tools a duck-mode turn may be handed: an allowlist, not a
+/// filter by tier, because duck mode is about reach and not about danger —
+/// a read tool is harmless and still shows it the repository.
+///
+/// Web search is the one thing a repo-blind partner can usefully call. No
+/// surface registers such a tool yet, so today a duck turn goes out with no
+/// tools at all, which is exactly the behaviour the mode promises.
+const DUCK_TOOLS: &[&str] = &["web_search"];
 
 /// The live repository index, shared by the command loop and its turns.
 type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
@@ -358,6 +374,9 @@ pub struct EngineConfig {
     pub fallback_chain:
         std::sync::Arc<tokio::sync::Mutex<titi_providers::FallbackChain<smol_str::SmolStr>>>,
     pub judgment_provider: Option<crate::judgment::JudgmentProvider>,
+    /// Mode the session starts in (`--mode plan|duck`). `SetMode` changes it
+    /// afterwards.
+    pub mode: crate::protocol::SessionMode,
 }
 
 impl EngineConfig {
@@ -392,6 +411,7 @@ impl EngineConfig {
                 titi_providers::FallbackChain::new(primary, Vec::new()),
             )),
             judgment_provider: None,
+            mode: crate::protocol::SessionMode::Agent,
         }
     }
 }
@@ -621,6 +641,7 @@ impl EngineRuntime {
             )
         });
         let runtime = Self {
+            mode: config.mode,
             config,
             resolver,
             commands: command_rx,
@@ -641,7 +662,6 @@ impl EngineRuntime {
             spent: Arc::new(AtomicU64::new(0)),
             budget: None,
             budget_tripped: false,
-            mode: crate::protocol::SessionMode::default(),
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -657,6 +677,16 @@ impl EngineRuntime {
         let mut active: Option<(TurnId, Arc<AtomicBool>)> = None;
         let mut queued = VecDeque::<SmolStr>::new();
         let mut primary_model = self.config.primary_model.clone();
+
+        // A session started with `--mode plan|duck` has a badge to fill in:
+        // the surface learns the mode the same way it learns every later
+        // change, so it never has to assume one.
+        if self.mode != crate::protocol::SessionMode::Agent {
+            let _ = self
+                .events
+                .send(EngineEvent::ModeChanged { mode: self.mode })
+                .await;
+        }
 
         loop {
             tokio::select! {
@@ -1114,11 +1144,16 @@ impl EngineRuntime {
         if let Some(identity) = self.identity_prompt() {
             parts.push(identity.to_string());
         }
-        if let Some(project) = self.project_context() {
-            parts.push(project);
-        }
-        if let Some(skills) = self.skill_list() {
-            parts.push(skills);
+        // Duck mode is repo-blind: project rules and the skill list both
+        // describe this repository, and a partner that quotes them has seen
+        // it after all.
+        if self.mode != crate::protocol::SessionMode::Duck {
+            if let Some(project) = self.project_context() {
+                parts.push(project);
+            }
+            if let Some(skills) = self.skill_list() {
+                parts.push(skills);
+            }
         }
         if let Some(brief) = mode_brief(self.mode) {
             parts.push(brief.to_owned());
@@ -1135,11 +1170,25 @@ impl EngineRuntime {
     ///
     /// Plan mode keeps read-tier tools only, so the turn cannot write,
     /// patch, or run anything: the plan is the whole output, and a tool the
-    /// model was never handed is one it cannot reach for by mistake.
+    /// model was never handed is one it cannot reach for by mistake. Duck
+    /// mode goes further and keeps only what cannot reach the machine at
+    /// all — see [`DUCK_TOOLS`].
     fn mode_tools(&self) -> ToolRegistry {
         let mut tools = self.tools.clone();
-        if self.mode == crate::protocol::SessionMode::Plan {
-            tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
+        match self.mode {
+            crate::protocol::SessionMode::Agent => {}
+            crate::protocol::SessionMode::Plan => {
+                tools.retain_tiers(&[titi_tools::ApprovalTier::Read]);
+            }
+            crate::protocol::SessionMode::Duck => {
+                let mut kept = ToolRegistry::new();
+                for name in DUCK_TOOLS {
+                    if let Some(handler) = tools.get(name) {
+                        kept.register(handler);
+                    }
+                }
+                tools = kept;
+            }
         }
         tools
     }
@@ -1240,7 +1289,12 @@ impl EngineRuntime {
         let turn_id = TurnId(self.next_turn.fetch_add(1, Ordering::SeqCst));
         let aborted = Arc::new(AtomicBool::new(false));
         let task_abort = Arc::clone(&aborted);
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        if self.mode == crate::protocol::SessionMode::Duck {
+            // No ranked file list rides the prompt: a duck that can quote
+            // the repository is not repo-blind, whatever the brief says.
+            config.genome_root = None;
+        }
         let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
         let tools = self.mode_tools();

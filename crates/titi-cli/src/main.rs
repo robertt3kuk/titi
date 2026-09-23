@@ -13,6 +13,8 @@ usage: titi [options]
   --goal <text>               run the coder/reviewer goal loop headless and exit
                               0 (pass), 1 (partial) or 3 (fail) for CI
   --approval <mode>           always-ask | write | yolo (default: write)
+  --mode <mode>               agent | plan | duck (default: agent)
+                              plan: read-only tools; duck: repo-blind chat
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
   --list-keys                 list stored providers (never the keys)
@@ -31,6 +33,7 @@ fn main() -> io::Result<()> {
     let mut set_key: Option<(String, String)> = None;
     let mut list_keys = false;
     let mut approval = titi_tools::ApprovalMode::Write;
+    let mut mode = titi_engine::protocol::SessionMode::Agent;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--mouse" {
@@ -78,6 +81,20 @@ fn main() -> io::Result<()> {
                 Ok(mode) => approval = mode,
                 Err(reason) => {
                     eprintln!("{reason}");
+                    std::process::exit(2);
+                }
+            }
+        } else if arg == "--mode" {
+            let Some(raw) = args.next() else {
+                eprintln!("usage: titi --mode <agent|plan|duck>");
+                std::process::exit(2);
+            };
+            match raw.as_str() {
+                "agent" => mode = titi_engine::protocol::SessionMode::Agent,
+                "plan" => mode = titi_engine::protocol::SessionMode::Plan,
+                "duck" => mode = titi_engine::protocol::SessionMode::Duck,
+                other => {
+                    eprintln!("unknown mode {other}\n\n{USAGE}");
                     std::process::exit(2);
                 }
             }
@@ -134,7 +151,7 @@ fn main() -> io::Result<()> {
     let _enter = runtime.enter();
 
     let (engine, models, session_id) =
-        titi_cli::engine::start_engine_with(approval).map_err(io::Error::other)?;
+        titi_cli::engine::start_engine_with(approval, mode).map_err(io::Error::other)?;
     let session_log =
         titi_cli::session_log::SessionLog::open(&titi_config::agent_dir(), &session_id);
     if session_log.is_none() {
