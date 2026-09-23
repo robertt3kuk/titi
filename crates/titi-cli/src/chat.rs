@@ -475,7 +475,9 @@ impl Chat {
                 self.show_context(&parts, window);
                 Applied::none()
             }
-            EngineEvent::Failed { turn_id, message, .. } => {
+            EngineEvent::Failed {
+                turn_id, message, ..
+            } => {
                 self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
                 if turn_id.is_some() && turn_id == self.active_turn_id {
                     self.finish_turn()
@@ -608,11 +610,22 @@ impl Chat {
                 self.push(LineKind::Tool, format!("tool agent {name}: started"));
                 Applied::none()
             }
-            EngineEvent::AgentFinished { agent_id, summary, success, .. } => {
+            EngineEvent::AgentFinished {
+                agent_id,
+                summary,
+                success,
+                ..
+            } => {
                 if success {
-                    self.push(LineKind::Tool, format!("tool done  agent {agent_id}: {summary}"));
+                    self.push(
+                        LineKind::Tool,
+                        format!("tool done  agent {agent_id}: {summary}"),
+                    );
                 } else {
-                    self.push(LineKind::Tool, format!("tool error agent {agent_id}: {summary}"));
+                    self.push(
+                        LineKind::Tool,
+                        format!("tool error agent {agent_id}: {summary}"),
+                    );
                 }
                 Applied::none()
             }
@@ -929,7 +942,7 @@ impl Chat {
         if args.is_empty() {
             self.push(
                 LineKind::Note,
-                "usage: /switch <model-id-or-alias>[:<level>]\ne.g. /switch opus, /switch @review:high, /switch anthropic/claude-3-5-sonnet"
+                "usage: /switch <model-id>[:<level>]\ne.g. /switch sonnet, /switch @review:high, /switch anthropic/claude-3-5-sonnet"
                     .to_owned(),
             );
             return Applied::none();
@@ -941,8 +954,18 @@ impl Chat {
             return Applied::none();
         }
 
-        let (base_query, level) = if let Some((q, lvl)) = args.rsplit_once(':') {
-            (q, Some(lvl))
+        let (base_query, level) = if models.contains(&args.to_owned()) {
+            (args, None)
+        } else if let Some((q, lvl)) = args.rsplit_once(':') {
+            let lvl_lower = lvl.to_lowercase();
+            if matches!(
+                lvl_lower.as_str(),
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
+                (q, Some(lvl))
+            } else {
+                (args, None)
+            }
         } else {
             (args, None)
         };
@@ -953,36 +976,24 @@ impl Chat {
                 &crate::app::current_workspace(),
                 &[],
             ) {
-                if let Ok(resolved) =
-                    titi_config::roles::resolve_model_role(&settings, role, &self.model)
-                {
-                    resolved
-                } else {
-                    base_query.to_owned()
+                if settings.get("modelRoles").is_none() {
+                    self.push(LineKind::Error, "no model roles configured".to_owned());
+                    return Applied::none();
+                }
+                match titi_config::roles::resolve_model_role(&settings, role, &self.model) {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        self.push(LineKind::Error, format!("no such role @{role}"));
+                        return Applied::none();
+                    }
                 }
             } else {
-                base_query.to_owned()
+                self.push(LineKind::Error, "no model roles configured".to_owned());
+                return Applied::none();
             }
         } else {
             base_query.to_owned()
         };
-
-        fn is_subsequence(query: &str, target: &str) -> bool {
-            let mut target_chars = target.chars();
-            for q_c in query.chars() {
-                let mut matched = false;
-                while let Some(t_c) = target_chars.next() {
-                    if q_c.eq_ignore_ascii_case(&t_c) {
-                        matched = true;
-                        break;
-                    }
-                }
-                if !matched {
-                    return false;
-                }
-            }
-            true
-        }
 
         let mut candidates = Vec::new();
 
@@ -1005,14 +1016,6 @@ impl Chat {
             let query_lower = search_query.to_lowercase();
             for model in &models {
                 if model.to_lowercase().contains(&query_lower) {
-                    candidates.push(model);
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            for model in &models {
-                if is_subsequence(&search_query, model) {
                     candidates.push(model);
                 }
             }
@@ -3468,16 +3471,20 @@ mod tests {
             call_id: "call-1".into(),
             name: "bash".into(),
         });
-        
+
         chat.on_event(EngineEvent::Failed {
             turn_id: None,
             reason: titi_providers::ErrorReason::Rejected,
             message: "nope".into(),
         });
-        
+
         assert!(chat.turn_active);
         assert!(chat.approval.is_some());
-        assert!(chat.lines.iter().any(|line| line.kind == LineKind::Error && line.text == "nope"));
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text == "nope")
+        );
     }
 
     #[test]
@@ -3491,16 +3498,20 @@ mod tests {
             call_id: "call-1".into(),
             name: "bash".into(),
         });
-        
+
         chat.on_event(EngineEvent::Failed {
             turn_id: Some(TurnId(1)),
             reason: titi_providers::ErrorReason::Rejected,
             message: "nope".into(),
         });
-        
+
         assert!(!chat.turn_active);
         assert!(chat.approval.is_none());
-        assert!(chat.lines.iter().any(|line| line.kind == LineKind::Error && line.text == "nope"));
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error && line.text == "nope")
+        );
     }
 
     #[test]
@@ -4965,6 +4976,38 @@ mod tests {
     }
 
     #[test]
+    fn switch_fuzzy_does_not_match_subsequences() {
+        let mut chat = chat();
+        chat.catalog =
+            crate::engine::ModelCatalog::fixed(vec!["anthropic/claude-sonnet-4-5".to_owned()]);
+        type_text(&mut chat, "/switch opus");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("no model matches \"opus\""))
+        );
+    }
+
+    #[test]
+    fn switch_with_colon_id() {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "myco/llama3:8b".to_owned(),
+            "openai/gpt-4.1".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch myco/llama3:8b");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "myco/llama3:8b".into()
+            }))
+        );
+    }
+
+    #[test]
     fn switch_with_level() {
         let mut chat = chat();
         chat.catalog = crate::engine::ModelCatalog::fixed(vec![
@@ -5002,6 +5045,49 @@ mod tests {
             Some(ChatEffect::Send(EngineCommand::SwitchModel {
                 model: "anthropic/claude-opus-5".into()
             }))
+        );
+    }
+
+    #[test]
+    fn switch_role_without_model_roles_fails() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.catalog =
+            crate::engine::ModelCatalog::fixed(vec!["anthropic/claude-opus-5".to_owned()]);
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/switch @review");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("no model roles configured"))
+        );
+    }
+
+    #[test]
+    fn switch_role_unknown_fails() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.catalog =
+            crate::engine::ModelCatalog::fixed(vec!["anthropic/claude-opus-5".to_owned()]);
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+        std::fs::write(
+            chat.agent_dir.join("config.yml"),
+            "modelRoles:\n  review: anthropic/claude-opus-5\n",
+        )
+        .unwrap();
+
+        type_text(&mut chat, "/switch @unknown");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("no such role @unknown"))
         );
     }
 
@@ -5113,14 +5199,26 @@ mod tests {
             parent_id: None,
             kind: titi_engine::protocol::AgentKind::Subagent,
         });
-        assert!(chat.lines.last().unwrap().text.contains("agent worker: started"));
-        
+        assert!(
+            chat.lines
+                .last()
+                .unwrap()
+                .text
+                .contains("agent worker: started")
+        );
+
         chat.on_event(EngineEvent::AgentFinished {
             agent_id: "agent-1".into(),
             summary: "all done".into(),
             success: true,
         });
-        assert!(chat.lines.last().unwrap().text.contains("agent agent-1: all done"));
+        assert!(
+            chat.lines
+                .last()
+                .unwrap()
+                .text
+                .contains("agent agent-1: all done")
+        );
         assert_eq!(chat.lines.last().unwrap().kind, LineKind::Tool);
     }
 
