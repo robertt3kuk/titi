@@ -519,6 +519,16 @@ impl GoalOutcome {
         }
     }
 
+    /// Process exit code for a CI run: `PASS` is 0, `PARTIAL` is 1, and
+    /// everything else is 3.
+    ///
+    /// No verdict at all — cancelled, a coder or reviewer error, a check that
+    /// could not run — is a plain failure: none of those is a pass, and none
+    /// is a half-result a bot could act on.
+    pub fn exit_code(&self) -> i32 {
+        self.verdict.unwrap_or(Verdict::Fail).exit_code()
+    }
+
     fn cancelled(rounds: u32, trail: Trail) -> Self {
         Self {
             stop: GoalStop::Cancelled,
@@ -729,7 +739,14 @@ impl GoalLoop {
             }
         }
 
-        GoalOutcome::judged(GoalStop::RoundCap, Verdict::Fail, completed, trail)
+        // The cap is spent. A last review that could not tell is still a
+        // PARTIAL result, and CI reads that differently from a rejection;
+        // anything else — including no review at all — is a failure.
+        let verdict = match trail.review.as_ref().map(|review| review.verdict) {
+            Some(Verdict::Partial) => Verdict::Partial,
+            _ => Verdict::Fail,
+        };
+        GoalOutcome::judged(GoalStop::RoundCap, verdict, completed, trail)
     }
 }
 
@@ -761,7 +778,7 @@ pub fn goal_report(outcome: &GoalOutcome) -> String {
     };
     let mut line = format!("goal: {stop} · {rounds}");
     if let Some(verdict) = outcome.verdict {
-        line.push_str(" · verdict ");
+        line.push_str(VERDICT_MARK);
         line.push_str(&verdict.as_str().to_ascii_lowercase());
     }
     if !outcome.changes.is_empty() {
@@ -778,6 +795,30 @@ pub fn goal_report(outcome: &GoalOutcome) -> String {
         line.push_str(error);
     }
     line
+}
+
+/// The mark [`goal_report`] writes before the verdict word, and the one
+/// [`goal_exit_code`] looks for.
+const VERDICT_MARK: &str = " · verdict ";
+
+/// The exit code behind a [`goal_report`] line.
+///
+/// A surface that only sees `EngineEvent::GoalFinished` has the line and
+/// nothing else, so the code that writes the line reads it back: an unknown
+/// or missing verdict is a failure, never a pass.
+pub fn goal_exit_code(report: &str) -> i32 {
+    let Some(rest) = report.split(VERDICT_MARK).nth(1) else {
+        return Verdict::Fail.exit_code();
+    };
+    let word = rest
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    match word.to_ascii_uppercase().as_str() {
+        token if token == Verdict::Pass.as_str() => Verdict::Pass.exit_code(),
+        token if token == Verdict::Partial.as_str() => Verdict::Partial.exit_code(),
+        _ => Verdict::Fail.exit_code(),
+    }
 }
 
 /// A coder that asks the session's [`crate::AgentRunner`] for the next patch.
@@ -874,6 +915,111 @@ mod tests {
             }
             Ok(Patch::new(format!("patch for round {round}")))
         }
+    }
+
+    /// Answers with one scripted verdict, forever.
+    struct FixedReviewer {
+        verdict: Verdict,
+    }
+
+    #[async_trait]
+    impl Reviewer for FixedReviewer {
+        async fn review(&self, _request: ReviewRequest) -> Result<Review, SmolStr> {
+            Ok(Review {
+                verdict: self.verdict,
+                notes: "as judged".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_outcome_exits_zero_on_pass_one_on_partial_and_three_on_fail() {
+        let mut codes = Vec::new();
+        for verdict in [Verdict::Pass, Verdict::Partial, Verdict::Fail] {
+            let outcome = GoalLoop::new(
+                RecordingCoder::new() as Arc<dyn Coder>,
+                Arc::new(FixedReviewer { verdict }),
+            )
+            .with_max_rounds(2)
+            .run("ship it")
+            .await;
+            codes.push((outcome.stop, outcome.verdict, outcome.exit_code()));
+        }
+
+        assert_eq!(
+            codes,
+            vec![
+                (GoalStop::Passed, Some(Verdict::Pass), 0),
+                // The cap is spent with a reviewer that never could tell.
+                (GoalStop::RoundCap, Some(Verdict::Partial), 1),
+                (GoalStop::RoundCap, Some(Verdict::Fail), 3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_that_never_reached_a_verdict_exits_three() {
+        struct BrokenCoder;
+
+        #[async_trait]
+        impl Coder for BrokenCoder {
+            async fn code(&self, _request: CodeRequest) -> Result<Patch, SmolStr> {
+                Err("provider down".into())
+            }
+        }
+
+        let outcome = GoalLoop::new(
+            Arc::new(BrokenCoder),
+            Arc::new(FixedReviewer {
+                verdict: Verdict::Pass,
+            }),
+        )
+        .run("ship it")
+        .await;
+
+        assert_eq!(outcome.stop, GoalStop::Error);
+        assert_eq!(outcome.verdict, None);
+        assert_eq!(outcome.exit_code(), 3);
+    }
+
+    /// The headless surface sees the report line and nothing else, so the
+    /// line has to carry the code back.
+    #[test]
+    fn the_report_line_carries_the_exit_code_back() {
+        let outcome = |stop, verdict| GoalOutcome {
+            stop,
+            verdict,
+            rounds: 2,
+            patch: None,
+            review: None,
+            gate: None,
+            changes: vec![RoundChange {
+                round: 2,
+                change: StrategyChange::Effort,
+            }],
+            error: None,
+        };
+        for (stop, verdict) in [
+            (GoalStop::Passed, Some(Verdict::Pass)),
+            (GoalStop::RoundCap, Some(Verdict::Partial)),
+            (GoalStop::RoundCap, Some(Verdict::Fail)),
+            (GoalStop::Oscillation, Some(Verdict::Fail)),
+            (GoalStop::Cancelled, None),
+            (GoalStop::Error, None),
+            (GoalStop::GateUnavailable, None),
+        ] {
+            let outcome = outcome(stop, verdict);
+            let report = goal_report(&outcome);
+            assert_eq!(goal_exit_code(&report), outcome.exit_code(), "{report}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_names_no_verdict_is_not_a_pass() {
+        assert_eq!(goal_exit_code(""), 3);
+        assert_eq!(goal_exit_code("goal: cancelled · 2 rounds"), 3);
+        // A goal whose text happens to contain the word.
+        assert_eq!(goal_exit_code("goal: error · 1 round · make pass work"), 3);
     }
 
     struct AlwaysFails;

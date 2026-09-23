@@ -10,6 +10,8 @@ usage: titi [options]
 
   --headless, -p [prompt]     read EngineCommand JSONL on stdin, or run one prompt
   --prompt <text>             run one prompt headless and print the reply
+  --goal <text>               run the coder/reviewer goal loop headless and exit
+                              0 (pass), 1 (partial) or 3 (fail) for CI
   --approval <mode>           always-ask | write | yolo (default: write)
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
@@ -25,6 +27,7 @@ A / at the start of the line lists commands; up and down move, tab fills.
 fn main() -> io::Result<()> {
     let mut headless = false;
     let mut prompt: Option<String> = None;
+    let mut goal: Option<String> = None;
     let mut set_key: Option<(String, String)> = None;
     let mut list_keys = false;
     let mut approval = titi_tools::ApprovalMode::Write;
@@ -48,6 +51,13 @@ fn main() -> io::Result<()> {
                 std::process::exit(2);
             };
             prompt = Some(text);
+            headless = true;
+        } else if arg == "--goal" {
+            let Some(text) = args.next() else {
+                eprintln!("usage: titi --goal <text>");
+                std::process::exit(2);
+            };
+            goal = Some(text);
             headless = true;
         } else if arg == "--set-key" {
             match (args.next(), args.next()) {
@@ -74,12 +84,16 @@ fn main() -> io::Result<()> {
         } else if arg == "--help" || arg == "-h" {
             println!("{USAGE}");
             return Ok(());
-        } else if headless && prompt.is_none() && !arg.starts_with('-') {
+        } else if headless && goal.is_none() && prompt.is_none() && !arg.starts_with('-') {
             prompt = Some(arg);
         } else if arg.starts_with('-') {
             eprintln!("unknown option {arg}\n\n{USAGE}");
             std::process::exit(2);
         }
+    }
+    if goal.is_some() && prompt.is_some() {
+        eprintln!("use --goal or a prompt, not both\n\n{USAGE}");
+        std::process::exit(2);
     }
 
     if let Some((provider, key)) = set_key {
@@ -127,11 +141,14 @@ fn main() -> io::Result<()> {
         eprintln!("session: transcript writes are off (store unavailable)");
     }
     if headless {
-        let code = match prompt {
-            Some(text) => {
+        let code = match (goal, prompt) {
+            (Some(text), _) => {
+                runtime.block_on(titi_cli::headless::run_goal(engine, session_log, &text))?
+            }
+            (None, Some(text)) => {
                 runtime.block_on(titi_cli::headless::run_prompt(engine, session_log, &text))?
             }
-            None => runtime.block_on(titi_cli::headless::run(engine, session_log))?,
+            (None, None) => runtime.block_on(titi_cli::headless::run(engine, session_log))?,
         };
         std::process::exit(code);
     }
