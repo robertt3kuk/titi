@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod fs;
+pub mod hashline;
 pub mod sensitive;
 
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
     workspace_tools_with_cache, workspace_tools_with_policy,
 };
+pub use hashline::{HashlineEditTool, HashlineError, line_anchor};
 pub use sensitive::SensitivePolicy;
 
 /// How dangerous a tool is. Unknown tools are treated as [`ApprovalTier::Exec`].

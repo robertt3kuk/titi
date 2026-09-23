@@ -7,10 +7,11 @@ use serde_json::Value;
 use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
+use crate::hashline::HashlineEditTool;
 use crate::sensitive::SensitivePolicy;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
 
-fn arg_str(args: &Value, key: &str) -> Option<String> {
+pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|value| value.as_str())
         .map(str::to_owned)
@@ -41,7 +42,11 @@ fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
 /// `jail_path` for a tool that returns file contents to the model: the file
 /// must also not be a credential, checked on both the name asked for and the
 /// real path, so a harmless-looking link to `.env` is refused as well.
-fn readable_path(root: &Path, raw: &str, policy: &SensitivePolicy) -> Result<PathBuf, String> {
+pub(crate) fn readable_path(
+    root: &Path,
+    raw: &str,
+    policy: &SensitivePolicy,
+) -> Result<PathBuf, String> {
     let resolved = jail_path(root, raw)?;
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let relative = resolved.strip_prefix(&canonical_root).unwrap_or(&resolved);
@@ -53,14 +58,14 @@ fn readable_path(root: &Path, raw: &str, policy: &SensitivePolicy) -> Result<Pat
     Ok(resolved)
 }
 
-fn ok(output: impl Into<String>) -> ToolResult {
+pub(crate) fn ok(output: impl Into<String>) -> ToolResult {
     ToolResult {
         output: output.into().into(),
         is_error: false,
     }
 }
 
-fn err(output: impl Into<String>) -> ToolResult {
+pub(crate) fn err(output: impl Into<String>) -> ToolResult {
     ToolResult {
         output: output.into().into(),
         is_error: true,
@@ -433,6 +438,11 @@ pub fn workspace_tools_with_policy(
             cache: cache.clone(),
         }),
         Box::new(EditFileTool {
+            root: root.clone(),
+            cache: cache.clone(),
+            policy: policy.clone(),
+        }),
+        Box::new(HashlineEditTool {
             root: root.clone(),
             cache,
             policy: policy.clone(),
