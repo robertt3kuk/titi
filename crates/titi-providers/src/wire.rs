@@ -62,9 +62,13 @@ fn leading_system(req: &WireRequest) -> (Option<String>, usize) {
         .take_while(|m| m.role == Role::System)
         .count();
     // Both APIs reject a request with no messages at all, so a conversation
-    // that is nothing but system messages keeps its last one as a turn. The
-    // engine always adds the user prompt, so this is a guard against a caller
-    // that does not, not a case in today's turn loop.
+    // that is nothing but system messages keeps its last one as a turn: it
+    // arrives as user text instead of as the system field, which loses the
+    // role but keeps the content, and a request that is merely odd beats one
+    // that is rejected outright. With a single system message that is the
+    // whole request, so the system field ends up empty. The engine always
+    // appends the user prompt, so this guards a caller that does not rather
+    // than a path the turn loop takes.
     if folded == req.messages.len() {
         folded = folded.saturating_sub(1);
     }
@@ -680,6 +684,26 @@ mod tests {
         let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, None);
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["contents"].as_array().expect("contents").len(), 1);
+    }
+
+    /// The degenerate end of the same guard: one system message and nothing
+    /// else. Its content has to survive, and the only place left for it is a
+    /// user turn — an empty `messages` array would be rejected and inventing
+    /// a turn to keep it company would put words in the user's mouth.
+    #[test]
+    fn a_single_system_message_arrives_as_the_turn_rather_than_vanishing() {
+        let mut r = WireRequest::new("claude-test");
+        r.messages = vec![ChatMessage {
+            role: Role::System,
+            content: "you are titi".into(),
+            tool_calls: Vec::new(),
+        }];
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["system"], "");
+        assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "you are titi");
     }
 
     #[test]
