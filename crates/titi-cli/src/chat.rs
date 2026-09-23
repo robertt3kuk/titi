@@ -2866,9 +2866,9 @@ fn message_rows(line: &TranscriptLine, width: usize, ink: &Ink) -> Vec<Line<'sta
     match line.kind {
         LineKind::User => speech("you", ink.gold, ink.text, &line.text, width, ink),
         LineKind::Assistant => speech("titi", ink.accent, ink.text, &line.text, width, ink),
-        LineKind::Tool => vec![chip(tool_chip(&line.text, ink), ink, width)],
-        LineKind::Error => vec![chip(("✕", ink.red, line.text.clone(), ink.red), ink, width)],
-        LineKind::Note => vec![chip(("·", ink.dim, line.text.clone(), ink.dim), ink, width)],
+        LineKind::Tool => chip(tool_chip(&line.text, ink), ink, width),
+        LineKind::Error => chip(("✕", ink.red, line.text.clone(), ink.red), ink, width),
+        LineKind::Note => chip(("·", ink.dim, line.text.clone(), ink.dim), ink, width),
     }
 }
 
@@ -2925,16 +2925,35 @@ fn tool_chip(text: &str, ink: &Ink) -> (&'static str, Color, String, Color) {
     ("▸", ink.amber, text.to_owned(), ink.muted)
 }
 
-fn chip(parts: (&str, Color, String, Color), ink: &Ink, width: usize) -> Line<'static> {
+/// A marked block: the mark opens the first row, every following row is
+/// indented under the text column.
+///
+/// One note carries a whole block — `/diagnose`, `/git diff` and `/settings`
+/// each push one — so the text is split on its own newlines and every piece
+/// is wrapped to the pane, exactly as [`speech`] does. Truncating to one row
+/// threw everything past the first screen width away.
+fn chip(parts: (&str, Color, String, Color), ink: &Ink, width: usize) -> Vec<Line<'static>> {
     let (mark, mark_color, text, text_color) = parts;
     let room = width.saturating_sub(6).max(4);
-    let shown = titi_tui::width::truncate_to_width(&text, room);
-    Line::from(vec![
-        Span::styled("   ", ink.page()),
-        Span::styled(mark.to_owned(), ink.fg(mark_color)),
-        Span::styled(" ", ink.page()),
-        Span::styled(shown, ink.fg(text_color)),
-    ])
+    let pieces = wrap_plain(&text, room);
+    let mut rows = Vec::with_capacity(pieces.len());
+    for (index, piece) in pieces.into_iter().enumerate() {
+        let row = if index == 0 {
+            vec![
+                Span::styled("   ", ink.page()),
+                Span::styled(mark.to_owned(), ink.fg(mark_color)),
+                Span::styled(" ", ink.page()),
+                Span::styled(piece, ink.fg(text_color)),
+            ]
+        } else {
+            vec![
+                Span::styled("     ", ink.page()),
+                Span::styled(piece, ink.fg(text_color)),
+            ]
+        };
+        rows.push(Line::from(row));
+    }
+    rows
 }
 
 fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
@@ -3290,6 +3309,18 @@ mod tests {
         for ch in text.chars() {
             chat.on_key(Key::Char(ch), now);
         }
+    }
+
+    /// The rendered text of each row, the way the transcript stacks them.
+    fn row_texts(rows: &[Line<'static>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     #[test]
@@ -5027,5 +5058,99 @@ mod tests {
             _ => panic!("expected SubmitPrompt"),
         }
         assert!(applied.log.is_none());
+    }
+
+    /// Every physical line of a note is its own row, and a row too long for
+    /// the pane wraps instead of being cut: `/diagnose`, `/git diff` and
+    /// `/settings` each push one multi-line note, and a single truncated row
+    /// threw everything past the first screen width away.
+    #[test]
+    fn a_multi_line_note_is_one_row_per_line() {
+        let ink = Ink::titanium();
+        let line = TranscriptLine {
+            kind: LineKind::Note,
+            text: "alpha\nbeta\n\ngamma".to_owned(),
+        };
+        let rows = row_texts(&message_rows(&line, 40, &ink));
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[0].contains("alpha"), "{rows:?}");
+        assert!(rows[1].contains("beta"), "{rows:?}");
+        assert!(rows[2].trim().is_empty(), "blank line kept: {rows:?}");
+        assert!(rows[3].contains("gamma"), "{rows:?}");
+    }
+
+    /// A long line is wrapped over several rows, and no row overflows the
+    /// pane — the old renderer dropped the tail instead.
+    #[test]
+    fn a_long_note_wraps_within_the_width() {
+        let ink = Ink::titanium();
+        let words = std::iter::repeat_n("token", 60)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = TranscriptLine {
+            kind: LineKind::Note,
+            text: words.clone(),
+        };
+        let rows = row_texts(&message_rows(&line, 40, &ink));
+        assert!(rows.len() >= 8, "{rows:?}");
+        for row in &rows {
+            assert!(
+                titi_tui::width::visible_width(row) <= 40,
+                "row wider than the pane: {row:?}"
+            );
+        }
+        let joined: String = rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            joined.split_whitespace().filter(|w| *w == "token").count(),
+            60
+        );
+    }
+
+    /// An error and a tool chip split the same way a note does.
+    #[test]
+    fn errors_and_tool_chips_split_too() {
+        let ink = Ink::titanium();
+        for kind in [LineKind::Error, LineKind::Tool] {
+            let line = TranscriptLine {
+                kind,
+                text: "first\nsecond".to_owned(),
+            };
+            let rows = row_texts(&message_rows(&line, 40, &ink));
+            assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
+            assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
+        }
+    }
+
+    /// The whole block reaches the screen, each piece on a row of its own.
+    #[test]
+    fn a_multi_line_note_reaches_the_frame() {
+        let mut chat = chat();
+        chat.push(LineKind::Note, "one\ntwo\nthree".to_owned());
+        let view = frame_text(&mut chat);
+        let rows: Vec<String> = view
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(80)
+            .map(|row| row.iter().collect())
+            .collect();
+        let mut at = Vec::new();
+        for want in ["one", "two", "three"] {
+            let found: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains(want))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(found.len(), 1, "{want} once: {rows:?}");
+            at.push(found[0]);
+        }
+        assert!(
+            at[0] < at[1] && at[1] < at[2],
+            "the three lines share a row: {at:?} {rows:?}"
+        );
     }
 }
