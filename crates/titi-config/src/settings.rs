@@ -40,6 +40,7 @@ pub enum SettingsError {
 
 #[derive(Debug, Default)]
 pub struct Settings {
+    /// Lowest layer. Always empty today: see [`NO_SETTINGS_NOTE`].
     pub defaults: Value,
     pub global: Value,
     pub project: Value,
@@ -52,6 +53,17 @@ pub struct Settings {
 /// Canonical file names, in resolution order.
 pub const GLOBAL_FILES: [&str; 2] = ["config.yml", "config.yaml"];
 pub const PROJECT_SUBPATH: &str = ".titi/config.yml";
+
+/// What a surface reports when [`Settings::is_empty`] holds.
+///
+/// The `defaults` layer is deliberately empty: this crate owns no table of
+/// built-in values, because the real ones live in the binaries that consume
+/// the settings — the engine config, the approval mode, the provider
+/// registry. Copying them here would be a second source of truth free to
+/// drift, and [`Settings::resolve_source`] would start crediting a "default"
+/// layer for values the binaries may never use. Nothing is invented, so the
+/// empty state is merely named the same way everywhere.
+pub const NO_SETTINGS_NOTE: &str = "built-in defaults only";
 
 impl Settings {
     /// Discover and load all layers.
@@ -162,9 +174,10 @@ impl Settings {
 
     /// Effective value of a dotted key (`theme.dark`), highest layer wins.
     pub fn get(&self, key: &str) -> Option<Value> {
-        let mut current = self.effective();
+        let effective = self.effective();
+        let mut current = &effective;
         for seg in key.split('.') {
-            current = current.get(seg).cloned()?;
+            current = index(current, seg)?;
         }
         Some(current.clone())
     }
@@ -226,17 +239,30 @@ impl Settings {
     }
 
     /// Returns all effective keys with their source layer and value.
+    ///
+    /// Arrays are indexed rather than printed whole: a list of providers
+    /// becomes `providers.0.id`, `providers.0.base_url`, `providers.1.id`,
+    /// so every scalar carries the layer it came from. An empty array stays
+    /// a leaf — there is nothing under it, and dropping the key would hide
+    /// that a layer sets it.
     pub fn flatten(&self) -> std::collections::BTreeMap<String, (String, Value)> {
+        fn child(prefix: &str, seg: &str) -> String {
+            if prefix.is_empty() {
+                seg.to_owned()
+            } else {
+                format!("{prefix}.{seg}")
+            }
+        }
         fn walk(value: &Value, prefix: &str, map: &mut std::collections::BTreeMap<String, Value>) {
             match value {
                 Value::Object(obj) => {
                     for (k, v) in obj {
-                        let new_prefix = if prefix.is_empty() {
-                            k.clone()
-                        } else {
-                            format!("{prefix}.{k}")
-                        };
-                        walk(v, &new_prefix, map);
+                        walk(v, &child(prefix, k), map);
+                    }
+                }
+                Value::Array(items) if !items.is_empty() => {
+                    for (at, item) in items.iter().enumerate() {
+                        walk(item, &child(prefix, &at.to_string()), map);
                     }
                 }
                 _ => {
@@ -256,6 +282,16 @@ impl Settings {
             out.insert(k, (source, v));
         }
         out
+    }
+
+    /// Whether no layer sets a single key.
+    ///
+    /// True is neither an error nor a missing file: every binary still runs
+    /// on the defaults compiled into it. Surfaces report it with
+    /// [`NO_SETTINGS_NOTE`], so two commands cannot describe one state in
+    /// two contradictory ways.
+    pub fn is_empty(&self) -> bool {
+        self.flatten().is_empty()
     }
 
     /// Write a dotted key into the **global** layer and persist it (the only
@@ -336,9 +372,19 @@ impl Settings {
 fn lookup(layer: &Value, key: &str) -> Option<Value> {
     let mut current = layer;
     for seg in key.split('.') {
-        current = current.get(seg)?;
+        current = index(current, seg)?;
     }
     Some(current.clone())
+}
+
+/// One dotted segment into a value: an object key, or a decimal position in
+/// an array — the shape [`Settings::flatten`] gives array elements, so a
+/// flattened key resolves back to the layer that set it.
+fn index<'a>(value: &'a Value, seg: &str) -> Option<&'a Value> {
+    match value {
+        Value::Array(items) => items.get(seg.parse::<usize>().ok()?),
+        _ => value.get(seg),
+    }
 }
 
 /// Objects deep-merge; scalars and arrays are replaced wholesale.
@@ -520,6 +566,106 @@ mod tests {
         let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
         let values = settings.layer_values("privacy.sensitive");
         assert_eq!(values.len(), 2, "{values:?}");
+    }
+
+    /// A list of providers is a list of settings, not one opaque value: each
+    /// scalar gets its own key and its own source layer.
+    #[test]
+    fn array_entries_flatten_into_indexed_keys() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &project.path().join(PROJECT_SUBPATH),
+            "providers:\n  \
+             - id: myco\n    \
+             base_url: https://api.example.invalid/v1\n    \
+             headers:\n      \
+             x-team: platform\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        let flat = settings.flatten();
+        assert!(!flat.contains_key("providers"), "{flat:?}");
+        for (key, value) in [
+            ("providers.0.id", "myco"),
+            ("providers.0.base_url", "https://api.example.invalid/v1"),
+            ("providers.0.headers.x-team", "platform"),
+        ] {
+            assert_eq!(
+                flat.get(key),
+                Some(&("project".to_owned(), Value::String(value.to_owned()))),
+                "{key} in {flat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_of_scalars_is_indexed_too_and_keeps_its_layer() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "privacy:\n  allow: [\".env\", \"id_rsa\"]\n  sensitive: []\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        let flat = settings.flatten();
+        assert_eq!(
+            flat.get("privacy.allow.0"),
+            Some(&("agent".to_owned(), Value::String(".env".to_owned()))),
+            "{flat:?}"
+        );
+        assert_eq!(
+            flat.get("privacy.allow.1"),
+            Some(&("agent".to_owned(), Value::String("id_rsa".to_owned()))),
+            "{flat:?}"
+        );
+        // Nothing lives under an empty list, so it stays a leaf rather than
+        // vanishing from the listing.
+        assert_eq!(
+            flat.get("privacy.sensitive"),
+            Some(&("agent".to_owned(), Value::Array(Vec::new()))),
+            "{flat:?}"
+        );
+    }
+
+    /// The higher layer replaces an array wholesale, so its elements are the
+    /// ones listed — and each is credited to that layer.
+    #[test]
+    fn a_replaced_array_is_credited_to_the_layer_that_won() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "providers:\n  - id: from-agent\n",
+        );
+        write(
+            &project.path().join(PROJECT_SUBPATH),
+            "providers:\n  - id: from-project\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert_eq!(
+            settings.flatten().get("providers.0.id"),
+            Some(&(
+                "project".to_owned(),
+                Value::String("from-project".to_owned())
+            ))
+        );
+        assert_eq!(
+            settings.get("providers.0.id"),
+            Some(Value::String("from-project".to_owned()))
+        );
+    }
+
+    #[test]
+    fn no_layer_setting_anything_is_reported_as_built_in_defaults() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let mut settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert!(settings.is_empty());
+        assert_eq!(NO_SETTINGS_NOTE, "built-in defaults only");
+        settings
+            .set_runtime("theme.dark", Value::Bool(true))
+            .unwrap();
+        assert!(!settings.is_empty());
     }
 
     fn obj(pairs: &[(&str, Value)]) -> Value {
