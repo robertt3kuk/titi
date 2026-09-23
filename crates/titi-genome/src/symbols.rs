@@ -83,14 +83,12 @@ pub fn grammar_available(grammar: Grammar) -> bool {
     parser.set_language(&grammar.language()).is_ok()
 }
 
-/// Names `source` declares and publishes, in source order.
+/// Parses `source` with `grammar`, reusing this thread's parser.
 ///
-/// `None` means the file could not be parsed at all (no grammar for the
-/// extension, or the parser refused the input); the caller then contributes no
-/// symbols for the file rather than guessing at them.
-pub fn exports(path: &str, source: &str) -> Option<Vec<String>> {
-    let grammar = Grammar::from_path(path)?;
-    let tree = PARSERS.with(|cell| {
+/// `None` means the parser refused the input outright; it says nothing about
+/// syntax errors inside the tree, which tree-sitter reports as `ERROR` nodes.
+pub(crate) fn parse(grammar: Grammar, source: &str) -> Option<tree_sitter::Tree> {
+    PARSERS.with(|cell| {
         let mut parsers = cell.borrow_mut();
         let slot = parsers.slot(grammar);
         if slot.is_none() {
@@ -99,7 +97,17 @@ pub fn exports(path: &str, source: &str) -> Option<Vec<String>> {
             *slot = Some(parser);
         }
         slot.as_mut()?.parse(source, None)
-    })?;
+    })
+}
+
+/// Names `source` declares and publishes, in source order.
+///
+/// `None` means the file could not be parsed at all (no grammar for the
+/// extension, or the parser refused the input); the caller then contributes no
+/// symbols for the file rather than guessing at them.
+pub fn exports(path: &str, source: &str) -> Option<Vec<String>> {
+    let grammar = Grammar::from_path(path)?;
+    let tree = parse(grammar, source)?;
 
     let bytes = source.as_bytes();
     let mut out = Vec::new();
