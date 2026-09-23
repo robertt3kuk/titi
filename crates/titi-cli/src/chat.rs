@@ -57,6 +57,10 @@ pub enum Key {
     Up,
     Down,
     Tab,
+    PageUp,
+    PageDown,
+    PageUpHalf,
+    PageDownHalf,
 }
 
 /// What the screen asks the engine or the process to do.
@@ -210,6 +214,8 @@ pub struct Chat {
     hub: HubSession,
     /// Whether the roster panel is shown (`/hub`).
     hub_open: bool,
+    scroll_offset: usize,
+    last_transcript_height: usize,
 }
 
 impl Chat {
@@ -255,6 +261,8 @@ impl Chat {
             mode: SessionMode::Agent,
             hub: HubSession::default(),
             hub_open: false,
+            scroll_offset: 0,
+            last_transcript_height: 0,
         }
     }
 
@@ -367,12 +375,14 @@ impl Chat {
                 self.disarm();
                 self.input.pop();
                 self.picker = 0;
+                self.scroll_offset = 0;
                 Applied::none()
             }
             Key::Char(ch) => {
                 self.disarm();
                 self.input.push(ch);
                 self.picker = 0;
+                self.scroll_offset = 0;
                 Applied::none()
             }
             Key::Esc if self.picking() => {
@@ -381,7 +391,35 @@ impl Chat {
                 self.disarm();
                 Applied::none()
             }
-            Key::Esc | Key::CtrlD | Key::Up | Key::Down | Key::Tab => {
+            Key::Up => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                Applied::none()
+            }
+            Key::PageUp => {
+                let h = self.last_transcript_height;
+                self.scroll_offset = self.scroll_offset.saturating_add(h.saturating_sub(1));
+                Applied::none()
+            }
+            Key::PageDown => {
+                let h = self.last_transcript_height;
+                self.scroll_offset = self.scroll_offset.saturating_sub(h.saturating_sub(1));
+                Applied::none()
+            }
+            Key::PageUpHalf => {
+                let h = self.last_transcript_height / 2;
+                self.scroll_offset = self.scroll_offset.saturating_add(h.max(1));
+                Applied::none()
+            }
+            Key::PageDownHalf => {
+                let h = self.last_transcript_height / 2;
+                self.scroll_offset = self.scroll_offset.saturating_sub(h.max(1));
+                Applied::none()
+            }
+            Key::Esc | Key::CtrlD | Key::Tab => {
                 self.disarm();
                 Applied::none()
             }
@@ -1908,6 +1946,7 @@ impl Chat {
 
     fn push(&mut self, kind: LineKind, text: String) {
         self.lines.push(TranscriptLine { kind, text });
+        self.scroll_offset = 0;
     }
 
     /// The transcript as it stands. A cast replay renders these lines; the
@@ -2797,10 +2836,14 @@ fn transcript(
         }
     }
     let keep = height as usize;
-    let start = rows.len().saturating_sub(keep);
+    let total = rows.len();
+    chat.last_transcript_height = keep;
+    let max_offset = total.saturating_sub(keep);
+    chat.scroll_offset = chat.scroll_offset.clamp(0, max_offset);
+    let start = total.saturating_sub(keep + chat.scroll_offset);
     let mut lines = Vec::new();
     let mut photos = Vec::new();
-    for (index, row) in rows.into_iter().skip(start).enumerate() {
+    for (index, row) in rows.into_iter().skip(start).take(keep).enumerate() {
         match row {
             TranscriptRow::Text(line) => lines.push(line),
             TranscriptRow::Photo {
@@ -3193,6 +3236,10 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
         KeyCode::Tab => Some(Key::Tab),
+        KeyCode::PageUp => Some(Key::PageUp),
+        KeyCode::PageDown => Some(Key::PageDown),
+        KeyCode::Char('u') if control => Some(Key::PageUpHalf),
+        KeyCode::Char('d') if control => Some(Key::PageDownHalf),
         _ => None,
     }
 }
@@ -5405,5 +5452,40 @@ mod tests {
         let applied = chat.on_key(Key::Enter, Instant::now());
         assert!(applied.effect.is_none());
         assert!(chat.lines.iter().any(|line| line.text.contains("exports")));
+    }
+    #[test]
+    fn transcript_scrolls_with_page_keys() {
+        let mut chat = chat();
+        for i in 0..50 {
+            chat.push(LineKind::Note, format!("line {i}"));
+        }
+
+        let view = frame_text(&mut chat);
+        assert!(view.contains("line 49"), "bottom line visible");
+        assert!(!view.contains("line 0"), "top line hidden");
+
+        chat.on_key(Key::PageUp, Instant::now());
+        chat.on_key(Key::PageUp, Instant::now());
+        chat.on_key(Key::PageUp, Instant::now());
+        let view_scrolled = frame_text(&mut chat);
+        assert!(
+            view_scrolled.contains("line 0"),
+            "top line visible after scroll"
+        );
+        assert!(
+            !view_scrolled.contains("line 49"),
+            "bottom line hidden after scroll"
+        );
+
+        chat.on_key(Key::PageDown, Instant::now());
+        chat.on_key(Key::PageDown, Instant::now());
+        chat.on_key(Key::PageDown, Instant::now());
+        let view_down = frame_text(&mut chat);
+        assert!(view_down.contains("line 49"), "bottom line visible again");
+
+        chat.on_key(Key::PageUp, Instant::now());
+        chat.on_key(Key::Char('a'), Instant::now());
+        let view_reset = frame_text(&mut chat);
+        assert!(view_reset.contains("line 49"), "typing resets to bottom");
     }
 }
