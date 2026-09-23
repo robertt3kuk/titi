@@ -456,6 +456,12 @@ impl Chat {
                 self.push(LineKind::Note, report.to_string());
                 Applied::none()
             }
+            EngineEvent::CouncilFinished { report } => {
+                // Without an arm of its own the report falls into the
+                // wildcard below and the council answers into the void.
+                self.push(LineKind::Note, report.to_string());
+                Applied::none()
+            }
             EngineEvent::Notice { message } => {
                 self.push(LineKind::Note, one_line(&message, TOOL_PREVIEW));
                 Applied::none()

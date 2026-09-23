@@ -4,6 +4,7 @@ pub mod advisor;
 pub mod agents;
 pub mod claims;
 pub mod compaction;
+pub mod council;
 pub mod findings;
 pub mod goal;
 pub mod judgment;
@@ -20,6 +21,10 @@ pub mod tool_loop;
 
 pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
 pub use agents::{AgentContext, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner};
+pub use council::{
+    Council, CouncilError, CouncilMember, CouncilReport, DEFAULT_BRIEFS, DroppedMember,
+    MAX_MEMBERS, MIN_MEMBERS, MemberAnswer, SYNTHESIZER_BRIEF, council_report, run_council,
+};
 pub use goal::{
     CodeRequest, Coder, CommandGates, DEFAULT_GOAL_ROUNDS, GATE_OUTPUT_CAP, GateCommand,
     GateVerdict, Gates, GoalCancel, GoalLoop, GoalOutcome, GoalStop, Patch, RunnerCoder,

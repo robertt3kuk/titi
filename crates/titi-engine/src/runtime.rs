@@ -735,6 +735,9 @@ impl EngineRuntime {
                         EngineCommand::RunGoal { text } => {
                             self.spawn_goal(text, primary_model.clone());
                         }
+                        EngineCommand::RunCouncil { question } => {
+                            self.spawn_council(question, primary_model.clone());
+                        }
                         EngineCommand::MemoryList => {
                             if let Some(agent_dir) = self.config.agent_dir.clone() {
                                 let output = run_off_thread(move || {
@@ -1374,6 +1377,54 @@ impl EngineRuntime {
             let _ = events
                 .send(EngineEvent::GoalFinished {
                     report: crate::goal_report(&outcome).into(),
+                })
+                .await;
+        });
+    }
+
+    /// `/council` seats [`crate::DEFAULT_BRIEFS`] on the session model: one
+    /// runner per member, one for the fold. Like `/goal` it does not replace
+    /// the active turn or queue a `SubmitPrompt`.
+    fn spawn_council(&self, question: SmolStr, model: SmolStr) {
+        let events = self.events.clone();
+        let question = question.trim().to_owned();
+        if question.is_empty() {
+            tokio::spawn(async move {
+                let _ = events
+                    .send(EngineEvent::CouncilFinished {
+                        report: "usage: /council <question>".into(),
+                    })
+                    .await;
+            });
+            return;
+        }
+        let members = crate::DEFAULT_BRIEFS
+            .iter()
+            .map(|(name, brief, effort)| {
+                crate::CouncilMember::new(
+                    *name,
+                    *brief,
+                    model.clone(),
+                    *effort,
+                    Arc::new(crate::StreamingAgentRunner::new(
+                        Arc::clone(&self.resolver),
+                        model.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let synthesizer = Arc::new(crate::StreamingAgentRunner::new(
+            Arc::clone(&self.resolver),
+            model,
+        ));
+        tokio::spawn(async move {
+            let report = match crate::run_council(members, synthesizer, question).await {
+                Ok(report) => crate::council_report(&report),
+                Err(error) => format!("council: {error}"),
+            };
+            let _ = events
+                .send(EngineEvent::CouncilFinished {
+                    report: report.into(),
                 })
                 .await;
         });

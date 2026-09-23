@@ -955,6 +955,13 @@ impl App {
             EngineEvent::GoalFinished { report } => {
                 self.set_alert(report.to_string());
             }
+            EngineEvent::CouncilFinished { report } => {
+                // The council's report is a block — header, the fold, then one
+                // line per member — so it goes where it can be read, not into
+                // a one-line alert.
+                self.push_transcript(Section::Activity, report.to_string());
+                self.set_alert("council answered");
+            }
             EngineEvent::Notice { message } => {
                 self.push_transcript(Section::Activity, message.to_string());
                 self.set_alert(message.to_string());

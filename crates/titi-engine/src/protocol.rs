@@ -98,6 +98,10 @@ pub enum EngineCommand {
     RunGoal {
         text: SmolStr,
     },
+    /// Put a question to a council of briefs. This is not a chat turn.
+    RunCouncil {
+        question: SmolStr,
+    },
     /// Report what currently fills the context window, part by part.
     DescribeContext,
     /// Fold the history now, whatever the threshold says. `focus` is free
@@ -254,6 +258,10 @@ pub enum EngineEvent {
     },
     /// `/goal` finished. `report` is the line the surface shows.
     GoalFinished {
+        report: SmolStr,
+    },
+    /// `/council` finished. `report` is the block the surface shows.
+    CouncilFinished {
         report: SmolStr,
     },
     /// Something the user asked for was not done, without failing the turn.
