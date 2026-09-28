@@ -8,13 +8,30 @@
 
 Обновляется после каждого шага. Новая сессия начинает отсюда.
 
-## OAuth-вход в провайдера (2026-09-28, код в master, ждёт живого входа)
+## OAuth-вход в провайдера (2026-09-28, живой вход Codex пройден)
 
 Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забраны дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция); порт — таблица констант Rust и свой поток поверх неё.
 
 Сделано в `c3a57ef`: `titi-providers::oauth` (PKCE S256 из 96 байт → base64url, callback на `TcpListener` с разбором `code`/`state`/`error`, 404 на чужой путь, `port_fallback #false` у Codex, обмен кода JSON у Anthropic и form у Codex, идентичность Anthropic через bootstrap-запрос и Codex через claim'ы JWT, refresh, device-grant Codex; base64url и percent-encoding свои, из зависимостей только `sha2`); `auth.db` v3 с `refresh_token`/идентичностью и миграцией из v2; провод по `CredKind` (`Authorization: Bearer` + Claude Code отпечаток у Anthropic, `chatgpt-account-id`/`openai-beta` у Codex); движок — свеп `refresh_due` по skew перед ходом (терминальный отказ refresh удаляет строку, транзиентная ошибка оставляет); поверхность — `titi --login [provider]` (и `--login --device <id>`), `/login <provider>` в чате с печатью URL и вставкой кода, `/keys` с видом и остатком жизни.
 
 Тесты на момент коммита: `titi-providers` 151, `titi-secrets` 24, `titi-engine` 231, `titi-cli` 266; workspace 1464 passed, 0 failed. Смоук без сети и ключей: `titi --login` печатает `anthropic  Anthropic (Claude Pro/Max)` и `openai-codex  ChatGPT Plus/Pro (Codex Subscription)` и выходит 0; `titi --login nonexistent` печатает `unknown oauth provider nonexistent` и выходит 2; `titi --help` называет `--login`.
+
+Живой прогон владельца (2026-09-28): `titi --login openai-codex` в настоящем браузере довёл вход в ChatGPT Plus/Pro до конца и записал подписку в реальный `~/.titi/agent` (`--list-keys` → `openai-codex  (oauth, 239h 59m left)`), и ход модели на `openai-codex/gpt-5.5` в TUI (PTY 80×20) ответил `42` без ошибок. Живой вход Claude не проверен: подписки на этой машине нет, `--login anthropic` доходит до callback, печатает URL и отвергает любой подставленный код как `invalid_grant` — это отсутствие подписки, а не дефект кода.
+
+Прогон вскрыл три дефекта, не исполнявшихся ни одним тестом (их правит `092be78`):
+
+- массив `tools` для `OpenAiResponses` отправлялся чатовой формой (`{"type":"function","function":{…}}`, `openai_tools_wire`), и подписочный бэкенд Codex отвечал `400 {"error":{"message":"Missing required parameter: 'tools[0].name'"}}`; инструменты есть в каждом режиме (plan читает, duck ищет), поэтому ни один ход на токене не проходил. Теперь у Responses своя плоская форма `responses_tools_wire` (`name` рядом с `type`), у чатовых эндпоинтов остаётся `openai_tools_wire` — две семьи не могут делить один сериализатор (`crates/titi-providers/src/wire.rs`);
+- loopback-callback слушал только одну адресную семью: `TcpListener::bind(("localhost", port))` брал первый адрес и держал лишь `[::1]:54545`, так что `curl 127.0.0.1:54545/callback?…` получал `curl exit 7`. Дескриптор называет хост, а не семью, и какую выберет браузер — не знать, поэтому теперь на одном порту слушают все семьи, которые разрешает хост, первый редирект снимает остальные, а фолбэк порта двигает семьи вместе и `port_fallback: false` у Codex остаётся ошибкой конфигурации (`crates/titi-providers/src/oauth/callback.rs`);
+- голый `/login` печатал ростер провайдеров и оставлял выбор в памяти. Теперь это пикер подписок — строка на провайдера и метод (`browser`, `device code` там, где дескриптор его объявляет), `/login <provider> [key|device]` — грамматика, device-флоу доступен из чата, композер в нём не просит код, а провайдер без API-ключа отвергает inline-ключ (`crates/titi-cli/src/{chat.rs,login.rs,main.rs}`).
+
+Заодно не-2xx теперь несёт собственную формулировку провайдера (`error.message`/`code` или голое `message`; тело читается лимитированно и по таймауту, одна строка, креды маскируются, текст режется) вместо `upstream status N` (`crates/titi-providers/src/wire.rs`) — именно это сделало тот `400` читаемым.
+
+Наблюдения, которые НЕ чинились (оба — до сегодняшнего дня, не регрессии):
+
+- `SwitchModel` не эмитит событие движка (`crates/titi-engine/src/runtime.rs:766`), поэтому headless-JSONL клиент не может переключить модель перед ходом, а `crates/titi-cli/src/headless.rs:99` ждёт терминального события и висит;
+- `crates/titi-cli/src/app.rs` и стек оверлеев `titi-tui` недостижимы из продакшн-бинарника: он запускает `chat::run` (`crates/titi-cli/src/main.rs:292`).
+
+Тесты после правок (локально, `--locked`): `titi-cli` 276, `titi-providers` 162, `titi-engine` 231, `titi-secrets` 24; workspace 1485 passed, 0 failed; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets` и `cargo check --workspace --all-targets` чисты (у clippy только прежние `unwrap`/`expect` в тестовых модулях).
 
 | Шаг | Статус | Где |
 |-----|--------|-----|
@@ -25,9 +42,14 @@
 | Провод: авторизация по `CredKind` (Anthropic OAuth → `Authorization: Bearer` + `anthropic-beta` + отпечаток Claude Code; Codex → `chatgpt-account-id` + `openai-beta` и тело подписочного бэкенда) | done, `c3a57ef` | `crates/titi-providers/src/wire.rs` |
 | Свеп refresh по skew перед ходом, карантин отвергнутого refresh-токена | done, `c3a57ef` | `crates/titi-engine/src/registry.rs` |
 | Поверхность: `--login [provider]`, `--login --device <id>`, `/login <provider>` с callback+вставкой кода, `/keys` c oauth | done, `c3a57ef` | `crates/titi-cli/src/{main.rs,chat.rs,secrets.rs,login.rs}` |
-| Живая проверка владельцем (браузер + подписка + один ход на OAuth-токене) | blocked | `docs/QA_STATUS.md` |
+| Живая проверка владельцем: вход Codex (браузер + подписка) | done | `docs/QA_STATUS.md` |
+| Живой ход на подписке: `openai-codex/gpt-5.5` ответил, плоская форма tools у Responses | done, `092be78` | `crates/titi-providers/src/wire.rs` |
+| Callback слушает все семьи loopback на одном порту | done, `092be78` | `crates/titi-providers/src/oauth/callback.rs` |
+| Голый `/login` открывает пикер подписок, device-флоу из чата, inline-ключ у провайдера без API-ключа отвергнут | done, `092be78` | `crates/titi-cli/src/{chat.rs,login.rs,main.rs}` |
+| Не-2xx несёт сообщение провайдера вместо `upstream status N` | done, `092be78` | `crates/titi-providers/src/wire.rs` |
+| Живая проверка владельцем: вход Claude (браузер + подписка) | blocked (нет подписки) | `docs/QA_STATUS.md` |
 
-NEXT: живой вход владельцем — `titi --login anthropic`, затем один ход модели на OAuth-токене (нужны настоящий браузер и подписка), результат — в `docs/QA_STATUS.md`. Кода это не требует: device-flow и Codex-инференс (`/backend-api/codex/responses`) уже в срезе, вне его остались auth-broker (`titi creds serve`), мульти-аккаунты с бэкоффом и импорт кред Claude Code/Codex CLI.
+NEXT: остаются нерешёнными только два наблюдения выше (`SwitchModel` без события движка → headless висит; `app.rs` + оверлеи `titi-tui` недостижимы из бинарника) и живые проверки, для которых нужна подписка/время: вход Claude владельцем и свеп refresh на живом токене. Кода срез не требует: device-flow и Codex-инференс (`/backend-api/codex/responses`) уже в master, вне его остались auth-broker (`titi creds serve`), мульти-аккаунты с бэкоффом и импорт кред Claude Code/Codex CLI.
 
 ## Ход, история и промпт до провайдера (2026-09-23, вторая половина)
 
