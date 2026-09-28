@@ -1,6 +1,6 @@
 # GUI поверх общего ядра (gpui)
 
-> Сравнительный research 2026-08. Продуктовые решения — [`reference-product-port/README.md`](../reference-product-port/README.md). Действующий контракт: `EngineCommand`/`EngineEvent` в `titi-engine`. Crate desktop — `titi-desktop`, не `titi-gpui`. ANSI `Component` не поднимается в ядро.
+> Сравнительный research 2026-08. Продуктовые решения — этот README и [карта тем](../README.md). Действующий контракт: `EngineCommand`/`EngineEvent` в `titi-engine`. Crate desktop — `titi-desktop`, не `titi-gpui`. ANSI `Component` не поднимается в ядро.
 
 Как наложить нативный GUI (gpui от Zed) на тот же engine-контракт, который обслуживает TUI и headless. TUI, headless и GPUI — равноправные surfaces; GPUI начинается только после рабочего TUI/headless пути.
 

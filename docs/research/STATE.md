@@ -2,11 +2,29 @@
 
 ## Активное направление: reference product functional port
 
-Статус: **0.1.0 работает** (чат на ratatui, headless, инструменты, сессии, Genome, память, SOUL). Встроенный каталог: OpenAI, OpenRouter, OpenCode, Anthropic; пользовательский конфиг накладывается по id, а не заменяет список. Канонический handoff: [`reference-product-port/STATE.md`](reference-product-port/STATE.md). Решения: [`reference-product-port/DECISIONS.md`](reference-product-port/DECISIONS.md). Roadmap: [`reference-product-port/README.md`](reference-product-port/README.md). Goal loop поверх reviewer-а в master (`/goal`, 2026-09-23). Следующий шаг — ручная PTY-проверка `/goal` с живой моделью. Не начинать GPUI. Tree-sitter — замена эвристик Genome, не новый граф: symbol-level уже есть.
+Статус: **0.1.0 работает** (чат на ratatui, headless, инструменты, сессии, Genome, память, SOUL). Встроенный каталог: OpenAI, OpenRouter, OpenCode, Anthropic; пользовательский конфиг накладывается по id, а не заменяет список. Канон направления — этот файл плюс [карта тем](README.md); каталог `reference-product-port/`, на который ссылались старые доки, в репозитории отсутствует, ссылки в research-доках исправлены. Goal loop поверх reviewer-а в master (`/goal`, 2026-09-23). Следующий шаг — ручная PTY-проверка `/goal` с живой моделью. Не начинать GPUI. Tree-sitter — замена эвристик Genome, не новый граф: symbol-level уже есть.
 
-Правило продолжения: сначала прочитать dedicated STATE, прогнать baseline, выполнить только NEXT, затем синхронизировать оба STATE-файла.
+Правило продолжения: сначала прочитать этот STATE и док темы, прогнать baseline, выполнить только NEXT, затем обновить STATE.
 
 Обновляется после каждого шага. Новая сессия начинает отсюда.
+
+## OAuth-вход в провайдера (2026-09-28, in-progress)
+
+Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забрать можно дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция), порт ≈700 строк Rust.
+
+Состояние кода на сегодня (проверено по файлам, не по памяти): `auth.db` знает только `kind`/`token`/`expires_at` (v2, `store.rs`); лестница кредов в `titi-providers/src/creds.rs` существует, но живой `LayeredCredentialSource` (`titi-engine/src/registry.rs:181-207`) её не вызывает и читает env/.env → одну строку store; `/login` и `--set-key` всегда пишут `api_key`; ни PKCE, ни authorize-URL, ни callback-сервера, ни refresh, ни `expires_at`-обработки, ни авторизации по `CredKind` в `wire.rs` нет. То есть «логин» чинится не патчем, а реализацией потока.
+
+| Шаг | Статус | Где |
+|-----|--------|-----|
+| Ресерч omp (движки oauth-code/device/refresh, дескрипторы, хранилище, CLI-UX, инференс-заголовки) | done | [oauth-login.md](providers-streaming/oauth-login.md) |
+| План среза (крейты, типы, тесты, DoD) | review, ждёт решения владельца по объёму | `oauth-login.md`, секции «Rust-маппинг» и «Definition of Done» |
+| Реализация: `titi-providers::oauth` (PKCE, callback, обмен, refresh, дескрипторы anthropic/openai-codex) | todo | — |
+| Хранилище v3: `refresh_token`, идентичность, миграция | todo | `crates/titi-secrets/src/store.rs` |
+| Провод: авторизация по `CredKind` (Anthropic OAuth → `Authorization: Bearer` + `anthropic-beta`) | todo | `crates/titi-providers/src/wire.rs` |
+| Поверхность: `--login`, `/login <provider>` с callback+вставкой кода, `/keys` c oauth | todo | `crates/titi-cli/src/{main.rs,chat.rs,secrets.rs}` |
+| Живая проверка владельцем (браузер + подписка) | blocked до реализации | `docs/QA_STATUS.md` |
+
+NEXT: получить решение по объёму первого среза (оба провайдера или только Anthropic; инференс Codex через `/backend-api/codex/responses` — отдельно), затем CONVEYOR: тесты → код → CI.
 
 ## Ход, история и промпт до провайдера (2026-09-23, вторая половина)
 

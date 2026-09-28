@@ -1,6 +1,6 @@
 # Провайдеры и стриминг
 
-> Сравнительный research 2026-08. Продуктовые решения — [`reference-product-port/README.md`](../reference-product-port/README.md). Действующий registry: `titi-engine::ProviderRegistry` резолвит descriptor + transport + credential. Retry/fallback принадлежит engine и запрещён после visible delta.
+> Сравнительный research 2026-08. Продуктовые решения — этот README и [карта тем](../README.md). Действующий registry: `titi-engine::ProviderRegistry` резолвит descriptor + transport + credential. Retry/fallback принадлежит engine и запрещён после visible delta.
 
 Исследование каркаса модельных провайдеров: как харнессы организуют маршрутизацию запросов к LLM-бэкендам (Anthropic, OpenAI, Gemini, OpenRouter, локальные движки), чем различаются их транспорта (SSE / WebSocket / REST), как нормализуется поток событий, где живут учётные данные и как устроены retry/fallback-цепочки.
 
@@ -98,5 +98,6 @@ impl FallbackChain { pub fn next(&mut self) -> Option<ModelRef>; }
 - [transports.md](./transports.md) — транспорт-различия Anthropic/OpenAI/Gemini, endpoint-семейства, gateway overlay, retry/fallback, добавление нового провайдера, локальные движки.
 - [streaming-events.md](./streaming-events.md) — единый контракт стрим-событий, нормализация per-provider, квирки моделей в стриме, thinking-уровни.
 - [auth-credentials.md](./auth-credentials.md) — ladder кредов, env/.env, OAuth-потоки, auth-broker/gateway, локальные модели keyless.
+- [oauth-login.md](./oauth-login.md) — вход в провайдера по подписке: authorize-URL + PKCE, локальный callback, обмен кода, refresh, идентичность и инференс на OAuth-токене (референс omp, точные endpoint'ы и параметры).
 
 Дальнейший 2-й уровень (оставлено как план): `docs/research/providers-streaming/usage-costs.md` — семантика usage/cache-токенов и тарифные мультипликаторы; `docs/research/providers-streaming/thinking-dialects.md` — полная таблица dialect-режимов thinking/reasoning по провайдерам.

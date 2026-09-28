@@ -8,13 +8,13 @@
 - DoD: cargo test зелёный на слои merge + get/set/reset.
 
 ## M1 — Core Runtime
-- Темы: sessions-persistence, trajectory-gepa, compaction-context, system-prompt-soul, memory-learning, reference-product-port.
+- Темы: sessions-persistence, trajectory-gepa, compaction-context, system-prompt-soul, memory-learning.
 - Код: UI-независимый `titi-engine`, `EngineCommand`/`EngineEvent`, bounded provider/tool loop, сессии + персистентность, trajectory, compaction, SOUL и memory.
 - Порядок: engine protocol → provider registry/credentials → TUI vertical slice → tool loop → persistence/headless. GPUI начинается только после рабочего TUI/headless пути.
 - DoD: реальный prompt стримится через engine; cancel работает; transient fallback доказан тестом; permanent errors не повторяются; сессия переживает рестарт.
 
 ## M2 — Providers
-- Темы: providers-streaming, toolconv, model-switching, reference-product-port.
+- Темы: providers-streaming, toolconv, model-switching.
 - Код: `titi-engine::ProviderRegistry` (descriptor + transport + credential), wire transports в `titi-providers`, engine-owned retry/fallback до visible content, mid-session switch.
 - DoD: registry tests на missing credential / unknown model / fallback между transports; стриминг-тест на mock; смена модели mid-session без потери контекста.
 
@@ -49,7 +49,7 @@
 - DoD: два бота обмениваются сообщениями и переносят скилл.
 
 ## M9 — GPUI Workbench + Packaging
-- Темы: gui-gpui, packaging-headless, reference-product-port.
+- Темы: gui-gpui, packaging-headless.
 - Код: `titi-desktop` на Zed GPUI поверх того же `EngineCommand`/`EngineEvent`; Work, Files, Changes, Genome, Tools, Costs, Settings, Help; RPC/headless, packaging/signing.
 - Запрет: никаких provider/tool/session реализаций внутри desktop crate.
 - DoD: TUI, headless и GPUI управляют одной engine-сессией; RPC-клиент управляет turn; .app собирается и подписывается.

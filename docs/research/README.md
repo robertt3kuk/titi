@@ -2,14 +2,15 @@
 
 **Канон:** reference product задаёт продуктовую архитектуру (agent loop, Genome, workbench, surfaces). OMP — reference для TUI и tool UX. Hermes и Vellum — точечные источники идей, не равные источники архитектуры.
 
-Историческая формула «слияние трёх харнессов» сохранена в тематических README как comparative research 2026-08. Действующие решения и crate-карта живут в [reference-product-port/README.md](reference-product-port/README.md).
+Историческая формула «слияние трёх харнессов» сохранена в тематических README как comparative research 2026-08. Действующие решения и crate-карта живут в тематических README (каждая тема: решение, Rust-маппинг, Definition of Done).
 
-## Активный порт reference product
+## Активное направление
 
-Текущее направление разработки — функциональная модель reference product с единым Rust engine и нативным GPUI desktop. Канонические документы для продолжения любой моделью:
+Текущее направление разработки — функциональная модель reference product с единым Rust engine и нативным GPUI desktop. Точки возобновления для любой модели:
 
-- [решения, архитектура и milestones](reference-product-port/README.md);
-- [текущий checkpoint, проверки, риски и NEXT](reference-product-port/STATE.md).
+- [карта тем, граф зависимостей и порядок](README.md) — этот файл;
+- [текущий checkpoint, NEXT и риски](STATE.md);
+- [milestones и DoD](PLAN.md).
 
 ## Темы (20)
 

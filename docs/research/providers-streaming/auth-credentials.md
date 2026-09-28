@@ -74,6 +74,6 @@ pub struct BotAccountPool { map: FxHashMap<BotId, FxHashMap<ProviderId, Vec<Iden
 
 ## Deep-dive
 
-Написанные подсистемы: [transports.md](./transports.md), [streaming-events.md](./streaming-events.md).
+Написанные подсистемы: [transports.md](./transports.md), [streaming-events.md](./streaming-events.md), [oauth-login.md](./oauth-login.md) (сам поток входа: authorize+PKCE, локальный callback, обмен кода, refresh, идентичность, инференс на OAuth-токене).
 
 План 2-го уровня: `docs/research/providers-streaming/secrets-hygiene.md` — маскирование токенов в логах/ошибках (omp secrets.md), безопасное логирование HTTP-дампов; `docs/research/providers-streaming/broker-design.md` — полный дизайн credential-актора titi: схема SQLite, протокол снапшота, SSE-дельты, мультиботные пулы.

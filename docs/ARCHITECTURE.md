@@ -26,7 +26,7 @@ and renders `EngineEvent`; everything else sits under `titi-engine`.
 ## Genome: a ranked map instead of blind search
 
 Code: `crates/titi-genome/src/{lib,scan,parse,graph,project}.rs`, example
-`examples/map.rs`. Spec: `docs/research/reference-product-port/` (E3).
+`examples/map.rs`. Обзор темы — `docs/research/README.md`.
 
 ### What gets built
 
