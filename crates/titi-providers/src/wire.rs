@@ -135,6 +135,7 @@ fn gemini_contents_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
         .collect()
 }
 
+/// Chat Completions nests the declaration under `function`.
 fn openai_tools_wire(req: &WireRequest) -> Vec<Value> {
     req.tools
         .iter()
@@ -146,6 +147,29 @@ fn openai_tools_wire(req: &WireRequest) -> Vec<Value> {
                     "description": t.description.as_str(),
                     "parameters": t.parameters,
                 }
+            })
+        })
+        .collect()
+}
+
+/// The Responses family takes the same declaration flat: `name` sits beside
+/// `type`, not under a `function` object. Sending the chat shape to the
+/// ChatGPT subscription backend is refused outright with `Missing required
+/// parameter: 'tools[0].name'`, so the two families cannot share one
+/// serializer even though the tool set is identical.
+///
+/// `strict` is left out: it is opt-in schema enforcement, the endpoint
+/// answers 200 without it, and asking for it would reject a schema the
+/// backend can otherwise accept as a hint.
+fn responses_tools_wire(req: &WireRequest) -> Vec<Value> {
+    req.tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.name.as_str(),
+                "description": t.description.as_str(),
+                "parameters": t.parameters,
             })
         })
         .collect()
@@ -392,9 +416,14 @@ pub fn build_http_request(
             ];
             let mut body = serde_json::json!({
                 "model": req.model.as_str(),
+                // Chat-shaped input items (`{"role": …, "content": "text"}`)
+                // are what the Responses API calls an easy input message, and
+                // the Codex backend accepts them as-is: a probe against the
+                // live endpoint answered 200 with SSE deltas carrying this
+                // exact shape, so the messages are not reshaped here.
                 "input": openai_messages_wire(req),
                 "stream": true,
-                "tools": openai_tools_wire(req),
+                "tools": responses_tools_wire(req),
                 "max_output_tokens": req.max_tokens,
             });
             if let Some(sys) = &req.system {
@@ -647,6 +676,92 @@ async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
 // Transports
 // ---------------------------------------------------------------------------
 
+/// Bytes of an error body read before giving up, and characters of the
+/// provider's own text kept in the failure.
+const ERROR_BODY_LIMIT: usize = 8 * 1024;
+const ERROR_TEXT_LIMIT: usize = 400;
+/// A diagnostic body is small and arrives at once; a server that opens a
+/// stream and then says nothing must not hold the turn here.
+const ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The provider's own words for a rejected request.
+///
+/// Chat Completions, Anthropic and the Responses API all nest the reason
+/// under `error.message`/`error.code`; a gateway may send a bare `message`.
+/// Only that text travels: the request body is never read back into it, so no
+/// request material can leak through the failure.
+async fn upstream_error_message(
+    status: u16,
+    mut body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
+    credential: Option<&Credential>,
+) -> SmolStr {
+    let read = async {
+        let mut raw = Vec::new();
+        while raw.len() < ERROR_BODY_LIMIT {
+            match body.next().await {
+                Some(Ok(chunk)) => raw.extend(chunk),
+                _ => break,
+            }
+        }
+        raw
+    };
+    let raw = tokio::time::timeout(ERROR_BODY_TIMEOUT, read)
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&raw);
+    match provider_error_text(&text) {
+        Some(message) => SmolStr::new(redact_error_text(&message, credential)),
+        // A body that is not JSON at all still says more than the status
+        // alone, and the truncation keeps an HTML error page to one line.
+        None if !text.trim().is_empty() => {
+            SmolStr::new(redact_error_text(text.as_ref(), credential))
+        }
+        None => SmolStr::new(format!("upstream status {status}")),
+    }
+}
+
+/// `error.message` plus `error.code`, or a plain top-level `message`, from a
+/// provider's error body. `error` may itself be the string.
+fn provider_error_text(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error");
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| error.and_then(Value::as_str))?;
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("code").and_then(Value::as_str));
+    Some(match code {
+        Some(code) => format!("{message} (code {code})"),
+        None => message.to_owned(),
+    })
+}
+
+/// One line, cut to a diagnostic length, with the request's own access
+/// material masked the way the rest of the crate masks a secret.
+///
+/// A provider that echoes the credential back in its refusal — `Incorrect API
+/// key provided: sk-…` — would otherwise put it on the screen.
+fn redact_error_text(message: &str, credential: Option<&Credential>) -> String {
+    let mut text = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(access) = credential.map(|credential| credential.access.as_str())
+        // Short material would mask ordinary words in the message; a real key
+        // or token is never that short.
+        && access.chars().count() >= 8
+        && text.contains(access)
+    {
+        text = text.replace(access, &crate::creds::mask_secret(access));
+    }
+    if text.chars().count() > ERROR_TEXT_LIMIT {
+        text = text.chars().take(ERROR_TEXT_LIMIT).collect();
+        text.push('…');
+    }
+    text
+}
+
 /// Generic family transport over an injectable [`HttpFetch`].
 pub struct FamilyTransport {
     api: ApiKind,
@@ -692,16 +807,19 @@ impl Transport for FamilyTransport {
     ) -> Result<EventStream, TransportError> {
         let http_req = build_http_request(self.api, &self.base_url, &req, ctx.credential.as_ref());
         let resp = self.fetch.fetch(http_req).await?;
-        if resp.status == 429 || resp.status >= 500 {
-            return Err(TransportError::Retryable {
-                status: Some(resp.status),
-                message: format!("upstream status {}", resp.status).into(),
-            });
-        }
         if resp.status >= 400 {
-            return Err(TransportError::Fatal {
-                status: Some(resp.status),
-                message: format!("upstream status {}", resp.status).into(),
+            let message =
+                upstream_error_message(resp.status, resp.body, ctx.credential.as_ref()).await;
+            return Err(if resp.status == 429 || resp.status >= 500 {
+                TransportError::Retryable {
+                    status: Some(resp.status),
+                    message,
+                }
+            } else {
+                TransportError::Fatal {
+                    status: Some(resp.status),
+                    message,
+                }
             });
         }
         Ok(Box::pin(sse_event_stream(
@@ -721,6 +839,7 @@ pub type OpenAiCompatTransport = FamilyTransport;
 mod tests {
     use super::*;
     use crate::creds::LadderLevel;
+    use crate::mock::{MockFetch, MockFetchResponse};
     use crate::transport::ChatMessage;
 
     fn key(access: &str) -> Credential {
@@ -797,6 +916,161 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 128);
         assert_eq!(body["instructions"], "be brief");
         assert!(body["input"].is_array());
+    }
+
+    fn req_with_tools() -> WireRequest {
+        let mut r = req();
+        r.tools = vec![tool("bash")];
+        r.messages.push(ChatMessage {
+            role: Role::User,
+            content: "PROMPT-MARKER-9f3a".into(),
+            tool_calls: Vec::new(),
+        });
+        r
+    }
+
+    fn body_of(api: ApiKind, r: &WireRequest) -> Value {
+        let hr = build_http_request(api, "http://x/v1", r, None);
+        serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json")
+    }
+
+    /// The two OpenAI families declare a tool differently: Completions nests
+    /// it under `function`, the Responses family keeps `name` flat beside
+    /// `type`. The ChatGPT subscription backend refuses the chat shape with
+    /// `Missing required parameter: 'tools[0].name'`, so one serializer
+    /// cannot serve both.
+    #[test]
+    fn responses_tools_are_flat_where_completions_nest_them() {
+        let r = req_with_tools();
+
+        let chat = body_of(ApiKind::OpenAiCompletions, &r);
+        assert_eq!(chat["tools"][0]["type"], "function");
+        assert_eq!(chat["tools"][0]["function"]["name"], "bash");
+        assert_eq!(chat["tools"][0]["function"]["description"], "a tool");
+        assert_eq!(chat["tools"][0]["function"]["parameters"]["type"], "object");
+        assert!(chat["tools"][0].get("name").is_none(), "{chat}");
+
+        let responses = body_of(ApiKind::OpenAiResponses, &r);
+        assert_eq!(responses["tools"][0]["type"], "function");
+        assert_eq!(responses["tools"][0]["name"], "bash");
+        assert_eq!(responses["tools"][0]["description"], "a tool");
+        assert_eq!(responses["tools"][0]["parameters"]["type"], "object");
+        assert!(
+            responses["tools"][0].get("function").is_none(),
+            "{responses}"
+        );
+        // Opt-in schema enforcement, never asked for.
+        assert!(responses["tools"][0].get("strict").is_none(), "{responses}");
+    }
+
+    fn scripted(status: u16, body: &str) -> (Arc<MockFetch>, FamilyTransport) {
+        let fetch = Arc::new(MockFetch::new(vec![Ok(MockFetchResponse::sse(vec![
+            body.into(),
+        ])
+        .with_status(status))]));
+        let transport = FamilyTransport::new(
+            ApiKind::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex",
+            Arc::clone(&fetch) as Arc<dyn HttpFetch>,
+        );
+        (fetch, transport)
+    }
+
+    /// The failure of a scripted non-2xx. `expect_err` cannot be used: a
+    /// successful stream is not `Debug`.
+    async fn refusal(transport: &FamilyTransport, r: WireRequest) -> TransportError {
+        match transport
+            .stream(r, RequestCtx::with_key("sk-secret-token-abcdef"))
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a scripted failure must not open a stream"),
+        }
+    }
+
+    /// A non-2xx is the provider's answer and its body says why. Before this
+    /// the screen read only `upstream status 400`, and the reason — the
+    /// message the endpoint objected with — was thrown away.
+    #[tokio::test]
+    async fn a_rejected_request_surfaces_the_providers_message() {
+        let (fetch, transport) = scripted(
+            400,
+            r#"{"error":{"message":"Missing required parameter: 'tools[0].name'.","param":"tools[0].name","code":"missing_required_parameter"}}"#,
+        );
+        let err = refusal(&transport, req_with_tools()).await;
+        assert!(
+            matches!(
+                err,
+                TransportError::Fatal {
+                    status: Some(400),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("Missing required parameter: 'tools[0].name'."),
+            "{text}"
+        );
+        assert!(text.contains("missing_required_parameter"), "{text}");
+        // Neither the request's prompt nor its credential rides out with the
+        // failure; only the provider's own words do.
+        assert!(!text.contains("PROMPT-MARKER-9f3a"), "{text}");
+        assert!(!text.contains("sk-secret-token-abcdef"), "{text}");
+        // The request that earned the 400 really did carry flat tools.
+        assert_eq!(fetch.last_body().expect("body")["tools"][0]["name"], "bash");
+    }
+
+    /// A rate limit is retryable and its body says for how long, so the
+    /// message travels on that path too — masked where the provider echoed
+    /// the credential back.
+    #[tokio::test]
+    async fn a_rate_limit_keeps_its_message_and_masks_the_credential() {
+        let (_fetch, transport) = scripted(
+            429,
+            r#"{"error":{"message":"Rate limit reached for sk-secret-token-abcdef.","code":"rate_limit_exceeded"}}"#,
+        );
+        let err = refusal(&transport, req_with_tools()).await;
+        assert!(
+            matches!(
+                err,
+                TransportError::Retryable {
+                    status: Some(429),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("Rate limit reached"), "{text}");
+        assert!(text.contains("rate_limit_exceeded"), "{text}");
+        assert!(!text.contains("sk-secret-token-abcdef"), "{text}");
+        assert!(text.contains("…cdef"), "{text}");
+    }
+
+    /// Not every endpoint speaks the JSON error shape: a bare `message`
+    /// counts, and a body that is not JSON at all is still better than the
+    /// status alone — cut to one line, so an HTML page cannot flood the
+    /// screen.
+    #[tokio::test]
+    async fn a_plain_message_and_a_non_json_body_are_both_kept() {
+        let (_fetch, transport) = scripted(503, r#"{"message":"the model is loading"}"#);
+        let err = refusal(&transport, req()).await;
+        assert!(err.to_string().contains("the model is loading"), "{err}");
+
+        let (_fetch, transport) = scripted(502, "<html>\n  <body>bad gateway</body>\n</html>");
+        let err = refusal(&transport, req()).await;
+        assert!(
+            err.to_string()
+                .contains("<html> <body>bad gateway</body> </html>"),
+            "{err}"
+        );
+
+        // An empty body leaves the status, which is all there is to say.
+        let (_fetch, transport) = scripted(500, "");
+        let err = refusal(&transport, req()).await;
+        assert!(err.to_string().contains("upstream status 500"), "{err}");
     }
 
     #[test]

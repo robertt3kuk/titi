@@ -167,6 +167,9 @@ struct PendingApproval {
 struct OAuthLogin {
     provider: &'static OAuthProvider,
     flow: LoginFlow,
+    /// How this provider is being signed in. The device grant has no code to
+    /// paste back, so the composer must not ask for one.
+    method: LoginMethod,
 }
 
 /// Conversation on screen. No terminal, no session file.
@@ -210,6 +213,8 @@ pub struct Chat {
     login_driver: Option<Arc<dyn LoginDriver>>,
     /// Highlight in the leading-slash command list.
     picker: usize,
+    /// Highlight in the bare-`/login` subscription picker; `None` = closed.
+    login_picker: Option<usize>,
     /// Skills the engine discovered, offered by the same picker.
     skills: Vec<SkillRow>,
     /// Kitty or Ghostty unicode placeholders are available.
@@ -267,6 +272,7 @@ impl Chat {
             oauth: None,
             login_driver: None,
             picker: 0,
+            login_picker: None,
             skills: Vec::new(),
             kitty: false,
             tmux: false,
@@ -350,6 +356,9 @@ impl Chat {
         }
         if self.login_for.is_some() {
             return self.login_key(key);
+        }
+        if self.login_picker.is_some() {
+            return self.login_picker_key(key, now);
         }
         match key {
             Key::CtrlC if self.turn_active => {
@@ -696,6 +705,8 @@ impl Chat {
             return;
         }
         self.disarm();
+        // A pasted body is composer input, not a picker keystroke.
+        self.login_picker = None;
         for ch in text.chars() {
             if ch == '\n' || ch == '\r' {
                 if !self.input.ends_with(' ') {
@@ -1253,11 +1264,67 @@ impl Chat {
         self.picker = 0;
     }
 
+    /// Typing while the subscription picker is up. Arrows move, Enter signs
+    /// in to the highlighted row, Esc closes without writing; anything else
+    /// closes the picker and is handled as ordinary composer input.
+    fn login_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_login_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_login_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_login_picker(),
+            Key::Esc => {
+                self.login_picker = None;
+                self.disarm();
+                Applied::none()
+            }
+            other => {
+                self.login_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_login_picker(&mut self, delta: isize) {
+        let len = login_choices().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.login_picker.unwrap_or(0) % len;
+        self.login_picker = Some((current as isize + delta).rem_euclid(len as isize) as usize);
+    }
+
+    /// Signs in with the highlighted row. The picker is a way to name a
+    /// provider and a method, nothing more: it writes no credential itself.
+    fn accept_login_picker(&mut self) -> Applied {
+        let choice = self
+            .login_picker
+            .and_then(|at| login_choices().get(at).copied());
+        self.login_picker = None;
+        match choice {
+            Some(choice) => self.start_oauth_login(choice.provider, choice.method),
+            None => Applied::none(),
+        }
+    }
+
     /// Typing while a login prompt is up. In OAuth mode the line is the
     /// pasted code or redirect URL and Enter hands it to the flow; otherwise
     /// it is the API key and Enter stores it.
     fn login_key(&mut self, key: Key) -> Applied {
+        // The device grant finishes in the browser: there is no line to type,
+        // so only the way out is read.
+        let device = self
+            .oauth
+            .as_ref()
+            .is_some_and(|login| login.method == LoginMethod::Device);
         match key {
+            Key::Esc | Key::CtrlC => self.cancel_login(),
+            _ if device => Applied::none(),
             Key::Char(ch) if !ch.is_control() => {
                 self.input.push(ch);
                 Applied::none()
@@ -1267,17 +1334,18 @@ impl Chat {
                 Applied::none()
             }
             Key::Enter => self.store_login_secret(),
-            Key::Esc | Key::CtrlC => {
-                self.input.clear();
-                self.login_for = None;
-                // Dropping the flow is the cancel: the task's code end sees
-                // the channel close and stops waiting.
-                self.oauth = None;
-                self.push(LineKind::Note, "login cancelled".to_owned());
-                Applied::none()
-            }
             _ => Applied::none(),
         }
+    }
+
+    /// Leaves the login prompt. Dropping the flow is the cancel: the task's
+    /// code end sees the channel close and stops waiting.
+    fn cancel_login(&mut self) -> Applied {
+        self.input.clear();
+        self.login_for = None;
+        self.oauth = None;
+        self.push(LineKind::Note, "login cancelled".to_owned());
+        Applied::none()
     }
 
     fn store_login_secret(&mut self) -> Applied {
@@ -1316,11 +1384,17 @@ impl Chat {
     fn login(&mut self, args: &str) -> Applied {
         let mut parts = args.split_whitespace();
         let Some(provider) = parts.next() else {
-            return self.keys();
+            // Bare `/login`: offer what the user can sign into rather than
+            // make them remember a provider id.
+            self.login_picker = Some(0);
+            return Applied::none();
         };
-        let inline = parts.next();
+        let second = parts.next();
         if parts.next().is_some() {
-            self.push(LineKind::Error, "usage: /login <provider> [key]".to_owned());
+            self.push(
+                LineKind::Error,
+                "usage: /login <provider> [key|device]".to_owned(),
+            );
             return Applied::none();
         }
         if !self.known_provider(provider) {
@@ -1330,11 +1404,14 @@ impl Chat {
             );
             return Applied::none();
         }
-        if let Some(secret) = inline {
+        if second == Some("device") {
+            return self.start_device_login(provider);
+        }
+        if let Some(secret) = second {
             return self.store_inline_key(provider, secret);
         }
         if let Some(descriptor) = crate::login::find(provider) {
-            return self.start_oauth_login(descriptor);
+            return self.start_oauth_login(descriptor, LoginMethod::Browser);
         }
         self.login_for = Some(provider.to_owned());
         self.push(
@@ -1344,11 +1421,42 @@ impl Chat {
         Applied::none()
     }
 
-    /// `/login <provider>` for a provider that signs in through a browser.
+    /// `/login <provider> device`: the grant that needs no callback server.
+    /// Only a subscription descriptor that advertises one can run it, and a
+    /// provider with no descriptor has no device flow at all — saying so
+    /// beats typing a URL that does not exist.
+    fn start_device_login(&mut self, provider: &str) -> Applied {
+        match crate::login::find(provider) {
+            Some(descriptor) if descriptor.supports_device => {
+                self.start_oauth_login(descriptor, LoginMethod::Device)
+            }
+            Some(descriptor) => {
+                self.push(
+                    LineKind::Error,
+                    format!("login: {} has no device flow", descriptor.name),
+                );
+                Applied::none()
+            }
+            None => {
+                self.push(
+                    LineKind::Error,
+                    format!("login: {provider} has no device flow"),
+                );
+                Applied::none()
+            }
+        }
+    }
+
+    /// `/login <provider>` for a provider that signs in through a browser,
+    /// or its device-code grant.
     ///
     /// Nothing here waits: the driver starts the flow on the runtime the CLI
     /// already entered, and the frames after this one read what it reports.
-    fn start_oauth_login(&mut self, descriptor: &'static OAuthProvider) -> Applied {
+    fn start_oauth_login(
+        &mut self,
+        descriptor: &'static OAuthProvider,
+        method: LoginMethod,
+    ) -> Applied {
         let driver = match self.login_driver() {
             Ok(driver) => driver,
             Err(reason) => {
@@ -1356,16 +1464,25 @@ impl Chat {
                 return Applied::none();
             }
         };
-        match driver.begin(descriptor) {
+        let started = match method {
+            LoginMethod::Browser => driver.begin(descriptor),
+            LoginMethod::Device => driver.begin_device(descriptor),
+        };
+        match started {
             Ok(flow) => {
                 self.login_for = Some(descriptor.id.to_owned());
                 self.oauth = Some(OAuthLogin {
                     provider: descriptor,
                     flow,
+                    method,
                 });
+                let waiting = match method {
+                    LoginMethod::Browser => "waiting for the browser",
+                    LoginMethod::Device => "waiting for the device code",
+                };
                 self.push(
                     LineKind::Note,
-                    format!("login {}: waiting for the browser", descriptor.id),
+                    format!("login {}: {waiting}", descriptor.id),
                 );
             }
             Err(reason) => self.push(LineKind::Error, format!("login: {reason}")),
@@ -1394,6 +1511,19 @@ impl Chat {
         self.agent_dir = dir.into();
     }
 
+    /// The bare-`/login` picker's rows, in the order the arrow keys walk
+    /// them, each `Display ·method`. Empty when the picker is closed. A
+    /// surface without a screen can read what is on offer.
+    pub fn login_picker_rows(&self) -> Vec<String> {
+        if self.login_picker.is_none() {
+            return Vec::new();
+        }
+        login_choices()
+            .into_iter()
+            .map(login_choice_label)
+            .collect()
+    }
+
     /// Drains whatever the login reported since the last frame.
     ///
     /// Always `try_recv`: the flow runs on its own task, and the render loop
@@ -1416,10 +1546,18 @@ impl Chat {
         for event in reported {
             match event {
                 LoginEvent::Url { url, instructions } => {
-                    let id = self.oauth.as_ref().map_or("", |login| login.provider.id);
+                    let (id, method) = self
+                        .oauth
+                        .as_ref()
+                        .map(|login| (login.provider.id, login.method))
+                        .unwrap_or(("", LoginMethod::Browser));
+                    let opener = match method {
+                        LoginMethod::Browser => "open this URL in your browser",
+                        LoginMethod::Device => "open this URL on any device",
+                    };
                     self.push(
                         LineKind::Note,
-                        format!("login {id}: open this URL in your browser\n{url}\n{instructions}"),
+                        format!("login {id}: {opener}\n{url}\n{instructions}"),
                     );
                 }
                 LoginEvent::Progress(message) => self.push(LineKind::Note, message),
@@ -1459,12 +1597,32 @@ impl Chat {
         }
     }
 
+    /// `/login <provider> <key>`. A provider with no `credential_env` reads
+    /// its credential only from the store, which a sign-in writes: a key
+    /// pasted for it would sit there and never be used, so it is refused.
     fn store_inline_key(&mut self, provider: &str, secret: &str) -> Applied {
+        if !self.accepts_api_key(provider) {
+            let hint = if crate::login::find(provider).is_some() {
+                format!("login: {provider} takes no API key — use /login {provider} to sign in")
+            } else {
+                format!("login: {provider} takes no API key")
+            };
+            self.push(LineKind::Error, hint);
+            return Applied::none();
+        }
         match crate::secrets::store_key(&self.agent_dir, provider, secret) {
             Ok(()) => self.push(LineKind::Note, format!("{provider}: key stored")),
             Err(reason) => self.push(LineKind::Error, format!("login: {reason}")),
         }
         Applied::none()
+    }
+
+    /// Whether an API key is something this provider can read: a descriptor
+    /// with no `credential_env` has no api-key path at all.
+    fn accepts_api_key(&self, id: &str) -> bool {
+        self.registry_providers()
+            .iter()
+            .any(|provider| provider.id.as_str() == id && provider.credential_env.is_some())
     }
 
     fn logout(&mut self, args: &str) -> Applied {
@@ -1516,17 +1674,20 @@ impl Chat {
         let mut listed: Vec<String> = Vec::new();
         for provider in self.registry_providers() {
             let id = provider.id.to_string();
-            let status = if provider
+            let from_env = provider
                 .credential_env
                 .as_deref()
                 .and_then(|name| std::env::var(name).ok())
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                "env".to_owned()
-            } else if let Some(row) = stored.iter().find(|row| row.provider == id) {
-                crate::secrets::describe_key(row, now)
-            } else {
-                "no key".to_owned()
+                .is_some_and(|value| !value.trim().is_empty());
+            let row = stored.iter().find(|row| row.provider == id);
+            // Both facts matter: an environment variable hides neither the
+            // sign-in under it nor its remaining lifetime, and a signed-in
+            // provider is exactly the one whose token is about to expire.
+            let status = match (from_env, row) {
+                (true, Some(row)) => format!("env + {}", crate::secrets::describe_key(row, now)),
+                (true, None) => "env".to_owned(),
+                (false, Some(row)) => crate::secrets::describe_key(row, now),
+                (false, None) => "no key".to_owned(),
             };
             listed.push(id.clone());
             self.push(LineKind::Note, format!("{id}  {status}"));
@@ -2402,6 +2563,53 @@ enum PickRow {
     Skill(usize),
 }
 
+/// A way to sign in to a subscription provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginMethod {
+    /// Authorization code over the loopback callback, with the manual paste
+    /// as the fallback.
+    Browser,
+    /// The device grant: a code entered at a URL, on this machine or another.
+    Device,
+}
+
+/// One row of the bare-`/login` picker: a subscription provider and how to
+/// sign in to it.
+#[derive(Debug, Clone, Copy)]
+struct LoginChoice {
+    provider: &'static OAuthProvider,
+    method: LoginMethod,
+}
+
+/// What the bare-`/login` picker offers, in presentation order. A provider
+/// that can sign in both ways gets a row each, so the method is a choice the
+/// user makes rather than one the flow assumes.
+fn login_choices() -> Vec<LoginChoice> {
+    let mut rows = Vec::new();
+    for provider in crate::login::providers() {
+        rows.push(LoginChoice {
+            provider,
+            method: LoginMethod::Browser,
+        });
+        if provider.supports_device {
+            rows.push(LoginChoice {
+                provider,
+                method: LoginMethod::Device,
+            });
+        }
+    }
+    rows
+}
+
+/// One login row as it reads: the descriptor's display name and the method.
+fn login_choice_label(choice: LoginChoice) -> String {
+    let method = match choice.method {
+        LoginMethod::Browser => "browser",
+        LoginMethod::Device => "device code",
+    };
+    format!("{}  ·{method}", choice.provider.name)
+}
+
 /// The `/token` under the cursor: the trailing word, when it opens with a
 /// slash at the start of the line or after whitespace and holds nothing but
 /// name characters. That is what keeps `/tmp/photo.png` and `a/b` out.
@@ -2691,17 +2899,28 @@ fn repo_state(root: &Path) -> String {
     }
 }
 
+/// Rows the picker above the composer takes: the subscription picker when it
+/// is open, otherwise the slash/skill list.
 fn picker_height(chat: &Chat) -> u16 {
+    if chat.login_picker.is_some() {
+        return login_choices().len().min(8) as u16;
+    }
     picker_rows(chat).len().min(8) as u16
 }
 
-fn command_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
-    let rows = picker_rows(chat);
+/// The window of offers above the composer. `rows` are `(label, is_skill)`
+/// as they should read after the marker; the highlighted row is marked.
+fn picker_panel(
+    rows: &[(String, bool)],
+    selected: usize,
+    width: u16,
+    ink: &Ink,
+) -> Paragraph<'static> {
     let window = 8usize;
     let selected = if rows.is_empty() {
         0
     } else {
-        chat.picker % rows.len()
+        selected % rows.len()
     };
     let start = if rows.len() <= window {
         0
@@ -2714,35 +2933,65 @@ fn command_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         .enumerate()
         .skip(start)
         .take(window)
-        .map(|(index, row)| {
-            let (name, about, is_skill) = match row {
-                PickRow::Command(command) => (command.name, command.about, false),
-                PickRow::Skill(at) => chat
-                    .skills
-                    .get(*at)
-                    .map(|skill| (skill.name.as_str(), skill.about.as_str(), true))
-                    .unwrap_or(("", "", true)),
-            };
+        .map(|(index, (label, is_skill))| {
             let mark = if index == selected { "▶" } else { " " };
             let style = if index == selected {
                 ink.fg(ink.gold).add_modifier(Modifier::BOLD)
-            } else if is_skill {
+            } else if *is_skill {
                 ink.fg(ink.green)
             } else {
                 ink.fg(ink.muted)
             };
-            let label = if is_skill {
-                format!(" {mark} /{name:<12} ·skill {about}")
-            } else {
-                format!(" {mark} /{name:<12} {about}")
-            };
             Line::from(Span::styled(
-                titi_tui::width::truncate_to_width(&label, room),
+                titi_tui::width::truncate_to_width(&format!(" {mark} {label}"), room),
                 style,
             ))
         })
         .collect();
     Paragraph::new(lines).style(ink.page())
+}
+
+fn command_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
+    let rows = picker_rows(chat);
+    let selected = if rows.is_empty() {
+        0
+    } else {
+        chat.picker % rows.len()
+    };
+    let lines: Vec<(String, bool)> = rows
+        .iter()
+        .map(|row| match row {
+            PickRow::Command(command) => {
+                (format!("/{:<12} {}", command.name, command.about), false)
+            }
+            PickRow::Skill(at) => chat
+                .skills
+                .get(*at)
+                .map(|skill| (format!("/{:<12} ·skill {}", skill.name, skill.about), true))
+                .unwrap_or_default(),
+        })
+        .collect();
+    picker_panel(&lines, selected, width, ink)
+}
+
+/// The bare-`/login` picker's rows, or empty when it is closed.
+fn login_picker_lines(chat: &Chat) -> Vec<(String, bool)> {
+    if chat.login_picker.is_none() {
+        return Vec::new();
+    }
+    login_choices()
+        .into_iter()
+        .map(|choice| (login_choice_label(choice), false))
+        .collect()
+}
+
+fn login_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
+    picker_panel(
+        &login_picker_lines(chat),
+        chat.login_picker.unwrap_or(0),
+        width,
+        ink,
+    )
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
@@ -2774,7 +3023,12 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     frame.render_widget(body, cols[2]);
     paint_photos(frame, cols[2], &photos, &ink);
     if picker_h > 0 {
-        frame.render_widget(command_picker(chat, cols[3].width, &ink), cols[3]);
+        let picker = if chat.login_picker.is_some() {
+            login_picker(chat, cols[3].width, &ink)
+        } else {
+            command_picker(chat, cols[3].width, &ink)
+        };
+        frame.render_widget(picker, cols[3]);
     }
     frame.render_widget(composer(chat, cols[4].width, &ink), cols[4]);
 }
@@ -3227,8 +3481,14 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
             ink.fg(ink.amber).add_modifier(Modifier::BOLD),
         ))
     } else if let Some(provider) = &chat.login_for {
+        let device = chat
+            .oauth
+            .as_ref()
+            .is_some_and(|login| login.method == LoginMethod::Device);
         let shown = if !chat.input.is_empty() {
             "•".repeat(chat.input.chars().count().min(32))
+        } else if device {
+            "waiting for the device code".to_owned()
         } else if chat.oauth.is_some() {
             "paste the code or the redirect URL".to_owned()
         } else {
@@ -3273,6 +3533,14 @@ fn composer_caption(chat: &Chat) -> String {
     };
     let keys = if chat.approval.is_some() {
         "y allow  ·  n refuse"
+    } else if chat
+        .oauth
+        .as_ref()
+        .is_some_and(|login| login.method == LoginMethod::Device)
+    {
+        // The device grant finishes in the browser: there is nothing to
+        // submit here, only the way out.
+        "esc cancels"
     } else if chat.login_for.is_some() && chat.oauth.is_some() {
         "enter submits  ·  esc cancels"
     } else if chat.login_for.is_some() {
@@ -4781,6 +5049,64 @@ mod tests {
             let (codes, _lines) = tokio::sync::mpsc::unbounded_channel();
             Ok(LoginFlow { events, codes })
         }
+
+        fn begin_device(&self, _provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+            let (_urls, events) = tokio::sync::mpsc::unbounded_channel();
+            let (codes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            Ok(LoginFlow { events, codes })
+        }
+    }
+
+    /// Bare `/login` is the subscription picker: the rows sit above the
+    /// composer and go away on Esc.
+    #[test]
+    fn bare_login_paints_the_subscription_picker() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.set_login_driver(Arc::new(NoNetworkFlow));
+
+        type_text(&mut chat, "/login");
+        chat.on_key(Key::Enter, Instant::now());
+        let frame = frame_text(&mut chat);
+        for expected in [
+            "Anthropic (Claude Pro/Max)",
+            "ChatGPT Plus/Pro (Codex Subscription)",
+            "·browser",
+            "·device code",
+        ] {
+            assert!(frame.contains(expected), "{expected} is missing: {frame}");
+        }
+
+        chat.on_key(Key::Esc, Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(
+            !frame.contains("device code"),
+            "esc closed the picker: {frame}"
+        );
+    }
+
+    /// The device grant finishes in the browser, so the composer asks for no
+    /// code and offers no Enter: only the way out.
+    #[test]
+    fn the_device_login_asks_for_no_code() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.set_login_driver(Arc::new(NoNetworkFlow));
+
+        type_text(&mut chat, "/login openai-codex device");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "abc");
+
+        let frame = frame_text(&mut chat);
+        assert!(!frame.contains("paste the code"), "{frame}");
+        assert!(!frame.contains("enter submits"), "{frame}");
+        assert!(
+            !frame.contains('•'),
+            "no line is typed in device mode: {frame}"
+        );
+        assert!(frame.contains("esc cancels"), "{frame}");
     }
 
     /// A provider with an OAuth descriptor asks for a code, not a key: the

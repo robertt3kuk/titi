@@ -42,7 +42,15 @@ pub struct LoginFlow {
 /// belongs to a task the driver owns. Tests inject their own driver: nothing
 /// here is reachable without one.
 pub trait LoginDriver: Send + Sync {
+    /// Starts the browser authorization-code flow.
     fn begin(&self, provider: &'static OAuthProvider) -> Result<LoginFlow, String>;
+
+    /// Starts the device-code grant. Only a descriptor that advertises
+    /// `supports_device` has one, and the default refuses rather than
+    /// pretending: a driver that cannot run it must say so.
+    fn begin_device(&self, provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+        Err(format!("{} has no device flow", provider.name))
+    }
 }
 
 /// Drives `titi_providers::oauth::login` on the runtime the caller is on.
@@ -57,10 +65,11 @@ impl ChannelDriver {
             fetch: Arc::new(fetch),
         })
     }
-}
 
-impl LoginDriver for ChannelDriver {
-    fn begin(&self, provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+    /// Spawns one flow on the caller's runtime. The device grant has no
+    /// callback and no pasted code, but the choreography around it is the
+    /// same: events one way, pasted codes the other, one terminal event.
+    fn spawn(&self, provider: &'static OAuthProvider, device: bool) -> Result<LoginFlow, String> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "login needs a running runtime".to_owned())?;
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
@@ -71,13 +80,27 @@ impl LoginDriver for ChannelDriver {
                 events: sender.clone(),
                 codes: Mutex::new(code_rx),
             };
-            let outcome = oauth::login(provider, fetch.as_ref(), &ui).await;
+            let outcome = if device {
+                oauth::login_device(provider, fetch.as_ref(), &ui).await
+            } else {
+                oauth::login(provider, fetch.as_ref(), &ui).await
+            };
             let _ = sender.send(match outcome {
                 Ok(tokens) => LoginEvent::Done(Box::new(tokens)),
                 Err(error) => LoginEvent::Failed(error.to_string()),
             });
         });
         Ok(LoginFlow { events, codes })
+    }
+}
+
+impl LoginDriver for ChannelDriver {
+    fn begin(&self, provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+        self.spawn(provider, false)
+    }
+
+    fn begin_device(&self, provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+        self.spawn(provider, true)
     }
 }
 

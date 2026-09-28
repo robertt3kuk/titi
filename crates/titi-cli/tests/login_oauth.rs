@@ -13,39 +13,51 @@ use titi_engine::{CredentialSource, HttpTransportFactory, ProviderDescriptor, Pr
 use titi_providers::oauth::OAuthTokens;
 
 /// A login that needs no browser, no socket and no provider: it announces a
-/// URL, waits for a code on the channel and answers with a grant.
+/// URL, waits for a code on the channel and answers with a grant. The device
+/// grant has no pasted code, so that one finishes on its own.
 struct FakeLogin {
     url: String,
     expires_at: Option<i64>,
 }
 
-impl LoginDriver for FakeLogin {
-    fn begin(&self, _provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+impl FakeLogin {
+    fn flow(&self, instructions: &str, needs_code: bool) -> LoginFlow {
         let (events, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (codes, mut code_rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = events.send(LoginEvent::Url {
             url: self.url.clone(),
-            instructions: "Sign in, then paste the code.".to_owned(),
+            instructions: instructions.to_owned(),
         });
         let expires_at = self.expires_at;
         std::thread::spawn(move || {
             // The code end closing is a cancel: no answer, no event.
-            if code_rx.blocking_recv().is_some() {
-                let _ = events.send(LoginEvent::Done(Box::new(OAuthTokens {
-                    access: "sk-test-access".to_owned(),
-                    refresh: Some("sk-test-refresh".to_owned()),
-                    expires_at,
-                    account_id: Some("acct-1".to_owned()),
-                    email: Some("user@example.invalid".to_owned()),
-                    org_id: None,
-                    org_name: Some("Pro".to_owned()),
-                })));
+            if needs_code && code_rx.blocking_recv().is_none() {
+                return;
             }
+            let _ = events.send(LoginEvent::Done(Box::new(OAuthTokens {
+                access: "sk-test-access".to_owned(),
+                refresh: Some("sk-test-refresh".to_owned()),
+                expires_at,
+                account_id: Some("acct-1".to_owned()),
+                email: Some("user@example.invalid".to_owned()),
+                org_id: None,
+                org_name: Some("Pro".to_owned()),
+            })));
         });
-        Ok(LoginFlow {
+        LoginFlow {
             events: event_rx,
             codes,
-        })
+        }
+    }
+}
+
+impl LoginDriver for FakeLogin {
+    fn begin(&self, _provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+        Ok(self.flow("Sign in, then paste the code.", true))
+    }
+
+    fn begin_device(&self, _provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+        Ok(self.flow("Enter code: TEST-CODE", false))
     }
 }
 
@@ -193,6 +205,232 @@ fn an_inline_key_is_still_stored_as_an_api_key() {
     assert!(
         has_line(&chat, "anthropic: key stored"),
         "{}",
+        transcript(&chat)
+    );
+}
+
+#[test]
+fn bare_login_offers_both_providers_and_a_device_row() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/authorize");
+
+    let applied = send(&mut chat, "/login");
+    assert!(applied.effect.is_none(), "{applied:?}");
+
+    let offered = chat.login_picker_rows();
+    assert_eq!(
+        offered.len(),
+        3,
+        "one row per method, and only Codex has a device grant: {offered:?}"
+    );
+    assert!(
+        offered
+            .iter()
+            .any(|row| row.starts_with("Anthropic (Claude Pro/Max)")),
+        "{offered:?}"
+    );
+    assert!(
+        offered
+            .iter()
+            .any(|row| row.starts_with("ChatGPT Plus/Pro (Codex Subscription)")),
+        "{offered:?}"
+    );
+    assert!(
+        offered.iter().any(|row| row.contains("device code")),
+        "the device method is its own row: {offered:?}"
+    );
+    assert!(
+        rows(dir.path()).is_empty(),
+        "opening the picker writes nothing"
+    );
+}
+
+#[test]
+fn arrows_and_enter_start_the_highlighted_row() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/authorize");
+
+    send(&mut chat, "/login");
+    // Anthropic (browser) -> ChatGPT (browser).
+    chat.on_key(Key::Down, Instant::now());
+    chat.on_key(Key::Enter, Instant::now());
+    chat.poll_login();
+
+    let shown = transcript(&chat);
+    assert!(
+        shown.contains("login openai-codex: waiting for the browser"),
+        "the highlighted row, not the first: {shown}"
+    );
+    assert!(
+        shown.contains("https://example.invalid/authorize"),
+        "{shown}"
+    );
+    assert!(
+        chat.login_picker_rows().is_empty(),
+        "starting a login closes the picker"
+    );
+}
+
+#[test]
+fn esc_closes_the_subscription_picker_without_writing() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/authorize");
+
+    send(&mut chat, "/login");
+    assert!(!chat.login_picker_rows().is_empty());
+
+    let escaped = chat.on_key(Key::Esc, Instant::now());
+    assert!(escaped.effect.is_none());
+    assert!(chat.login_picker_rows().is_empty(), "esc closed the picker");
+    assert!(
+        rows(dir.path()).is_empty(),
+        "a closed picker writes nothing"
+    );
+
+    // Back at the composer: Enter sends a prompt rather than starting a login.
+    let sent = send(&mut chat, "hello");
+    assert!(
+        matches!(sent.effect, Some(ChatEffect::Send(_))),
+        "the prompt came back: {sent:?}"
+    );
+}
+
+#[test]
+fn the_picker_device_row_starts_the_device_flow() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/device");
+
+    send(&mut chat, "/login");
+    chat.on_key(Key::Down, Instant::now());
+    // ChatGPT (browser) -> ChatGPT (device code).
+    chat.on_key(Key::Down, Instant::now());
+    chat.on_key(Key::Enter, Instant::now());
+    poll_until(&mut chat, || !rows(dir.path()).is_empty());
+
+    let shown = transcript(&chat);
+    assert!(
+        shown.contains("login openai-codex: waiting for the device code"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("https://example.invalid/device"),
+        "the device URL is in the transcript: {shown}"
+    );
+    assert!(
+        shown.contains("Enter code: TEST-CODE"),
+        "the user code is in the transcript: {shown}"
+    );
+    assert!(shown.contains("logged in to"), "{shown}");
+    assert_eq!(rows(dir.path())[0].kind, "oauth");
+    assert!(
+        !shown.contains("sk-test-access"),
+        "the token stays out of the transcript: {shown}"
+    );
+}
+
+#[test]
+fn a_hand_typed_device_login_reaches_the_device_path() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/device");
+
+    send(&mut chat, "/login openai-codex device");
+    poll_until(&mut chat, || !rows(dir.path()).is_empty());
+
+    let shown = transcript(&chat);
+    assert!(shown.contains("Enter code: TEST-CODE"), "{shown}");
+    assert!(
+        shown.contains("open this URL on any device"),
+        "the device wording, not the browser one: {shown}"
+    );
+    assert!(shown.contains("logged in to"), "{shown}");
+}
+
+#[test]
+fn a_provider_without_device_flow_refuses_the_method() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat_with_fake(dir.path(), "https://example.invalid/authorize");
+
+    let applied = send(&mut chat, "/login anthropic device");
+    assert!(applied.effect.is_none(), "{applied:?}");
+    let shown = transcript(&chat);
+    assert!(shown.contains("has no device flow"), "{shown}");
+    assert!(
+        !shown.contains("waiting for"),
+        "no flow was started: {shown}"
+    );
+
+    // The refusal left the composer alone: Enter still sends a prompt.
+    let sent = send(&mut chat, "hello");
+    assert!(
+        matches!(sent.effect, Some(ChatEffect::Send(_))),
+        "the prompt came back: {sent:?}"
+    );
+}
+
+#[test]
+fn a_codex_inline_key_is_refused() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut chat = chat(dir.path());
+
+    let applied = send(&mut chat, "/login openai-codex sk-test-key");
+    assert!(applied.effect.is_none(), "{applied:?}");
+    assert!(
+        rows(dir.path()).is_empty(),
+        "a refused key is never written"
+    );
+    let shown = transcript(&chat);
+    assert!(shown.contains("takes no API key"), "{shown}");
+    assert!(
+        shown.contains("/login openai-codex"),
+        "the refusal points at the sign-in: {shown}"
+    );
+}
+
+/// An agent directory whose config declares a provider with its own
+/// environment variable — one this test sets and clears itself.
+fn agent_dir_with_env_provider() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp");
+    std::fs::write(
+        dir.path().join("config.yml"),
+        "providers:\n  \
+         - id: envsub\n    \
+         api: openai-completions\n    \
+         base_url: https://api.example.invalid/v1\n    \
+         credential_env: TITI_TEST_OAUTH_ENV_KEY\n    \
+         credential_required: true\n\
+         models:\n  \
+         - id: envsub/model\n    \
+         provider: envsub\n    \
+         wire_model: model\n",
+    )
+    .expect("config");
+    dir
+}
+
+#[test]
+fn keys_shows_an_env_key_and_a_stored_subscription_together() {
+    let dir = agent_dir_with_env_provider();
+    // The environment is process-wide, so the variable is this test's own and
+    // no other test reads it.
+    unsafe { std::env::set_var("TITI_TEST_OAUTH_ENV_KEY", "sk-test-env") };
+    let tokens = OAuthTokens {
+        access: "sk-test-access".to_owned(),
+        refresh: None,
+        expires_at: None,
+        account_id: None,
+        email: None,
+        org_id: None,
+        org_name: None,
+    };
+    titi_cli::secrets::store_oauth(dir.path(), "envsub", &tokens).expect("store oauth");
+
+    let mut chat = chat(dir.path());
+    send(&mut chat, "/keys");
+    unsafe { std::env::remove_var("TITI_TEST_OAUTH_ENV_KEY") };
+
+    assert!(
+        has_line(&chat, "envsub  env + oauth"),
+        "a subscription is not hidden by the environment: {}",
         transcript(&chat)
     );
 }
