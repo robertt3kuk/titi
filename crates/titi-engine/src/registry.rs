@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,12 @@ pub struct ProviderDescriptor {
     pub credential_env: Option<SmolStr>,
     #[serde(default = "default_true")]
     pub credential_required: bool,
+    /// Whether this provider's catalog comes from a live listing that costs a
+    /// stored credential. Off by default: a subscription backend is the only
+    /// provider that has a listing worth asking for and a credential that is
+    /// not an env var.
+    #[serde(default)]
+    pub discover_with_credential: bool,
 }
 
 const fn default_true() -> bool {
@@ -84,15 +92,20 @@ fn is_usable_model_id(id: &str) -> bool {
 /// *why* it failed; this function adds the catalog's own policy on top — which
 /// ids are printable, and how many a single server may contribute.
 ///
-/// Discovery only ever runs for providers that need no credential, so no key
-/// is sent. A server that still answers 401 or 403 is one the user has to fix,
-/// and the error says so rather than reading as an empty catalog.
+/// `credential` is the provider's resolved credential, sent as a bearer token
+/// whichever kind it is: an OpenAI-compatible listing authenticates that way,
+/// and the `x-api-key` distinction belongs to inference, not to a catalog
+/// request. A provider that needs no credential passes `None`, and one that
+/// answers 401 or 403 anyway is the user's to fix — the error says so rather
+/// than reading as an empty catalog.
 pub async fn discover_models(
     provider: &ProviderDescriptor,
+    credential: Option<&Credential>,
     fetch: &dyn HttpFetch,
 ) -> Result<Vec<ModelDescriptor>, DiscoveryError> {
+    let key = credential.map(|credential| credential.access.as_str());
     let wire_models =
-        titi_providers::list_models(&provider.id, &provider.base_url, None, fetch).await?;
+        titi_providers::list_models(&provider.id, &provider.base_url, key, fetch).await?;
     Ok(wire_models
         .iter()
         .map(|wire| wire.as_str())
@@ -128,6 +141,18 @@ impl ResolvedModel {
 
 pub trait CredentialSource: Send + Sync + 'static {
     fn resolve(&self, provider: &ProviderDescriptor) -> Option<Credential>;
+
+    /// Renew stored OAuth credentials that are about to expire. The default
+    /// source stores nothing to renew.
+    ///
+    /// Boxed rather than `async fn` because a registry reaches its source
+    /// through `dyn CredentialSource`, which an async method cannot serve.
+    fn refresh_due<'a>(
+        &'a self,
+        _fetch: &'a dyn HttpFetch,
+    ) -> Pin<Box<dyn Future<Output = Vec<RefreshOutcome>> + Send + 'a>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -140,12 +165,39 @@ impl CredentialSource for EnvCredentialSource {
         if access.trim().is_empty() {
             return None;
         }
-        Some(Credential {
-            access: access.into(),
-            kind: CredKind::ApiKey,
-            level: LadderLevel::Env,
-        })
+        Some(Credential::api_key(access, LadderLevel::Env))
     }
+}
+
+/// What the refresh sweep did with one stored OAuth row.
+///
+/// Never carries token material: the row is named by `provider/label`, which
+/// is an identifier, and the outcome is one of three states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshState {
+    /// A fresh access token was exchanged and written back.
+    Refreshed,
+    /// The provider definitively rejected the refresh token: the row is gone
+    /// and the account has to log in again.
+    Quarantined,
+    /// A transport failure. The row is untouched — it may still be good, and
+    /// deleting it on a flaky network would log the user out.
+    Transient,
+}
+
+/// One row the sweep looked at, identified by `provider/label`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    pub account: SmolStr,
+    pub state: RefreshState,
+}
+
+/// Unix seconds, the clock the store writes and the provider skews speak.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 /// Env, layered `.env`, then `auth.db` for the provider id.
@@ -174,6 +226,81 @@ impl LayeredCredentialSource {
             store_path: agent_dir.join("auth.db"),
         }
     }
+
+    /// Stored OAuth rows whose access token is within its provider's skew of
+    /// expiry. Synchronous and network-free: exactly what the sweep below
+    /// would renew.
+    ///
+    /// A row without a refresh token, or without an expiry, is not due: there
+    /// is nothing to exchange, and "never expires" is not a deadline.
+    pub fn due_oauth_rows(&self) -> Vec<titi_secrets::store::Credential> {
+        let now = unix_now();
+        let Ok(store) = titi_secrets::store::AuthStore::open(&self.store_path) else {
+            return Vec::new();
+        };
+        let Ok(rows) = store.list() else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter(|row| row.kind == "oauth" && row.refresh_token.is_some())
+            .filter(|row| {
+                let Some(expires_at) = row.expires_at else {
+                    return false;
+                };
+                let skew = titi_providers::oauth::find(&row.provider)
+                    .map_or(0, |provider| provider.refresh_skew_secs);
+                expires_at - skew <= now
+            })
+            .collect()
+    }
+
+    /// Renew every due OAuth row: exchange the refresh token, write the
+    /// result back through the store, and drop a row whose refresh token the
+    /// provider has definitively rejected.
+    ///
+    /// Called in front of a turn's first resolve, outside the synchronous
+    /// ladder, because the exchange is network work.
+    pub async fn refresh_due(&self, fetch: &dyn HttpFetch) -> Vec<RefreshOutcome> {
+        let due = self.due_oauth_rows();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let Ok(store) = titi_secrets::store::AuthStore::open(&self.store_path) else {
+            return Vec::new();
+        };
+        let mut outcomes = Vec::with_capacity(due.len());
+        for row in due {
+            let account: SmolStr = format!("{}/{}", row.provider, row.label).into();
+            let Some(provider) = titi_providers::oauth::find(&row.provider) else {
+                // No descriptor: the row is not one titi can renew, and
+                // guessing an endpoint for it would be worse than skipping.
+                continue;
+            };
+            let current = titi_providers::oauth::from_stored(&row);
+            let state = match titi_providers::oauth::refresh(provider, &current, fetch).await {
+                Ok(tokens) => {
+                    let mut record =
+                        titi_providers::oauth::to_record(&tokens, &row.provider, &row.label);
+                    // A refresh renews the token, not the authorization: the
+                    // moment the account first logged in stays put.
+                    record.authorized_at = row.authorized_at.or(record.authorized_at);
+                    // A failed write is transient: the row still holds the
+                    // old token and the next turn tries again.
+                    match store.store_oauth(record) {
+                        Ok(()) => RefreshState::Refreshed,
+                        Err(_) => RefreshState::Transient,
+                    }
+                }
+                Err(error) if error.is_terminal() => {
+                    let _ = store.remove_account(&row.provider, &row.label);
+                    RefreshState::Quarantined
+                }
+                Err(_) => RefreshState::Transient,
+            };
+            outcomes.push(RefreshOutcome { account, state });
+        }
+        outcomes
+    }
 }
 
 impl CredentialSource for LayeredCredentialSource {
@@ -182,11 +309,7 @@ impl CredentialSource for LayeredCredentialSource {
             && let Some(access) = self.env.resolve(key)
             && !access.trim().is_empty()
         {
-            return Some(Credential {
-                access: access.into(),
-                kind: CredKind::ApiKey,
-                level: LadderLevel::Env,
-            });
+            return Some(Credential::api_key(access, LadderLevel::Env));
         }
         let store = titi_secrets::store::AuthStore::open(&self.store_path).ok()?;
         let stored = store.get(provider.id.as_str()).ok()??;
@@ -200,8 +323,19 @@ impl CredentialSource for LayeredCredentialSource {
             } else {
                 CredKind::ApiKey
             },
+            // OAuth rows carry the account the token belongs to; the wire
+            // schemes that need it (Codex) read it from here.
+            account_id: stored.account_id.map(SmolStr::new),
             level: LadderLevel::Stored,
         })
+    }
+
+    fn refresh_due<'a>(
+        &'a self,
+        fetch: &'a dyn HttpFetch,
+    ) -> Pin<Box<dyn Future<Output = Vec<RefreshOutcome>> + Send + 'a>> {
+        // Inherent wins over trait dispatch here: this is the async sweep.
+        Box::pin(self.refresh_due(fetch))
     }
 }
 
@@ -307,8 +441,8 @@ impl ProviderRegistry {
         errors.values().cloned().collect()
     }
 
-    /// Asks every credential-free provider what it can serve, in the
-    /// background, one task each.
+    /// Asks every listable provider what it can serve, in the background, one
+    /// task each.
     ///
     /// Nothing on the start path waits for this, and no provider waits for
     /// another: each listing joins the catalog the moment it arrives, so a
@@ -318,12 +452,14 @@ impl ProviderRegistry {
     /// is nothing to spawn on, and discovery is skipped.
     ///
     /// A provider that needs a key is left alone: asking a paid gateway for
-    /// its catalog is a request the user did not make.
+    /// its catalog is a request the user did not make. A provider that opted
+    /// in ([`ProviderDescriptor::discover_with_credential`]) is asked with the
+    /// credential it already has.
     pub fn spawn_local_discovery(self: &Arc<Self>) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let providers = self.keyless_providers();
+        let providers = self.discoverable_providers();
         if providers.is_empty() {
             return;
         }
@@ -331,21 +467,49 @@ impl ProviderRegistry {
             return;
         };
         let fetch: Arc<dyn HttpFetch> = Arc::new(fetch);
-        for provider in providers {
+        for (provider, credential) in providers {
             let registry = Arc::clone(self);
             let fetch = Arc::clone(&fetch);
             handle.spawn(async move {
-                registry.refresh_models(&provider, fetch.as_ref()).await;
+                registry
+                    .refresh_models(&provider, credential.as_ref(), fetch.as_ref())
+                    .await;
             });
         }
     }
 
-    fn keyless_providers(&self) -> Vec<ProviderDescriptor> {
+    /// The same pass on an injected fetch, one provider after another: what
+    /// [`ProviderRegistry::spawn_local_discovery`] spawns, without a runtime.
+    pub async fn discover_providers(&self, fetch: &dyn HttpFetch) {
+        for (provider, credential) in self.discoverable_providers() {
+            self.refresh_models(&provider, credential.as_ref(), fetch)
+                .await;
+        }
+    }
+
+    /// Providers whose catalog may be asked for, each with the credential the
+    /// listing needs.
+    ///
+    /// A credential-free provider is listed with no credential. A provider
+    /// that opted in is listed only once a credential actually resolves: the
+    /// credential is the entry ticket, and a request without it would only be
+    /// answered 401.
+    fn discoverable_providers(&self) -> Vec<(ProviderDescriptor, Option<Credential>)> {
         self.providers
             .values()
-            .map(|entry| &entry.descriptor)
-            .filter(|provider| !provider.credential_required && provider.credential_env.is_none())
-            .cloned()
+            .filter_map(|entry| {
+                let provider = &entry.descriptor;
+                let keyless = !provider.credential_required && provider.credential_env.is_none();
+                if keyless {
+                    return Some((provider.clone(), None));
+                }
+                if !provider.discover_with_credential {
+                    return None;
+                }
+                self.credentials
+                    .resolve(provider)
+                    .map(|credential| (provider.clone(), Some(credential)))
+            })
             .collect()
     }
 
@@ -355,11 +519,19 @@ impl ProviderRegistry {
     /// One provider's refusal is its own: the listing runs per provider, so a
     /// gateway that rejects the key costs that gateway's models and nothing
     /// else. The others keep filling the catalog around it.
-    async fn refresh_models(&self, provider: &ProviderDescriptor, fetch: &dyn HttpFetch) {
+    async fn refresh_models(
+        &self,
+        provider: &ProviderDescriptor,
+        credential: Option<&Credential>,
+        fetch: &dyn HttpFetch,
+    ) {
         // Bounds a task rather than a person: a socket that accepts and never
         // answers must not pin a listing future for the life of the process.
-        let Ok(listing) =
-            tokio::time::timeout(DISCOVERY_TIMEOUT, discover_models(provider, fetch)).await
+        let Ok(listing) = tokio::time::timeout(
+            DISCOVERY_TIMEOUT,
+            discover_models(provider, credential, fetch),
+        )
+        .await
         else {
             return;
         };
@@ -444,6 +616,30 @@ impl crate::runtime::TransportResolver for ProviderRegistry {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, RegistryError> {
         ProviderRegistry::resolve(self, model)
     }
+
+    fn refresh_due(&self) -> Pin<Box<dyn Future<Output = Vec<RefreshOutcome>> + Send + '_>> {
+        Box::pin(async move {
+            // The client is built once per process, on the first turn that
+            // runs, and only if the TLS stack builds at all.
+            let Some(fetch) = shared_fetch() else {
+                return Vec::new();
+            };
+            self.credentials.refresh_due(fetch.as_ref()).await
+        })
+    }
+}
+
+/// One HTTP client per process, for the credentials that renew outside a
+/// transport: the sweep reads and writes the store itself, so it has no
+/// transport to borrow a fetch from.
+fn shared_fetch() -> Option<&'static Arc<dyn HttpFetch>> {
+    static FETCH: std::sync::LazyLock<Option<Arc<dyn HttpFetch>>> =
+        std::sync::LazyLock::new(|| {
+            titi_providers::ReqwestFetch::new()
+                .ok()
+                .map(|fetch| Arc::new(fetch) as Arc<dyn HttpFetch>)
+        });
+    FETCH.as_ref()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -577,6 +773,7 @@ mod tests {
             base_url: base_url.into(),
             credential_env: env.map(SmolStr::from),
             credential_required: env.is_some(),
+            discover_with_credential: false,
         }
     }
 
@@ -615,6 +812,7 @@ mod tests {
                 Some(Credential {
                     access: "sk-test".into(),
                     kind: CredKind::ApiKey,
+                    account_id: None,
                     level: LadderLevel::Env,
                 })
             }
@@ -741,7 +939,7 @@ mod tests {
         ]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
-        let found = discover_models(&provider, &fetch)
+        let found = discover_models(&provider, None, &fetch)
             .await
             .expect("a listing the server answered");
 
@@ -763,7 +961,7 @@ mod tests {
         })]);
         let provider = gateway("lmstudio", "http://127.0.0.1:1234/v1", None);
 
-        let error = discover_models(&provider, &fetch)
+        let error = discover_models(&provider, None, &fetch)
             .await
             .expect_err("an unreachable server is reported, not invented");
         assert!(!error.is_auth(), "{error}");
@@ -782,7 +980,7 @@ mod tests {
                 })]);
             let provider = gateway("openai", "https://api.openai.com/v1", None);
 
-            let error = discover_models(&provider, &fetch)
+            let error = discover_models(&provider, None, &fetch)
                 .await
                 .expect_err("a refused key is not an empty listing");
 
@@ -804,7 +1002,7 @@ mod tests {
         })]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
-        let error = discover_models(&provider, &fetch)
+        let error = discover_models(&provider, None, &fetch)
             .await
             .expect_err("404 is still an answer, not a listing");
         assert!(!error.is_auth(), "{error}");
@@ -826,7 +1024,7 @@ mod tests {
         let fetch = titi_providers::MockFetch::sse(vec![body]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
-        let found = discover_models(&provider, &fetch)
+        let found = discover_models(&provider, None, &fetch)
             .await
             .expect("the flood still parses");
 
@@ -863,9 +1061,9 @@ mod tests {
         .expect("registry builds");
 
         let asked: Vec<SmolStr> = registry
-            .keyless_providers()
+            .discoverable_providers()
             .into_iter()
-            .map(|provider| provider.id)
+            .map(|(provider, _)| provider.id)
             .collect();
         assert_eq!(asked, vec![SmolStr::from("ollama")]);
     }
@@ -891,7 +1089,7 @@ mod tests {
         let fetch =
             titi_providers::MockFetch::sse(vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()]);
 
-        registry.refresh_models(&ollama, &fetch).await;
+        registry.refresh_models(&ollama, None, &fetch).await;
 
         assert_eq!(registry.model_ids(), vec![SmolStr::from("ollama/qwen3:8b")]);
         assert!(registry.resolve("ollama/qwen3:8b").is_ok());
@@ -921,12 +1119,12 @@ mod tests {
             status: 401,
             chunks: vec![r#"{"error":"invalid api key"}"#.to_owned()],
         })]);
-        registry.refresh_models(&refusing, &refused).await;
+        registry.refresh_models(&refusing, None, &refused).await;
 
         let answering = gateway("ollama", "http://127.0.0.1:11434/v1", None);
         let listing =
             titi_providers::MockFetch::sse(vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()]);
-        registry.refresh_models(&answering, &listing).await;
+        registry.refresh_models(&answering, None, &listing).await;
 
         assert_eq!(registry.model_ids(), vec![SmolStr::from("ollama/qwen3:8b")]);
         let reported = registry.discovery_errors();
@@ -960,7 +1158,7 @@ mod tests {
             status: None,
             message: "connection refused".into(),
         })]);
-        registry.refresh_models(&provider, &unreachable).await;
+        registry.refresh_models(&provider, None, &unreachable).await;
         assert!(
             registry.discovery_errors().is_empty(),
             "a server that is not running is not news"
@@ -970,12 +1168,12 @@ mod tests {
             status: 403,
             chunks: vec!["forbidden".to_owned()],
         })]);
-        registry.refresh_models(&provider, &refused).await;
+        registry.refresh_models(&provider, None, &refused).await;
         assert_eq!(registry.discovery_errors().len(), 1);
 
         let listing =
             titi_providers::MockFetch::sse(vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()]);
-        registry.refresh_models(&provider, &listing).await;
+        registry.refresh_models(&provider, None, &listing).await;
         assert!(
             registry.discovery_errors().is_empty(),
             "the fixed key kept warning"

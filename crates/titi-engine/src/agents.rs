@@ -298,7 +298,7 @@ impl AgentRunner for StreamingAgentRunner {
         });
         let aborted = Arc::new(AtomicBool::new(false));
         let ctx = RequestCtx {
-            api_key: resolved.credential.map(|credential| credential.access),
+            credential: resolved.credential,
             aborted: Arc::clone(&aborted),
         };
         let mut stream = resolved

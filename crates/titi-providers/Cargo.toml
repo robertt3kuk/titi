@@ -12,9 +12,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 futures = "0.3"
 async-trait = "0.1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 smol_str = { version = "0.3", features = ["serde"] }
 serde_json = "1"
+sha2 = "0.10"
+titi-secrets = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

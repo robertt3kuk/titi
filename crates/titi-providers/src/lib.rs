@@ -12,6 +12,7 @@ pub mod fallback;
 pub mod gemini;
 pub mod http;
 pub mod mock;
+pub mod oauth;
 pub mod openai;
 pub mod partial_json;
 pub mod sse;

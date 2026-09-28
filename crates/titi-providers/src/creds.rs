@@ -40,8 +40,29 @@ pub enum LadderLevel {
 pub struct Credential {
     pub access: SmolStr,
     pub kind: CredKind,
+    /// Account the token belongs to, for the schemes that name it on the
+    /// wire (Codex `chatgpt-account-id`). An identifier, never a secret.
+    pub account_id: Option<SmolStr>,
     /// Which rung produced this credential (for telemetry/rotation).
     pub level: LadderLevel,
+}
+
+impl Credential {
+    /// An `api_key` credential, the kind every non-OAuth rung yields.
+    pub fn api_key(access: impl Into<SmolStr>, level: LadderLevel) -> Self {
+        Self {
+            access: access.into(),
+            kind: CredKind::ApiKey,
+            account_id: None,
+            level,
+        }
+    }
+
+    /// Attach the account the token was issued for.
+    pub fn with_account_id(mut self, account_id: Option<&str>) -> Self {
+        self.account_id = account_id.map(SmolStr::new);
+        self
+    }
 }
 
 impl fmt::Debug for Credential {
@@ -49,6 +70,7 @@ impl fmt::Debug for Credential {
         f.debug_struct("Credential")
             .field("access", &mask_secret(&self.access))
             .field("kind", &self.kind)
+            .field("account_id", &self.account_id)
             .field("level", &self.level)
             .finish()
     }
@@ -79,6 +101,7 @@ pub struct Account {
     label: SmolStr,
     access: SmolStr,
     kind: CredKind,
+    account_id: Option<SmolStr>,
 }
 
 impl Account {
@@ -87,7 +110,14 @@ impl Account {
             label: label.into(),
             access: access.into(),
             kind,
+            account_id: None,
         }
+    }
+
+    /// Attach the account the token was issued for ([`Credential::account_id`]).
+    pub fn with_account_id(mut self, account_id: impl Into<SmolStr>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
     }
 
     pub fn label(&self) -> &str {
@@ -108,6 +138,7 @@ impl Account {
         Credential {
             access: self.access.clone(),
             kind: self.kind,
+            account_id: self.account_id.clone(),
             level,
         }
     }
@@ -233,6 +264,8 @@ pub struct LadderCtx {
     pub runtime_override: Option<SmolStr>,
     pub config_key: Option<SmolStr>,
     pub oauth_token: Option<SmolStr>,
+    /// Account the OAuth token was issued for; only the OAuth rung carries one.
+    pub oauth_account_id: Option<SmolStr>,
     pub login_key: Option<SmolStr>,
     pub env_key: Option<SmolStr>,
     pub stored_key: Option<SmolStr>,
@@ -256,9 +289,16 @@ pub fn resolve_credential(ctx: &LadderCtx) -> Option<Credential> {
     ];
     for (level, v, kind) in rungs {
         if let Some(access) = v.clone() {
+            // Only the OAuth rung knows an account id; every other rung is a
+            // bare key with no identity to name.
+            let account_id = match level {
+                LadderLevel::OAuth => ctx.oauth_account_id.clone(),
+                _ => None,
+            };
             return Some(Credential {
                 access,
                 kind,
+                account_id,
                 level,
             });
         }
@@ -302,6 +342,7 @@ mod tests {
             runtime_override: None,
             config_key: None,
             oauth_token: None,
+            oauth_account_id: None,
             login_key: None,
             env_key: None,
             stored_key: None,
@@ -408,6 +449,7 @@ mod tests {
             Some(Credential {
                 access: "sk-test-default".into(),
                 kind: CredKind::ApiKey,
+                account_id: None,
                 level: LadderLevel::Stored,
             })
         );
@@ -526,6 +568,23 @@ mod tests {
         assert_eq!(cred.kind, CredKind::BearerToken);
     }
 
+    /// The account id belongs to the OAuth rung alone: an API key has no
+    /// account to name, so a stray id must not ride a key rung to the wire.
+    #[test]
+    fn only_the_oauth_rung_carries_an_account_id() {
+        let mut c = ctx();
+        c.oauth_token = Some("tok".into());
+        c.oauth_account_id = Some("acct-1".into());
+        let cred = resolve_credential(&c).expect("resolve");
+        assert_eq!(cred.account_id.as_deref(), Some("acct-1"));
+
+        let mut c = ctx();
+        c.login_key = Some("key".into());
+        c.oauth_account_id = Some("acct-1".into());
+        let cred = resolve_credential(&c).expect("resolve");
+        assert_eq!(cred.account_id, None);
+    }
+
     #[test]
     fn empty_ladder_resolves_none() {
         assert!(resolve_credential(&ctx()).is_none());
@@ -538,12 +597,14 @@ mod tests {
         let cred = Credential {
             access: "a".into(),
             kind: CredKind::ApiKey,
+            account_id: None,
             level: LadderLevel::Env,
         };
         // Destructure exhaustively: any added field would break this.
         let Credential {
             access,
             kind: _,
+            account_id: _,
             level: _,
         } = cred;
         assert_eq!(access, "a");

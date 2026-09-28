@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::io::{self, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -27,6 +28,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::herdr::{self, AgentState};
 use crate::hub::{HubSession, HubUpdate};
+use crate::login::{LoginDriver, LoginEvent, LoginFlow, OAuthProvider};
 use crate::session_log::SessionLog;
 
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
@@ -158,6 +160,15 @@ struct PendingApproval {
     name: String,
 }
 
+/// A login the screen started but has not finished.
+///
+/// The flow itself is a task; this is only the two ends the render loop
+/// holds, so a frame never waits on a browser, a socket or a person.
+struct OAuthLogin {
+    provider: &'static OAuthProvider,
+    flow: LoginFlow,
+}
+
 /// Conversation on screen. No terminal, no session file.
 pub struct Chat {
     lines: Vec<TranscriptLine>,
@@ -187,8 +198,16 @@ pub struct Chat {
     last_completion_tokens: u32,
     quit_armed: Option<Instant>,
     hint: String,
-    /// Provider waiting for a key. The composer masks whatever is typed.
+    /// Provider waiting for a key or an OAuth code. The composer masks
+    /// whatever is typed in either case.
     login_for: Option<String>,
+    /// The OAuth login behind `login_for`, when the provider is signed in
+    /// through a browser rather than with a pasted key.
+    oauth: Option<OAuthLogin>,
+    /// Where a login is started. Production builds the terminal driver on
+    /// first use; tests inject one so no socket, browser or provider is
+    /// involved.
+    login_driver: Option<Arc<dyn LoginDriver>>,
     /// Highlight in the leading-slash command list.
     picker: usize,
     /// Skills the engine discovered, offered by the same picker.
@@ -245,6 +264,8 @@ impl Chat {
             quit_armed: None,
             hint: String::new(),
             login_for: None,
+            oauth: None,
+            login_driver: None,
             picker: 0,
             skills: Vec::new(),
             kitty: false,
@@ -1232,6 +1253,9 @@ impl Chat {
         self.picker = 0;
     }
 
+    /// Typing while a login prompt is up. In OAuth mode the line is the
+    /// pasted code or redirect URL and Enter hands it to the flow; otherwise
+    /// it is the API key and Enter stores it.
     fn login_key(&mut self, key: Key) -> Applied {
         match key {
             Key::Char(ch) if !ch.is_control() => {
@@ -1242,10 +1266,13 @@ impl Chat {
                 self.input.pop();
                 Applied::none()
             }
-            Key::Enter => self.store_login_key(),
+            Key::Enter => self.store_login_secret(),
             Key::Esc | Key::CtrlC => {
                 self.input.clear();
                 self.login_for = None;
+                // Dropping the flow is the cancel: the task's code end sees
+                // the channel close and stops waiting.
+                self.oauth = None;
                 self.push(LineKind::Note, "login cancelled".to_owned());
                 Applied::none()
             }
@@ -1253,9 +1280,25 @@ impl Chat {
         }
     }
 
-    fn store_login_key(&mut self) -> Applied {
+    fn store_login_secret(&mut self) -> Applied {
         let secret = std::mem::take(&mut self.input);
         let secret = secret.trim().to_owned();
+        if self.oauth.is_some() {
+            if secret.is_empty() {
+                self.push(LineKind::Error, "login: a code is required".to_owned());
+                return Applied::none();
+            }
+            let delivered = self
+                .oauth
+                .as_ref()
+                .is_some_and(|oauth| oauth.flow.codes.send(secret).is_ok());
+            if delivered {
+                self.push(LineKind::Note, "login: code submitted".to_owned());
+            } else {
+                self.push(LineKind::Error, "login: the flow ended".to_owned());
+            }
+            return Applied::none();
+        }
         let Some(provider) = self.login_for.take() else {
             return Applied::none();
         };
@@ -1290,12 +1333,130 @@ impl Chat {
         if let Some(secret) = inline {
             return self.store_inline_key(provider, secret);
         }
+        if let Some(descriptor) = crate::login::find(provider) {
+            return self.start_oauth_login(descriptor);
+        }
         self.login_for = Some(provider.to_owned());
         self.push(
             LineKind::Note,
             format!("login {provider}: paste the key, enter stores it"),
         );
         Applied::none()
+    }
+
+    /// `/login <provider>` for a provider that signs in through a browser.
+    ///
+    /// Nothing here waits: the driver starts the flow on the runtime the CLI
+    /// already entered, and the frames after this one read what it reports.
+    fn start_oauth_login(&mut self, descriptor: &'static OAuthProvider) -> Applied {
+        let driver = match self.login_driver() {
+            Ok(driver) => driver,
+            Err(reason) => {
+                self.push(LineKind::Error, format!("login: {reason}"));
+                return Applied::none();
+            }
+        };
+        match driver.begin(descriptor) {
+            Ok(flow) => {
+                self.login_for = Some(descriptor.id.to_owned());
+                self.oauth = Some(OAuthLogin {
+                    provider: descriptor,
+                    flow,
+                });
+                self.push(
+                    LineKind::Note,
+                    format!("login {}: waiting for the browser", descriptor.id),
+                );
+            }
+            Err(reason) => self.push(LineKind::Error, format!("login: {reason}")),
+        }
+        Applied::none()
+    }
+
+    fn login_driver(&mut self) -> Result<Arc<dyn LoginDriver>, String> {
+        if let Some(driver) = &self.login_driver {
+            return Ok(Arc::clone(driver));
+        }
+        let driver: Arc<dyn LoginDriver> = Arc::new(crate::login::ChannelDriver::new()?);
+        self.login_driver = Some(Arc::clone(&driver));
+        Ok(driver)
+    }
+
+    /// Replace the OAuth driver. Tests inject a fake so no network is used;
+    /// production leaves it unset and builds the terminal one on first login.
+    pub fn set_login_driver(&mut self, driver: Arc<dyn LoginDriver>) {
+        self.login_driver = Some(driver);
+    }
+
+    /// Point the screen at another agent directory — the store `/login`
+    /// writes and `/keys` reads.
+    pub fn set_agent_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.agent_dir = dir.into();
+    }
+
+    /// Drains whatever the login reported since the last frame.
+    ///
+    /// Always `try_recv`: the flow runs on its own task, and the render loop
+    /// must not wait on a browser, a socket or a person.
+    pub fn poll_login(&mut self) {
+        let mut reported = Vec::new();
+        let mut ended = false;
+        if let Some(login) = self.oauth.as_mut() {
+            loop {
+                match login.flow.events.try_recv() {
+                    Ok(event) => reported.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in reported {
+            match event {
+                LoginEvent::Url { url, instructions } => {
+                    let id = self.oauth.as_ref().map_or("", |login| login.provider.id);
+                    self.push(
+                        LineKind::Note,
+                        format!("login {id}: open this URL in your browser\n{url}\n{instructions}"),
+                    );
+                }
+                LoginEvent::Progress(message) => self.push(LineKind::Note, message),
+                LoginEvent::Done(tokens) => self.finish_login(&tokens),
+                LoginEvent::Failed(reason) => {
+                    self.login_for = None;
+                    self.oauth = None;
+                    self.push(LineKind::Error, format!("login: {reason}"));
+                }
+            }
+        }
+        if ended && self.oauth.is_some() {
+            let login_for = self.login_for.take();
+            self.oauth = None;
+            let id = login_for.unwrap_or_else(|| "provider".to_owned());
+            self.push(LineKind::Error, format!("login {id}: the flow ended"));
+        }
+    }
+
+    /// The credential the flow came back with: store it, then say who signed
+    /// in and let the model list catch up.
+    fn finish_login(&mut self, tokens: &titi_providers::oauth::OAuthTokens) {
+        let Some(login) = self.oauth.take() else {
+            return;
+        };
+        self.login_for = None;
+        let provider = login.provider;
+        match crate::secrets::store_oauth(&self.agent_dir, provider.store_as, tokens) {
+            Ok(()) => {
+                self.push(
+                    LineKind::Note,
+                    crate::login::identity_line(provider, tokens),
+                );
+                self.catalog.refresh_after_login();
+            }
+            Err(reason) => self.push(LineKind::Error, format!("login: {reason}")),
+        }
     }
 
     fn store_inline_key(&mut self, provider: &str, secret: &str) -> Applied {
@@ -1346,24 +1507,39 @@ impl Chat {
             .any(|provider| provider.id.as_str() == id)
     }
 
+    /// `/keys` reads the store, not the environment: a signed-in provider
+    /// looks exactly like a keyless one otherwise, and the kind and the
+    /// remaining lifetime are what say whether it is about to stop working.
     fn keys(&mut self) -> Applied {
-        let stored = crate::secrets::list_keys(&self.agent_dir)
-            .map(|rows| rows.into_iter().map(|row| row.provider).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let now = crate::secrets::now_secs();
+        let stored = crate::secrets::list_keys(&self.agent_dir).unwrap_or_default();
+        let mut listed: Vec<String> = Vec::new();
         for provider in self.registry_providers() {
+            let id = provider.id.to_string();
             let status = if provider
                 .credential_env
                 .as_deref()
                 .and_then(|name| std::env::var(name).ok())
                 .is_some_and(|value| !value.trim().is_empty())
             {
-                "env"
-            } else if stored.iter().any(|id| id == provider.id.as_str()) {
-                "stored"
+                "env".to_owned()
+            } else if let Some(row) = stored.iter().find(|row| row.provider == id) {
+                crate::secrets::describe_key(row, now)
             } else {
-                "no key"
+                "no key".to_owned()
             };
-            self.push(LineKind::Note, format!("{}  {status}", provider.id));
+            listed.push(id.clone());
+            self.push(LineKind::Note, format!("{id}  {status}"));
+        }
+        // A credential whose provider left the config still exists, and this
+        // is the only place that would say so.
+        let orphans: Vec<&crate::secrets::StoredKey> = stored
+            .iter()
+            .filter(|row| !listed.contains(&row.provider))
+            .collect();
+        for row in orphans {
+            let status = crate::secrets::describe_key(row, now);
+            self.push(LineKind::Note, format!("{}  {status}", row.provider));
         }
         Applied::none()
     }
@@ -1460,26 +1636,28 @@ impl Chat {
         Applied::none()
     }
 
-    /// Every known provider and whether a key is in reach — names and status
-    /// only, never a value.
+    /// Every known provider and whether a credential is in reach — names,
+    /// kinds and lifetimes only, never a value.
     fn provider_status(&self) -> Vec<String> {
-        let stored = crate::secrets::list_keys(&self.agent_dir)
-            .map(|rows| rows.into_iter().map(|row| row.provider).collect::<Vec<_>>())
-            .unwrap_or_default();
+        let now = crate::secrets::now_secs();
+        let stored = crate::secrets::list_keys(&self.agent_dir).unwrap_or_default();
         self.registry_providers()
             .into_iter()
             .map(|provider| {
-                let status = if provider
+                let from_env = provider
                     .credential_env
                     .as_deref()
                     .and_then(|name| std::env::var(name).ok())
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    "env"
-                } else if stored.iter().any(|id| id == provider.id.as_str()) {
-                    "stored"
+                    .is_some_and(|value| !value.trim().is_empty());
+                let row = stored
+                    .iter()
+                    .find(|row| row.provider == provider.id.as_str());
+                let status = if from_env {
+                    "env".to_owned()
+                } else if let Some(row) = row {
+                    crate::secrets::describe_key(row, now)
                 } else {
-                    "no key"
+                    "no key".to_owned()
                 };
                 format!("{} ({status})", provider.id)
             })
@@ -2083,7 +2261,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "keys",
-        about: "which providers have a key",
+        about: "which providers have a key or a sign-in",
     },
     Command {
         name: "usage",
@@ -2091,7 +2269,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "login",
-        about: "store a provider key",
+        about: "sign in to a provider, or store a key",
     },
     Command {
         name: "logout",
@@ -3049,10 +3227,12 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
             ink.fg(ink.amber).add_modifier(Modifier::BOLD),
         ))
     } else if let Some(provider) = &chat.login_for {
-        let shown = if chat.input.is_empty() {
-            format!("paste the {provider} key")
-        } else {
+        let shown = if !chat.input.is_empty() {
             "•".repeat(chat.input.chars().count().min(32))
+        } else if chat.oauth.is_some() {
+            "paste the code or the redirect URL".to_owned()
+        } else {
+            format!("paste the {provider} key")
         };
         let color = if chat.input.is_empty() {
             ink.dim
@@ -3093,6 +3273,8 @@ fn composer_caption(chat: &Chat) -> String {
     };
     let keys = if chat.approval.is_some() {
         "y allow  ·  n refuse"
+    } else if chat.login_for.is_some() && chat.oauth.is_some() {
+        "enter submits  ·  esc cancels"
     } else if chat.login_for.is_some() {
         "enter stores  ·  esc cancels"
     } else if chat.paused {
@@ -3271,6 +3453,7 @@ fn pump(
     // Same tick as the engine, and just as non-blocking: an unhosted hub
     // costs one `try_recv` that returns nothing.
     chat.poll_hub();
+    chat.poll_login();
     Ok(false)
 }
 
@@ -4585,6 +4768,50 @@ mod tests {
         assert_eq!(
             crate::secrets::list_keys(dir.path()).unwrap()[0].provider,
             "openai"
+        );
+    }
+
+    /// A flow that never answers. The screen's own half of a login is all
+    /// this test drives, and it must not open a socket to do it.
+    struct NoNetworkFlow;
+
+    impl LoginDriver for NoNetworkFlow {
+        fn begin(&self, _provider: &'static OAuthProvider) -> Result<LoginFlow, String> {
+            let (_urls, events) = tokio::sync::mpsc::unbounded_channel();
+            let (codes, _lines) = tokio::sync::mpsc::unbounded_channel();
+            Ok(LoginFlow { events, codes })
+        }
+    }
+
+    /// A provider with an OAuth descriptor asks for a code, not a key: the
+    /// composer says which, and Enter hands the line to the flow — never to
+    /// the store, which would keep a half of the login as a credential.
+    #[test]
+    fn login_for_an_oauth_provider_enters_code_mode() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.set_login_driver(Arc::new(NoNetworkFlow));
+
+        type_text(&mut chat, "/login anthropic");
+        chat.on_key(Key::Enter, Instant::now());
+
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("paste the code or the redirect URL"),
+            "{frame}"
+        );
+        assert!(frame.contains("enter submits"), "{frame}");
+
+        type_text(&mut chat, "sk-test-code");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.login_for.is_some(), "the login is still open");
+        assert!(
+            crate::secrets::list_keys(dir.path())
+                .expect("keys")
+                .is_empty(),
+            "a pasted code is not a key"
         );
     }
 

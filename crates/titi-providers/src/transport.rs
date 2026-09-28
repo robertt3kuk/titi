@@ -94,16 +94,23 @@ impl WireRequest {
 /// Per-request context carried alongside the wire payload.
 #[derive(Debug, Clone, Default)]
 pub struct RequestCtx {
-    /// Runtime override (`--api-key`); never persisted.
-    pub api_key: Option<SmolStr>,
+    /// Resolved credential of the provider the request goes to; `None` for a
+    /// keyless local endpoint. The transport picks the auth scheme from its
+    /// kind, so a key string never reaches the wire undecided.
+    pub credential: Option<crate::creds::Credential>,
     /// Abort signal: set to `true` to cancel the stream.
     pub aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RequestCtx {
+    /// A context for a bare runtime key (`--api-key`, tests): no ladder ran,
+    /// so the key is the runtime rung's `api_key`.
     pub fn with_key(key: impl Into<SmolStr>) -> Self {
         Self {
-            api_key: Some(key.into()),
+            credential: Some(crate::creds::Credential::api_key(
+                key,
+                crate::creds::LadderLevel::Runtime,
+            )),
             ..Self::default()
         }
     }
@@ -267,7 +274,14 @@ mod tests {
     #[test]
     fn request_ctx_key_is_runtime_only() {
         let ctx = RequestCtx::with_key("sk-test");
-        assert_eq!(ctx.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            ctx.credential.as_ref().map(|c| c.access.as_str()),
+            Some("sk-test")
+        );
+        assert_eq!(
+            ctx.credential.as_ref().map(|c| c.level),
+            Some(crate::creds::LadderLevel::Runtime)
+        );
         assert!(!ctx.is_aborted());
     }
 }

@@ -144,7 +144,7 @@ impl SessionNamer {
             tool_calls: Vec::new(),
         });
         let ctx = RequestCtx {
-            api_key: resolved.credential.map(|credential| credential.access),
+            credential: resolved.credential,
             aborted: Arc::new(AtomicBool::new(false)),
         };
         let mut stream = resolved.transport.stream(wire, ctx).await.ok()?;

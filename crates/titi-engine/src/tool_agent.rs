@@ -104,7 +104,7 @@ impl AgentRunner for ToolAgentRunner {
             .resolver
             .resolve(&self.model)
             .map_err(|error| SmolStr::from(error.to_string()))?;
-        let api_key = resolved.credential.map(|credential| credential.access);
+        let credential = resolved.credential;
 
         let mut messages = vec![ChatMessage {
             role: Role::User,
@@ -140,7 +140,7 @@ impl AgentRunner for ToolAgentRunner {
                 .stream(
                     wire,
                     RequestCtx {
-                        api_key: api_key.clone(),
+                        credential: credential.clone(),
                         aborted: Arc::clone(&aborted),
                     },
                 )

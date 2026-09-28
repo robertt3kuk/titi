@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::compat::StreamDecodePolicy;
+use crate::creds::{CredKind, Credential};
 use crate::http::{BodyChunk, HttpFetch, HttpRequest, ReqwestFetch};
 use crate::sse::{SseDecoder, SseFrame};
 use crate::stream::{ErrorReason, StopReason, StreamEvent};
@@ -184,23 +185,179 @@ fn gemini_tools_wire(req: &WireRequest) -> Vec<Value> {
     })]
 }
 
+/// Claude Code's OAuth inference fingerprint: the versions and profile omp
+/// spoofs (`providers/anthropic.ts`, `providers/claude-code-fingerprint.ts`;
+/// omp is MIT, Stencil Labs). These are protocol facts about the subscription
+/// endpoint, which version-gates on the `User-Agent`/`X-Stainless-*` pair.
+const CLAUDE_CODE_VERSION: &str = "2.1.280";
+/// `@anthropic-ai/sdk` version bundled by that Claude Code release
+/// (`claude-code-fingerprint.ts:17`); omp's Anthropic refresh rule templates
+/// the same version into its user agent (`rules/auth/anthropic.kdl`).
+pub(crate) const CLAUDE_CODE_SDK_VERSION: &str = "0.112.1";
+/// Node version Claude Code's `X-Stainless-Runtime-Version` reports
+/// (`anthropic.ts:597`).
+const CLAUDE_CODE_NODE_VERSION: &str = "v26.3.0";
+
+/// The beta profile a Claude Code agent request carries, in omp's order:
+/// `claudeCodeAgentBetaDefaults` plus the thinking-gated `effort` beta and
+/// `fallback-credit` (omp `anthropic.ts:243-253`).
+const CLAUDE_CODE_BETAS: &[&str] = &[
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "mid-conversation-system-2026-04-07",
+    "effort-2025-11-24",
+    "fallback-credit-2026-06-01",
+];
+
+/// Codex CLI version the subscription backend is told we are; it gates model
+/// availability on this value, on `/models?client_version=` as well as on
+/// `/responses` (`pi-catalog/src/wire/codex.ts`).
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.155.1";
+
+/// The Stainless wire values for the machine this process runs on, or `None`
+/// where omp's map has no honest answer. Arch and OS are facts about the host;
+/// the Node runtime version omp reports is not a fact here, so it is absent.
+fn stainless_arch() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some("x64"),
+        "aarch64" => Some("arm64"),
+        "x86" | "i686" => Some("x86"),
+        _ => None,
+    }
+}
+
+fn stainless_os() -> Option<&'static str> {
+    match std::env::consts::OS {
+        "macos" => Some("MacOS"),
+        "linux" => Some("Linux"),
+        "windows" => Some("Windows"),
+        "freebsd" => Some("FreeBSD"),
+        _ => None,
+    }
+}
+
+/// The `X-Stainless-*` set a Claude Code request carries (omp
+/// `anthropic.ts:590-599`).
+fn push_stainless_headers(headers: &mut Vec<(SmolStr, SmolStr)>) {
+    headers.push(("x-stainless-lang".into(), "js".into()));
+    headers.push((
+        "x-stainless-package-version".into(),
+        CLAUDE_CODE_SDK_VERSION.into(),
+    ));
+    headers.push(("x-stainless-retry-count".into(), "0".into()));
+    headers.push(("x-stainless-runtime".into(), "node".into()));
+    headers.push((
+        "x-stainless-runtime-version".into(),
+        CLAUDE_CODE_NODE_VERSION.into(),
+    ));
+    headers.push(("x-stainless-timeout".into(), "600".into()));
+    if let Some(arch) = stainless_arch() {
+        headers.push(("x-stainless-arch".into(), arch.into()));
+    }
+    if let Some(os) = stainless_os() {
+        headers.push(("x-stainless-os".into(), os.into()));
+    }
+}
+
+/// The headers a subscription (OAuth) request carries on `anthropic-messages`:
+/// `Authorization: Bearer` replaces `x-api-key`, and the Claude Code profile
+/// rides along (omp `anthropic.ts:376-406`).
+///
+/// `accept-encoding` is the one header of that profile titi does not send:
+/// the reqwest build behind [`ReqwestFetch`] enables no decompression feature,
+/// so asking for a compressed body would hand the SSE pump bytes it cannot
+/// read.
+fn anthropic_oauth_headers(access: &str) -> Vec<(SmolStr, SmolStr)> {
+    let mut headers = vec![
+        ("content-type".into(), "application/json".into()),
+        // OAuth requests ask for JSON even though the body streams frames.
+        ("accept".into(), "application/json".into()),
+        (
+            "user-agent".into(),
+            format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").into(),
+        ),
+        ("anthropic-beta".into(), CLAUDE_CODE_BETAS.join(",").into()),
+        (
+            "anthropic-dangerous-direct-browser-access".into(),
+            "true".into(),
+        ),
+        ("anthropic-version".into(), "2023-06-01".into()),
+        ("authorization".into(), format!("Bearer {access}").into()),
+        ("x-app".into(), "cli".into()),
+        // Stripped by hyper on HTTP/2, where it is illegal and unnecessary.
+        ("connection".into(), "keep-alive".into()),
+    ];
+    push_stainless_headers(&mut headers);
+    headers
+}
+
+/// Whether `base_url` is the ChatGPT subscription backend the Codex CLI
+/// speaks to (`https://chatgpt.com/backend-api/codex`) rather than the
+/// pay-per-token API. Only the subscription wire carries the OAuth profile,
+/// and only it gates its model list on the client version.
+pub(crate) fn is_chatgpt_backend(base_url: &str) -> bool {
+    let rest = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    host.split(':')
+        .next()
+        .is_some_and(|host| host.eq_ignore_ascii_case("chatgpt.com"))
+        && path.trim_end_matches('/').ends_with("backend-api/codex")
+}
+
+/// Claim path the Codex backend nests the ChatGPT account id under
+/// (`pi-catalog/src/wire/codex.ts`).
+const CODEX_JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
+
+/// The `chatgpt_account_id` claim of an access token. Rows stored before titi
+/// kept the account id have none, and the token itself carries it; anything
+/// that is not a JWT yields `None` rather than a wrong header.
+fn account_id_from_jwt(access: &str) -> Option<SmolStr> {
+    let mut parts = access.split('.');
+    let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let decoded = crate::oauth::encode::base64url_decode(payload.trim_end_matches('=')).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get(CODEX_JWT_CLAIM_PATH)?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(SmolStr::new)
+}
+
 /// Serialize a normalized request into a family-specific HTTP request.
+///
+/// The auth scheme follows the credential's kind, not the family alone: the
+/// same `anthropic-messages` endpoint is reached with `x-api-key` on an API
+/// key and with `Authorization: Bearer` plus the Claude Code profile on a
+/// subscription token.
 pub fn build_http_request(
     api: ApiKind,
     base_url: &str,
     req: &WireRequest,
-    api_key: Option<&str>,
+    credential: Option<&Credential>,
 ) -> HttpRequest {
-    let auth_headers = |headers: &mut Vec<(SmolStr, SmolStr)>, key: Option<&str>, style: &str| {
-        if let Some(k) = key {
-            match style {
-                "anthropic" => {
-                    headers.push(("x-api-key".into(), k.into()));
-                    headers.push(("anthropic-version".into(), "2023-06-01".into()));
-                }
-                "query" => {} // Gemini key appended to URL
-                _ => headers.push(("authorization".into(), format!("Bearer {k}").into())),
+    let auth_headers = |headers: &mut Vec<(SmolStr, SmolStr)>, style: &str| {
+        let Some(cred) = credential else {
+            return;
+        };
+        match style {
+            "anthropic" => {
+                headers.push(("x-api-key".into(), cred.access.clone()));
+                headers.push(("anthropic-version".into(), "2023-06-01".into()));
             }
+            "query" => {} // Gemini key appended to URL
+            _ => headers.push((
+                "authorization".into(),
+                format!("Bearer {}", cred.access).into(),
+            )),
         }
     };
     match api {
@@ -209,7 +366,7 @@ pub fn build_http_request(
                 ("content-type".into(), "application/json".into()),
                 ("accept".into(), "text/event-stream".into()),
             ];
-            auth_headers(&mut headers, api_key, "bearer");
+            auth_headers(&mut headers, "bearer");
             let body = serde_json::json!({
                 "model": req.model.as_str(),
                 "messages": openai_messages_wire(req),
@@ -226,11 +383,13 @@ pub fn build_http_request(
             }
         }
         ApiKind::OpenAiResponses => {
+            let codex_cred = credential
+                .filter(|cred| cred.kind == CredKind::BearerToken)
+                .filter(|_| is_chatgpt_backend(base_url));
             let mut headers = vec![
                 ("content-type".into(), "application/json".into()),
                 ("accept".into(), "text/event-stream".into()),
             ];
-            auth_headers(&mut headers, api_key, "bearer");
             let mut body = serde_json::json!({
                 "model": req.model.as_str(),
                 "input": openai_messages_wire(req),
@@ -240,6 +399,40 @@ pub fn build_http_request(
             });
             if let Some(sys) = &req.system {
                 body["instructions"] = Value::String(sys.to_string());
+            }
+            if let Some(cred) = codex_cred {
+                headers.push((
+                    "authorization".into(),
+                    format!("Bearer {}", cred.access).into(),
+                ));
+                // The account id rides the wire as an identifier; without one
+                // the header is omitted rather than guessed.
+                let account_id = cred
+                    .account_id
+                    .clone()
+                    .or_else(|| account_id_from_jwt(&cred.access));
+                if let Some(account_id) = account_id {
+                    headers.push(("chatgpt-account-id".into(), account_id));
+                }
+                headers.push(("openai-beta".into(), "responses=experimental".into()));
+                // The subscription backend attributes the client by name; titi
+                // names itself, the way omp names itself `omp`.
+                headers.push(("originator".into(), "titi".into()));
+                headers.push(("version".into(), CODEX_CLIENT_VERSION.into()));
+                headers.push((
+                    "user-agent".into(),
+                    format!("titi/{}", crate::VERSION).into(),
+                ));
+                // The Codex backend stores nothing (`store: false` in omp's
+                // transform), requires the encrypted reasoning payload back,
+                // and rejects caller-supplied output caps.
+                body["store"] = Value::Bool(false);
+                body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("max_output_tokens");
+                }
+            } else {
+                auth_headers(&mut headers, "bearer");
             }
             HttpRequest {
                 method: "POST".into(),
@@ -253,7 +446,16 @@ pub fn build_http_request(
                 ("content-type".into(), "application/json".into()),
                 ("accept".into(), "text/event-stream".into()),
             ];
-            auth_headers(&mut headers, api_key, "anthropic");
+            let bearer = match credential {
+                Some(cred) if cred.kind == CredKind::BearerToken => {
+                    headers = anthropic_oauth_headers(&cred.access);
+                    true
+                }
+                _ => {
+                    auth_headers(&mut headers, "anthropic");
+                    false
+                }
+            };
             let (system, folded) = leading_system(req);
             let mut body = serde_json::json!({
                 "model": req.model.as_str(),
@@ -274,21 +476,26 @@ pub fn build_http_request(
             }
             HttpRequest {
                 method: "POST".into(),
-                url: format!("{}/v1/messages", base_url.trim_end_matches('/')).into(),
+                url: format!(
+                    "{}/v1/messages{}",
+                    base_url.trim_end_matches('/'),
+                    if bearer { "?beta=true" } else { "" }
+                )
+                .into(),
                 headers,
                 body: Some(body.to_string().into_bytes()),
             }
         }
         ApiKind::GeminiGenerateContent => {
             let mut headers = vec![("content-type".into(), "application/json".into())];
-            auth_headers(&mut headers, api_key, "query");
+            auth_headers(&mut headers, "query");
             let mut url = format!(
                 "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
                 base_url.trim_end_matches('/'),
                 req.model.as_str()
             );
-            if let Some(k) = api_key {
-                url.push_str(&format!("&key={k}"));
+            if let Some(cred) = credential {
+                url.push_str(&format!("&key={}", cred.access));
             }
             let (system, folded) = leading_system(req);
             let mut body = serde_json::json!({
@@ -483,7 +690,7 @@ impl Transport for FamilyTransport {
         req: WireRequest,
         ctx: RequestCtx,
     ) -> Result<EventStream, TransportError> {
-        let http_req = build_http_request(self.api, &self.base_url, &req, ctx.api_key.as_deref());
+        let http_req = build_http_request(self.api, &self.base_url, &req, ctx.credential.as_ref());
         let resp = self.fetch.fetch(http_req).await?;
         if resp.status == 429 || resp.status >= 500 {
             return Err(TransportError::Retryable {
@@ -513,7 +720,30 @@ pub type OpenAiCompatTransport = FamilyTransport;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::creds::LadderLevel;
     use crate::transport::ChatMessage;
+
+    fn key(access: &str) -> Credential {
+        Credential::api_key(access, LadderLevel::LoginKey)
+    }
+
+    fn bearer(access: &str) -> Credential {
+        Credential {
+            access: access.into(),
+            kind: CredKind::BearerToken,
+            account_id: None,
+            level: LadderLevel::OAuth,
+        }
+    }
+
+    /// Header lookup: the wire carries lower-case names, and a fingerprint
+    /// test must not pass because of a spelling.
+    fn header<'a>(hr: &'a HttpRequest, name: &str) -> Option<&'a str> {
+        hr.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 
     fn req() -> WireRequest {
         let mut r = WireRequest::new("gpt-test");
@@ -537,7 +767,12 @@ mod tests {
     #[test]
     fn openai_completions_wire_shape() {
         let r = req();
-        let hr = build_http_request(ApiKind::OpenAiCompletions, "http://x/v1", &r, Some("sk"));
+        let hr = build_http_request(
+            ApiKind::OpenAiCompletions,
+            "http://x/v1",
+            &r,
+            Some(&key("sk")),
+        );
         assert!(hr.url.ends_with("/chat/completions"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["model"], "gpt-test");
@@ -567,7 +802,7 @@ mod tests {
     #[test]
     fn anthropic_wire_shape() {
         let r = req();
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         assert!(hr.url.ends_with("/v1/messages"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["system"][0]["text"], "be brief");
@@ -597,7 +832,12 @@ mod tests {
     #[test]
     fn gemini_wire_shape() {
         let r = req();
-        let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, Some("gk"));
+        let hr = build_http_request(
+            ApiKind::GeminiGenerateContent,
+            "http://x",
+            &r,
+            Some(&key("gk")),
+        );
         assert!(hr.url.contains(":streamGenerateContent?alt=sse"));
         assert!(hr.url.contains("key=gk"));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
@@ -625,7 +865,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
         ];
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["system"][0]["text"], "you are titi");
         assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
@@ -685,7 +925,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
         ];
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["system"][0]["text"], "you are titi");
         let sent: Vec<&str> = body["messages"]
@@ -715,7 +955,7 @@ mod tests {
                 tool_calls: Vec::new(),
             },
         ];
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert_eq!(body["system"][0]["text"], "you are titi");
         assert_eq!(body["messages"].as_array().expect("msgs").len(), 1);
@@ -741,7 +981,7 @@ mod tests {
             content: "you are titi".into(),
             tool_calls: Vec::new(),
         }];
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         // Nothing is left for the system field, and an empty block array is
         // not a request Anthropic accepts, so the field is simply absent.
@@ -773,7 +1013,7 @@ mod tests {
     }
 
     fn anthropic_body(r: &WireRequest) -> Value {
-        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", r, Some("k"));
+        let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", r, Some(&key("k")));
         serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json")
     }
 
@@ -888,5 +1128,175 @@ mod tests {
             after_messages.as_array().expect("msgs").len(),
             before_messages.as_array().expect("msgs").len() + 2
         );
+    }
+
+    /// A subscription token authenticates the same endpoint differently: the
+    /// bearer replaces `x-api-key` and the Claude Code profile rides along.
+    /// omp `providers/anthropic.ts:376-406`, betas from `:226-253`.
+    #[test]
+    fn anthropic_bearer_sends_the_claude_code_profile() {
+        let r = req();
+        let hr = build_http_request(
+            ApiKind::AnthropicMessages,
+            "https://api.anthropic.com",
+            &r,
+            Some(&bearer("sk-ant-oat-xyz")),
+        );
+        assert_eq!(hr.url, "https://api.anthropic.com/v1/messages?beta=true");
+        assert_eq!(header(&hr, "authorization"), Some("Bearer sk-ant-oat-xyz"));
+        assert_eq!(header(&hr, "x-api-key"), None);
+        assert_eq!(header(&hr, "anthropic-version"), Some("2023-06-01"));
+        assert_eq!(header(&hr, "accept"), Some("application/json"));
+        assert_eq!(
+            header(&hr, "anthropic-dangerous-direct-browser-access"),
+            Some("true")
+        );
+        assert_eq!(header(&hr, "x-app"), Some("cli"));
+        assert_eq!(
+            header(&hr, "user-agent"),
+            Some("claude-cli/2.1.280 (external, cli)")
+        );
+        assert_eq!(
+            header(&hr, "anthropic-beta"),
+            Some(
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+                 effort-2025-11-24,fallback-credit-2026-06-01"
+            )
+        );
+        // The whole Stainless set is pinned; arch and OS describe this host
+        // and are the only two that may be absent.
+        assert_eq!(header(&hr, "x-stainless-lang"), Some("js"));
+        assert_eq!(header(&hr, "x-stainless-package-version"), Some("0.112.1"));
+        assert_eq!(header(&hr, "x-stainless-retry-count"), Some("0"));
+        assert_eq!(header(&hr, "x-stainless-runtime"), Some("node"));
+        assert_eq!(header(&hr, "x-stainless-timeout"), Some("600"));
+        assert_eq!(header(&hr, "x-stainless-runtime-version"), Some("v26.3.0"));
+        assert_eq!(header(&hr, "connection"), Some("keep-alive"));
+    }
+
+    /// The API-key path is untouched by the OAuth branch: no bearer, no beta
+    /// profile, and no `?beta=true`.
+    #[test]
+    fn anthropic_api_key_wire_is_unchanged() {
+        let r = req();
+        let hr = build_http_request(
+            ApiKind::AnthropicMessages,
+            "https://api.anthropic.com",
+            &r,
+            Some(&key("sk-ant-key")),
+        );
+        assert_eq!(hr.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(header(&hr, "x-api-key"), Some("sk-ant-key"));
+        assert_eq!(header(&hr, "anthropic-version"), Some("2023-06-01"));
+        assert_eq!(header(&hr, "authorization"), None);
+        assert_eq!(header(&hr, "anthropic-beta"), None);
+        assert_eq!(header(&hr, "user-agent"), None);
+    }
+
+    /// An OpenAI API key on `/responses` keeps the plain body: no `store`,
+    /// no `include`, and the caller's output cap is still forwarded.
+    #[test]
+    fn openai_responses_api_key_wire_is_unchanged() {
+        let r = req();
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://api.openai.com/v1",
+            &r,
+            Some(&key("sk-openai")),
+        );
+        assert_eq!(header(&hr, "authorization"), Some("Bearer sk-openai"));
+        assert_eq!(header(&hr, "chatgpt-account-id"), None);
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["max_output_tokens"], 128);
+        assert!(body.get("store").is_none());
+        assert!(body.get("include").is_none());
+    }
+
+    /// A subscription token on the ChatGPT backend: bearer plus account id,
+    /// and a body the Codex backend accepts (`store: false`, encrypted
+    /// reasoning requested, no caller-supplied output cap).
+    #[test]
+    fn codex_bearer_carries_the_account_id_and_its_own_body() {
+        let r = req();
+        let cred = bearer("sk-oat-codex").with_account_id(Some("acct-42"));
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex",
+            &r,
+            Some(&cred),
+        );
+        assert_eq!(hr.url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(header(&hr, "authorization"), Some("Bearer sk-oat-codex"));
+        assert_eq!(header(&hr, "chatgpt-account-id"), Some("acct-42"));
+        assert_eq!(header(&hr, "openai-beta"), Some("responses=experimental"));
+        assert_eq!(header(&hr, "originator"), Some("titi"));
+        assert_eq!(header(&hr, "version"), Some("0.155.1"));
+        assert_eq!(
+            header(&hr, "user-agent"),
+            Some(format!("titi/{}", crate::VERSION).as_str())
+        );
+        assert_eq!(header(&hr, "accept"), Some("text/event-stream"));
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["store"], false);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["instructions"], "be brief");
+        assert!(body.get("max_output_tokens").is_none(), "{body}");
+    }
+
+    /// A subscription token stored before titi kept the account id still
+    /// names it: the id is in the token's claims. Without one, the header is
+    /// absent rather than wrong.
+    #[test]
+    fn codex_account_id_falls_back_to_the_token_claim() {
+        // {"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}
+        let claims = crate::oauth::encode::base64url_encode(
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}"#,
+        );
+        let token = format!("header.{claims}.signature");
+        assert_eq!(account_id_from_jwt(&token).as_deref(), Some("acct-jwt"));
+        assert_eq!(account_id_from_jwt("sk-plain-key"), None);
+        assert_eq!(account_id_from_jwt("a.!!!.c"), None);
+
+        let r = req();
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex",
+            &r,
+            Some(&bearer(&token)),
+        );
+        assert_eq!(header(&hr, "chatgpt-account-id"), Some("acct-jwt"));
+
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex",
+            &r,
+            Some(&bearer("sk-plain-key")),
+        );
+        assert_eq!(header(&hr, "chatgpt-account-id"), None);
+    }
+
+    /// The Codex profile belongs to the ChatGPT backend alone: the same
+    /// bearer against the pay-per-token API is a plain bearer request.
+    #[test]
+    fn a_bearer_on_the_plain_openai_api_is_not_codex() {
+        let r = req();
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://api.openai.com/v1",
+            &r,
+            Some(&bearer("tok")),
+        );
+        assert_eq!(header(&hr, "authorization"), Some("Bearer tok"));
+        assert_eq!(header(&hr, "openai-beta"), None);
+        assert_eq!(header(&hr, "originator"), None);
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert!(body.get("store").is_none());
+        assert_eq!(body["max_output_tokens"], 128);
     }
 }

@@ -45,6 +45,7 @@ impl CredentialSource for AlwaysKeyed {
         Some(titi_providers::Credential {
             access: "sk-test".into(),
             kind: titi_providers::CredKind::ApiKey,
+            account_id: None,
             level: titi_providers::LadderLevel::Env,
         })
     }
@@ -73,14 +74,15 @@ fn every_builtin_model_resolves_through_its_own_provider() {
 }
 
 /// A provider that needs no key must not claim to need one, and a provider
-/// that does must name the variable it reads: the message for a missing key
-/// is the only instruction the user gets.
+/// that does must have a way to get one: an environment variable, or — for
+/// the Codex subscription — a credential stored by `titi --login`.
 #[test]
 fn a_provider_asks_for_a_key_exactly_when_it_has_one_to_ask_for() {
     for provider in default_registry_config().providers {
+        let from_login = provider.id == "openai-codex";
         assert_eq!(
             provider.credential_required,
-            provider.credential_env.is_some(),
+            provider.credential_env.is_some() || from_login,
             "{} disagrees with itself about needing a key",
             provider.id
         );

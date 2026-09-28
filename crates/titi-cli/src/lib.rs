@@ -7,6 +7,7 @@ pub mod headless;
 pub mod herdr;
 pub mod hub;
 pub mod keys;
+pub mod login;
 pub mod ompcast;
 pub mod recap;
 pub mod secrets;

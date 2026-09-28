@@ -12,13 +12,15 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// Store error: filesystem failure, database failure, or a rejected account
-/// label. No variant ever carries a token.
+/// label / provider id. No variant ever carries a token.
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
     Db(rusqlite::Error),
     /// Account label outside `[A-Za-z0-9._-]{1,64}`.
     InvalidLabel(String),
+    /// Provider id is empty.
+    InvalidProvider(String),
 }
 
 impl fmt::Display for Error {
@@ -30,6 +32,9 @@ impl fmt::Display for Error {
                 f,
                 "invalid account label {label:?}: expected 1-64 characters of [A-Za-z0-9._-]"
             ),
+            Error::InvalidProvider(provider) => {
+                write!(f, "invalid provider id {provider:?}: must not be empty")
+            }
         }
     }
 }
@@ -39,7 +44,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Db(e) => Some(e),
-            Error::InvalidLabel(_) => None,
+            Error::InvalidLabel(_) | Error::InvalidProvider(_) => None,
         }
     }
 }
@@ -64,21 +69,30 @@ pub const DEFAULT_LABEL: &str = "default";
 /// Longest accepted label; keeps `provider/label` ids short enough to show.
 const MAX_LABEL_LEN: usize = 64;
 
-/// Table shape v2: one row per `provider/label` account.
+/// Table shape v3: one row per `provider/label` account. The trailing columns
+/// are OAuth-only — an API key leaves them NULL and [`AuthStore::store_oauth`]
+/// is their only writer.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS credentials (
-                provider   TEXT NOT NULL,
-                label      TEXT NOT NULL DEFAULT 'default',
-                kind       TEXT NOT NULL,
-                token      TEXT NOT NULL,
-                expires_at INTEGER,
-                updated_at INTEGER NOT NULL,
+                provider      TEXT NOT NULL,
+                label         TEXT NOT NULL DEFAULT 'default',
+                kind          TEXT NOT NULL,
+                token         TEXT NOT NULL,
+                expires_at    INTEGER,
+                updated_at    INTEGER NOT NULL,
+                refresh_token TEXT,
+                account_id    TEXT,
+                email         TEXT,
+                org_id        TEXT,
+                org_name      TEXT,
+                authorized_at INTEGER,
                 PRIMARY KEY (provider, label)
             );";
 
 /// One stored credential, identified by `provider/label`.
 ///
-/// `Debug` masks the token on purpose: only the label and the last four
-/// characters may ever reach a log, an error or a screen.
+/// `Debug` masks the token material on purpose: the access and refresh tokens
+/// only ever appear as their last four characters; the label and the identity
+/// fields may reach a log, an error or a screen as they are.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub provider: String,
@@ -91,6 +105,15 @@ pub struct Credential {
     /// Unix seconds; `None` = never expires.
     pub expires_at: Option<i64>,
     pub updated_at: i64,
+    /// OAuth refresh token; `None` for an API key or a non-renewable token.
+    pub refresh_token: Option<String>,
+    /// Provider-side account identity for an OAuth credential.
+    pub account_id: Option<String>,
+    pub email: Option<String>,
+    pub org_id: Option<String>,
+    pub org_name: Option<String>,
+    /// Unix seconds the OAuth grant was authorized.
+    pub authorized_at: Option<i64>,
 }
 
 impl Credential {
@@ -115,6 +138,48 @@ impl fmt::Debug for Credential {
             .field("token", &self.masked_token())
             .field("expires_at", &self.expires_at)
             .field("updated_at", &self.updated_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_deref().map(mask_secret),
+            )
+            .field("account_id", &self.account_id)
+            .field("email", &self.email)
+            .field("org_id", &self.org_id)
+            .field("org_name", &self.org_name)
+            .field("authorized_at", &self.authorized_at)
+            .finish()
+    }
+}
+
+/// The OAuth columns of one `provider/label` account, as
+/// [`AuthStore::store_oauth`] writes them. `Debug` masks `access` and
+/// `refresh`; the identity fields are not secret material.
+pub struct OAuthRecord<'a> {
+    pub provider: &'a str,
+    pub label: &'a str,
+    pub access: &'a str,
+    pub refresh: Option<&'a str>,
+    pub expires_at: Option<i64>,
+    pub account_id: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub org_id: Option<&'a str>,
+    pub org_name: Option<&'a str>,
+    pub authorized_at: Option<i64>,
+}
+
+impl fmt::Debug for OAuthRecord<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthRecord")
+            .field("provider", &self.provider)
+            .field("label", &self.label)
+            .field("access", &mask_secret(self.access))
+            .field("refresh", &self.refresh.map(mask_secret))
+            .field("expires_at", &self.expires_at)
+            .field("account_id", &self.account_id)
+            .field("email", &self.email)
+            .field("org_id", &self.org_id)
+            .field("org_name", &self.org_name)
+            .field("authorized_at", &self.authorized_at)
             .finish()
     }
 }
@@ -191,15 +256,63 @@ impl AuthStore {
         expires_at: Option<i64>,
     ) -> Result<()> {
         validate_label(label)?;
+        // A plain store write is an API key: it owns no refresh material, so
+        // every OAuth-only column is reset rather than left stale.
         self.conn.execute(
-            "INSERT INTO credentials (provider, label, kind, token, expires_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO credentials (provider, label, kind, token, expires_at, updated_at,
+                                      refresh_token, account_id, email, org_id, org_name, authorized_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(provider, label) DO UPDATE SET
                 kind = excluded.kind,
                 token = excluded.token,
                 expires_at = excluded.expires_at,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                refresh_token = NULL,
+                account_id = NULL,
+                email = NULL,
+                org_id = NULL,
+                org_name = NULL,
+                authorized_at = NULL",
             rusqlite::params![provider, label, kind, token, expires_at, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or update one `provider/label` OAuth account with `kind`
+    /// `"oauth"`. This is the only writer of the OAuth-only columns.
+    pub fn store_oauth(&self, record: OAuthRecord<'_>) -> Result<()> {
+        validate_label(record.label)?;
+        if record.provider.is_empty() {
+            return Err(Error::InvalidProvider(record.provider.to_owned()));
+        }
+        self.conn.execute(
+            "INSERT INTO credentials (provider, label, kind, token, expires_at, updated_at,
+                                      refresh_token, account_id, email, org_id, org_name, authorized_at)
+             VALUES (?1, ?2, 'oauth', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(provider, label) DO UPDATE SET
+                kind = 'oauth',
+                token = excluded.token,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at,
+                refresh_token = excluded.refresh_token,
+                account_id = excluded.account_id,
+                email = excluded.email,
+                org_id = excluded.org_id,
+                org_name = excluded.org_name,
+                authorized_at = excluded.authorized_at",
+            rusqlite::params![
+                record.provider,
+                record.label,
+                record.access,
+                record.expires_at,
+                now(),
+                record.refresh,
+                record.account_id,
+                record.email,
+                record.org_id,
+                record.org_name,
+                record.authorized_at,
+            ],
         )?;
         Ok(())
     }
@@ -208,7 +321,8 @@ impl AuthStore {
     /// the first label in rotation order.
     pub fn get(&self, provider: &str) -> Result<Option<Credential>> {
         let mut stmt = self.conn.prepare(
-            "SELECT provider, label, kind, token, expires_at, updated_at
+            "SELECT provider, label, kind, token, expires_at, updated_at,
+                    refresh_token, account_id, email, org_id, org_name, authorized_at
              FROM credentials WHERE provider = ?1
              ORDER BY label = 'default' DESC, label ASC
              LIMIT 1",
@@ -224,7 +338,8 @@ impl AuthStore {
     pub fn get_account(&self, provider: &str, label: &str) -> Result<Option<Credential>> {
         validate_label(label)?;
         let mut stmt = self.conn.prepare(
-            "SELECT provider, label, kind, token, expires_at, updated_at
+            "SELECT provider, label, kind, token, expires_at, updated_at,
+                    refresh_token, account_id, email, org_id, org_name, authorized_at
              FROM credentials WHERE provider = ?1 AND label = ?2",
         )?;
         let mut rows = stmt.query([provider, label])?;
@@ -238,7 +353,8 @@ impl AuthStore {
     /// first, then alphabetical) — the input of a rotation.
     pub fn accounts(&self, provider: &str) -> Result<Vec<Credential>> {
         let mut stmt = self.conn.prepare(
-            "SELECT provider, label, kind, token, expires_at, updated_at
+            "SELECT provider, label, kind, token, expires_at, updated_at,
+                    refresh_token, account_id, email, org_id, org_name, authorized_at
              FROM credentials WHERE provider = ?1
              ORDER BY label = 'default' DESC, label ASC",
         )?;
@@ -286,7 +402,8 @@ impl AuthStore {
     /// All stored credentials, ordered by provider then rotation order.
     pub fn list(&self) -> Result<Vec<Credential>> {
         let mut stmt = self.conn.prepare(
-            "SELECT provider, label, kind, token, expires_at, updated_at
+            "SELECT provider, label, kind, token, expires_at, updated_at,
+                    refresh_token, account_id, email, org_id, org_name, authorized_at
              FROM credentials ORDER BY provider, label = 'default' DESC, label ASC",
         )?;
         let rows = stmt.query_map([], row_to_credential)?;
@@ -298,36 +415,48 @@ impl AuthStore {
     }
 
     /// Quarantine dead credentials: drop every row whose `expires_at` has
-    /// passed (e.g. refresh tokens that can no longer be renewed).
+    /// passed *and* which cannot be renewed. A row holding a refresh token is
+    /// renewable and stays until the refresh itself is refused.
     /// Returns the number of quarantined rows.
     pub fn quarantine_expired(&self) -> Result<usize> {
         let n = self.conn.execute(
-            "DELETE FROM credentials WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            "DELETE FROM credentials
+             WHERE expires_at IS NOT NULL AND expires_at < ?1 AND refresh_token IS NULL",
             [now()],
         )?;
         Ok(n)
     }
 }
 
-/// Additive migration to the v2 shape: a v1 table (`provider` as primary key,
-/// no `label`) is rebuilt with `(provider, label)` and every existing row
-/// becomes its provider's [`DEFAULT_LABEL`] account. Nothing is dropped.
+/// Additive migration to the v3 shape of [`SCHEMA`].
+///
+/// A v1 table (`provider` as primary key, no `label`) is rebuilt with
+/// `(provider, label)` and every existing row becomes its provider's
+/// [`DEFAULT_LABEL`] account. A v2 table (has `label`, lacks `refresh_token`)
+/// keeps its labels and gains the OAuth columns as NULL. Nothing is dropped.
 fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     if !table_exists(conn, "credentials")? {
         conn.execute_batch(SCHEMA)?;
         return Ok(());
     }
-    if column_exists(conn, "credentials", "label")? {
+    let has_label = column_exists(conn, "credentials", "label")?;
+    if has_label && column_exists(conn, "credentials", "refresh_token")? {
         return Ok(());
     }
+    // Pre-v2 rows have no label; they all become the provider's default account.
+    let label = if has_label {
+        "label".to_owned()
+    } else {
+        format!("'{DEFAULT_LABEL}'")
+    };
     conn.execute_batch(&format!(
         "BEGIN IMMEDIATE;
-         ALTER TABLE credentials RENAME TO credentials_v1;
+         ALTER TABLE credentials RENAME TO credentials_old;
          {SCHEMA}
          INSERT INTO credentials (provider, label, kind, token, expires_at, updated_at)
-            SELECT provider, '{DEFAULT_LABEL}', kind, token, expires_at, updated_at
-            FROM credentials_v1;
-         DROP TABLE credentials_v1;
+            SELECT provider, {label}, kind, token, expires_at, updated_at
+            FROM credentials_old;
+         DROP TABLE credentials_old;
          COMMIT;"
     ))?;
     Ok(())
@@ -363,6 +492,12 @@ fn row_to_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<Credential> {
         token: row.get(3)?,
         expires_at: row.get(4)?,
         updated_at: row.get(5)?,
+        refresh_token: row.get(6)?,
+        account_id: row.get(7)?,
+        email: row.get(8)?,
+        org_id: row.get(9)?,
+        org_name: row.get(10)?,
+        authorized_at: row.get(11)?,
     })
 }
 
@@ -779,6 +914,330 @@ mod tests {
                 .quarantine_expired()
                 .unwrap_or_else(|e| panic!("quarantine: {e}")),
             0
+        );
+    }
+
+    /// A minimal `OAuthRecord`; tests override the fields they care about.
+    fn oauth_record<'a>(provider: &'a str, label: &'a str, access: &'a str) -> OAuthRecord<'a> {
+        OAuthRecord {
+            provider,
+            label,
+            access,
+            refresh: None,
+            expires_at: None,
+            account_id: None,
+            email: None,
+            org_id: None,
+            org_name: None,
+            authorized_at: None,
+        }
+    }
+
+    #[test]
+    fn legacy_v2_database_migrates_to_v3_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir failed: {e}"));
+        let path = dir.path().join("auth.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap_or_else(|e| panic!("open: {e}"));
+            conn.execute_batch(
+                "CREATE TABLE credentials (
+                    provider   TEXT NOT NULL,
+                    label      TEXT NOT NULL DEFAULT 'default',
+                    kind       TEXT NOT NULL,
+                    token      TEXT NOT NULL,
+                    expires_at INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (provider, label)
+                );
+                 INSERT INTO credentials VALUES ('anthropic', 'oauth', 'oauth', 'sk-test-access', 1700000000, 42);
+                 INSERT INTO credentials VALUES ('openai', 'default', 'api_key', 'sk-test-key', NULL, 43);",
+            )
+            .unwrap_or_else(|e| panic!("seed v2: {e}"));
+        }
+
+        let store = AuthStore::open(&path).unwrap_or_else(|e| panic!("migrate: {e}"));
+        let oauth = store
+            .get_account("anthropic", "oauth")
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("oauth row lost in migration"));
+        assert_eq!(oauth.kind, "oauth");
+        assert_eq!(oauth.token, "sk-test-access");
+        assert_eq!(oauth.expires_at, Some(1_700_000_000));
+        assert_eq!(oauth.updated_at, 42);
+        assert_eq!(oauth.refresh_token, None);
+        assert_eq!(oauth.account_id, None);
+        assert_eq!(oauth.email, None);
+        assert_eq!(oauth.org_id, None);
+        assert_eq!(oauth.org_name, None);
+        assert_eq!(oauth.authorized_at, None);
+
+        let key = store
+            .get_account("openai", DEFAULT_LABEL)
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("api_key row lost in migration"));
+        assert_eq!(key.kind, "api_key");
+        assert_eq!(key.token, "sk-test-key");
+        assert_eq!(key.expires_at, None);
+        assert_eq!(key.updated_at, 43);
+        assert_eq!(key.refresh_token, None);
+
+        // Re-opening the migrated database is a no-op.
+        drop(store);
+        let store = AuthStore::open(&path).unwrap_or_else(|e| panic!("reopen: {e}"));
+        assert_eq!(
+            store.list().unwrap_or_else(|e| panic!("list: {e}")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn store_oauth_round_trips_every_field() {
+        let (_dir, store) = open_tmp("auth.db");
+        store
+            .store_oauth(OAuthRecord {
+                refresh: Some("sk-test-refresh-5678"),
+                expires_at: Some(1_700_000_000),
+                account_id: Some("acc-1"),
+                email: Some("dev@example.invalid"),
+                org_id: Some("org-1"),
+                org_name: Some("Example Org"),
+                authorized_at: Some(1_699_000_000),
+                ..oauth_record("anthropic", "work", "sk-test-access-1234")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+
+        let cred = store
+            .get_account("anthropic", "work")
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("oauth row missing"));
+        assert_eq!(cred.kind, "oauth");
+        assert_eq!(cred.token, "sk-test-access-1234");
+        assert_eq!(cred.refresh_token.as_deref(), Some("sk-test-refresh-5678"));
+        assert_eq!(cred.expires_at, Some(1_700_000_000));
+        assert_eq!(cred.account_id.as_deref(), Some("acc-1"));
+        assert_eq!(cred.email.as_deref(), Some("dev@example.invalid"));
+        assert_eq!(cred.org_id.as_deref(), Some("org-1"));
+        assert_eq!(cred.org_name.as_deref(), Some("Example Org"));
+        assert_eq!(cred.authorized_at, Some(1_699_000_000));
+        assert!(cred.updated_at > 0);
+
+        // The same account, seen by `accounts` and `list`.
+        assert_eq!(
+            store
+                .accounts("anthropic")
+                .unwrap_or_else(|e| panic!("accounts: {e}"))
+                .first()
+                .and_then(|c| c.refresh_token.clone()),
+            Some("sk-test-refresh-5678".to_owned())
+        );
+        assert_eq!(
+            store
+                .list()
+                .unwrap_or_else(|e| panic!("list: {e}"))
+                .first()
+                .and_then(|c| c.email.clone()),
+            Some("dev@example.invalid".to_owned())
+        );
+
+        // Upserting the same account replaces the whole record.
+        store
+            .store_oauth(oauth_record("anthropic", "work", "sk-test-access-9999"))
+            .unwrap_or_else(|e| panic!("re-store_oauth: {e}"));
+        let cred = store
+            .get_account("anthropic", "work")
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("oauth row missing"));
+        assert_eq!(cred.token, "sk-test-access-9999");
+        assert_eq!(cred.refresh_token, None);
+        assert_eq!(cred.email, None);
+        let accounts = store
+            .accounts("anthropic")
+            .unwrap_or_else(|e| panic!("accounts: {e}"));
+        assert_eq!(accounts.len(), 1);
+
+        // `get` prefers the `default` label exactly as it does for API keys.
+        store
+            .store_oauth(oauth_record(
+                "anthropic",
+                DEFAULT_LABEL,
+                "sk-test-oauth-default",
+            ))
+            .unwrap_or_else(|e| panic!("store_oauth default: {e}"));
+        let primary = store
+            .get("anthropic")
+            .unwrap_or_else(|e| panic!("get: {e}"))
+            .unwrap_or_else(|| panic!("expected a primary account"));
+        assert_eq!(primary.label, DEFAULT_LABEL);
+        assert_eq!(primary.token, "sk-test-oauth-default");
+    }
+
+    #[test]
+    fn store_oauth_rejects_empty_provider_and_illegal_label() {
+        let (_dir, store) = open_tmp("auth.db");
+        let err = store
+            .store_oauth(oauth_record("", "work", "sk-test"))
+            .expect_err("empty provider must be rejected");
+        assert!(matches!(err, Error::InvalidProvider(_)), "got {err:?}");
+        let err = store
+            .store_oauth(oauth_record("anthropic", "with/slash", "sk-test"))
+            .expect_err("illegal label must be rejected");
+        assert!(matches!(err, Error::InvalidLabel(_)), "got {err:?}");
+        assert!(!err.to_string().contains("sk-test"), "error leaked a token");
+        let stored = store.list().unwrap_or_else(|e| panic!("list: {e}"));
+        assert!(stored.is_empty());
+    }
+
+    #[test]
+    fn api_key_write_clears_oauth_only_columns() {
+        let (_dir, store) = open_tmp("auth.db");
+        store
+            .store_oauth(OAuthRecord {
+                refresh: Some("sk-test-refresh"),
+                expires_at: Some(1_700_000_000),
+                account_id: Some("acc-1"),
+                email: Some("dev@example.invalid"),
+                org_id: Some("org-1"),
+                org_name: Some("Example Org"),
+                authorized_at: Some(1_699_000_000),
+                ..oauth_record("anthropic", "work", "sk-test-access")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+
+        store
+            .store_account("anthropic", "work", "api_key", "sk-test-key", None)
+            .unwrap_or_else(|e| panic!("store_account: {e}"));
+
+        let cred = store
+            .get_account("anthropic", "work")
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("row missing"));
+        assert_eq!(cred.kind, "api_key");
+        assert_eq!(cred.token, "sk-test-key");
+        assert_eq!(cred.expires_at, None);
+        assert_eq!(cred.refresh_token, None);
+        assert_eq!(cred.account_id, None);
+        assert_eq!(cred.email, None);
+        assert_eq!(cred.org_id, None);
+        assert_eq!(cred.org_name, None);
+        assert_eq!(cred.authorized_at, None);
+    }
+
+    #[test]
+    fn quarantine_expired_keeps_renewable_rows() {
+        let (_dir, store) = open_tmp("auth.db");
+        let now = now();
+        // Expired API key: unrenewable.
+        store
+            .store("dead-key", "api_key", "k", Some(now - 100))
+            .unwrap_or_else(|e| panic!("store: {e}"));
+        // Expired OAuth row without a refresh token: unrenewable.
+        store
+            .store_oauth(OAuthRecord {
+                expires_at: Some(now - 100),
+                ..oauth_record("dead-oauth", DEFAULT_LABEL, "sk-test-a")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+        // Expired OAuth row holding a refresh token: renewable, must survive.
+        store
+            .store_oauth(OAuthRecord {
+                refresh: Some("sk-test-refresh"),
+                expires_at: Some(now - 100),
+                account_id: Some("acc-1"),
+                ..oauth_record("renewable", DEFAULT_LABEL, "sk-test-b")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+        // Fresh and never-expiring rows.
+        store
+            .store_oauth(OAuthRecord {
+                refresh: Some("sk-test-refresh"),
+                expires_at: Some(now + 3_600),
+                ..oauth_record("live", DEFAULT_LABEL, "sk-test-c")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+        store
+            .store_account("never", DEFAULT_LABEL, "api_key", "k2", None)
+            .unwrap_or_else(|e| panic!("store: {e}"));
+
+        assert_eq!(
+            store
+                .quarantine_expired()
+                .unwrap_or_else(|e| panic!("quarantine: {e}")),
+            2
+        );
+        assert!(
+            store
+                .get("dead-key")
+                .unwrap_or_else(|e| panic!("get: {e}"))
+                .is_none()
+        );
+        assert!(
+            store
+                .get("dead-oauth")
+                .unwrap_or_else(|e| panic!("get: {e}"))
+                .is_none()
+        );
+        let renewable = store
+            .get("renewable")
+            .unwrap_or_else(|e| panic!("get: {e}"))
+            .unwrap_or_else(|| panic!("renewable row was quarantined"));
+        assert_eq!(renewable.refresh_token.as_deref(), Some("sk-test-refresh"));
+        assert_eq!(renewable.account_id.as_deref(), Some("acc-1"));
+        assert!(
+            store
+                .get("live")
+                .unwrap_or_else(|e| panic!("get: {e}"))
+                .is_some()
+        );
+        assert!(
+            store
+                .get("never")
+                .unwrap_or_else(|e| panic!("get: {e}"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn debug_masks_oauth_token_material() {
+        let (_dir, store) = open_tmp("auth.db");
+        store
+            .store_oauth(OAuthRecord {
+                refresh: Some("sk-test-refresh-5678"),
+                expires_at: Some(1_700_000_000),
+                account_id: Some("acc-1"),
+                email: Some("dev@example.invalid"),
+                org_id: Some("org-1"),
+                org_name: Some("Example Org"),
+                authorized_at: Some(1_699_000_000),
+                ..oauth_record("anthropic", "work", "sk-test-access-1234")
+            })
+            .unwrap_or_else(|e| panic!("store_oauth: {e}"));
+        let cred = store
+            .get_account("anthropic", "work")
+            .unwrap_or_else(|e| panic!("get_account: {e}"))
+            .unwrap_or_else(|| panic!("oauth row missing"));
+
+        let debug = format!("{cred:?}");
+        assert!(
+            !debug.contains("sk-test"),
+            "Debug leaked token material: {debug}"
+        );
+        assert!(
+            debug.contains("dev@example.invalid"),
+            "identity missing: {debug}"
+        );
+        assert!(debug.contains("acc-1"), "identity missing: {debug}");
+        assert_eq!(cred.masked_token(), "…1234");
+
+        // The write-side record masks on the same path.
+        let record = oauth_record("anthropic", "work", "sk-test-access-1234");
+        let record_debug = format!("{record:?}");
+        assert!(
+            !record_debug.contains("sk-test-access-1234"),
+            "OAuthRecord Debug leaked the access token: {record_debug}"
+        );
+        assert!(
+            record_debug.contains("…1234"),
+            "mask missing: {record_debug}"
         );
     }
 }

@@ -9,7 +9,7 @@ use titi_providers::ApiKind;
 use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_policy};
 
 pub fn default_registry_config() -> ProviderRegistryConfig {
-    ProviderRegistryConfig {
+    let mut config = ProviderRegistryConfig {
         providers: vec![
             ProviderDescriptor {
                 id: "openai".into(),
@@ -17,6 +17,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://api.openai.com/v1".into(),
                 credential_env: Some("OPENAI_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
             },
             ProviderDescriptor {
                 id: "openrouter".into(),
@@ -24,6 +25,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://openrouter.ai/api/v1".into(),
                 credential_env: Some("OPENROUTER_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
             },
             ProviderDescriptor {
                 id: "opencode-go".into(),
@@ -31,6 +33,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://opencode.ai/zen/go/v1".into(),
                 credential_env: Some("OPENCODE_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
             },
             ProviderDescriptor {
                 id: "anthropic".into(),
@@ -38,6 +41,22 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://api.anthropic.com".into(),
                 credential_env: Some("ANTHROPIC_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
+            },
+            // A ChatGPT subscription instead of an API key: the credential
+            // comes from `titi --login openai-codex`, so there is no
+            // `credential_env` to fall back on. `credential_required` keeps
+            // the keyless listing pass away from this endpoint;
+            // `discover_with_credential` lets the registry ask it for the
+            // live catalog once a token is stored, and the ids below are what
+            // the descriptor ships before that.
+            ProviderDescriptor {
+                id: "openai-codex".into(),
+                api: ApiKind::OpenAiResponses,
+                base_url: "https://chatgpt.com/backend-api/codex".into(),
+                credential_env: None,
+                credential_required: true,
+                discover_with_credential: true,
             },
             // Cheap OpenAI-compatible gateways: plain Chat Completions, so
             // they reuse the compat transport and add no provider branch.
@@ -47,6 +66,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://api.cline.bot/api/v1".into(),
                 credential_env: Some("CLINE_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
             },
             ProviderDescriptor {
                 id: "bai".into(),
@@ -54,6 +74,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "https://api.b.ai/v1".into(),
                 credential_env: Some("BAI_API_KEY".into()),
                 credential_required: true,
+                discover_with_credential: false,
             },
             // Local servers. No key, and no built-in models: what is loaded
             // is whatever the user pulled, so the ids come from their config
@@ -66,6 +87,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 credential_env: None,
                 credential_required: false,
+                discover_with_credential: false,
             },
             ProviderDescriptor {
                 id: "lmstudio".into(),
@@ -73,6 +95,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 base_url: "http://127.0.0.1:1234/v1".into(),
                 credential_env: None,
                 credential_required: false,
+                discover_with_credential: false,
             },
         ],
         models: vec![
@@ -143,7 +166,45 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 context_window: None,
             },
         ],
-    }
+    };
+    config.models.extend(codex_models());
+    config
+}
+
+/// Codex wire ids, from the omp catalog rule
+/// (`pi-catalog/src/compat/rules/providers/openai-codex.kdl`, MIT, and the
+/// wire census in `docs/research/providers-streaming/oauth-login.md`). They
+/// are what the descriptor offers before a login: once a token is stored the
+/// registry folds the endpoint's own listing in beside them, and a declared
+/// id always wins. The `-wm` ids are the worker siblings.
+const CODEX_WIRE_MODELS: &[(&str, Option<u64>)] = &[
+    ("gpt-5.5", None),
+    ("gpt-5.6", None),
+    ("gpt-5.6-luna", None),
+    ("gpt-5.6-sol", None),
+    ("gpt-5.6-terra", None),
+    ("gpt-6-astra", Some(272_000)),
+    ("gpt-6-astra-wm", Some(272_000)),
+    ("gpt-6-sol", None),
+    ("gpt-6-sol-wm", None),
+    ("gpt-6-luna", None),
+    ("gpt-6-luna-wm", None),
+    ("gpt-daybreak-blue-latest", None),
+    ("gpt-daybreak-blue-latest-wm", None),
+    ("gpt-daybreak-red-latest", None),
+    ("gpt-daybreak-red-latest-wm", None),
+];
+
+fn codex_models() -> Vec<ModelDescriptor> {
+    CODEX_WIRE_MODELS
+        .iter()
+        .map(|(wire, window)| ModelDescriptor {
+            id: format!("openai-codex/{wire}").into(),
+            provider: "openai-codex".into(),
+            wire_model: (*wire).into(),
+            context_window: *window,
+        })
+        .collect()
 }
 
 /// Keeps the models that `available` accepts, in their original order.
@@ -234,6 +295,29 @@ impl ModelCatalog {
             failures.extend(registry.discovery_errors());
         }
         failures
+    }
+
+    /// Re-reads the registry after a credential appears — a `/login`.
+    ///
+    /// The startup order was decided from the keys that existed then, so a
+    /// model that has just become usable sits behind the ones that already
+    /// were. `resolve` is the acceptance `start_engine_with` applies, and
+    /// discovery is re-asked: a provider that lists its catalog against a
+    /// stored credential has one now. A catalog with no registry behind it
+    /// does not move.
+    pub fn refresh_after_login(&mut self) {
+        let Some(registry) = &self.registry else {
+            return;
+        };
+        registry.spawn_local_discovery();
+        let mut candidates = self.startup.clone();
+        for id in registry.model_ids() {
+            let id = id.to_string();
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
+        }
+        self.startup = prefer_available_models(candidates, |id| registry.resolve(id).is_ok());
     }
 }
 

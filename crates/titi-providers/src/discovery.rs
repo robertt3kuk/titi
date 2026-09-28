@@ -100,6 +100,23 @@ impl std::fmt::Display for DiscoveryError {
 
 impl std::error::Error for DiscoveryError {}
 
+/// The URL a provider's model list lives at.
+///
+/// The ChatGPT subscription backend version-gates its listing the way it
+/// gates inference: without `client_version` it answers with the models an
+/// older client is allowed to see (omp `pi-catalog/src/wire/codex.ts`). Every
+/// other endpoint gets the plain path.
+fn models_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if crate::wire::is_chatgpt_backend(base) {
+        return format!(
+            "{base}/models?client_version={}",
+            crate::wire::CODEX_CLIENT_VERSION
+        );
+    }
+    format!("{base}/models")
+}
+
 /// Model ids an OpenAI-compatible server lists at `GET <base_url>/models`.
 ///
 /// `api_key` is sent as a bearer token and never appears in a returned error.
@@ -120,7 +137,7 @@ pub async fn list_models(
     }
     let request = HttpRequest {
         method: "GET".into(),
-        url: format!("{}/models", base_url.trim_end_matches('/')).into(),
+        url: models_url(base_url).into(),
         headers,
         body: None,
     };
@@ -246,6 +263,20 @@ mod tests {
             r#"{"error":"nope"}"#.to_owned(),
         ])
         .with_status(status))])
+    }
+
+    /// The ChatGPT subscription backend version-gates the models it admits to
+    /// seeing; without the query it answers with an older client's catalog.
+    #[test]
+    fn the_chatgpt_backend_listing_carries_the_client_version() {
+        assert_eq!(
+            models_url("https://chatgpt.com/backend-api/codex"),
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={}",
+                crate::wire::CODEX_CLIENT_VERSION
+            )
+        );
+        assert_eq!(models_url(BASE), "https://api.example.invalid/v1/models");
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -7,7 +9,8 @@ use futures::StreamExt;
 use smol_str::SmolStr;
 use titi_genome::Genome;
 use titi_providers::{
-    ChatMessage, ErrorReason, RequestCtx, Role, StreamEvent, Transport, TransportError, WireRequest,
+    ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, Transport, TransportError,
+    WireRequest,
 };
 use titi_tools::{ApprovalMode, ApprovalTier, ToolRegistry};
 use tokio::sync::mpsc;
@@ -15,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::claims::Claims;
 use crate::findings::Findings;
 use crate::protocol::{ContextPart, EngineCommand, EngineEvent, TurnId};
-use crate::registry::{RegistryError, ResolvedModel};
+use crate::registry::{RefreshOutcome, RegistryError, ResolvedModel};
 use crate::steering::Steering;
 use crate::tool_loop::{
     ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools,
@@ -320,6 +323,14 @@ mod tests {
 /// Resolves a model id to its provider transport.
 pub trait TransportResolver: Send + Sync + 'static {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, RegistryError>;
+
+    /// Renew the OAuth credentials a turn is about to resolve, in front of the
+    /// first resolve. The default resolver owns no credential store.
+    ///
+    /// A boxed future because the runtime reaches its resolver through `dyn`.
+    fn refresh_due(&self) -> Pin<Box<dyn Future<Output = Vec<RefreshOutcome>> + Send + '_>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 impl<F> TransportResolver for F
@@ -1637,6 +1648,12 @@ async fn run_turn(
     // Session-wide token meter the turn adds its own spend to.
     spent: Arc<AtomicU64>,
 ) -> Option<Vec<ChatMessage>> {
+    // In front of the resolve below, and outside the synchronous ladder: a
+    // subscription token that expires between turns would otherwise fail the
+    // turn it was resolved for. The outcomes are the resolver's business —
+    // a refresh that failed leaves the stored credential in place, and the
+    // resolve that follows says what is wrong with it.
+    let _ = resolver.refresh_due().await;
     let mut models = Vec::with_capacity(1 + config.fallback_models.len());
     models.push(primary_model);
     models.extend(config.fallback_models);
@@ -1685,7 +1702,7 @@ async fn run_turn(
                 return None;
             }
         };
-        let api_key = resolved.credential.map(|credential| credential.access);
+        let credential = resolved.credential;
         let wire_model = resolved.wire_model;
         let transport = resolved.transport;
         let _ = events
@@ -1766,7 +1783,7 @@ async fn run_turn(
                     &messages,
                     &wire_model,
                     Arc::clone(&transport),
-                    api_key.clone(),
+                    credential.clone(),
                     events.clone(),
                     Arc::clone(&aborted),
                     &tools,
@@ -1877,7 +1894,7 @@ async fn stream_attempt(
     messages: &[ChatMessage],
     model: &SmolStr,
     transport: Arc<dyn Transport>,
-    api_key: Option<SmolStr>,
+    credential: Option<Credential>,
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
@@ -1896,7 +1913,7 @@ async fn stream_attempt(
     request.messages = messages.to_vec();
     request.tools = tools.specs();
     let context = RequestCtx {
-        api_key,
+        credential,
         aborted: Arc::clone(&aborted),
     };
     let mut stream = transport

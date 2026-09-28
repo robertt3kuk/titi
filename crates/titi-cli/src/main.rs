@@ -20,13 +20,16 @@ usage: titi [options]
   --replay-fast               with --replay: no pauses between records
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
-  --list-keys                 list stored providers (never the keys)
+  --list-keys                 list stored providers, kind and lifetime (never the keys)
+  --login [provider]          sign in to a provider with OAuth; no argument lists them
+  --device                    with --login: use the device code, no callback server
   --help, -h                  this text
 
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. y / n answers a write or a shell prompt.
-/model switches to the next model that has a key. /login stores a key.
-A / at the start of the line lists commands; up and down move, tab fills.
+/model switches to the next model that has a key. /login signs in to a
+provider, or stores a key. A / at the start of the line lists commands; up
+and down move, tab fills.
 ";
 
 fn main() -> io::Result<()> {
@@ -35,12 +38,19 @@ fn main() -> io::Result<()> {
     let mut goal: Option<String> = None;
     let mut set_key: Option<(String, String)> = None;
     let mut list_keys = false;
+    let mut login: Option<Option<String>> = None;
+    let mut login_device = false;
     let mut record: Option<std::path::PathBuf> = None;
     let mut replay: Option<std::path::PathBuf> = None;
     let mut replay_fast = false;
     let mut approval = titi_tools::ApprovalMode::Write;
     let mut mode = titi_engine::protocol::SessionMode::Agent;
-    let mut args = std::env::args().skip(1);
+    // Collected: `--login` needs to look at the next argument without eating
+    // it, and `Skip<Args>` is not cloneable.
+    let mut args = std::env::args()
+        .skip(1)
+        .collect::<Vec<String>>()
+        .into_iter();
     while let Some(arg) = args.next() {
         if arg == "--mouse" {
             // Kept so older scripts still parse. The chat does not track the mouse.
@@ -78,6 +88,28 @@ fn main() -> io::Result<()> {
             }
         } else if arg == "--list-keys" {
             list_keys = true;
+        } else if arg == "--login" {
+            // The provider is optional, so the flag must not eat the next
+            // option when it is absent. `--device` in between picks the
+            // device grant, which needs no callback server.
+            let device = args.clone().next().is_some_and(|value| value == "--device");
+            if device {
+                let _ = args.next();
+            }
+            login = Some(match args.clone().next() {
+                Some(value) if !value.starts_with('-') => {
+                    let _ = args.next();
+                    Some(value)
+                }
+                _ => None,
+            });
+            if device {
+                login_device = true;
+                if matches!(login, Some(None)) {
+                    eprintln!("usage: titi --login --device <provider>");
+                    std::process::exit(2);
+                }
+            }
         } else if arg == "--record" {
             let Some(path) = args.next() else {
                 eprintln!("usage: titi --record <path.ompcast>");
@@ -152,13 +184,40 @@ fn main() -> io::Result<()> {
                 Ok(())
             }
             Ok(keys) => {
+                let now = titi_cli::secrets::now_secs();
                 for key in keys {
-                    eprintln!("{}  ({})", key.provider, key.kind);
+                    let kind = titi_cli::secrets::describe_key(&key, now);
+                    eprintln!("{}  ({kind})", key.provider);
                 }
                 Ok(())
             }
             Err(reason) => {
                 eprintln!("could not read keys: {reason}");
+                std::process::exit(1);
+            }
+        };
+    }
+    if let Some(provider) = login {
+        let Some(id) = provider else {
+            for provider in titi_cli::login::providers() {
+                eprintln!("{}  {}", provider.id, provider.name);
+            }
+            return Ok(());
+        };
+        if titi_cli::login::find(&id).is_none() {
+            eprintln!("unknown oauth provider {id}");
+            std::process::exit(2);
+        }
+        let dir = titi_config::agent_dir();
+        let result = if login_device {
+            titi_cli::login::run_login_device(&id, &dir)
+        } else {
+            titi_cli::login::run_login(&id, &dir)
+        };
+        return match result {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                eprintln!("login failed: {reason}");
                 std::process::exit(1);
             }
         };

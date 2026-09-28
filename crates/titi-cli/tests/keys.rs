@@ -14,6 +14,7 @@ fn descriptor() -> ProviderDescriptor {
         base_url: "https://example.invalid/v1".into(),
         credential_env: Some("TITI_TEST_OPENCODE_GO_KEY".into()),
         credential_required: true,
+        discover_with_credential: false,
     }
 }
 
