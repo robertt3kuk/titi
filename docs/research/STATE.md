@@ -33,6 +33,10 @@
 
 Тесты после правок (локально, `--locked`): `titi-cli` 276, `titi-providers` 162, `titi-engine` 231, `titi-secrets` 24; workspace 1485 passed, 0 failed; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets` и `cargo check --workspace --all-targets` чисты (у clippy только прежние `unwrap`/`expect` в тестовых модулях).
 
+Ссылка входа теперь кликабельна и не боится переноса: authorize-URL печатается как OSC 8-гиперссылка, а каждое ребро завёрнутого URL несёт URL целиком, поэтому обрыв строки больше не оставляет нечего кликать (раньше жестянка рвала URL посреди токена и вешала на него свои отступы). В TUI это `paint_links` (`crates/titi-cli/src/chat.rs`): span не может нести управляющие символы — ratatui выкидывает их, пока заполняет буфер, — поэтому ESC-последовательности пишутся прямо в ячейки уже нарисованного ребра с `CellDiffOption::ForcedWidth(1)`, а `wrap_url` режет URL по рёбрам без потери байта; в `titi --login` тот же URL оборачивает `caps::osc8_link` (`crates/titi-cli/src/login.rs`, `crates/titi-tui/src/caps.rs`), тоже `3feab86`. Предел честный: проверено на байтовом уровне PTY (80×20, 6 рёбер по 456-символьному URL, каждое с полным URL как target, видимый текст сходится в URL байт в байт; и `/login`, и `--login`), клик мышью в GUI-терминале не проверялся; терминал без OSC 8 покажет просто весь URL текстом.
+
+Две косметики, которые эта правка не тронула: мастхед (`crates/titi-cli/src/chat.rs:3138-3158`) режет id модели посимвольно без многоточия — живой кадр показал `open -codex/gpt-5.5`; `titi --login` в device-флоу печатает браузерную формулировку (`crates/titi-cli/src/login.rs:173-196`) вместо device-инструкций.
+
 | Шаг | Статус | Где |
 |-----|--------|-----|
 | Ресерч omp (движки oauth-code/device/refresh, дескрипторы, хранилище, CLI-UX, инференс-заголовки) | done | [oauth-login.md](providers-streaming/oauth-login.md) |
