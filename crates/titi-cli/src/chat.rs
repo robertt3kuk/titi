@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Stdout, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::CellDiffOption;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -3015,13 +3017,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if roster_h > 0 {
         frame.render_widget(roster(chat, &ink), cols[1]);
     }
-    let (body, photos) = if chat.lines.is_empty() {
-        (empty_state(cols[2].height, &ink), Vec::new())
+    let (body, photos, links) = if chat.lines.is_empty() {
+        (empty_state(cols[2].height, &ink), Vec::new(), Vec::new())
     } else {
         transcript(chat, cols[2].width, cols[2].height, &ink)
     };
     frame.render_widget(body, cols[2]);
     paint_photos(frame, cols[2], &photos, &ink);
+    paint_links(frame, cols[2], &links);
     if picker_h > 0 {
         let picker = if chat.login_picker.is_some() {
             login_picker(chat, cols[3].width, &ink)
@@ -3215,6 +3218,23 @@ enum TranscriptRow {
     },
 }
 
+/// A rendered row that is part of a URL: the visible text and the URL it
+/// stands for. `row` is the index of that row inside its line's rows.
+#[derive(Debug)]
+struct LinkRow {
+    row: usize,
+    url: String,
+    text: String,
+}
+
+/// A link row where the last frame put it, ready for [`paint_links`]. `row`
+/// is relative to the transcript pane.
+struct LinkPaint {
+    row: u16,
+    url: String,
+    text: String,
+}
+
 struct PhotoPaint {
     row: u16,
     id: u32,
@@ -3227,18 +3247,24 @@ fn transcript(
     width: u16,
     height: u16,
     ink: &Ink,
-) -> (Paragraph<'static>, Vec<PhotoPaint>) {
+) -> (Paragraph<'static>, Vec<PhotoPaint>, Vec<LinkPaint>) {
     let inner = (width as usize).saturating_sub(2).max(8);
     let max_cols = width.saturating_sub(8).max(8);
     let owned = chat.lines.clone();
     let mut rows: Vec<TranscriptRow> = Vec::new();
+    let mut links: Vec<(usize, LinkRow)> = Vec::new();
     for (index, line) in owned.iter().enumerate() {
         let gap = matches!(line.kind, LineKind::User | LineKind::Assistant) && index > 0;
         if gap && !rows.is_empty() {
             rows.push(TranscriptRow::Text(Line::from("")));
         }
-        for text in message_rows(line, inner, ink) {
+        let base = rows.len();
+        let (texts, line_links) = message_rows(line, inner, ink);
+        for text in texts {
             rows.push(TranscriptRow::Text(text));
+        }
+        for link in line_links {
+            links.push((base + link.row, link));
         }
         if chat.kitty {
             for path in image_paths(&line.text) {
@@ -3262,7 +3288,23 @@ fn transcript(
     let start = total.saturating_sub(keep + chat.scroll_offset);
     let mut lines = Vec::new();
     let mut photos = Vec::new();
+    let mut paints = Vec::new();
+    let mut next_link = 0usize;
     for (index, row) in rows.into_iter().skip(start).take(keep).enumerate() {
+        let at = start + index;
+        while next_link < links.len() && links[next_link].0 < at {
+            next_link += 1;
+        }
+        if let Some((row_at, link)) = links.get(next_link)
+            && *row_at == at
+        {
+            paints.push(LinkPaint {
+                row: index as u16,
+                url: link.url.clone(),
+                text: link.text.clone(),
+            });
+            next_link += 1;
+        }
         match row {
             TranscriptRow::Text(line) => lines.push(line),
             TranscriptRow::Photo {
@@ -3280,7 +3322,7 @@ fn transcript(
             }
         }
     }
-    (Paragraph::new(lines).style(ink.page()), photos)
+    (Paragraph::new(lines).style(ink.page()), photos, paints)
 }
 
 fn paint_photos(
@@ -3315,6 +3357,60 @@ fn paint_photos(
             cell.set_fg(Color::Rgb(red, green, blue));
             cell.set_bg(ink.page);
         }
+    }
+}
+
+/// Hangs an OSC 8 hyperlink on a URL row by writing the escapes into the
+/// cells the row already holds.
+///
+/// The escapes cannot travel as span text: ratatui drops every grapheme that
+/// carries a control character while it fills its buffer
+/// (`Buffer::set_stringn`), so an OSC 8 inside a `Span` reaches the terminal
+/// as bare `]8;;…` text. A cell written through `Cell::set_symbol` is not
+/// filtered, and both escapes are zero-width, so each rides on a character
+/// that is already there: the open on the first cell of the row, the close on
+/// the last one. `CellDiffOption::ForcedWidth(1)` tells the diff the cell is
+/// one column wide all the same — ratatui documents it for exactly this, "escape
+/// sequences will have some computed width that does not match what is written
+/// to the screen" — so the cursor the terminal advances is still the row's text.
+///
+/// Every row of a wrapped URL carries the whole URL, so clicking any row of
+/// the link opens it. A terminal that ignores OSC 8 consumes the sequences
+/// and shows the same text; the frame itself still holds that text, so a
+/// redraw after a resize or a scroll re-emits the link with it.
+fn paint_links(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, links: &[LinkPaint]) {
+    if links.is_empty() {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for link in links {
+        let y = area.y.saturating_add(link.row);
+        let first = area.x;
+        // The columns the text really takes: a character is at least one cell.
+        let mut cells = 0u16;
+        let mut last = None;
+        for ch in link.text.chars() {
+            last = Some(cells);
+            cells =
+                cells.saturating_add(titi_tui::width::visible_width(&ch.to_string()).max(1) as u16);
+        }
+        let Some(offset) = last else {
+            continue;
+        };
+        let Some(cell) = buf.cell_mut((first, y)) else {
+            continue;
+        };
+        let mut open = titi_tui::caps::osc8_open(&link.url);
+        open.push_str(cell.symbol());
+        cell.set_symbol(&open);
+        cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+        let Some(cell) = buf.cell_mut((first.saturating_add(offset), y)) else {
+            continue;
+        };
+        let mut close = cell.symbol().to_owned();
+        close.push_str(titi_tui::caps::OSC8_CLOSE);
+        cell.set_symbol(&close);
+        cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
     }
 }
 
@@ -3356,14 +3452,98 @@ fn consider_image(found: &mut Vec<String>, raw: &str) {
     }
 }
 
-fn message_rows(line: &TranscriptLine, width: usize, ink: &Ink) -> Vec<Line<'static>> {
-    match line.kind {
+/// The rows of one transcript line, plus every row that carries a URL.
+fn message_rows(
+    line: &TranscriptLine,
+    width: usize,
+    ink: &Ink,
+) -> (Vec<Line<'static>>, Vec<LinkRow>) {
+    if line.kind == LineKind::Note
+        && let Some((head, url, instructions)) = login_link(&line.text)
+    {
+        return link_note(head, url, instructions, ink, width);
+    }
+    let rows = match line.kind {
         LineKind::User => speech("you", ink.gold, ink.text, &line.text, width, ink),
         LineKind::Assistant => speech("titi", ink.accent, ink.text, &line.text, width, ink),
         LineKind::Tool => chip(tool_chip(&line.text, ink), ink, width),
         LineKind::Error => chip(("✕", ink.red, line.text.clone(), ink.red), ink, width),
         LineKind::Note => chip(("·", ink.dim, line.text.clone(), ink.dim), ink, width),
+    };
+    (rows, Vec::new())
+}
+
+/// The sign-in note as its three parts: the head line, the authorize URL and
+/// the trailing instructions.
+fn login_link(text: &str) -> Option<(&str, &str, &str)> {
+    let (head, rest) = text.split_once('\n')?;
+    let (url, instructions) = rest.split_once('\n').unwrap_or((rest, ""));
+    if !head.starts_with("login ") || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
     }
+    Some((head, url, instructions))
+}
+
+/// A sign-in note: the head and the instructions are ordinary chip rows, the
+/// URL gets rows of its own.
+///
+/// [`chip`] would indent every row past the first and cut a word with no
+/// space at the pane edge, so a long URL came out split across rows with five
+/// spaces of chrome in the middle and no row holding a clickable link. Here
+/// each URL row is exactly one slice of the URL, flush left on the pane
+/// width, so the rows still spell the URL when a terminal has no hyperlinks
+/// — and [`paint_links`] can hang that same URL on every row.
+fn link_note(
+    head: &str,
+    url: &str,
+    instructions: &str,
+    ink: &Ink,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<LinkRow>) {
+    let mut rows = chip(("·", ink.dim, head.to_owned(), ink.dim), ink, width);
+    let mut links = Vec::new();
+    for piece in wrap_url(url, width) {
+        links.push(LinkRow {
+            row: rows.len(),
+            url: url.to_owned(),
+            text: piece.clone(),
+        });
+        rows.push(Line::from(Span::styled(piece, ink.fg(ink.dim))));
+    }
+    if !instructions.is_empty() {
+        // The continuation shape [`chip`] would have given the third
+        // paragraph: five spaces under the text column, no mark of its own.
+        let room = width.saturating_sub(6).max(4);
+        for piece in wrap_plain(instructions, room) {
+            rows.push(Line::from(vec![
+                Span::styled("     ", ink.page()),
+                Span::styled(piece, ink.fg(ink.dim)),
+            ]));
+        }
+    }
+    (rows, links)
+}
+
+/// Cuts `url` into pane-wide rows without losing a character: every byte
+/// lands on exactly one row, so the rows concatenate back to the URL.
+fn wrap_url(url: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut piece = String::new();
+    let mut col = 0usize;
+    for ch in url.chars() {
+        let cell = titi_tui::width::visible_width(&ch.to_string());
+        if col + cell > width && !piece.is_empty() {
+            rows.push(std::mem::take(&mut piece));
+            col = 0;
+        }
+        piece.push(ch);
+        col += cell;
+    }
+    if !piece.is_empty() || rows.is_empty() {
+        rows.push(piece);
+    }
+    rows
 }
 
 fn speech(
@@ -5891,7 +6071,7 @@ mod tests {
             kind: LineKind::Note,
             text: "alpha\nbeta\n\ngamma".to_owned(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &ink));
+        let rows = row_texts(&message_rows(&line, 40, &ink).0);
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(rows[0].contains("alpha"), "{rows:?}");
         assert!(rows[1].contains("beta"), "{rows:?}");
@@ -5911,7 +6091,7 @@ mod tests {
             kind: LineKind::Note,
             text: words.clone(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &ink));
+        let rows = row_texts(&message_rows(&line, 40, &ink).0);
         assert!(rows.len() >= 8, "{rows:?}");
         for row in &rows {
             assert!(
@@ -5939,10 +6119,371 @@ mod tests {
                 kind,
                 text: "first\nsecond".to_owned(),
             };
-            let rows = row_texts(&message_rows(&line, 40, &ink));
+            let rows = row_texts(&message_rows(&line, 40, &ink).0);
             assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
             assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
         }
+    }
+
+    /// The URL of a sign-in note is never cut mid-token and never carries the
+    /// chip's mark or indent: every row of it is a slice of the URL, so the
+    /// rows join back to the URL byte for byte.
+    #[test]
+    fn a_long_login_url_is_one_slice_per_row() {
+        let ink = Ink::titanium();
+        let url = format!(
+            "https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann\
+             &response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
+             &scope=openid%20profile%20email%20offline_access&state={}",
+            "b".repeat(60)
+        );
+        let line = TranscriptLine {
+            kind: LineKind::Note,
+            text: format!(
+                "login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"
+            ),
+        };
+        let (rows, links) = message_rows(&line, 78, &ink);
+        let texts = row_texts(&rows);
+        assert!(
+            links.len() >= 4,
+            "a 300-char URL spans rows: {}",
+            links.len()
+        );
+        let visible: String = links.iter().map(|link| link.text.as_str()).collect();
+        assert_eq!(visible, url, "rows lost or changed a byte");
+        for link in &links {
+            assert_eq!(link.url, url, "every row targets the whole URL");
+            assert_eq!(texts[link.row], link.text, "the drawn row is the URL slice");
+            assert!(
+                titi_tui::width::visible_width(&texts[link.row]) <= 78,
+                "row over the pane: {:?}",
+                texts[link.row]
+            );
+            assert!(
+                !texts[link.row].contains('·'),
+                "the chip mark is not part of the link: {:?}",
+                texts[link.row]
+            );
+        }
+        assert!(texts[0].contains("login openai-codex"), "{texts:?}");
+        assert!(texts[0].contains('·'), "{texts:?}");
+        assert!(
+            texts[rows.len() - 1].contains("Enter code: WXYZ"),
+            "{texts:?}"
+        );
+    }
+
+    /// A URL that fits one row is one link row, and the row is the URL.
+    #[test]
+    fn a_short_login_url_is_one_row() {
+        let ink = Ink::titanium();
+        let url = "https://auth.openai.com/codex/device";
+        let line = TranscriptLine {
+            kind: LineKind::Note,
+            text: format!(
+                "login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"
+            ),
+        };
+        let (rows, links) = message_rows(&line, 78, &ink);
+        assert_eq!(links.len(), 1, "{:?}", row_texts(&rows));
+        assert_eq!(row_texts(&rows)[links[0].row], url);
+        assert_eq!(links[0].url, url);
+    }
+
+    /// Every other note, and every error, stays exactly as it was: no OSC 8,
+    /// even when its text happens to hold a URL.
+    #[test]
+    fn other_lines_get_no_link_rows() {
+        let ink = Ink::titanium();
+        for (kind, text) in [
+            (
+                LineKind::Note,
+                "see https://example.invalid/docs for the rest",
+            ),
+            (LineKind::Error, "login: https://example.invalid/failed"),
+            (
+                LineKind::Note,
+                "login openai-codex: waiting for the browser",
+            ),
+            (
+                LineKind::Note,
+                "login openai-codex: no URL\nEnter code: WXYZ",
+            ),
+            (
+                LineKind::Assistant,
+                "login x: open this URL\nhttps://example.invalid\nnow",
+            ),
+        ] {
+            let line = TranscriptLine {
+                kind,
+                text: text.to_owned(),
+            };
+            let (_, links) = message_rows(&line, 78, &ink);
+            assert!(links.is_empty(), "{kind:?} {text:?} grew a link: {links:?}");
+        }
+    }
+
+    /// The frame's own cells carry the link: the open sequence and the whole
+    /// URL sit on the first cell of every row the URL spans, the close on the
+    /// last, and what the rows spell is still exactly the URL.
+    #[test]
+    fn a_frame_hangs_the_whole_url_on_every_row() {
+        let url = long_authorize_url('c');
+        let mut chat = chat();
+        chat.push(
+            LineKind::Note,
+            format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
+        );
+        let rows = frame_rows(&mut chat, 80, 20);
+        let open = format!("\x1b]8;;{url}\x1b\\");
+        let link_rows: Vec<&String> = rows.iter().filter(|row| row.contains("\x1b]8;;")).collect();
+        let chunks = wrap_url(&url, 78);
+        assert!(chunks.len() >= 4, "the URL spans rows: {chunks:?}");
+        assert_eq!(link_rows.len(), chunks.len(), "{link_rows:?}");
+        let mut shown = String::new();
+        for (row, chunk) in link_rows.iter().zip(&chunks) {
+            assert_eq!(
+                row.matches(&open).count(),
+                1,
+                "the row targets the whole URL: {row:?}"
+            );
+            assert_eq!(
+                row.matches(titi_tui::caps::OSC8_CLOSE).count(),
+                1,
+                "{row:?}"
+            );
+            let visible = strip_escapes(row);
+            assert_eq!(visible.trim_end(), *chunk, "row shows its slice: {row:?}");
+            assert!(!visible.contains('…'), "nothing elided: {row:?}");
+            shown.push_str(visible.trim_end());
+        }
+        assert_eq!(shown, url, "the rows spell the URL byte for byte");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("login openai-codex: open this URL")),
+            "the head line is still there: {rows:?}"
+        );
+    }
+
+    /// A URL that fits one row gets exactly one open and one close.
+    #[test]
+    fn a_one_row_link_has_one_pair() {
+        let url = "https://auth.openai.com/codex/device";
+        let mut chat = chat();
+        chat.push(
+            LineKind::Note,
+            format!("login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"),
+        );
+        let rows = frame_rows(&mut chat, 80, 20);
+        let link_rows: Vec<&String> = rows.iter().filter(|row| row.contains("\x1b]8;;")).collect();
+        assert_eq!(link_rows.len(), 1, "{link_rows:?}");
+        assert_eq!(link_rows[0].matches("\x1b]8;;").count(), 2);
+        assert_eq!(strip_escapes(link_rows[0]).trim_end(), url);
+    }
+
+    /// End to end through a real backend: the bytes the terminal receives
+    /// carry the whole URL on every row, and a screen that ignores OSC 8
+    /// shows the URL, whole, with no ellipsis.
+    #[test]
+    fn a_frame_and_the_backend_leave_the_url_whole() {
+        let url = long_authorize_url('d');
+        let mut chat = chat();
+        chat.push(
+            LineKind::Note,
+            format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
+        );
+        let sink = Sink::default();
+        let mut terminal = match ratatui::Terminal::new(CrosstermBackend::new(sink.clone())) {
+            Ok(terminal) => terminal,
+            Err(error) => panic!("test backend: {error}"),
+        };
+        assert!(
+            terminal
+                .resize(ratatui::layout::Rect::new(0, 0, 80, 20))
+                .is_ok()
+        );
+        assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
+        let raw = String::from_utf8_lossy(&sink.0.borrow()).into_owned();
+        let open = format!("\x1b]8;;{url}\x1b\\");
+        let chunks = wrap_url(&url, 78);
+        assert_eq!(
+            raw.matches(&open).count(),
+            chunks.len(),
+            "every row targets the whole URL"
+        );
+        assert_eq!(
+            raw.matches(titi_tui::caps::OSC8_CLOSE).count(),
+            chunks.len()
+        );
+        let view = screen(&raw, 80, 20);
+        let first = match view.iter().position(|row| row.starts_with("https://")) {
+            Some(first) => first,
+            None => panic!("no URL row on the screen: {view:?}"),
+        };
+        let shown: String = view[first..first + chunks.len()]
+            .iter()
+            .map(|row| row.trim_end())
+            .collect();
+        assert_eq!(
+            shown, url,
+            "escapes ignored, the screen shows the URL whole"
+        );
+        assert!(
+            view.iter().any(|row| row.contains("login openai-codex")),
+            "the head line is on the screen: {view:?}"
+        );
+    }
+
+    /// A frame with an ordinary note and an error carries no hyperlink at all,
+    /// even when the text holds a URL.
+    #[test]
+    fn a_frame_without_a_login_url_has_no_osc8() {
+        let mut chat = chat();
+        chat.push(LineKind::Note, "model openai/gpt-4.1".to_owned());
+        chat.push(
+            LineKind::Error,
+            "login: see https://example.invalid/trouble".to_owned(),
+        );
+        for row in frame_rows(&mut chat, 80, 20) {
+            assert!(!row.contains("\x1b]8;;"), "an OSC 8 leaked: {row:?}");
+        }
+    }
+
+    fn long_authorize_url(fill: char) -> String {
+        format!(
+            "https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann\
+             &response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
+             &scope=openid%20profile%20email%20offline_access&state={}",
+            fill.to_string().repeat(40)
+        )
+    }
+
+    /// The rendered cells of every row of a frame, escapes included.
+    fn frame_rows(chat: &mut Chat, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => panic!("test backend: {error}"),
+        };
+        assert!(terminal.draw(|frame| draw(frame, chat)).is_ok());
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A backend that keeps what it was given, so a test can read the bytes
+    /// the terminal would have received.
+    #[derive(Clone, Default)]
+    struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What a screen renderer shows: CSI and OSC sequences consumed, CUP
+    /// moves the cursor, every other character lands in the grid. A terminal
+    /// that ignores OSC 8 sees exactly this.
+    fn screen(text: &str, width: usize, height: usize) -> Vec<String> {
+        let mut grid = vec![vec![' '; width]; height];
+        let mut row = 0usize;
+        let mut col = 0usize;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' {
+                if row < height && col < width {
+                    grid[row][col] = ch;
+                }
+                col += 1;
+                if col >= width {
+                    col = 0;
+                    row += 1;
+                }
+                continue;
+            }
+            match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    let mut command = ' ';
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            command = next;
+                            break;
+                        }
+                        params.push(next);
+                    }
+                    if command == 'H' {
+                        let mut parts = params.split(';');
+                        row = parts
+                            .next()
+                            .and_then(|part| part.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                        col = parts
+                            .next()
+                            .and_then(|part| part.parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .saturating_sub(1);
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        grid.into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect()
+    }
+
+    /// What a screen renderer shows: CSI and OSC sequences removed, the rest
+    /// kept in order.
+    fn strip_escapes(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' {
+                out.push(ch);
+                continue;
+            }
+            match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// The whole block reaches the screen, each piece on a row of its own.

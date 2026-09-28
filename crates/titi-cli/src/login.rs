@@ -171,11 +171,7 @@ impl Default for TerminalUi {
 
 impl OAuthUi for TerminalUi {
     fn on_auth(&self, url: &str, instructions: &str) {
-        eprintln!("{instructions}");
-        eprintln!();
-        eprintln!("Open this URL in your browser:\n{url}");
-        eprintln!();
-        eprintln!("Paste the authorization code (or the full redirect URL):");
+        eprint!("{}", auth_notice(url, instructions));
         open_browser(url);
     }
 
@@ -186,6 +182,17 @@ impl OAuthUi for TerminalUi {
     fn manual_code(&self) -> Option<String> {
         self.lines.lock().ok()?.pop_front()
     }
+}
+
+/// What `titi --login` prints when the provider wants a browser. The URL is
+/// one OSC 8 hyperlink; a terminal that does not speak the sequence consumes
+/// it and prints the URL unchanged.
+fn auth_notice(url: &str, instructions: &str) -> String {
+    format!(
+        "{instructions}\n\nOpen this URL in your browser:\n{}\n\n\
+         Paste the authorization code (or the full redirect URL):\n",
+        titi_tui::caps::osc8_link(url, url)
+    )
 }
 
 /// Hands the URL to the desktop's opener. A browser that does not open costs
@@ -319,5 +326,29 @@ mod tests {
             panic!("an unknown provider must not run a flow");
         };
         assert_eq!(reason, "unknown oauth provider nope");
+    }
+
+    /// The terminal path prints the URL once, as one clickable link, and
+    /// still prints the URL itself when the sequence is ignored.
+    #[test]
+    fn the_auth_notice_links_the_whole_url() {
+        let url = "https://auth.openai.com/oauth/authorize?client_id=app_X&state=abc";
+        let printed = auth_notice(url, "A browser should open.");
+        let open = format!("\x1b]8;;{url}\x1b\\");
+        assert_eq!(printed.matches(&open).count(), 1, "{printed:?}");
+        assert_eq!(printed.matches(titi_tui::caps::OSC8_CLOSE).count(), 1);
+        assert!(
+            printed.contains(&format!("Open this URL in your browser:\n{open}{url}")),
+            "{printed:?}"
+        );
+        assert!(printed.contains("A browser should open."), "{printed:?}");
+        // A screen with no hyperlink support drops the sequence and keeps the URL.
+        let plain = printed
+            .replace(&open, "")
+            .replace(titi_tui::caps::OSC8_CLOSE, "");
+        assert!(
+            plain.contains(&format!("Open this URL in your browser:\n{url}")),
+            "{plain:?}"
+        );
     }
 }

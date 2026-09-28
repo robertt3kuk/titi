@@ -313,6 +313,22 @@ pub fn wrap_sync(frame: &str) -> String {
     format!("\x1b[?2026h{frame}\x1b[?2026l")
 }
 
+/// OSC 8 hyperlink open sequence (`ESC ] 8 ; ; <uri> ST`), with `ST` = `ESC \`.
+///
+/// A terminal that does not know OSC 8 consumes the sequence and prints the
+/// text that follows unchanged, so the visible text is always the whole fallback.
+pub fn osc8_open(uri: &str) -> String {
+    format!("\x1b]8;;{uri}\x1b\\")
+}
+
+/// OSC 8 hyperlink close sequence (`ESC ] 8 ; ; ST`).
+pub const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
+
+/// `text` as one clickable link to `uri`; the visible text is untouched.
+pub fn osc8_link(uri: &str, text: &str) -> String {
+    format!("{}{text}{OSC8_CLOSE}", osc8_open(uri))
+}
+
 /// OSC 52 clipboard copy (`ESC ] 52 ; c ; <base64> BEL`).
 pub fn osc52_copy(text: &str) -> String {
     use base64::Engine as _;
@@ -582,6 +598,20 @@ mod tests {
         assert!(seq.starts_with("\x1b]52;c;"));
         assert!(seq.ends_with('\u{07}'));
         assert!(seq.contains("aGk="), "base64(hi)=aGk=: {seq}");
+    }
+
+    #[test]
+    fn osc8_link_wraps_the_text_with_the_uri_as_the_target() {
+        let url = "https://example.invalid/a?b=c%20d";
+        assert_eq!(
+            osc8_open(url),
+            "\x1b]8;;https://example.invalid/a?b=c%20d\x1b\\"
+        );
+        assert_eq!(OSC8_CLOSE, "\x1b]8;;\x1b\\");
+        assert_eq!(
+            osc8_link(url, "click"),
+            "\x1b]8;;https://example.invalid/a?b=c%20d\x1b\\click\x1b]8;;\x1b\\"
+        );
     }
 
     #[test]
