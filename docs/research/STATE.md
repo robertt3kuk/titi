@@ -8,23 +8,26 @@
 
 Обновляется после каждого шага. Новая сессия начинает отсюда.
 
-## OAuth-вход в провайдера (2026-09-28, in-progress)
+## OAuth-вход в провайдера (2026-09-28, код в master, ждёт живого входа)
 
-Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забрать можно дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция), порт ≈700 строк Rust.
+Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забраны дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция); порт — таблица констант Rust и свой поток поверх неё.
 
-Состояние кода на сегодня (проверено по файлам, не по памяти): `auth.db` знает только `kind`/`token`/`expires_at` (v2, `store.rs`); лестница кредов в `titi-providers/src/creds.rs` существует, но живой `LayeredCredentialSource` (`titi-engine/src/registry.rs:181-207`) её не вызывает и читает env/.env → одну строку store; `/login` и `--set-key` всегда пишут `api_key`; ни PKCE, ни authorize-URL, ни callback-сервера, ни refresh, ни `expires_at`-обработки, ни авторизации по `CredKind` в `wire.rs` нет. То есть «логин» чинится не патчем, а реализацией потока.
+Сделано в `c3a57ef`: `titi-providers::oauth` (PKCE S256 из 96 байт → base64url, callback на `TcpListener` с разбором `code`/`state`/`error`, 404 на чужой путь, `port_fallback #false` у Codex, обмен кода JSON у Anthropic и form у Codex, идентичность Anthropic через bootstrap-запрос и Codex через claim'ы JWT, refresh, device-grant Codex; base64url и percent-encoding свои, из зависимостей только `sha2`); `auth.db` v3 с `refresh_token`/идентичностью и миграцией из v2; провод по `CredKind` (`Authorization: Bearer` + Claude Code отпечаток у Anthropic, `chatgpt-account-id`/`openai-beta` у Codex); движок — свеп `refresh_due` по skew перед ходом (терминальный отказ refresh удаляет строку, транзиентная ошибка оставляет); поверхность — `titi --login [provider]` (и `--login --device <id>`), `/login <provider>` в чате с печатью URL и вставкой кода, `/keys` с видом и остатком жизни.
+
+Тесты на момент коммита: `titi-providers` 151, `titi-secrets` 24, `titi-engine` 231, `titi-cli` 266; workspace 1464 passed, 0 failed. Смоук без сети и ключей: `titi --login` печатает `anthropic  Anthropic (Claude Pro/Max)` и `openai-codex  ChatGPT Plus/Pro (Codex Subscription)` и выходит 0; `titi --login nonexistent` печатает `unknown oauth provider nonexistent` и выходит 2; `titi --help` называет `--login`.
 
 | Шаг | Статус | Где |
 |-----|--------|-----|
 | Ресерч omp (движки oauth-code/device/refresh, дескрипторы, хранилище, CLI-UX, инференс-заголовки) | done | [oauth-login.md](providers-streaming/oauth-login.md) |
-| План среза (крейты, типы, тесты, DoD) | review, ждёт решения владельца по объёму | `oauth-login.md`, секции «Rust-маппинг» и «Definition of Done» |
-| Реализация: `titi-providers::oauth` (PKCE, callback, обмен, refresh, дескрипторы anthropic/openai-codex) | todo | — |
-| Хранилище v3: `refresh_token`, идентичность, миграция | todo | `crates/titi-secrets/src/store.rs` |
-| Провод: авторизация по `CredKind` (Anthropic OAuth → `Authorization: Bearer` + `anthropic-beta`) | todo | `crates/titi-providers/src/wire.rs` |
-| Поверхность: `--login`, `/login <provider>` с callback+вставкой кода, `/keys` c oauth | todo | `crates/titi-cli/src/{main.rs,chat.rs,secrets.rs}` |
-| Живая проверка владельцем (браузер + подписка) | blocked до реализации | `docs/QA_STATUS.md` |
+| План среза (крейты, типы, тесты, DoD) | done | `oauth-login.md`, секции «Rust-маппинг» и «Definition of Done» |
+| Реализация: `titi-providers::oauth` (PKCE, callback, обмен, refresh, дескрипторы anthropic/openai-codex) | done, `c3a57ef` | `crates/titi-providers/src/oauth/{mod,pkce,callback,encode,device,provider}.rs` |
+| Хранилище v3: `refresh_token`, идентичность, миграция из v2 | done, `c3a57ef` | `crates/titi-secrets/src/store.rs` |
+| Провод: авторизация по `CredKind` (Anthropic OAuth → `Authorization: Bearer` + `anthropic-beta` + отпечаток Claude Code; Codex → `chatgpt-account-id` + `openai-beta` и тело подписочного бэкенда) | done, `c3a57ef` | `crates/titi-providers/src/wire.rs` |
+| Свеп refresh по skew перед ходом, карантин отвергнутого refresh-токена | done, `c3a57ef` | `crates/titi-engine/src/registry.rs` |
+| Поверхность: `--login [provider]`, `--login --device <id>`, `/login <provider>` с callback+вставкой кода, `/keys` c oauth | done, `c3a57ef` | `crates/titi-cli/src/{main.rs,chat.rs,secrets.rs,login.rs}` |
+| Живая проверка владельцем (браузер + подписка + один ход на OAuth-токене) | blocked | `docs/QA_STATUS.md` |
 
-NEXT: получить решение по объёму первого среза (оба провайдера или только Anthropic; инференс Codex через `/backend-api/codex/responses` — отдельно), затем CONVEYOR: тесты → код → CI.
+NEXT: живой вход владельцем — `titi --login anthropic`, затем один ход модели на OAuth-токене (нужны настоящий браузер и подписка), результат — в `docs/QA_STATUS.md`. Кода это не требует: device-flow и Codex-инференс (`/backend-api/codex/responses`) уже в срезе, вне его остались auth-broker (`titi creds serve`), мульти-аккаунты с бэкоффом и импорт кред Claude Code/Codex CLI.
 
 ## Ход, история и промпт до провайдера (2026-09-23, вторая половина)
 

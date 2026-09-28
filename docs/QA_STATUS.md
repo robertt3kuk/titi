@@ -19,6 +19,7 @@ Last full manual pass: — (none recorded yet)
 | `--prompt` one-shot | unverified | — | — | |
 | `--headless` JSONL ready frame | unverified | — | — | |
 | `/goal` listing, usage error, start and stop | partial | 2026-09-23 (b2041ce) | tmux 110×30 | `/go` lists `/goal`; bare `/goal` → usage; `/goal <text>` starts and stops cleanly with 0 rounds when no key is set. A live coder/reviewer run needs a provider key — not done. |
+| OAuth login (`--login`, `/login`, `/keys`) | partial | 2026-09-28 (c3a57ef) | `cargo run -p titi-cli` (flag smoke; no terminal needed) | Implemented: `titi --login [provider]`, `titi --login --device <id>` (Codex device code), `/login <provider>` in the chat (prints the authorize URL, Enter hands over the pasted code, Esc cancels without writing), `/keys` shows `oauth` with the remaining lifetime. Smoke without network or keys: `--login` lists `anthropic` and `openai-codex` and exits 0; `--login nonexistent` prints `unknown oauth provider nonexistent` and exits 2; `--help` names `--login`. **Pending the owner:** the live login `titi --login anthropic` (real browser and a paid subscription), then one model turn on the OAuth token to prove the subscription headers are accepted — neither was exercised here. |
 
 Status values: `pass`, `fail` (link the issue or commit), `partial`,
 `unverified`.
