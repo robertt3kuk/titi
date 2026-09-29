@@ -55,7 +55,7 @@ titi --headless --goal "cargo test -p titi-core passes"
 titi --mode plan
 ```
 
-`--headless` reads `{"v":1,"command":…}` frames from stdin and writes events to stdout. The first line is `{"ready":true,"protocol":1}`.
+`--headless` reads `{"v":1,"command":…}` frames from stdin and writes events to stdout. The first line is `{"ready":true,"protocol":1}`. Not every command answers with an event — `Steer`, `RestoreHistory`, `Cancel` with no turn, and `ApproveTool` are quiet, so a client must not block on a reply to them — and closing stdin ends the run.
 
 `--goal` runs the coder/reviewer loop without a screen and exits with the code CI reads: `0` when the reviewer passes it, `1` on a partial verdict, `3` on anything else, a missing verdict included. Events still go to stdout as JSONL; the report line goes to stderr, where a shell script can read it without parsing the stream.
 
@@ -251,7 +251,7 @@ titi --headless --goal "cargo test -p titi-core проходит"
 titi --mode plan
 ```
 
-`--headless` читает со stdin кадры `{"v":1,"command":…}` и пишет события в stdout. Первая строка — `{"ready":true,"protocol":1}`.
+`--headless` читает со stdin кадры `{"v":1,"command":…}` и пишет события в stdout. Первая строка — `{"ready":true,"protocol":1}`. Отвечает событием не каждая команда — `Steer`, `RestoreHistory`, `Cancel` без активного хода и `ApproveTool` молчат, поэтому клиент не должен ждать от них ответа, — а закрытие stdin завершает прогон.
 
 `--goal` гоняет цикл «кодер + ревьюер» без экрана и выходит с кодом, который читает CI: `0`, если ревьюер принял, `1` при частичном вердикте, `3` во всех остальных случаях, включая отсутствие вердикта. События по-прежнему уходят в stdout как JSONL; строка отчёта — в stderr, чтобы её мог прочитать shell-скрипт, не разбирая поток.
 

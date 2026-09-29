@@ -26,10 +26,16 @@
 
 Заодно не-2xx теперь несёт собственную формулировку провайдера (`error.message`/`code` или голое `message`; тело читается лимитированно и по таймауту, одна строка, креды маскируются, текст режется) вместо `upstream status N` (`crates/titi-providers/src/wire.rs`) — именно это сделало тот `400` читаемым.
 
-Наблюдения, которые НЕ чинились (оба — до сегодняшнего дня, не регрессии):
+`SwitchModel` починен (`459f7dc`): команда меняла модель и не эмитила события движка (`crates/titi-engine/src/runtime.rs:766`), поэтому headless-JSONL клиент не мог переключить модель перед ходом, а `crates/titi-cli/src/headless.rs:99` ждал терминального события и висел — `printf … | titi --headless` стоял до таймаута клиента. Теперь движок отвечает `EngineEvent::ModelSwitched { turn_id: Option<TurnId>, from, to }`: standalone-переключение шлёт `None` (у переключения вне хода нет хода, который можно назвать), фолбэк посреди хода — `Some(id)`, и вариант остался один, чтобы поверхность, которой нужна только пара `from`/`to`, читала оба случая одинаково; arm отвечает и когда модель не меняется, чтобы клиент, ждущий исхода, не висел на no-op. `headless::run` читает stdin своим потоком, качает события движка, пока ждёт следующий кадр, и завершает прогон на EOF, когда в полёте нет джоба; неотвечающие команды (`Steer`, `RestoreHistory`, `Cancel` без хода, `ApproveTool`) описаны в доках модуля и README.
 
-- `SwitchModel` не эмитит событие движка (`crates/titi-engine/src/runtime.rs:766`), поэтому headless-JSONL клиент не может переключить модель перед ходом, а `crates/titi-cli/src/headless.rs:99` ждёт терминального события и висит;
+Остаётся одно наблюдение (до сегодняшнего дня, не регрессия):
+
 - `crates/titi-cli/src/app.rs` и стек оверлеев `titi-tui` недостижимы из продакшн-бинарника: он запускает `chat::run` (`crates/titi-cli/src/main.rs:292`).
+
+Два недочёта этой правки, найденные и не чинившиеся (оба открыты, строки по `459f7dc`):
+
+- чат печатает заметку о переключении дважды — обработчик события и командная сторона (`crates/titi-cli/src/chat.rs:535`, `:813`, `:1116`); остаться должна ровно одна;
+- `crates/titi-cli/src/app.rs:930-932` печатает `model fallback: …` и для standalone-переключения, где слово «fallback» теперь неверно (сегодня эта поверхность из продакшн-бинарника не достижима).
 
 Тесты после правок (локально, `--locked`): `titi-cli` 276, `titi-providers` 162, `titi-engine` 231, `titi-secrets` 24; workspace 1485 passed, 0 failed; `cargo fmt --all --check`, `cargo clippy --workspace --all-targets` и `cargo check --workspace --all-targets` чисты (у clippy только прежние `unwrap`/`expect` в тестовых модулях).
 
@@ -53,7 +59,7 @@
 | Не-2xx несёт сообщение провайдера вместо `upstream status N` | done, `092be78` | `crates/titi-providers/src/wire.rs` |
 | Живая проверка владельцем: вход Claude (браузер + подписка) | blocked (нет подписки) | `docs/QA_STATUS.md` |
 
-NEXT: остаются нерешёнными только два наблюдения выше (`SwitchModel` без события движка → headless висит; `app.rs` + оверлеи `titi-tui` недостижимы из бинарника) и живые проверки, для которых нужна подписка/время: вход Claude владельцем и свеп refresh на живом токене. Кода срез не требует: device-flow и Codex-инференс (`/backend-api/codex/responses`) уже в master, вне его остались auth-broker (`titi creds serve`), мульти-аккаунты с бэкоффом и импорт кред Claude Code/Codex CLI.
+NEXT: остаётся нерешённым одно наблюдение выше (`app.rs` + оверлеи `titi-tui` недостижимы из бинарника) и два недочёта переключения модели (двойная заметка в чате, `crates/titi-cli/src/chat.rs:535`/`:813`/`:1116`; `model fallback` в `crates/titi-cli/src/app.rs:930-932`), а из живых проверок нужны подписка/время: вход Claude владельцем и свеп refresh на живом токене. Кода срез не требует: device-flow и Codex-инференс (`/backend-api/codex/responses`) уже в master, вне его остались auth-broker (`titi creds serve`), мульти-аккаунты с бэкоффом и импорт кред Claude Code/Codex CLI.
 
 ## Ход, история и промпт до провайдера (2026-09-23, вторая половина)
 
