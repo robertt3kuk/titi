@@ -176,6 +176,47 @@ struct PendingApproval {
     name: String,
 }
 
+/// What the running turn is doing, for the status row above the composer.
+///
+/// Every phase is entered because an engine event said so; none is guessed
+/// from a flag. There is no request-sent and no first-token event, so
+/// `Waiting` is the turn's state from the moment it is asked for until the
+/// first `StreamDelta` or `ThinkingDelta` — the interval that used to be
+/// invisible.
+///
+/// Ownership rule, so the screen never reports one fact twice: this row owns
+/// the moving glyph, the elapsed seconds and the one fact that changes (the
+/// phase, the characters received, the tool's name). The masthead keeps only
+/// the slow state word, the mode and the model; the composer keeps the key
+/// hints.
+#[derive(Debug, Clone)]
+enum WorkPhase {
+    /// Asked for; the model has not answered with anything yet.
+    Waiting,
+    /// Assistant text is arriving. The count is read from the reply the
+    /// deltas built, so it is what the chat received, not a token estimate.
+    Streaming,
+    /// Reasoning is arriving and no answer text has yet. The events tell
+    /// these apart: `ThinkingDelta` is not `StreamDelta`
+    /// (crates/titi-engine/src/protocol.rs:166-172).
+    Thinking,
+    /// One tool call is running. `call_id` is what a `ToolFinished` must
+    /// carry before this phase may end, so a second call cannot end the
+    /// first one's state.
+    Tool {
+        call_id: String,
+        name: String,
+        since: Instant,
+    },
+}
+
+impl WorkPhase {
+    /// Whether this phase is the given tool call, still running.
+    fn is_tool(&self, call_id: &str) -> bool {
+        matches!(self, Self::Tool { call_id: running, .. } if running == call_id)
+    }
+}
+
 /// A login the screen started but has not finished.
 ///
 /// The flow itself is a task; this is only the two ends the render loop
@@ -194,9 +235,13 @@ pub struct Chat {
     input: String,
     turn_active: bool,
     /// When the running turn was asked for. `Some` exactly while
-    /// `turn_active`: the masthead reads it for the spinner and the elapsed
-    /// seconds, so a request in flight is visible before the first token.
+    /// `turn_active`: the status row above the composer reads it for the
+    /// spinner and the elapsed seconds, so a request in flight is visible
+    /// before the first token.
     turn_started: Option<Instant>,
+    /// Which phase the status row is in. Kept current on every turn so the
+    /// row never shows a stale one; only read while `turn_active`.
+    phase: WorkPhase,
     active_turn_id: Option<titi_engine::TurnId>,
     model: String,
     /// Live: a local server that answers after the first frame adds models,
@@ -272,6 +317,7 @@ impl Chat {
             input: String::new(),
             turn_active: false,
             turn_started: None,
+            phase: WorkPhase::Waiting,
             active_turn_id: None,
             model: model.clone(),
             catalog: crate::engine::ModelCatalog::fixed(vec![model]),
@@ -488,8 +534,11 @@ impl Chat {
                 self.turn_active = true;
                 // A prompt sent from the composer already stamped the start;
                 // one the engine began on its own (a goal, a loop) is stamped
-                // here, so the masthead has a time either way.
+                // here, so the status row has a time either way.
                 self.turn_started.get_or_insert_with(Instant::now);
+                // Whatever a previous turn left in the phase, this turn
+                // starts before its first token: only a delta moves it on.
+                self.phase = WorkPhase::Waiting;
                 self.active_turn_id = Some(turn_id);
                 self.model = model.to_string();
                 self.reply.clear();
@@ -502,14 +551,23 @@ impl Chat {
                 self.drop_thinking();
                 self.reply.push_str(&text);
                 self.show_reply();
+                // A tool cannot stream and run at once, so text is always
+                // the newer fact.
+                self.phase = WorkPhase::Streaming;
                 Applied::none()
             }
             EngineEvent::ThinkingDelta { text, .. } if self.reply.is_empty() => {
                 self.thinking.push_str(&text);
                 self.show_thinking();
+                self.phase = WorkPhase::Thinking;
                 Applied::none()
             }
             EngineEvent::ToolStarted { call_id, name, .. } => {
+                self.phase = WorkPhase::Tool {
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    since: Instant::now(),
+                };
                 self.push(LineKind::Tool, format!("tool {name}"));
                 // The call goes to the session file now, not at the end of
                 // the turn: the result below it has to follow its own call,
@@ -528,12 +586,32 @@ impl Chat {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
                 });
+                // The phase is left as it stands. The engine emits
+                // `ToolStarted` before it asks (crates/titi-engine/src/
+                // tool_loop.rs:145 then :271), so the running call keeps its
+                // own clock while the person decides, and answering hands
+                // the row back to that call without a second start time.
                 self.hint.clear();
                 Applied::none()
             }
             EngineEvent::ToolFinished {
-                output, is_error, ..
+                call_id,
+                output,
+                is_error,
+                ..
             } => {
+                // Only the call that owns the row may end it: a late
+                // `ToolFinished` for another call must not wipe the elapsed
+                // time of the one still running.
+                if self.phase.is_tool(&call_id) {
+                    // A tool only borrows the row. When it returns, the turn
+                    // is the model's again — and after the turn's first
+                    // token it stays `Streaming` between rounds, so a round
+                    // that follows a tool is never mislabelled as the turn's
+                    // first wait. The character count keeps growing from
+                    // where it stood.
+                    self.phase = WorkPhase::Streaming;
+                }
                 let preview = one_line(&output, TOOL_PREVIEW);
                 let text = if is_error {
                     format!("tool error  {preview}")
@@ -1185,6 +1263,7 @@ impl Chat {
                     self.show_history(&messages);
                     self.turn_active = false;
                     self.turn_started = None;
+                    self.phase = WorkPhase::Waiting;
                     self.approval = None;
                     self.push(LineKind::Note, summary);
                     Applied::send(EngineCommand::RestoreHistory { messages }, None)
@@ -2377,6 +2456,9 @@ impl Chat {
         self.recorded_reply = 0;
         self.turn_active = false;
         self.turn_started = None;
+        // No phase outlives its turn: the next one starts in `Waiting`, and
+        // an idle chat must not be left holding a tool's clock.
+        self.phase = WorkPhase::Waiting;
         self.active_turn_id = None;
         self.approval = None;
         self.assistant_at = None;
@@ -3673,11 +3755,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     let panel = panel_view_for(chat, area.height, area.width);
     let picker_h = panel.as_ref().map(PanelView::height).unwrap_or(0);
     let roster_h = roster_height(chat, area.height);
+    let status = work_row(chat, area.width, &ink);
     let cols = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(roster_h),
         Constraint::Min(1),
         Constraint::Length(picker_h),
+        // Zero while nothing is running, so an idle screen keeps every row it
+        // had before this row existed.
+        Constraint::Length(u16::from(status.is_some())),
         Constraint::Length(4),
     ])
     .split(area);
@@ -3696,7 +3782,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if let Some(view) = &panel {
         frame.render_widget(picker_panel(view, cols[3].width, &ink), cols[3]);
     }
-    frame.render_widget(composer(chat, cols[4].width, &ink), cols[4]);
+    if let Some(status) = status {
+        frame.render_widget(status, cols[4]);
+    }
+    frame.render_widget(composer(chat, cols[5].width, &ink), cols[5]);
 }
 
 /// Rows the roster panel takes: one per peer plus its heading, capped so a
@@ -3826,25 +3915,12 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         SessionMode::Agent => String::new(),
         other => format!("  {}", other.label()),
     };
-    // A turn in flight says so with a moving glyph and the time it has been
-    // running: the wait before the first token is the one thing the owner
-    // could not see, and `working` alone cannot tell a live turn from a
-    // stalled one.
-    //
-    // Honest limit: the Responses/Codex decoder does emit `ThinkingDelta`
-    // for reasoning deltas (crates/titi-providers/src/openai.rs:286) and the
-    // transcript shows them, but the Codex request does not ask for a
-    // reasoning summary (crates/titi-providers/src/wire.rs:459), so the first
-    // seconds of such a turn are spent waiting rather than reading. This
-    // glyph is therefore the only sign of life until the first token.
-    let state = match chat.turn_elapsed() {
-        Some(elapsed) => format!(
-            "{} {state} {}",
-            spinner_frame(elapsed),
-            elapsed_label(elapsed)
-        ),
-        None => state.to_owned(),
-    };
+    // A turn in flight is not described here beyond the word `working`:
+    // the moving glyph, the elapsed seconds and every changing fact live in
+    // the status row directly above the composer (`work_row`), which is
+    // where the person is looking and where the prompt they typed came
+    // from. Two lines animating the same clock would make a stall harder to
+    // spot, not easier.
     let mid = format!("  {state}{mode}{loops}");
     let mut right = format!("{}{ctx}  {} ", chat.model, chat.session_label);
     let fixed = titi_tui::width::visible_width(left) + titi_tui::width::visible_width(&mid) + 2;
@@ -3872,6 +3948,84 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         Span::styled(right, ink.fg(ink.muted)),
     ]);
     Paragraph::new(line).style(ink.page())
+}
+
+/// The live status row, drawn on the single line between the conversation and
+/// the composer box, or `None` when there is nothing to report.
+///
+/// `None` is what makes an idle screen identical to a screen from before this
+/// row existed: the caller gives it no height, so it cannot even leave a blank
+/// line behind.
+///
+/// Honest limit for the wait: the Responses/Codex decoder does emit
+/// `ThinkingDelta` for reasoning deltas (crates/titi-providers/src/openai.rs:286),
+/// but a Codex request does not ask for a reasoning summary
+/// (crates/titi-providers/src/wire.rs:459), so on that provider the first
+/// seconds of a turn are spent in `Waiting` with nothing to show for them.
+/// The glyph and the seconds are the whole signal there, and they are the
+/// reason this row exists.
+fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
+    if !chat.turn_active && chat.approval.is_none() {
+        return None;
+    }
+    // An approval outranks the phase it interrupted: the engine is stopped
+    // on a person, and which tool it is stopped on is the fact that matters.
+    // The masthead's `needs you` is the session state; this row says what the
+    // person is being asked about, and the composer below says what to press.
+    if let Some(pending) = &chat.approval {
+        return Some(work_line(
+            "⚠",
+            &format!("needs you · {}", pending.name),
+            ink.amber,
+            width,
+            ink,
+        ));
+    }
+    let elapsed = chat.turn_elapsed().unwrap_or_default();
+    let (glyph, fact, color) = match &chat.phase {
+        WorkPhase::Waiting => (
+            spinner_frame(elapsed),
+            format!("waiting for the first token · {}", elapsed_label(elapsed)),
+            ink.accent,
+        ),
+        WorkPhase::Streaming => (
+            spinner_frame(elapsed),
+            format!(
+                "streaming · {} · {} chars",
+                elapsed_label(elapsed),
+                chat.reply.chars().count()
+            ),
+            ink.accent,
+        ),
+        WorkPhase::Thinking => (
+            spinner_frame(elapsed),
+            format!(
+                "thinking · {} · {} chars",
+                elapsed_label(elapsed),
+                chat.thinking.chars().count()
+            ),
+            ink.gold,
+        ),
+        WorkPhase::Tool { name, since, .. } => (
+            "⚙",
+            format!("{name} · {}", elapsed_label(since.elapsed())),
+            ink.gold,
+        ),
+    };
+    Some(work_line(glyph, &fact, color, width, ink))
+}
+
+/// One status row, cut to the screen with an ellipsis. A row that does not fit
+/// is truncated here rather than wrapped: a wrapped line would push the
+/// composer down and read as part of the conversation.
+fn work_line(glyph: &str, fact: &str, color: Color, width: u16, ink: &Ink) -> Paragraph<'static> {
+    let row = format!(" {glyph} {fact}");
+    let room = (width as usize).saturating_sub(1);
+    let mut text = titi_tui::width::truncate_to_width(&row, room.max(1));
+    if titi_tui::width::visible_width(&row) > room.max(1) {
+        text.push('…');
+    }
+    Paragraph::new(Line::from(Span::styled(text, ink.fg(color)))).style(ink.page())
 }
 
 fn empty_state(height: u16, ink: &Ink) -> Paragraph<'static> {
@@ -4729,10 +4883,21 @@ mod tests {
         after.split_off(before)
     }
 
-    /// The elapsed-seconds token the masthead is showing, if it shows one.
+    /// The elapsed-seconds token the status row is showing, if it shows one.
+    /// The row is the only place a live elapsed time is rendered.
     fn shown_seconds(frame: &str) -> Option<f64> {
-        let rest = &frame[frame.find("working ")? + "working ".len()..];
-        rest[..rest.find('s')?].parse().ok()
+        frame
+            .split([' ', '·'])
+            .filter_map(|token| token.strip_suffix('s'))
+            .find_map(|token| token.parse().ok())
+    }
+
+    /// The row directly above the composer box: the one line the status row
+    /// is drawn on. Read from the rendered frame, so a test sees what a user
+    /// sees and not what a helper promised.
+    fn above_composer(chat: &mut Chat, width: u16, height: u16) -> String {
+        let rows = frame_rows(chat, width, height);
+        rows[height as usize - 5].clone()
     }
 
     fn type_text(chat: &mut Chat, text: &str) {
@@ -5607,6 +5772,316 @@ mod tests {
         assert!(chat.turn_elapsed().is_none());
         assert!(!chat.turn_active);
         assert!(!frame_text(&mut chat).contains("working"));
+    }
+
+    /// The key hints are not what the status row replaces: whatever the row
+    /// says, the composer's caption is still there.
+    #[test]
+    fn the_caption_survives_every_phase() {
+        let mut chat = chat();
+        assert!(frame_text(&mut chat).contains("enter sends  ·  /model  ·  ctrl-c quits"));
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        assert!(frame_text(&mut chat).contains("enter steers  ·  ctrl-c stops"));
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "hello".into(),
+        });
+        assert!(frame_text(&mut chat).contains("enter steers  ·  ctrl-c stops"));
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+        });
+        assert!(frame_text(&mut chat).contains("enter steers  ·  ctrl-c stops"));
+    }
+
+    /// An idle screen is the screen from before this row existed: no row is
+    /// laid out at all, so not even a blank line is left above the composer.
+    #[test]
+    fn an_idle_screen_has_no_status_row() {
+        let mut chat = chat();
+        assert!(work_row(&chat, 80, &Ink::titanium()).is_none());
+        let rows = frame_rows(&mut chat, 80, 24);
+        // The composer still starts where it did: four rows from the bottom.
+        assert!(rows[20].starts_with('╭'), "{:?}", rows[20]);
+        assert!(rows[23].starts_with('╰'), "{:?}", rows[23]);
+        for row in &rows {
+            assert!(!row.contains("streaming"), "{row:?}");
+            assert!(!row.contains("thinking"), "{row:?}");
+            assert!(!row.contains("waiting for the first token"), "{row:?}");
+            assert!(!row.contains("chars"), "{row:?}");
+        }
+    }
+
+    /// From the prompt to the first token the row says what it is waiting
+    /// for, and for how long: `working` alone cannot tell a live turn from a
+    /// stalled one.
+    #[test]
+    fn a_submitted_turn_waits_for_the_first_token() {
+        let mut chat = chat();
+        type_text(&mut chat, "read Cargo.toml");
+        chat.on_key(Key::Enter, Instant::now());
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("waiting for the first token"), "{row:?}");
+        assert!(!row.contains("chars"), "nothing has arrived yet: {row:?}");
+        assert!(shown_seconds(&row).is_some_and(|s| s < 1.0), "{row:?}");
+        assert!(
+            SPINNER.iter().any(|glyph| row.contains(glyph)),
+            "no spinner: {row:?}"
+        );
+        // The masthead keeps the state word but not the clock.
+        let masthead = frame_rows(&mut chat, 80, 20)[0].clone();
+        assert!(masthead.contains("working"), "{masthead:?}");
+        assert!(
+            shown_seconds(&masthead).is_none(),
+            "the clock is the row's alone: {masthead:?}"
+        );
+    }
+
+    /// Text arriving moves the row to streaming, and the count is the text
+    /// the chat received — it grows with every delta.
+    #[test]
+    fn the_first_delta_streams_and_the_count_grows() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "Hello".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("streaming"), "{row:?}");
+        assert!(row.contains("5 chars"), "{row:?}");
+
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: ", world".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("12 chars"), "{row:?}");
+    }
+
+    /// Reasoning is not the answer: `ThinkingDelta` gets its own word, and
+    /// the first answer text takes it back.
+    #[test]
+    fn reasoning_is_a_phase_of_its_own() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "anthropic/claude-sonnet-4-5".into(),
+        });
+        chat.on_event(EngineEvent::ThinkingDelta {
+            turn_id: TurnId(1),
+            text: "weighing it".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("thinking"), "{row:?}");
+        assert!(row.contains("11 chars"), "{row:?}");
+        assert!(!row.contains("streaming"), "{row:?}");
+
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "Hi".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("streaming"), "{row:?}");
+        assert!(!row.contains("thinking"), "{row:?}");
+    }
+
+    /// A tool borrows the row and gives it back when its own call finishes.
+    #[test]
+    fn a_running_tool_owns_the_row_until_its_call_finishes() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "reading".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "read".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("read ·"), "{row:?}");
+        assert!(shown_seconds(&row).is_some(), "{row:?}");
+
+        // A result for a call that is not the one on the row leaves it be:
+        // two calls can never overwrite each other's state.
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: "c2".into(),
+            output: "something else".into(),
+            is_error: false,
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("read ·"), "{row:?}");
+
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            output: "fn main() {}".into(),
+            is_error: false,
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("streaming"), "{row:?}");
+        assert!(row.contains("7 chars"), "{row:?}");
+        assert!(!row.contains("read ·"), "{row:?}");
+    }
+
+    /// While the engine holds a call for an answer, the row is the engine
+    /// waiting on a person and names the tool it stopped on.
+    #[test]
+    fn a_pending_approval_names_the_tool_and_hands_the_row_back() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+        });
+        chat.on_event(EngineEvent::ToolApprovalNeeded {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("needs you"), "{row:?}");
+        assert!(row.contains("bash"), "{row:?}");
+
+        // Answering it is the composer's `y`; the row goes back to the call
+        // that was interrupted, still running.
+        chat.on_key(Key::Char('y'), Instant::now());
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(!row.contains("needs you"), "{row:?}");
+        assert!(row.contains("bash ·"), "{row:?}");
+    }
+
+    /// No phase outlives its turn, however the turn ended.
+    #[test]
+    fn no_status_row_survives_a_finished_turn() {
+        let started = |chat: &mut Chat| {
+            chat.on_event(EngineEvent::TurnStarted {
+                turn_id: TurnId(1),
+                model: "openai/gpt-4.1".into(),
+            });
+            chat.on_event(EngineEvent::ToolStarted {
+                turn_id: TurnId(1),
+                call_id: "c1".into(),
+                name: "bash".into(),
+            });
+            let row = above_composer(chat, 80, 20);
+            assert!(row.contains("bash ·"), "{row:?}");
+            row
+        };
+
+        let mut finished = chat();
+        started(&mut finished);
+        finished.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let row = above_composer(&mut finished, 80, 20);
+        assert!(!row.contains("bash ·"), "{row:?}");
+        assert!(work_row(&finished, 80, &Ink::titanium()).is_none());
+
+        let mut failed = chat();
+        started(&mut failed);
+        failed.on_event(EngineEvent::Failed {
+            turn_id: Some(TurnId(1)),
+            message: "no such model".into(),
+            reason: titi_providers::ErrorReason::Rejected,
+        });
+        assert!(work_row(&failed, 80, &Ink::titanium()).is_none());
+
+        let mut cancelled = chat();
+        started(&mut cancelled);
+        cancelled.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) });
+        assert!(work_row(&cancelled, 80, &Ink::titanium()).is_none());
+    }
+
+    /// A long tool name is cut with an ellipsis on the row, never wrapped:
+    /// every row is exactly as wide as the screen and the composer keeps its
+    /// four rows at 60, 80 and 120 columns.
+    #[test]
+    fn the_status_row_is_cut_to_fit_at_60_80_and_120_columns() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "mcp__a_tool_name_that_is_far_too_long_for_any_narrow_screen_to_show_whole"
+                .into(),
+        });
+        for (width, height) in [(60u16, 20u16), (80, 20), (120, 30)] {
+            let rows = frame_rows(&mut chat, width, height);
+            let at = height as usize;
+            for row in &rows {
+                assert_eq!(
+                    titi_tui::width::visible_width(row),
+                    width as usize,
+                    "{width}x{height}: {row:?}"
+                );
+            }
+            let row = &rows[at - 5];
+            assert!(row.contains("mcp__a_tool_name"), "{width}: {row:?}");
+            if width == 120 {
+                assert!(!row.contains('…'), "{width} fits it whole: {row:?}");
+            } else {
+                assert!(row.contains('…'), "{width}: {row:?}");
+            }
+            // Nothing of the row leaked onto the line above it, and the
+            // composer's borders are still its own four rows.
+            assert!(
+                !rows[at - 6].contains("mcp__"),
+                "{width}: {:?}",
+                rows[at - 6]
+            );
+            assert!(rows[at - 4].starts_with('╭'), "{width}: {:?}", rows[at - 4]);
+            assert!(rows[at - 1].starts_with('╰'), "{width}: {:?}", rows[at - 1]);
+        }
+    }
+
+    /// The extra row must not break a screen too small to hold it: the layout
+    /// still draws, every row is exactly as wide as the screen, and nothing
+    /// panics with a turn running.
+    #[test]
+    fn a_tiny_screen_still_draws_while_a_turn_runs() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+        });
+        for (width, height) in [(20u16, 6u16), (16, 6), (60, 7), (16, 3)] {
+            let rows = frame_rows(&mut chat, width, height);
+            assert_eq!(rows.len(), height as usize);
+            for row in &rows {
+                assert_eq!(
+                    titi_tui::width::visible_width(row),
+                    width as usize,
+                    "{width}x{height}: {row:?}"
+                );
+            }
+        }
     }
 
     /// The model label is the session's own name, so it goes before the model
