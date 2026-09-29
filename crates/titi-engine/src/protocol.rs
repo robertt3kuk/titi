@@ -213,8 +213,15 @@ pub enum EngineEvent {
     AgentFocused {
         agent_id: Option<SmolStr>,
     },
+    /// The primary model changed, whether from a mid-turn fallback or a
+    /// standalone `SwitchModel`.
+    ///
+    /// A standalone switch belongs to no turn, so `turn_id` is `None` there;
+    /// a fallback happens inside a turn and names it. The field is optional
+    /// rather than a separate variant so a surface that only needs the pair
+    /// (`from`, `to`) handles both the same way.
     ModelSwitched {
-        turn_id: TurnId,
+        turn_id: Option<TurnId>,
         from: SmolStr,
         to: SmolStr,
     },

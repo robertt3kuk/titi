@@ -764,7 +764,16 @@ impl EngineRuntime {
                             }
                         }
                         EngineCommand::SwitchModel { model } => {
-                            primary_model = model;
+                            // Answer, even when the model does not change: a
+                            // surface that waits for the outcome must not hang
+                            // on a switch it cannot observe. The event carries
+                            // no turn because a standalone switch has none.
+                            let from = std::mem::replace(&mut primary_model, model.clone());
+                            let _ = self.events.send(EngineEvent::ModelSwitched {
+                                turn_id: None,
+                                from,
+                                to: model,
+                            }).await;
                         }
                         EngineCommand::RunGoal { text } => {
                             self.spawn_goal(text, primary_model.clone());
@@ -1683,7 +1692,7 @@ async fn run_turn(
         if let Some(previous) = previous_model.take() {
             let _ = events
                 .send(EngineEvent::ModelSwitched {
-                    turn_id,
+                    turn_id: Some(turn_id),
                     from: previous,
                     to: model.clone(),
                 })

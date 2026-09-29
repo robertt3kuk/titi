@@ -791,6 +791,46 @@ async fn falls_back_after_transient_budget() {
     assert!(events.iter().any(|event| matches!(event, EngineEvent::ModelSwitched { from, to, .. } if from == "primary" && to == "backup")));
 }
 
+/// A standalone switch is not part of a turn, so it answers with a
+/// `ModelSwitched` that names no turn — the field is `None`, not a fabricated
+/// id. A switch to the model that is already active answers too, so a surface
+/// that waits for the outcome cannot hang on a no-op.
+#[tokio::test]
+async fn switch_model_answers_outside_a_turn() {
+    let mut engine = EngineRuntime::start(EngineConfig::new("primary"), resolver(vec![]));
+
+    engine
+        .send(EngineCommand::SwitchModel {
+            model: "next".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.recv().await,
+        Some(EngineEvent::ModelSwitched {
+            turn_id: None,
+            from: "primary".into(),
+            to: "next".into(),
+        })
+    );
+
+    // Same model: still an answer, with `from` equal to `to`.
+    engine
+        .send(EngineCommand::SwitchModel {
+            model: "next".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.recv().await,
+        Some(EngineEvent::ModelSwitched {
+            turn_id: None,
+            from: "next".into(),
+            to: "next".into(),
+        })
+    );
+}
+
 #[tokio::test]
 async fn does_not_retry_permanent_errors() {
     let primary = Arc::new(MockTransport::new(vec![MockBody::Err(

@@ -1,3 +1,7 @@
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use titi_engine::{EngineCommand, EngineEvent, TurnId};
 use titi_providers::StopReason;
 
@@ -44,4 +48,59 @@ fn frame_version_is_optional_and_enforced() {
 
     // A line that is not a frame is malformed, not a version error.
     assert!(matches!(decode("not json"), Err(FrameError::Malformed(_))));
+}
+
+/// The defect this guards: a lone `SwitchModel` on a closed pipe used to
+/// hang. The engine emitted nothing for it and `headless::run` parked on the
+/// events channel, so `printf … | titi --headless` sat there until the
+/// client's own timeout and never printed the switch. Now the command
+/// answers and a closed stdin ends the run.
+#[test]
+fn a_lone_switch_model_answers_and_the_runner_exits() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_titi"))
+        .arg("--headless")
+        .env("TITI_AGENT_DIR", dir.path())
+        .env("TITI_NO_GENOME", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(br#"{"v":1,"command":{"SwitchModel":{"model":"openai-codex/gpt-5.5"}}}"#)
+            .expect("write the frame");
+        // Dropping stdin closes the pipe: exactly the `printf |` invocation.
+    }
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the runner did not exit after stdin closed: it is parked");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = reader.join().expect("the reader thread");
+
+    assert!(status.success(), "{status:?} — stdout: {out}");
+    assert!(out.contains(r#""ready":true"#), "{out}");
+    let line = out
+        .lines()
+        .find(|line| line.contains("ModelSwitched"))
+        .unwrap_or_else(|| panic!("no switch event on stdout: {out}"));
+    assert!(line.contains(r#""turn_id":null"#), "{line}");
+    assert!(line.contains(r#""from":"#), "{line}");
+    assert!(line.contains(r#""to":"openai-codex/gpt-5.5""#), "{line}");
 }
