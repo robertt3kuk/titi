@@ -52,6 +52,12 @@ struct OpenToolCall {
     block_id: String,
     call_id: String,
     name: String,
+    /// Responses-only: the wire `item_id` of the announced output item, which
+    /// is what keys an argument frame to this block when the calls interleave.
+    item_id: String,
+    /// Responses-only: at least one argument fragment was handed over, so a
+    /// whole-arguments payload later in the stream must not be re-emitted.
+    args_streamed: bool,
 }
 
 impl OpenToolCall {
@@ -251,6 +257,99 @@ fn close_all(state: &mut OpenAiStreamState, wire_reason: &str) -> Vec<StreamEven
     events
 }
 
+/// The id a Responses output item is referred to by afterwards: the argument
+/// frames carry it as `item_id`.
+fn output_item_id(item: &Value) -> Option<&str> {
+    item.get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+}
+
+/// The tool slot a Responses frame belongs to.
+///
+/// The `item_id` announced by `response.output_item.added` decides it: the
+/// Codex backend puts no name and no call id on the argument frames, only that
+/// id, and two calls may interleave their argument deltas. `output_index` is
+/// the fallback for a stream that never announced the item.
+fn responses_tool_slot(
+    state: &mut OpenAiStreamState,
+    payload: &Value,
+    item: Option<&Value>,
+) -> usize {
+    let item_id = payload
+        .get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.and_then(output_item_id));
+    if let Some(item_id) = item_id
+        && let Some(index) = state.tools.iter().position(|t| t.item_id == item_id)
+    {
+        return index;
+    }
+    let index = match payload.get("output_index").and_then(Value::as_u64) {
+        Some(index) => index as usize,
+        // Nothing identifies the frame. An argument frame belongs to the call
+        // in progress, so it reuses the newest slot instead of opening a
+        // second block for the same call; a frame that does name an item is
+        // taken as a new one.
+        None if item_id.is_none() => state.tools.len().saturating_sub(1),
+        None => state.tools.len(),
+    };
+    while state.tools.len() <= index {
+        let i = state.tools.len();
+        state.tools.push(OpenToolCall::new(i));
+        state.tools_opened.push(false);
+    }
+    if let Some(item_id) = item_id {
+        state.tools[index].item_id = item_id.to_owned();
+    }
+    index
+}
+
+/// Open the block for a slot once the call has a name. Idempotent.
+fn open_tool_call(state: &mut OpenAiStreamState, index: usize) -> Option<StreamEvent> {
+    if state.tools_opened[index] || state.tools[index].name.is_empty() {
+        return None;
+    }
+    state.tools_opened[index] = true;
+    state.seen_tools = true;
+    Some(StreamEvent::ToolcallStart {
+        id: BlockId(state.tools[index].block_id.clone().into()),
+        call: ToolCallRef {
+            call_id: SmolStr::from(state.tools[index].call_id.clone()),
+            name: SmolStr::from(state.tools[index].name.clone()),
+        },
+    })
+}
+
+fn close_tool_call(state: &mut OpenAiStreamState, index: usize) -> Option<StreamEvent> {
+    if std::mem::take(&mut state.tools_opened[index]) {
+        Some(StreamEvent::ToolcallEnd {
+            id: BlockId(state.tools[index].block_id.clone().into()),
+        })
+    } else {
+        None
+    }
+}
+
+/// Hand over arguments that arrive whole, when no fragment was streamed for
+/// the block: re-sending them after fragments would make a concatenating
+/// consumer duplicate the arguments.
+fn finish_tool_args(
+    state: &mut OpenAiStreamState,
+    index: usize,
+    args: Option<&str>,
+) -> Option<StreamEvent> {
+    let args = args.filter(|args| !args.is_empty())?;
+    if state.tools[index].args_streamed {
+        return None;
+    }
+    state.tools[index].args_streamed = true;
+    Some(StreamEvent::ToolcallDelta {
+        id: BlockId(state.tools[index].block_id.clone().into()),
+        json: args.into(),
+    })
+}
+
 /// Decode one Responses-API SSE event (name comes from `event:` line).
 pub fn decode_responses_event(
     event: &str,
@@ -299,49 +398,110 @@ pub fn decode_responses_event(
                 });
             }
         }
+        "response.output_item.added" => {
+            let Some(item) = payload.get("item") else {
+                return events;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return events;
+            }
+            if !state.started {
+                state.started = true;
+                events.push(StreamEvent::Start);
+            }
+            // The Codex backend names the call here, once, before the argument
+            // frames — which carry neither name nor call id.
+            let index = responses_tool_slot(state, payload, Some(item));
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                state.tools[index].name = name.to_owned();
+            }
+            if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                state.tools[index].call_id = call_id.to_owned();
+            }
+            events.extend(open_tool_call(state, index));
+        }
         "response.function_call_arguments.delta" => {
             if !state.started {
                 state.started = true;
                 events.push(StreamEvent::Start);
             }
-            let index = payload
-                .get("output_index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            while state.tools.len() <= index {
-                let i = state.tools.len();
-                state.tools.push(OpenToolCall::new(i));
-                state.tools_opened.push(false);
-            }
+            let index = responses_tool_slot(state, payload, None);
             if !state.tools_opened[index] {
-                let name = payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let call_id = payload
-                    .get("item_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if name.is_empty() {
+                // The first-party API names the call on the delta itself; the
+                // Codex backend named it earlier in `output_item.added`, so
+                // that stash is what opens the block here.
+                if state.tools[index].name.is_empty()
+                    && let Some(name) = payload.get("name").and_then(Value::as_str)
+                {
+                    state.tools[index].name = name.to_owned();
+                }
+                if state.tools[index].call_id.is_empty()
+                    && let Some(call_id) = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("item_id"))
+                        .and_then(Value::as_str)
+                {
+                    state.tools[index].call_id = call_id.to_owned();
+                }
+                if state.tools[index].name.is_empty() {
                     return events;
                 }
-                state.tools_opened[index] = true;
-                state.seen_tools = true;
-                state.tools[index].name = name.to_owned();
-                state.tools[index].call_id = call_id.to_owned();
-                events.push(StreamEvent::ToolcallStart {
-                    id: BlockId(state.tools[index].block_id.clone().into()),
-                    call: ToolCallRef {
-                        call_id: SmolStr::from(state.tools[index].call_id.clone()),
-                        name: SmolStr::from(name),
-                    },
-                });
+                events.extend(open_tool_call(state, index));
             }
             if let Some(args) = payload.get("delta").and_then(Value::as_str) {
+                // A fragment, not the accumulated buffer: consumers concatenate
+                // `ToolcallDelta.json` across frames.
+                state.tools[index].args_streamed |= !args.is_empty();
                 events.push(StreamEvent::ToolcallDelta {
                     id: BlockId(state.tools[index].block_id.clone().into()),
                     json: args.into(),
                 });
+            }
+        }
+        "response.function_call_arguments.done" => {
+            if !state.started {
+                state.started = true;
+                events.push(StreamEvent::Start);
+            }
+            let index = responses_tool_slot(state, payload, None);
+            if let Some(args) = finish_tool_args(
+                state,
+                index,
+                payload.get("arguments").and_then(Value::as_str),
+            ) {
+                events.push(args);
+            }
+        }
+        "response.output_item.done" => {
+            let Some(item) = payload.get("item") else {
+                return events;
+            };
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return events;
+            }
+            if !state.started {
+                state.started = true;
+                events.push(StreamEvent::Start);
+            }
+            let index = responses_tool_slot(state, payload, Some(item));
+            if state.tools[index].name.is_empty()
+                && let Some(name) = item.get("name").and_then(Value::as_str)
+            {
+                state.tools[index].name = name.to_owned();
+            }
+            if state.tools[index].call_id.is_empty()
+                && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+            {
+                state.tools[index].call_id = call_id.to_owned();
+            }
+            events.extend(open_tool_call(state, index));
+            if let Some(args) =
+                finish_tool_args(state, index, item.get("arguments").and_then(Value::as_str))
+            {
+                events.push(args);
+            }
+            if let Some(end) = close_tool_call(state, index) {
+                events.push(end);
             }
         }
         "response.completed" | "response.failed" | "response.incomplete" => {
@@ -641,5 +801,322 @@ mod tests {
             &policy,
         );
         assert!(ev.is_empty());
+    }
+
+    /// Feed a scripted Responses stream frame by frame; collect every event.
+    fn drive_responses(frames: &[(&str, Value)]) -> Vec<StreamEvent> {
+        let mut s = responses_state();
+        let policy = StreamDecodePolicy::default();
+        let mut all = Vec::new();
+        for (name, payload) in frames {
+            all.extend(decode_responses_event(name, payload, &mut s, &policy));
+        }
+        all
+    }
+
+    /// Every tool block opened, in order.
+    fn tool_starts(events: &[StreamEvent]) -> Vec<(BlockId, ToolCallRef)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolcallStart { id, call } => Some((id.clone(), call.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The arguments a consumer assembles for one block by concatenation.
+    fn args_of(events: &[StreamEvent], block: &str) -> String {
+        let block = BlockId(block.into());
+        let mut out = String::new();
+        for e in events {
+            if let StreamEvent::ToolcallDelta { id, json } = e
+                && id == &block
+            {
+                out.push_str(json);
+            }
+        }
+        out
+    }
+
+    fn tool_ends(events: &[StreamEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolcallEnd { .. }))
+            .count()
+    }
+
+    #[test]
+    fn responses_codex_order_assembles_tool_call() {
+        // The ChatGPT subscription backend names the call once, on
+        // `response.output_item.added`; its argument frames carry neither
+        // name nor call id, only `item_id`.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.output_item.added",
+                json!({
+                    "type":"response.output_item.added","output_index":0,
+                    "item":{"id":"fc_1","type":"function_call","status":"in_progress",
+                            "name":"read","call_id":"call_1","arguments":""}
+                }),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"path\":"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\"Cargo"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":".toml\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\"path\":\"Cargo.toml\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({
+                    "type":"response.output_item.done","output_index":0,
+                    "item":{"id":"fc_1","type":"function_call","status":"completed",
+                            "name":"read","call_id":"call_1","arguments":"{\"path\":\"Cargo.toml\"}"}
+                }),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+
+        assert_eq!(events[0], StreamEvent::Start);
+        assert_eq!(
+            tool_starts(&events),
+            vec![(
+                BlockId("tool_0".into()),
+                ToolCallRef {
+                    call_id: "call_1".into(),
+                    name: "read".into()
+                }
+            )]
+        );
+        assert_eq!(args_of(&events, "tool_0"), r#"{"path":"Cargo.toml"}"#);
+        let parsed: Value = serde_json::from_str(&args_of(&events, "tool_0")).expect("args parse");
+        assert_eq!(parsed["path"], "Cargo.toml");
+        // Three fragments streamed: the whole-arguments frames add nothing.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::ToolcallDelta { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(tool_ends(&events), 1);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::ToolUse
+            })
+        );
+    }
+
+    #[test]
+    fn responses_first_party_order_names_the_call_on_the_delta() {
+        // The other shape: no `output_item.added`; every argument delta names
+        // the call itself.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","output_index":0,
+                       "name":"read","item_id":"call_2","delta":"{\"path\":\"a.rs\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.rs\"}"}),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+
+        assert_eq!(
+            tool_starts(&events),
+            vec![(
+                BlockId("tool_0".into()),
+                ToolCallRef {
+                    call_id: "call_2".into(),
+                    name: "read".into()
+                }
+            )]
+        );
+        assert_eq!(args_of(&events, "tool_0"), r#"{"path":"a.rs"}"#);
+        assert_eq!(tool_ends(&events), 1);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::ToolUse
+            })
+        );
+    }
+
+    #[test]
+    fn responses_frames_without_an_index_stay_one_block() {
+        // An endpoint that sends neither `item_id` nor `output_index` on the
+        // argument frames: they all belong to the call in progress.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","name":"read","delta":"{\"path\":"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","delta":"\"a.rs\"}"}),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+        assert_eq!(tool_starts(&events).len(), 1);
+        assert_eq!(args_of(&events, "tool_0"), r#"{"path":"a.rs"}"#);
+        assert_eq!(tool_ends(&events), 1);
+    }
+
+    #[test]
+    fn responses_interleaved_tool_calls_key_on_the_item() {
+        // Two calls announced before either streams, and their argument frames
+        // carry no `output_index`: only `item_id` can keep them apart.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,
+                       "item":{"id":"fc_a","type":"function_call","name":"read","call_id":"call_a"}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":1,
+                       "item":{"id":"fc_b","type":"function_call","name":"grep","call_id":"call_b"}}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"{\"pattern\":"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"{\"path\":"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"\"x\"}"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"\"a.rs\"}"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_b"}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type":"response.function_call_arguments.done","item_id":"fc_a"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","item_id":"fc_b",
+                       "item":{"id":"fc_b","type":"function_call","name":"grep","call_id":"call_b"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","item_id":"fc_a",
+                       "item":{"id":"fc_a","type":"function_call","name":"read","call_id":"call_a"}}),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+
+        assert_eq!(
+            tool_starts(&events),
+            vec![
+                (
+                    BlockId("tool_0".into()),
+                    ToolCallRef {
+                        call_id: "call_a".into(),
+                        name: "read".into()
+                    }
+                ),
+                (
+                    BlockId("tool_1".into()),
+                    ToolCallRef {
+                        call_id: "call_b".into(),
+                        name: "grep".into()
+                    }
+                ),
+            ]
+        );
+        assert_eq!(args_of(&events, "tool_0"), r#"{"path":"a.rs"}"#);
+        assert_eq!(args_of(&events, "tool_1"), r#"{"pattern":"x"}"#);
+        assert_eq!(tool_ends(&events), 2);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::ToolUse
+            })
+        );
+    }
+
+    #[test]
+    fn responses_whole_arguments_on_done_frames_still_yield_the_call() {
+        // No argument deltas: the item carries the arguments whole.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,
+                       "item":{"id":"fc_1","type":"function_call","name":"read","call_id":"call_1"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,
+                       "item":{"id":"fc_1","type":"function_call","name":"read","call_id":"call_1",
+                               "arguments":"{\"path\":\"Cargo.toml\"}"}}),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+        assert_eq!(tool_starts(&events).len(), 1);
+        assert_eq!(args_of(&events, "tool_0"), r#"{"path":"Cargo.toml"}"#);
+        assert_eq!(tool_ends(&events), 1);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::ToolUse
+            })
+        );
+
+        // A stream that never announced the item at all still decodes it.
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,
+                       "item":{"id":"fc_9","type":"function_call","name":"bash","call_id":"call_9",
+                               "arguments":"{\"cmd\":\"ls\"}"}}),
+            ),
+            ("response.completed", json!({"type":"response.completed"})),
+        ]);
+        assert_eq!(
+            tool_starts(&events),
+            vec![(
+                BlockId("tool_0".into()),
+                ToolCallRef {
+                    call_id: "call_9".into(),
+                    name: "bash".into()
+                }
+            )]
+        );
+        assert_eq!(args_of(&events, "tool_0"), r#"{"cmd":"ls"}"#);
+        assert_eq!(tool_ends(&events), 1);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::ToolUse
+            })
+        );
     }
 }

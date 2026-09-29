@@ -5,6 +5,7 @@
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use smol_str::SmolStr;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -47,6 +48,73 @@ fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
     }
     for m in &req.messages {
         out.push(serde_json::json!({"role": m.role.openai_role(), "content": m.content.as_str()}));
+    }
+    out
+}
+
+/// The Responses family has no `tool` role. A result travels as a
+/// `{"type": "function_call_output", "call_id": …, "output": …}` item, and the
+/// ChatGPT subscription backend refuses the chat shape outright (400,
+/// `Invalid value: 'tool'. Supported values are: 'assistant', 'system',
+/// 'developer', and 'user'`). It refuses an unpaired output too (`No tool call
+/// found for function call output with call_id …`), so the call the assistant
+/// made is replayed as a `function_call` item as well.
+///
+/// [`ChatMessage`](crate::transport::ChatMessage) carries the call's name and
+/// id but not its arguments — `execute_tools` records the calls without them —
+/// so the replayed item carries `""`, which is what the API itself puts on a
+/// call item whose arguments have not streamed yet (`output_item.added`).
+///
+/// A tool result carries no call id either, but `execute_tools` appends one
+/// result per call in the order it recorded the calls, so each result takes
+/// the oldest still-unmatched call id of the assistant message in front of it.
+fn responses_input_wire(req: &WireRequest) -> Vec<Value> {
+    let mut out = Vec::with_capacity(req.messages.len() + 1);
+    if let Some(sys) = &req.system {
+        out.push(serde_json::json!({"role": "system", "content": sys.as_str()}));
+    }
+    let mut pending: VecDeque<SmolStr> = VecDeque::new();
+    for m in &req.messages {
+        match m.role {
+            Role::Assistant => {
+                pending.clear();
+                pending.extend(m.tool_calls.iter().map(|call| call.call_id.clone()));
+                if !m.content.is_empty() {
+                    // A turn that only called tools has no prose, and an empty
+                    // easy message is not part of the shape the API documents.
+                    out.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": m.content.as_str(),
+                    }));
+                }
+                for call in &m.tool_calls {
+                    out.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": call.call_id.as_str(),
+                        "name": call.name.as_str(),
+                        "arguments": "",
+                    }));
+                }
+            }
+            Role::Tool => match pending.pop_front() {
+                Some(call_id) => out.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id.as_str(),
+                    "output": m.content.as_str(),
+                })),
+                // Only a history whose assistant call was folded away reaches
+                // this; the result keeps its text under a role the API accepts
+                // rather than as an output item it would reject.
+                None => out.push(serde_json::json!({
+                    "role": "user",
+                    "content": m.content.as_str(),
+                })),
+            },
+            other => out.push(serde_json::json!({
+                "role": other.openai_role(),
+                "content": m.content.as_str(),
+            })),
+        }
     }
     out
 }
@@ -416,12 +484,12 @@ pub fn build_http_request(
             ];
             let mut body = serde_json::json!({
                 "model": req.model.as_str(),
-                // Chat-shaped input items (`{"role": …, "content": "text"}`)
-                // are what the Responses API calls an easy input message, and
-                // the Codex backend accepts them as-is: a probe against the
-                // live endpoint answered 200 with SSE deltas carrying this
-                // exact shape, so the messages are not reshaped here.
-                "input": openai_messages_wire(req),
+                // The Responses API's "easy input message" (`{"role": …,
+                // "content": "text"}`) is its shape for a turn of prose; tool
+                // results are item-shaped, which is what `responses_input_wire`
+                // adds. A probe against the live endpoint answered 200 with SSE
+                // deltas for the prose shape, so the prose is not reshaped here.
+                "input": responses_input_wire(req),
                 "stream": true,
                 "tools": responses_tools_wire(req),
                 "max_output_tokens": req.max_tokens,
@@ -961,6 +1029,94 @@ mod tests {
         );
         // Opt-in schema enforcement, never asked for.
         assert!(responses["tools"][0].get("strict").is_none(), "{responses}");
+    }
+
+    /// A tool round trip on the Responses family: the assistant's calls replay
+    /// as `function_call` items and each result as the `function_call_output`
+    /// paired with it, never as a `tool`-role message — the ChatGPT backend
+    /// answers that role with 400 (`Invalid value: 'tool'. Supported values
+    /// are: 'assistant', 'system', 'developer', and 'user'`) and an unpaired
+    /// output with `No tool call found for function call output with call_id …`.
+    #[test]
+    fn responses_tool_results_are_output_items_paired_with_their_call() {
+        let mut r = req_with_tools();
+        r.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: "reading it".into(),
+            tool_calls: vec![
+                crate::stream::ToolCallRef {
+                    call_id: "call_a".into(),
+                    name: "read".into(),
+                },
+                crate::stream::ToolCallRef {
+                    call_id: "call_b".into(),
+                    name: "read".into(),
+                },
+            ],
+        });
+        r.messages.push(ChatMessage {
+            role: Role::Tool,
+            content: "OUTPUT-A".into(),
+            tool_calls: Vec::new(),
+        });
+        r.messages.push(ChatMessage {
+            role: Role::Tool,
+            content: "OUTPUT-B".into(),
+            tool_calls: Vec::new(),
+        });
+        // A result whose call was folded out of the history keeps its text
+        // under a role the API accepts.
+        r.messages.push(ChatMessage {
+            role: Role::Tool,
+            content: "OUTPUT-ORPHAN".into(),
+            tool_calls: Vec::new(),
+        });
+
+        let body = body_of(ApiKind::OpenAiResponses, &r);
+        let input = body["input"].as_array().expect("input");
+        assert!(input.iter().all(|item| item["role"] != "tool"), "{body}");
+
+        let tail = &input[input.len() - 6..];
+        assert_eq!(tail[0]["role"], "assistant");
+        assert_eq!(tail[0]["content"], "reading it");
+        assert_eq!(tail[1]["type"], "function_call");
+        assert_eq!(tail[1]["call_id"], "call_a");
+        assert_eq!(tail[1]["name"], "read");
+        assert_eq!(tail[2]["type"], "function_call");
+        assert_eq!(tail[2]["call_id"], "call_b");
+        assert_eq!(tail[3]["type"], "function_call_output");
+        assert_eq!(tail[3]["call_id"], "call_a");
+        assert_eq!(tail[3]["output"], "OUTPUT-A");
+        assert_eq!(tail[4]["type"], "function_call_output");
+        assert_eq!(tail[4]["call_id"], "call_b");
+        assert_eq!(tail[4]["output"], "OUTPUT-B");
+        // The unpaired result is the item after the pair, as user text.
+        assert_eq!(tail[5]["role"], "user");
+        assert_eq!(tail[5]["content"], "OUTPUT-ORPHAN");
+    }
+
+    /// A turn that only called tools has no prose; the empty easy message it
+    /// would otherwise send is not part of the documented shape.
+    #[test]
+    fn responses_tool_only_assistant_turn_has_no_empty_message() {
+        let mut r = req();
+        r.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: SmolStr::default(),
+            tool_calls: vec![crate::stream::ToolCallRef {
+                call_id: "call_a".into(),
+                name: "read".into(),
+            }],
+        });
+        let body = body_of(ApiKind::OpenAiResponses, &r);
+        let input = body["input"].as_array().expect("input");
+        assert!(
+            input
+                .iter()
+                .all(|item| !(item["role"] == "assistant" && item["content"] == "")),
+            "{body}"
+        );
+        assert_eq!(input.last().expect("call")["type"], "function_call");
     }
 
     fn scripted(status: u16, body: &str) -> (Arc<MockFetch>, FamilyTransport) {
