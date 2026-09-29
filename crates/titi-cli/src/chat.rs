@@ -6294,15 +6294,18 @@ mod tests {
             format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
         );
         let sink = Sink::default();
-        let mut terminal = match ratatui::Terminal::new(CrosstermBackend::new(sink.clone())) {
+        // A fixed viewport, not the fullscreen one: `Terminal::new` asks the
+        // backend for its size, and a real crossterm backend answers that by
+        // querying the terminal, which a CI runner without a tty refuses with
+        // `EAGAIN`. The bytes that leave the backend are the same either way.
+        let viewport = ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 20));
+        let mut terminal = match Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            ratatui::TerminalOptions { viewport },
+        ) {
             Ok(terminal) => terminal,
             Err(error) => panic!("test backend: {error}"),
         };
-        assert!(
-            terminal
-                .resize(ratatui::layout::Rect::new(0, 0, 80, 20))
-                .is_ok()
-        );
         assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
         let raw = String::from_utf8_lossy(&sink.0.borrow()).into_owned();
         let open = format!("\x1b]8;;{url}\x1b\\");
