@@ -3,7 +3,7 @@
 //! The state machine does not touch the terminal, so tests drive it with
 //! keys and engine events. [`run`] is the only place that owns the screen.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Stdout, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,20 @@ const GIT_POLL: Duration = Duration::from_millis(10);
 /// Most one slash command keeps from a git call. A diff longer than this is
 /// a file to read, not a transcript line.
 const GIT_OUTPUT_CAP: usize = 64 * 1024;
+
+/// Fewest and most lines the picker above the composer takes. The floor keeps
+/// a window on a short screen from showing a single row with two `… more`
+/// lines around it; the ceiling keeps the conversation on screen, however
+/// long the catalog is.
+const PICKER_MIN_ROWS: usize = 3;
+const PICKER_MAX_ROWS: usize = 14;
+
+/// Braille spinner frames, in omp's glyph set, one step per loop tick: the
+/// run loop wakes on a 50ms poll, so a step of 50ms means the glyph changes
+/// on every frame it draws. A spinner that does not move reads as a frozen
+/// screen, which is worse than no spinner at all.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_PERIOD: Duration = Duration::from_millis(50);
 
 /// One key the state machine understands. The terminal loop translates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +193,10 @@ pub struct Chat {
     lines: Vec<TranscriptLine>,
     input: String,
     turn_active: bool,
+    /// When the running turn was asked for. `Some` exactly while
+    /// `turn_active`: the masthead reads it for the spinner and the elapsed
+    /// seconds, so a request in flight is visible before the first token.
+    turn_started: Option<Instant>,
     active_turn_id: Option<titi_engine::TurnId>,
     model: String,
     /// Live: a local server that answers after the first frame adds models,
@@ -217,6 +235,9 @@ pub struct Chat {
     picker: usize,
     /// Highlight in the bare-`/login` subscription picker; `None` = closed.
     login_picker: Option<usize>,
+    /// The model browser bare `/model` and bare `/switch` open; `None` =
+    /// closed.
+    model_picker: Option<ModelPicker>,
     /// Skills the engine discovered, offered by the same picker.
     skills: Vec<SkillRow>,
     /// Kitty or Ghostty unicode placeholders are available.
@@ -250,6 +271,7 @@ impl Chat {
             lines: Vec::new(),
             input: String::new(),
             turn_active: false,
+            turn_started: None,
             active_turn_id: None,
             model: model.clone(),
             catalog: crate::engine::ModelCatalog::fixed(vec![model]),
@@ -275,6 +297,7 @@ impl Chat {
             login_driver: None,
             picker: 0,
             login_picker: None,
+            model_picker: None,
             skills: Vec::new(),
             kitty: false,
             tmux: false,
@@ -362,6 +385,9 @@ impl Chat {
         if self.login_picker.is_some() {
             return self.login_picker_key(key, now);
         }
+        if self.model_picker.is_some() {
+            return self.model_picker_key(key, now);
+        }
         match key {
             Key::CtrlC if self.turn_active => {
                 self.disarm();
@@ -399,7 +425,7 @@ impl Chat {
                         }
                     }
                 }
-                self.submit()
+                self.submit(now)
             }
             Key::Backspace => {
                 self.disarm();
@@ -460,6 +486,10 @@ impl Chat {
         match event {
             EngineEvent::TurnStarted { turn_id, model, .. } => {
                 self.turn_active = true;
+                // A prompt sent from the composer already stamped the start;
+                // one the engine began on its own (a goal, a loop) is stamped
+                // here, so the masthead has a time either way.
+                self.turn_started.get_or_insert_with(Instant::now);
                 self.active_turn_id = Some(turn_id);
                 self.model = model.to_string();
                 self.reply.clear();
@@ -709,6 +739,7 @@ impl Chat {
         self.disarm();
         // A pasted body is composer input, not a picker keystroke.
         self.login_picker = None;
+        self.model_picker = None;
         for ch in text.chars() {
             if ch == '\n' || ch == '\r' {
                 if !self.input.ends_with(' ') {
@@ -748,7 +779,7 @@ impl Chat {
         }
     }
 
-    fn submit(&mut self) -> Applied {
+    fn submit(&mut self, now: Instant) -> Applied {
         let text = self.input.trim().to_owned();
         if text.is_empty() {
             return Applied::none();
@@ -772,6 +803,7 @@ impl Chat {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
         } else {
             self.turn_active = true;
+            self.turn_started = Some(now);
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
     }
@@ -797,10 +829,13 @@ impl Chat {
             self.push(LineKind::Error, "no models".to_owned());
             return Some(Applied::none());
         }
-        let next = if rest.is_empty() {
-            let index = models.iter().position(|id| id == &self.model).unwrap_or(0);
-            models[(index + 1) % models.len()].clone()
-        } else if let Some(found) = models
+        // Bare `/model` opens the browser rather than cycling: a cycle hides
+        // the list, and the list is what a model is chosen from.
+        if rest.is_empty() {
+            self.open_model_picker();
+            return Some(Applied::none());
+        }
+        let next = if let Some(found) = models
             .iter()
             .find(|id| id.as_str() == rest || id.rsplit('/').next() == Some(rest))
         {
@@ -810,7 +845,9 @@ impl Chat {
             return Some(Applied::none());
         };
         self.model = next.clone();
-        self.push(LineKind::Note, format!("model {next}"));
+        // The confirmation is the engine's: a `ModelSwitched` event is the
+        // one place that knows the switch happened, and narrating it here as
+        // well would print it twice.
         Some(Applied::send(
             EngineCommand::SwitchModel { model: next.into() },
             None,
@@ -973,6 +1010,7 @@ impl Chat {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
         } else {
             self.turn_active = true;
+            self.turn_started = Some(Instant::now());
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
     }
@@ -1006,11 +1044,13 @@ impl Chat {
 
     fn switch(&mut self, args: &str) -> Applied {
         if args.is_empty() {
-            self.push(
-                LineKind::Note,
-                "usage: /switch <model-id>[:<level>]\ne.g. /switch sonnet, /switch @review:high, /switch anthropic/claude-3-5-sonnet"
-                    .to_owned(),
-            );
+            // Bare `/switch` is the same browser as bare `/model`: naming a
+            // model by hand and picking it from the list are one action.
+            if self.catalog.ids().is_empty() {
+                self.push(LineKind::Error, "no models".to_owned());
+                return Applied::none();
+            }
+            self.open_model_picker();
             return Applied::none();
         }
 
@@ -1113,7 +1153,9 @@ impl Chat {
         }
 
         self.model = next.clone();
-        self.push(LineKind::Note, format!("switched to {next}"));
+        // One confirmation per switch, and it is the engine's `ModelSwitched`
+        // that prints it: a command that narrates its own switch announces
+        // one the engine may refuse.
         Applied::send(EngineCommand::SwitchModel { model: next.into() }, None)
     }
 
@@ -1142,6 +1184,7 @@ impl Chat {
                 Ok(messages) => {
                     self.show_history(&messages);
                     self.turn_active = false;
+                    self.turn_started = None;
                     self.approval = None;
                     self.push(LineKind::Note, summary);
                     Applied::send(EngineCommand::RestoreHistory { messages }, None)
@@ -1312,6 +1355,133 @@ impl Chat {
             Some(choice) => self.start_oauth_login(choice.provider, choice.method),
             None => Applied::none(),
         }
+    }
+
+    /// Typing while the model picker is up.
+    ///
+    /// Arrows move through the matched rows, Enter switches, a printable key
+    /// narrows the query, Backspace takes back the last character. Esc clears
+    /// the query and closes only on the second press: a filter is cheap to
+    /// undo, but a picker that closed on the first Esc would make a narrow
+    /// search cost a reopen.
+    fn model_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_model_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_model_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_model_picker(),
+            Key::Esc => {
+                match self.model_picker.as_mut() {
+                    Some(picker) if !picker.query.is_empty() => {
+                        picker.query.clear();
+                        picker.selected = 0;
+                    }
+                    _ => self.model_picker = None,
+                }
+                self.disarm();
+                Applied::none()
+            }
+            Key::Backspace
+                if self
+                    .model_picker
+                    .as_ref()
+                    .is_some_and(|p| !p.query.is_empty()) =>
+            {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            other => {
+                // Anything else — Backspace with an empty query, Ctrl-C,
+                // Ctrl-D — closes the picker and is handled as ordinary
+                // composer input, the way the `/login` picker hands a key
+                // back.
+                self.model_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_model_picker(&mut self, delta: isize) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        let len = picker.matched().len();
+        if len == 0 {
+            return;
+        }
+        let current = picker.selected % len;
+        picker.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Switches to the highlighted offer. A query that matches nothing is
+    /// refused in the transcript, in the words `/switch` refuses it with;
+    /// a switch that goes through is announced once, by the engine.
+    fn accept_model_picker(&mut self) -> Applied {
+        let Some(picker) = self.model_picker.take() else {
+            return Applied::none();
+        };
+        let matched = picker.matched();
+        let Some(offer) = matched
+            .get(picker.selected % matched.len().max(1))
+            .map(|at| &picker.offers[*at])
+        else {
+            self.push(
+                LineKind::Error,
+                format!(
+                    "no model matches \"{}\"; try /model to see the list",
+                    picker.query
+                ),
+            );
+            return Applied::none();
+        };
+        let model = offer.target().to_owned();
+        self.model = model.clone();
+        Applied::send(
+            EngineCommand::SwitchModel {
+                model: model.into(),
+            },
+            None,
+        )
+    }
+
+    /// Opens the model picker over the catalog, roles first.
+    ///
+    /// The selection starts on the model in use, and the window pins the
+    /// selection, so the picker never opens with the current model scrolled
+    /// out of sight.
+    fn open_model_picker(&mut self) {
+        let mut picker = ModelPicker {
+            offers: picker_roles(self)
+                .into_iter()
+                .map(|(name, model)| ModelOffer::Role { name, model })
+                .chain(model_rows(self).into_iter().map(ModelOffer::Model))
+                .collect(),
+            query: String::new(),
+            selected: 0,
+        };
+        if let Some(at) = picker
+            .matched()
+            .iter()
+            .position(|at| picker.offers[*at].target() == self.model)
+        {
+            picker.selected = at;
+        }
+        self.model_picker = Some(picker);
     }
 
     /// Typing while a login prompt is up. In OAuth mode the line is the
@@ -1676,20 +1846,15 @@ impl Chat {
         let mut listed: Vec<String> = Vec::new();
         for provider in self.registry_providers() {
             let id = provider.id.to_string();
-            let from_env = provider
-                .credential_env
-                .as_deref()
-                .and_then(|name| std::env::var(name).ok())
-                .is_some_and(|value| !value.trim().is_empty());
-            let row = stored.iter().find(|row| row.provider == id);
+            let credential = Credential::of(&provider, &stored);
             // Both facts matter: an environment variable hides neither the
             // sign-in under it nor its remaining lifetime, and a signed-in
             // provider is exactly the one whose token is about to expire.
-            let status = match (from_env, row) {
-                (true, Some(row)) => format!("env + {}", crate::secrets::describe_key(row, now)),
-                (true, None) => "env".to_owned(),
-                (false, Some(row)) => crate::secrets::describe_key(row, now),
-                (false, None) => "no key".to_owned(),
+            let status = match (&credential.stored, credential.from_env) {
+                (Some(row), true) => format!("env + {}", crate::secrets::describe_key(row, now)),
+                (Some(row), false) => crate::secrets::describe_key(row, now),
+                (None, true) => "env".to_owned(),
+                (None, false) => "no key".to_owned(),
             };
             listed.push(id.clone());
             self.push(LineKind::Note, format!("{id}  {status}"));
@@ -1807,17 +1972,10 @@ impl Chat {
         self.registry_providers()
             .into_iter()
             .map(|provider| {
-                let from_env = provider
-                    .credential_env
-                    .as_deref()
-                    .and_then(|name| std::env::var(name).ok())
-                    .is_some_and(|value| !value.trim().is_empty());
-                let row = stored
-                    .iter()
-                    .find(|row| row.provider == provider.id.as_str());
-                let status = if from_env {
+                let credential = Credential::of(&provider, &stored);
+                let status = if credential.from_env {
                     "env".to_owned()
-                } else if let Some(row) = row {
+                } else if let Some(row) = &credential.stored {
                     crate::secrets::describe_key(row, now)
                 } else {
                     "no key".to_owned()
@@ -2218,6 +2376,7 @@ impl Chat {
         self.reply.clear();
         self.recorded_reply = 0;
         self.turn_active = false;
+        self.turn_started = None;
         self.active_turn_id = None;
         self.approval = None;
         self.assistant_at = None;
@@ -2292,6 +2451,11 @@ impl Chat {
     /// conversation.
     pub fn push_user(&mut self, text: &str) {
         self.push(LineKind::User, text.to_owned());
+    }
+
+    /// How long the running turn has been in flight. `None` when none is.
+    fn turn_elapsed(&self) -> Option<Duration> {
+        self.turn_started.map(|started| started.elapsed())
     }
 
     fn agent_state(&self) -> AgentState {
@@ -2612,6 +2776,322 @@ fn login_choice_label(choice: LoginChoice) -> String {
     format!("{}  ·{method}", choice.provider.name)
 }
 
+/// What credential a provider has in reach, without its value.
+///
+/// `/keys`, `/diagnose` and the model picker all ask the same question — is
+/// there a token, a key or a variable behind this provider — so they read it
+/// here once, in one order: the environment first, the auth store second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Credential {
+    from_env: bool,
+    stored: Option<crate::secrets::StoredKey>,
+}
+
+impl Credential {
+    fn of(
+        provider: &titi_engine::ProviderDescriptor,
+        stored: &[crate::secrets::StoredKey],
+    ) -> Self {
+        let from_env = provider
+            .credential_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .is_some_and(|value| !value.trim().is_empty());
+        Self {
+            from_env,
+            stored: stored
+                .iter()
+                .find(|row| row.provider == provider.id.as_str())
+                .cloned(),
+        }
+    }
+
+    /// The kind in one word — `oauth` for a subscription, `key` for an API
+    /// key, `env` for a variable — and `None` when the provider has nothing,
+    /// which is not worth a chip on every row of its group.
+    fn label(&self) -> Option<&str> {
+        if self.from_env {
+            return Some("env");
+        }
+        let kind = self.stored.as_ref()?.kind.as_str();
+        Some(match kind {
+            "api_key" => "key",
+            other => other,
+        })
+    }
+}
+
+/// One catalog model as the picker states it: the id `/switch` takes, the
+/// provider that runs it, the window its descriptor declares, and the
+/// credential that provider holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRow {
+    id: String,
+    provider: String,
+    context_window: Option<u64>,
+    credential: Option<String>,
+}
+
+/// One offer in the model picker: a configured role, or a catalog model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelOffer {
+    /// A `modelRoles` name and the model it resolves to right now. This is
+    /// `/switch @name`, spelled out.
+    Role {
+        name: String,
+        model: String,
+    },
+    Model(ModelRow),
+}
+
+impl ModelOffer {
+    /// What a query is matched against: `@role` and the model it means, or
+    /// the model id, which reads `provider/model`.
+    fn haystack(&self) -> String {
+        match self {
+            Self::Role { name, model } => format!("@{name} {model}"),
+            Self::Model(row) => row.id.clone(),
+        }
+    }
+
+    /// The section a row belongs to: roles share one, models group by the
+    /// provider that runs them.
+    fn group(&self) -> &str {
+        match self {
+            Self::Role { .. } => "roles",
+            Self::Model(row) => row.provider.as_str(),
+        }
+    }
+
+    /// The model the picker switches to.
+    fn target(&self) -> &str {
+        match self {
+            Self::Role { model, .. } => model,
+            Self::Model(row) => &row.id,
+        }
+    }
+}
+
+/// The model browser: bare `/model` and bare `/switch` open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelPicker {
+    /// Roles first, then the catalog in catalog order — the order the screen
+    /// falls back to when nothing ranks above anything else.
+    offers: Vec<ModelOffer>,
+    /// The typed filter. Matched as a subsequence against `provider/model`,
+    /// so `cdx` finds `openai-codex/…`; a query starting with `@` means the
+    /// roles and nothing else.
+    query: String,
+    /// The selection, as an index into [`ModelPicker::matched`].
+    selected: usize,
+}
+
+impl ModelPicker {
+    /// The offers the query keeps, best match first. Ties keep catalog
+    /// order, so rows never swap under the cursor while a query grows.
+    fn matched(&self) -> Vec<usize> {
+        let roles_only = self.query.starts_with('@');
+        let needle = self.query.trim_start_matches('@');
+        let mut scored: Vec<(i32, usize)> = self
+            .offers
+            .iter()
+            .enumerate()
+            .filter(|(_, offer)| !roles_only || matches!(offer, ModelOffer::Role { .. }))
+            .filter_map(|(at, offer)| {
+                fuzzy_score(needle, &offer.haystack()).map(|score| (score, at))
+            })
+            .collect();
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        scored.into_iter().map(|(_, at)| at).collect()
+    }
+
+    /// The matched offers as sections: one per provider, roles as their own.
+    /// A section sits where its best match does, so searching `codex` puts
+    /// the whole `openai-codex` group at the top instead of scattering its
+    /// rows between the providers above it.
+    fn sections(&self) -> Vec<(String, Vec<usize>)> {
+        let mut order: Vec<String> = Vec::new();
+        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        for at in self.matched() {
+            let group = self.offers[at].group().to_owned();
+            if !buckets.contains_key(&group) {
+                order.push(group.clone());
+            }
+            buckets.entry(group).or_default().push(at);
+        }
+        order
+            .into_iter()
+            .filter_map(|group| buckets.remove(&group).map(|offers| (group, offers)))
+            .collect()
+    }
+}
+
+/// The catalog as picker rows: every id the catalog offers, with the
+/// provider, declared window and credential behind it.
+///
+/// The declared facts come from the same registry config the engine builds
+/// its catalog from, so a model that declares a window in settings is one
+/// the picker states. A model a local server discovered declares nothing:
+/// its provider is the id's own prefix and its window is unknown.
+fn model_rows(chat: &Chat) -> Vec<ModelRow> {
+    let config =
+        crate::engine::registry_config_for(&chat.agent_dir, &crate::app::current_workspace());
+    let stored = crate::secrets::list_keys(&chat.agent_dir).unwrap_or_default();
+    let credentials: Vec<(String, String)> = config
+        .providers
+        .iter()
+        .filter_map(|provider| {
+            Credential::of(provider, &stored)
+                .label()
+                .map(|label| (provider.id.to_string(), label.to_owned()))
+        })
+        .collect();
+    chat.catalog
+        .ids()
+        .into_iter()
+        .map(|id| {
+            let declared = config.models.iter().find(|model| model.id == id.as_str());
+            let provider = declared
+                .map(|model| model.provider.to_string())
+                .unwrap_or_else(|| id.split('/').next().unwrap_or_default().to_owned());
+            ModelRow {
+                credential: credentials
+                    .iter()
+                    .find(|(name, _)| name == &provider)
+                    .map(|(_, label)| label.clone()),
+                context_window: declared.and_then(|model| model.context_window),
+                id,
+                provider,
+            }
+        })
+        .collect()
+}
+
+/// The `modelRoles` the settings declare, each with the model it resolves to
+/// now — the same resolution `/switch @role` uses.
+fn picker_roles(chat: &Chat) -> Vec<(String, String)> {
+    let Ok(settings) = titi_config::settings::Settings::load(
+        &chat.agent_dir,
+        &crate::app::current_workspace(),
+        &[],
+    ) else {
+        return Vec::new();
+    };
+    let Some(roles) = settings
+        .get("modelRoles")
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, String)> = roles
+        .keys()
+        .filter_map(|name| {
+            let model =
+                titi_config::roles::resolve_model_role(&settings, name, &chat.model).ok()?;
+            (!model.trim().is_empty()).then(|| (name.clone(), model))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Where a character may start a word: the start of the string, or the far
+/// side of a separator. A hit there is a name being spelled, not letters
+/// that happen to sit in the same order.
+fn is_word_start(hay: &[char], at: usize) -> bool {
+    at == 0 || matches!(hay[at - 1], '/' | '-' | '.' | '_' | ' ' | '@')
+}
+
+/// How well `query` matches `haystack`: `None` when the query is not a
+/// subsequence of it at all, otherwise a score that puts a provider prefix
+/// (`codex` → `openai-codex/…`) and a word start above a loose scattering of
+/// the same letters.
+fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let mut score = 0i32;
+    let mut cursor = 0usize;
+    let mut previous: Option<usize> = None;
+    for ch in needle {
+        let found = cursor + hay.get(cursor..)?.iter().position(|cell| *cell == ch)?;
+        score += 1;
+        if is_word_start(&hay, found) {
+            score += 3;
+        }
+        if previous == Some(found.saturating_sub(1)) && found > 0 {
+            score += 2;
+        }
+        previous = Some(found);
+        cursor = found + 1;
+    }
+    // The query spelled out in order, not one letter per word: `codex` is
+    // the provider's name, and that is what the user meant.
+    if haystack.to_lowercase().contains(&query.to_lowercase()) {
+        score += 6;
+    }
+    Some(score)
+}
+
+/// A context window in the fewest cells that stay exact: `272k`, `1M`.
+fn context_label(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// A row's label, cut with an ellipsis when even its mandatory part does not
+/// fit, so a narrow screen shows that something was dropped rather than
+/// quietly printing half a model id.
+fn ellipsis_label(text: &str, room: usize) -> String {
+    if titi_tui::width::visible_width(text) <= room {
+        return text.to_owned();
+    }
+    format!(
+        "{}…",
+        titi_tui::width::truncate_to_width(text, room.saturating_sub(1))
+    )
+}
+
+/// One model row: the id, the window the model declares, the credential its
+/// provider holds, and the mark for the model in use.
+///
+/// Parts leave from the least important as the terminal narrows: the provider
+/// first (it is the id's own prefix and the heading of the group), then the
+/// window. The credential and the mark stay, and an id that no longer fits is
+/// cut with an ellipsis — never silently, and never into a string that reads
+/// like a whole model id.
+fn model_row_label(row: &ModelRow, current: bool, room: usize) -> String {
+    let credential = match &row.credential {
+        Some(label) => format!("  {label}"),
+        None => String::new(),
+    };
+    let window = match row.context_window {
+        Some(tokens) => format!("  {}", context_label(tokens)),
+        None => String::new(),
+    };
+    let provider = format!("  ·{}", row.provider);
+    let marker = if current { "  ✓ current" } else { "" };
+    for section in [format!("{provider}{window}"), window.clone(), String::new()] {
+        let label = format!("{}{section}{credential}{marker}", row.id);
+        if titi_tui::width::visible_width(&label) <= room {
+            return label;
+        }
+    }
+    let tail = format!("{credential}{marker}");
+    let head = titi_tui::width::truncate_to_width(
+        &row.id,
+        room.saturating_sub(titi_tui::width::visible_width(&tail) + 1),
+    );
+    format!("{head}…{tail}")
+}
+
 /// The `/token` under the cursor: the trailing word, when it opens with a
 /// slash at the start of the line or after whitespace and holds nothing but
 /// name characters. That is what keeps `/tmp/photo.png` and `a/b` out.
@@ -2901,99 +3381,286 @@ fn repo_state(root: &Path) -> String {
     }
 }
 
-/// Rows the picker above the composer takes: the subscription picker when it
-/// is open, otherwise the slash/skill list.
-fn picker_height(chat: &Chat) -> u16 {
-    if chat.login_picker.is_some() {
-        return login_choices().len().min(8) as u16;
-    }
-    picker_rows(chat).len().min(8) as u16
+/// The most lines the picker above the composer may take: what is left of
+/// the screen after the masthead, one line of conversation and the composer,
+/// capped so a tall window never lets a picker eat the session it sits in.
+fn panel_body(total: u16) -> usize {
+    ((total as usize).saturating_sub(6)).clamp(PICKER_MIN_ROWS, PICKER_MAX_ROWS)
 }
 
-/// The window of offers above the composer. `rows` are `(label, is_skill)`
-/// as they should read after the marker; the highlighted row is marked.
-fn picker_panel(
-    rows: &[(String, bool)],
-    selected: usize,
-    width: u16,
-    ink: &Ink,
-) -> Paragraph<'static> {
-    let window = 8usize;
-    let selected = if rows.is_empty() {
-        0
-    } else {
-        selected % rows.len()
-    };
-    let start = if rows.len() <= window {
-        0
-    } else {
-        selected.saturating_sub(window / 2).min(rows.len() - window)
-    };
-    let room = (width as usize).saturating_sub(2).max(8);
-    let lines: Vec<Line<'static>> = rows
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(window)
-        .map(|(index, (label, is_skill))| {
-            let mark = if index == selected { "▶" } else { " " };
-            let style = if index == selected {
-                ink.fg(ink.gold).add_modifier(Modifier::BOLD)
-            } else if *is_skill {
-                ink.fg(ink.green)
-            } else {
-                ink.fg(ink.muted)
-            };
-            Line::from(Span::styled(
-                titi_tui::width::truncate_to_width(&format!(" {mark} {label}"), room),
-                style,
-            ))
+/// Cells a row label may use: the panel has `room` and spends three of it on
+/// the cursor and the spaces around it.
+fn panel_label_room(width: u16) -> usize {
+    (width as usize).saturating_sub(2).max(8).saturating_sub(3)
+}
+
+/// One line above the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PanelLine {
+    /// A section heading. Not selectable: it names the group below it.
+    Heading(String),
+    /// A selectable offer. `accent` is the green the repo gives a skill;
+    /// the model picker marks roles with it too.
+    Row { text: String, accent: bool },
+}
+
+/// The slice of a picker's lines that is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelWindow {
+    start: usize,
+    count: usize,
+    /// Lines the window hides above and below itself.
+    above: usize,
+    below: usize,
+}
+
+/// The picker above the composer, windowed and sized by the same code that
+/// draws it, so the space the layout reserves and the lines that land in it
+/// cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelView {
+    /// The line above the rows, when the picker has something to say: the
+    /// model picker puts the query and the counts there.
+    title: Option<String>,
+    lines: Vec<PanelLine>,
+    /// The line the cursor is on; `None` when nothing is selectable.
+    selected: Option<usize>,
+    window: PanelWindow,
+}
+
+impl PanelView {
+    /// Lines this takes, title and `… N more` included.
+    fn height(&self) -> u16 {
+        (usize::from(self.title.is_some())
+            + self.window.count
+            + usize::from(self.window.above > 0)
+            + usize::from(self.window.below > 0)) as u16
+    }
+}
+
+/// The window a panel shows: the selected line kept in view, at most `room`
+/// lines, and how many lines hide on each side. A `… N more` line is paid for
+/// out of the same room, and only when there is something for it to hide.
+fn panel_window(len: usize, selected: usize, room: usize) -> PanelWindow {
+    let asked = room.max(1);
+    if len <= asked {
+        return PanelWindow {
+            start: 0,
+            count: len,
+            above: 0,
+            below: 0,
+        };
+    }
+    // Each marker line costs a row, and giving one back can move a row past
+    // the end — which is a marker appearing or going away in turn — so the
+    // window is settled by shrinking until what it shows fits in `asked`.
+    let mut room = asked;
+    loop {
+        let window = panel_slice(len, selected, room);
+        let lines = room + usize::from(window.above > 0) + usize::from(window.below > 0);
+        if lines <= asked || room == 1 {
+            return window;
+        }
+        room -= 1;
+    }
+}
+
+/// One window of `room` rows around `selected`, before the `… N more` lines
+/// are paid for: the selection centred, then pulled back so the window never
+/// runs past either end.
+fn panel_slice(len: usize, selected: usize, room: usize) -> PanelWindow {
+    let room = room.max(1);
+    let start = selected
+        .min(len - 1)
+        .saturating_sub(room / 2)
+        .min(len.saturating_sub(room));
+    PanelWindow {
+        start,
+        count: room.min(len),
+        above: start,
+        below: len.saturating_sub(start + room),
+    }
+}
+
+/// A panel from its lines: the window around the selected line.
+fn panel_view(
+    title: Option<String>,
+    lines: Vec<PanelLine>,
+    selected: Option<usize>,
+    body: usize,
+) -> PanelView {
+    let body = body.saturating_sub(usize::from(title.is_some())).max(1);
+    let window = panel_window(lines.len(), selected.unwrap_or(0), body);
+    PanelView {
+        title,
+        lines,
+        selected,
+        window,
+    }
+}
+
+/// The picker above the composer for the state on screen: the login picker,
+/// the model browser, or the slash/skill list.
+fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.login_picker.is_some() {
+        return Some(login_panel(chat, total));
+    }
+    if chat.model_picker.is_some() {
+        return Some(model_panel(chat, total, width));
+    }
+    if picker_rows(chat).is_empty() {
+        return None;
+    }
+    Some(command_panel(chat, total))
+}
+
+/// The bare-`/login` picker: a provider and a method per row. Nothing is
+/// typed into it, so it has no title.
+fn login_panel(chat: &Chat, total: u16) -> PanelView {
+    let lines = login_choices()
+        .into_iter()
+        .map(|choice| PanelLine::Row {
+            text: login_choice_label(choice),
+            accent: false,
         })
         .collect();
-    Paragraph::new(lines).style(ink.page())
+    panel_view(None, lines, chat.login_picker, panel_body(total))
 }
 
-fn command_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
+/// The slash/skill list, in the order the arrows walk it.
+fn command_panel(chat: &Chat, total: u16) -> PanelView {
     let rows = picker_rows(chat);
     let selected = if rows.is_empty() {
         0
     } else {
         chat.picker % rows.len()
     };
-    let lines: Vec<(String, bool)> = rows
+    let lines: Vec<PanelLine> = rows
         .iter()
         .map(|row| match row {
-            PickRow::Command(command) => {
-                (format!("/{:<12} {}", command.name, command.about), false)
-            }
-            PickRow::Skill(at) => chat
-                .skills
-                .get(*at)
-                .map(|skill| (format!("/{:<12} ·skill {}", skill.name, skill.about), true))
-                .unwrap_or_default(),
+            PickRow::Command(command) => PanelLine::Row {
+                text: format!("/{:<12} {}", command.name, command.about),
+                accent: false,
+            },
+            PickRow::Skill(at) => PanelLine::Row {
+                text: chat
+                    .skills
+                    .get(*at)
+                    .map(|skill| format!("/{:<12} ·skill {}", skill.name, skill.about))
+                    .unwrap_or_default(),
+                accent: true,
+            },
         })
         .collect();
-    picker_panel(&lines, selected, width, ink)
+    panel_view(None, lines, Some(selected), panel_body(total))
 }
 
-/// The bare-`/login` picker's rows, or empty when it is closed.
-fn login_picker_lines(chat: &Chat) -> Vec<(String, bool)> {
-    if chat.login_picker.is_none() {
-        return Vec::new();
+/// The model browser: a heading per provider group, its rows under it, and
+/// the query and the counts on the title line.
+fn model_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
+    let body = panel_body(total);
+    let Some(picker) = &chat.model_picker else {
+        return panel_view(None, Vec::new(), None, body);
+    };
+    let matched = picker.matched();
+    let selected_offer = matched.get(picker.selected % matched.len().max(1)).copied();
+    let title = if picker.query.is_empty() {
+        format!("models · {}", picker.offers.len())
+    } else {
+        format!(
+            "models · {} of {} · \"{}\"",
+            matched.len(),
+            picker.offers.len(),
+            picker.query
+        )
+    };
+    let room = panel_label_room(width);
+    let mut lines: Vec<PanelLine> = Vec::new();
+    let mut selected = None;
+    let sections = picker.sections();
+    if sections.is_empty() {
+        lines.push(PanelLine::Heading(format!(
+            "no model matches \"{}\"",
+            picker.query
+        )));
     }
-    login_choices()
-        .into_iter()
-        .map(|choice| (login_choice_label(choice), false))
-        .collect()
+    for (group, offers) in sections {
+        lines.push(PanelLine::Heading(format!("▾ {group}  {}", offers.len())));
+        for at in offers {
+            if selected_offer == Some(at) {
+                selected = Some(lines.len());
+            }
+            let offer = &picker.offers[at];
+            lines.push(PanelLine::Row {
+                text: model_offer_label(offer, &chat.model, room),
+                accent: matches!(offer, ModelOffer::Role { .. }),
+            });
+        }
+    }
+    panel_view(Some(title), lines, selected, body)
 }
 
-fn login_picker(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
-    picker_panel(
-        &login_picker_lines(chat),
-        chat.login_picker.unwrap_or(0),
-        width,
-        ink,
-    )
+/// One offer as a row reads: a role with the model it means, or a model with
+/// its declared window and its provider's credential.
+fn model_offer_label(offer: &ModelOffer, current: &str, room: usize) -> String {
+    match offer {
+        ModelOffer::Role { name, model } => ellipsis_label(&format!("@{name}  →  {model}"), room),
+        ModelOffer::Model(row) => model_row_label(row, row.id == current, room),
+    }
+}
+
+/// The picker above the composer. `view` carries its own window, so the rows
+/// drawn are exactly the rows the layout made room for.
+fn picker_panel(view: &PanelView, width: u16, ink: &Ink) -> Paragraph<'static> {
+    let room = (width as usize).saturating_sub(2).max(8);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    if let Some(title) = &view.title {
+        rows.push(Line::from(Span::styled(
+            titi_tui::width::truncate_to_width(&format!(" {title}"), room),
+            ink.fg(ink.dim),
+        )));
+    }
+    if view.window.above > 0 {
+        rows.push(hidden_line(view.window.above, "above", room, ink));
+    }
+    for (at, line) in view
+        .lines
+        .iter()
+        .enumerate()
+        .skip(view.window.start)
+        .take(view.window.count)
+    {
+        let selected = view.selected == Some(at);
+        let (text, style) = match line {
+            PanelLine::Heading(text) => (
+                format!("  {text}"),
+                ink.fg(ink.accent).add_modifier(Modifier::BOLD),
+            ),
+            PanelLine::Row { text, .. } if selected => (
+                format!(" ▶ {text}"),
+                ink.fg(ink.gold).add_modifier(Modifier::BOLD),
+            ),
+            PanelLine::Row { text, accent: true } => (format!("   {text}"), ink.fg(ink.green)),
+            PanelLine::Row { text, .. } => (format!("   {text}"), ink.fg(ink.muted)),
+        };
+        rows.push(Line::from(Span::styled(
+            titi_tui::width::truncate_to_width(&text, room),
+            style,
+        )));
+    }
+    if view.window.below > 0 {
+        rows.push(hidden_line(view.window.below, "below", room, ink));
+    }
+    Paragraph::new(rows).style(ink.page())
+}
+
+/// `… 12 more below`: a windowed list says how much of itself is out of
+/// sight, rather than ending as if that were all of it.
+fn hidden_line(count: usize, side: &str, room: usize, ink: &Ink) -> Line<'static> {
+    Line::from(Span::styled(
+        titi_tui::width::truncate_to_width(&format!("   … {count} more {side}"), room),
+        ink.fg(ink.dim),
+    ))
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
@@ -3003,7 +3670,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if area.height < 6 || area.width < 16 {
         return;
     }
-    let picker_h = picker_height(chat);
+    let panel = panel_view_for(chat, area.height, area.width);
+    let picker_h = panel.as_ref().map(PanelView::height).unwrap_or(0);
     let roster_h = roster_height(chat, area.height);
     let cols = Layout::vertical([
         Constraint::Length(1),
@@ -3025,13 +3693,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     frame.render_widget(body, cols[2]);
     paint_photos(frame, cols[2], &photos, &ink);
     paint_links(frame, cols[2], &links);
-    if picker_h > 0 {
-        let picker = if chat.login_picker.is_some() {
-            login_picker(chat, cols[3].width, &ink)
-        } else {
-            command_picker(chat, cols[3].width, &ink)
-        };
-        frame.render_widget(picker, cols[3]);
+    if let Some(view) = &panel {
+        frame.render_widget(picker_panel(view, cols[3].width, &ink), cols[3]);
     }
     frame.render_widget(composer(chat, cols[4].width, &ink), cols[4]);
 }
@@ -3115,6 +3778,17 @@ impl Ink {
     }
 }
 
+/// The spinner frame for an elapsed time: ten glyphs 80ms apart, wrapping.
+fn spinner_frame(elapsed: Duration) -> &'static str {
+    SPINNER[(elapsed.as_millis() / SPINNER_PERIOD.as_millis()) as usize % SPINNER.len()]
+}
+
+/// The elapsed seconds of a running turn, one decimal deep: coarse enough to
+/// stay readable, fine enough to move every frame.
+fn elapsed_label(elapsed: Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
 fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
     let state = if chat.approval.is_some() {
         "needs you"
@@ -3152,15 +3826,45 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         SessionMode::Agent => String::new(),
         other => format!("  {}", other.label()),
     };
+    // A turn in flight says so with a moving glyph and the time it has been
+    // running: the wait before the first token is the one thing the owner
+    // could not see, and `working` alone cannot tell a live turn from a
+    // stalled one.
+    //
+    // Honest limit: the Responses/Codex decoder does emit `ThinkingDelta`
+    // for reasoning deltas (crates/titi-providers/src/openai.rs:286) and the
+    // transcript shows them, but the Codex request does not ask for a
+    // reasoning summary (crates/titi-providers/src/wire.rs:459), so the first
+    // seconds of such a turn are spent waiting rather than reading. This
+    // glyph is therefore the only sign of life until the first token.
+    let state = match chat.turn_elapsed() {
+        Some(elapsed) => format!(
+            "{} {state} {}",
+            spinner_frame(elapsed),
+            elapsed_label(elapsed)
+        ),
+        None => state.to_owned(),
+    };
     let mid = format!("  {state}{mode}{loops}");
     let mut right = format!("{}{ctx}  {} ", chat.model, chat.session_label);
     let fixed = titi_tui::width::visible_width(left) + titi_tui::width::visible_width(&mid) + 2;
-    let room = (width as usize).saturating_sub(fixed);
+    // One cell is kept as the gutter before the right half: without it a
+    // full line runs the model into the state beside it (`planopenai-codex/…`).
+    let room = (width as usize).saturating_sub(fixed + 1);
     if titi_tui::width::visible_width(&right) > room {
-        right = titi_tui::width::truncate_to_width(&right, room);
+        // The session label is the least informative thing on this side, so
+        // it is what goes first: a truncated session id still names a file,
+        // while `open -codex/gpt-5.5` names nothing at all.
+        right = format!("{}{ctx} ", chat.model);
+    }
+    if titi_tui::width::visible_width(&right) > room {
+        // Even the model does not fit: cut it where it stands, with an
+        // ellipsis, so a short id never reads as a whole one.
+        let head = titi_tui::width::truncate_to_width(&chat.model, room.saturating_sub(1));
+        right = format!("{head}…");
     }
     let used = fixed + titi_tui::width::visible_width(&right);
-    let gap = (width as usize).saturating_sub(used);
+    let gap = (width as usize).saturating_sub(used).max(1);
     let line = Line::from(vec![
         Span::styled(left, ink.fg(ink.accent).add_modifier(Modifier::BOLD)),
         Span::styled(mid, ink.fg(state_color)),
@@ -3713,6 +4417,8 @@ fn composer_caption(chat: &Chat) -> String {
     };
     let keys = if chat.approval.is_some() {
         "y allow  ·  n refuse"
+    } else if chat.model_picker.is_some() {
+        "↑↓ move  ·  enter switches  ·  esc clears or closes"
     } else if chat
         .oauth
         .as_ref()
@@ -3986,25 +4692,100 @@ mod tests {
     }
 
     fn frame_text(chat: &mut Chat) -> String {
-        let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = match ratatui::Terminal::new(backend) {
-            Ok(terminal) => terminal,
-            Err(error) => panic!("test backend: {error}"),
-        };
-        assert!(terminal.draw(|frame| draw(frame, chat)).is_ok());
-        terminal
-            .backend()
-            .buffer()
-            .content
+        frame_rows(chat, 80, 24).join("")
+    }
+
+    /// A chat whose catalog and settings are the test's own: its agent
+    /// directory is a fresh temp dir, so no machine's `config.yml` decides
+    /// what a picker row says. The dir is returned with the chat because
+    /// dropping it would take the agent directory away mid-test.
+    fn picker_chat(model: &str, session: &str) -> (tempfile::TempDir, Chat) {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = Chat::new(model, session);
+        chat.agent_dir = dir.path().to_path_buf();
+        (dir, chat)
+    }
+
+    /// The transcript's model confirmations, in the order they landed.
+    fn confirmations(chat: &Chat) -> Vec<String> {
+        chat.lines
             .iter()
-            .map(|cell| cell.symbol())
+            .filter(|line| line.text.starts_with("model "))
+            .map(|line| line.text.clone())
             .collect()
+    }
+
+    /// Plays the `ModelSwitched` the engine answers a switch with, and
+    /// returns the confirmations *this* switch added: a switch that adds two
+    /// lines is a switch that was narrated twice.
+    fn confirmations_after_switch(chat: &mut Chat, to: &str) -> Vec<String> {
+        let before = confirmations(chat).len();
+        chat.on_event(EngineEvent::ModelSwitched {
+            turn_id: None,
+            from: chat.model.clone().into(),
+            to: to.into(),
+        });
+        let mut after = confirmations(chat);
+        after.split_off(before)
+    }
+
+    /// The elapsed-seconds token the masthead is showing, if it shows one.
+    fn shown_seconds(frame: &str) -> Option<f64> {
+        let rest = &frame[frame.find("working ")? + "working ".len()..];
+        rest[..rest.find('s')?].parse().ok()
     }
 
     fn type_text(chat: &mut Chat, text: &str) {
         let now = Instant::now();
         for ch in text.chars() {
             chat.on_key(Key::Char(ch), now);
+        }
+    }
+
+    /// The picker, the masthead and the composer hold at 60, 80 and 120
+    /// columns — every row exactly as wide as the screen, the composer's
+    /// border intact — and a screen too small to lay out still draws instead
+    /// of panicking.
+    #[test]
+    fn the_screen_holds_at_60_80_and_120_columns() {
+        let (dir, mut chat) =
+            picker_chat("openai-codex/gpt-daybreak-blue-latest-wm", "session-1234");
+        crate::secrets::store_key(dir.path(), "openai-codex", "sk-test").expect("store");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai-codex/gpt-daybreak-blue-latest-wm".to_owned(),
+            "openai-codex/gpt-5.5".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "codex");
+
+        for (width, height) in [(60u16, 20u16), (80, 20), (120, 30)] {
+            let rows = frame_rows(&mut chat, width, height);
+            assert_eq!(rows.len(), height as usize);
+            for row in &rows {
+                assert_eq!(
+                    titi_tui::width::visible_width(row),
+                    width as usize,
+                    "{width}x{height}: {row:?}"
+                );
+            }
+            let top = &rows[height as usize - 4];
+            let bottom = &rows[height as usize - 1];
+            assert!(top.starts_with('╭') && top.ends_with('╮'), "{top:?}");
+            assert!(
+                bottom.starts_with('╰') && bottom.ends_with('╯'),
+                "{bottom:?}"
+            );
+        }
+
+        // Smaller than the picker, the composer and the masthead can share.
+        for (width, height) in [(20u16, 6u16), (16, 6), (60, 7)] {
+            let rows = frame_rows(&mut chat, width, height);
+            assert_eq!(rows.len(), height as usize);
+            for row in &rows {
+                assert_eq!(titi_tui::width::visible_width(row), width as usize);
+            }
         }
     }
 
@@ -4290,23 +5071,574 @@ mod tests {
         );
     }
 
+    /// Bare `/model` is the browser, not a cycle: Enter takes the row the
+    /// cursor is on, which starts as the model in use.
     #[test]
-    fn slash_model_cycles_without_sending_a_prompt() {
-        let mut chat = chat();
+    fn bare_model_opens_the_browser_on_the_model_in_use() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
         chat.catalog = crate::engine::ModelCatalog::fixed(vec![
             "openai/gpt-4.1".to_owned(),
             "opencode-go/glm-5.3-flash".to_owned(),
         ]);
         type_text(&mut chat, "/model");
+        let opened = chat.on_key(Key::Enter, Instant::now());
+        assert!(opened.effect.is_none(), "opening sends nothing: {opened:?}");
+        assert!(chat.model_picker.is_some());
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("models · 2"), "{frame}");
+        assert!(frame.contains("✓ current"), "{frame}");
+
         let applied = chat.on_key(Key::Enter, Instant::now());
         match applied.effect {
             Some(ChatEffect::Send(EngineCommand::SwitchModel { model })) => {
-                assert_eq!(model.as_str(), "opencode-go/glm-5.3-flash");
+                assert_eq!(model.as_str(), "openai/gpt-4.1");
             }
             other => panic!("expected a model switch, got {other:?}"),
         }
         assert!(applied.log.is_none());
         assert!(!chat.turn_active);
+    }
+
+    /// Rows are grouped, and each row states what titi knows: the id, the
+    /// declared window when there is one, and the credential behind the
+    /// provider.
+    #[test]
+    fn the_browser_groups_by_provider_and_states_the_known_facts() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "opencode-go/glm-5.3-flash".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+
+        let frame = frame_text(&mut chat);
+        for expected in [
+            "▾ openai",
+            "▾ opencode-go",
+            "▾ anthropic",
+            "openai/gpt-4.1",
+            "·openai",
+            "1M",
+            "·anthropic",
+            "200k",
+            // A model that declares no window gets no chip; the row still
+            // names its provider.
+            "opencode-go/glm-5.3-flash  ·opencode-go",
+        ] {
+            assert!(frame.contains(expected), "{expected} is missing: {frame}");
+        }
+    }
+
+    /// A stored credential is named on its provider's rows, so a
+    /// subscription-backed model is recognizable without `/keys`.
+    #[test]
+    fn a_row_names_the_credential_the_provider_holds() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        crate::secrets::store_key(dir.path(), "openai", "sk-test").expect("store");
+        crate::secrets::store_oauth(
+            dir.path(),
+            "openai-codex",
+            &titi_providers::oauth::OAuthTokens {
+                access: "sk-test".to_owned(),
+                refresh: Some("sk-test-refresh".to_owned()),
+                expires_at: Some(crate::secrets::now_secs() + 3_600),
+                account_id: None,
+                email: None,
+                org_id: None,
+                org_name: None,
+            },
+        )
+        .expect("store oauth");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "openai-codex/gpt-5.5".to_owned(),
+        ]);
+
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("openai/gpt-4.1  ·openai  1M  key"),
+            "an api key reads as a key: {frame}"
+        );
+        assert!(
+            frame.contains("openai-codex/gpt-5.5  ·openai-codex  oauth"),
+            "a subscription reads as oauth: {frame}"
+        );
+    }
+
+    /// Typing narrows the list, and the title says what is left and what was
+    /// typed. Matching is a subsequence, the repo's habit for `/switch`.
+    #[test]
+    fn typing_narrows_the_browser_and_the_title_shows_the_query() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "snnt");
+
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("anthropic/claude-sonnet-4-5"), "{frame}");
+        assert!(
+            !frame.contains("·openai  1M"),
+            "the filtered row is gone, the masthead keeps naming the model: {frame}"
+        );
+        assert!(frame.contains("1 of 2"), "{frame}");
+        assert!(frame.contains("\"snnt\""), "{frame}");
+    }
+
+    /// A provider name spelled out ranks that provider's rows above a model
+    /// whose letters only happen to sit in the same order.
+    #[test]
+    fn a_provider_prefix_outranks_a_scattered_match() {
+        let (_dir, mut chat) = picker_chat("openai-codex/gpt-5.5", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "cerebras/qwen3-coder-x".to_owned(),
+            "openai-codex/gpt-5.5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "codex");
+
+        let picker = chat.model_picker.as_ref().expect("open");
+        let matched = picker.matched();
+        assert_eq!(matched.len(), 2, "both match, one ranks higher");
+        assert_eq!(picker.offers[matched[0]].target(), "openai-codex/gpt-5.5");
+        // The cursor starts on the best match, so Enter takes it.
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "openai-codex/gpt-5.5".into()
+            }))
+        );
+    }
+
+    /// Esc takes the query back first and closes on the second press: a
+    /// filter is cheap to undo, and closing on one key would make a narrow
+    /// search cost a reopen.
+    #[test]
+    fn esc_clears_the_query_then_closes_without_switching() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "sonnet");
+        assert!(frame_text(&mut chat).contains("1 of 2"));
+
+        let first = chat.on_key(Key::Esc, Instant::now());
+        assert!(first.effect.is_none());
+        assert!(chat.model_picker.is_some(), "the picker is still open");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("models · 2"), "the query is gone: {frame}");
+        assert!(frame.contains("openai/gpt-4.1"), "{frame}");
+
+        let second = chat.on_key(Key::Esc, Instant::now());
+        assert!(second.effect.is_none());
+        assert!(chat.model_picker.is_none(), "the second esc closes it");
+        assert_eq!(chat.model, "openai/gpt-4.1", "nothing switched");
+        assert!(
+            !chat
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("model ")),
+            "closing says nothing"
+        );
+    }
+
+    /// Enter switches to the highlighted row and confirms in the words
+    /// `/model <id>` uses — the argument form keeps working unchanged.
+    #[test]
+    fn enter_switches_and_the_engine_confirms_once() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        type_text(&mut chat, "sonnet");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-sonnet-4-5".into()
+            }))
+        );
+        assert_eq!(chat.model, "anthropic/claude-sonnet-4-5");
+        assert!(chat.model_picker.is_none());
+        assert!(
+            confirmations(&chat).is_empty(),
+            "the engine owns the confirmation: {:?}",
+            chat.lines
+        );
+        assert_eq!(
+            confirmations_after_switch(&mut chat, "anthropic/claude-sonnet-4-5"),
+            ["model anthropic/claude-sonnet-4-5"]
+        );
+    }
+
+    /// Bare `/switch` is the same browser, and one switch reads as one line —
+    /// the engine's, whether the model was picked or named.
+    #[test]
+    fn bare_switch_opens_the_browser_and_confirms_once() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/switch");
+        let opened = chat.on_key(Key::Enter, Instant::now());
+        assert!(opened.effect.is_none());
+        assert!(chat.model_picker.is_some());
+        type_text(&mut chat, "opus");
+
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+        assert_eq!(
+            confirmations_after_switch(&mut chat, "anthropic/claude-opus-5"),
+            ["model anthropic/claude-opus-5"]
+        );
+    }
+
+    /// `/model <sel>` resolves the way it always did — a whole id or the last
+    /// segment — and an id it cannot place is the refusal it always was.
+    #[test]
+    fn a_model_argument_resolves_by_id_and_by_last_segment() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-sonnet-4-5".to_owned(),
+        ]);
+
+        type_text(&mut chat, "/model anthropic/claude-sonnet-4-5");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-sonnet-4-5".into()
+            }))
+        );
+        assert_eq!(chat.model, "anthropic/claude-sonnet-4-5");
+
+        type_text(&mut chat, "/model gpt-4.1");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "openai/gpt-4.1".into()
+            }))
+        );
+
+        type_text(&mut chat, "/model nope");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.model_picker.is_none(), "an argument is not a picker");
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "unknown model nope"),
+            "{:?}",
+            chat.lines
+        );
+    }
+
+    /// The engine's `ModelSwitched` is the only confirmation, on every path:
+    /// a command that also narrated its own switch printed the line twice.
+    #[test]
+    fn a_switch_confirms_once_from_the_command_path_too() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model anthropic/claude-opus-5");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+        assert!(confirmations(&chat).is_empty(), "{:?}", chat.lines);
+        assert_eq!(
+            confirmations_after_switch(&mut chat, "anthropic/claude-opus-5"),
+            ["model anthropic/claude-opus-5"]
+        );
+
+        type_text(&mut chat, "/switch opus");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+        assert_eq!(
+            confirmations_after_switch(&mut chat, "anthropic/claude-opus-5"),
+            ["model anthropic/claude-opus-5"]
+        );
+    }
+
+    /// An argument is not a picker: the resolution tests above must not have
+    /// come to depend on a browser being open.
+    #[test]
+    fn a_command_with_an_argument_does_not_open_the_picker() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model anthropic/claude-opus-5");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.model_picker.is_none());
+
+        type_text(&mut chat, "/switch opus");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.model_picker.is_none());
+    }
+
+    /// A configured role is a row of its own, first in the list, and it
+    /// switches to the model it resolves to — `/switch @role`, spelled out.
+    #[test]
+    fn configured_roles_lead_the_list_and_switch_to_their_model() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        std::fs::write(
+            dir.path().join("config.yml"),
+            "modelRoles:\n  review: anthropic/claude-opus-5\n",
+        )
+        .expect("config");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▾ roles  1"), "{frame}");
+        assert!(
+            frame.contains("@review  →  anthropic/claude-opus-5"),
+            "{frame}"
+        );
+
+        // `@` is the roles and nothing else.
+        type_text(&mut chat, "@");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("@review"), "{frame}");
+        assert!(
+            !frame.contains("·openai  1M"),
+            "no model row survives an `@` query: {frame}"
+        );
+
+        // The cursor moves to the only match as the query narrows, so Enter
+        // takes the role's model.
+        type_text(&mut chat, "rev");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SwitchModel {
+                model: "anthropic/claude-opus-5".into()
+            }))
+        );
+        assert_eq!(chat.model, "anthropic/claude-opus-5");
+    }
+
+    /// A long list is windowed around the cursor and says how much of itself
+    /// is out of sight, rather than ending as if that were all of it.
+    #[test]
+    fn a_long_list_is_windowed_and_says_what_it_hides() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(
+            (0..30)
+                .map(|at| format!("openai/gpt-4.{at}"))
+                .collect::<Vec<_>>(),
+        );
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("more below"), "something is hidden: {frame}");
+        assert!(!frame.contains("more above"), "nothing above yet: {frame}");
+        assert!(
+            frame.contains("✓ current"),
+            "the cursor row is shown: {frame}"
+        );
+
+        for _ in 0..15 {
+            chat.on_key(Key::Down, Instant::now());
+        }
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("more above"), "the window scrolled: {frame}");
+        assert!(
+            frame.contains("more below"),
+            "and it still hides the rest: {frame}"
+        );
+    }
+
+    /// The window keeps the cursor in view and never exceeds the lines it was
+    /// given, whatever the selection and the list length.
+    #[test]
+    fn the_window_always_contains_the_selection() {
+        for len in 1..40usize {
+            for selected in 0..len {
+                for room in 1..=PICKER_MAX_ROWS {
+                    let window = panel_window(len, selected, room);
+                    let lines = window.count
+                        + usize::from(window.above > 0)
+                        + usize::from(window.below > 0);
+                    assert!(
+                        window.count > 0,
+                        "len {len} selected {selected} room {room}"
+                    );
+                    assert!(
+                        selected >= window.start && selected < window.start + window.count,
+                        "len {len} selected {selected} room {room}: {window:?}"
+                    );
+                    assert!(window.start + window.count <= len, "{window:?}");
+                    assert!(lines <= room.max(PICKER_MIN_ROWS), "{window:?}");
+                }
+            }
+        }
+    }
+
+    /// The rows of a narrowing screen give up the least useful part first,
+    /// and a cut id says it was cut.
+    #[test]
+    fn a_narrow_row_drops_the_provider_before_it_cuts_the_model() {
+        let row = ModelRow {
+            id: "openai-codex/gpt-daybreak-blue-latest-wm".to_owned(),
+            provider: "openai-codex".to_owned(),
+            context_window: Some(272_000),
+            credential: Some("oauth".to_owned()),
+        };
+        assert_eq!(
+            model_row_label(&row, false, 78),
+            "openai-codex/gpt-daybreak-blue-latest-wm  ·openai-codex  272k  oauth"
+        );
+        // The provider is the id's own prefix and the heading above it, so it
+        // goes first; then the window.
+        assert_eq!(
+            model_row_label(&row, false, 60),
+            "openai-codex/gpt-daybreak-blue-latest-wm  272k  oauth"
+        );
+        assert_eq!(
+            model_row_label(&row, false, 50),
+            "openai-codex/gpt-daybreak-blue-latest-wm  oauth"
+        );
+        // The credential and the mark are what a narrow row must keep.
+        let cut = model_row_label(&row, true, 40);
+        assert!(titi_tui::width::visible_width(&cut) <= 40, "{cut}");
+        assert!(cut.contains('…'), "{cut}");
+        assert!(cut.ends_with("oauth  ✓ current"), "{cut}");
+    }
+
+    /// A turn in flight shows a moving glyph and the seconds it has been
+    /// running: `working` alone cannot tell a live turn from a stalled one.
+    #[test]
+    fn a_running_turn_shows_a_spinner_and_its_elapsed_seconds() {
+        let mut chat = chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now() - Duration::from_secs(3));
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("working"), "{frame}");
+        assert!(
+            SPINNER.iter().any(|glyph| frame.contains(glyph)),
+            "no spinner frame: {frame}"
+        );
+        let shown = shown_seconds(&frame).unwrap_or_else(|| panic!("no seconds: {frame}"));
+        assert!((3.0..4.0).contains(&shown), "{shown} in {frame}");
+    }
+
+    /// Nothing about a turn is claimed when none is running.
+    #[test]
+    fn an_idle_frame_has_no_spinner_and_no_seconds() {
+        let mut chat = chat();
+        let frame = frame_text(&mut chat);
+        assert!(!frame.contains("working"), "{frame}");
+        assert!(
+            !SPINNER.iter().any(|glyph| frame.contains(glyph)),
+            "{frame}"
+        );
+        assert!(shown_seconds(&frame).is_none(), "{frame}");
+    }
+
+    /// The spinner steps on every loop tick, so consecutive frames differ.
+    #[test]
+    fn the_spinner_moves_frame_by_frame() {
+        assert_eq!(spinner_frame(Duration::ZERO), SPINNER[0]);
+        assert_eq!(spinner_frame(SPINNER_PERIOD), SPINNER[1]);
+        assert_ne!(
+            spinner_frame(SPINNER_PERIOD * 3),
+            spinner_frame(SPINNER_PERIOD * 4)
+        );
+        assert_eq!(spinner_frame(SPINNER_PERIOD * 10), SPINNER[0], "it wraps");
+        assert_eq!(elapsed_label(Duration::from_millis(3_200)), "3.2s");
+        assert_eq!(elapsed_label(Duration::from_secs(12)), "12.0s");
+    }
+
+    /// A turn the engine started on its own still gets a start time, and one
+    /// that ends forgets it: no state outlives its turn.
+    #[test]
+    fn the_turn_clock_starts_and_stops_with_the_turn() {
+        let mut chat = chat();
+        assert!(chat.turn_elapsed().is_none());
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        assert!(chat.turn_elapsed().is_some());
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        assert!(chat.turn_elapsed().is_none());
+        assert!(!chat.turn_active);
+        assert!(!frame_text(&mut chat).contains("working"));
+    }
+
+    /// The model label is the session's own name, so it goes before the model
+    /// does: a truncated session id still names a file, `open -codex/…`
+    /// names nothing.
+    #[test]
+    fn a_narrow_masthead_drops_the_session_label_before_it_cuts_the_model() {
+        let mut chat = chat();
+        chat.model = "openai-codex/gpt-5.5".to_owned();
+        chat.session_label = "SESSIONLABEL".to_owned();
+
+        let wide = frame_rows(&mut chat, 80, 20).join("");
+        assert!(wide.contains("openai-codex/gpt-5.5"), "{wide}");
+        assert!(wide.contains("SESSIONLABEL"), "{wide}");
+
+        let narrow = frame_rows(&mut chat, 40, 20).join("");
+        assert!(
+            narrow.contains("openai-codex/gpt-5.5"),
+            "the model survived: {narrow}"
+        );
+        assert!(!narrow.contains("SESSIONLABEL"), "the label went: {narrow}");
+    }
+
+    /// What is left after that is cut where it stands, with an ellipsis.
+    #[test]
+    fn a_model_id_that_still_does_not_fit_is_cut_visibly() {
+        let mut chat = chat();
+        chat.model = "some-provider/a-very-long-model-name-here".to_owned();
+        chat.session_label = "SESSIONLABEL".to_owned();
+        let narrow = frame_rows(&mut chat, 44, 20).join("");
+        assert!(!narrow.contains("some-provider/a-very-long-model-name-here"));
+        assert!(narrow.contains('…'), "the cut is visible: {narrow}");
     }
 
     /// A provider that refused the key contributes no models and looks
@@ -4497,7 +5829,11 @@ mod tests {
 
             let did_something = applied.effect.is_some()
                 || applied.log.is_some()
-                || chat.lines.len() > lines_before;
+                || chat.lines.len() > lines_before
+                // A picker is an answer too: `/model` and `/login` open one
+                // instead of printing.
+                || chat.model_picker.is_some()
+                || chat.login_picker.is_some();
             assert!(
                 did_something,
                 "/{} does nothing (no effect, no log, no output)",
@@ -5751,16 +7087,6 @@ mod tests {
     ];
 
     #[test]
-    fn switch_with_no_args_prints_usage() {
-        let mut chat = chat();
-        type_text(&mut chat, "/switch");
-        let applied = chat.on_key(Key::Enter, Instant::now());
-        assert!(applied.effect.is_none());
-        let view = frame_text(&mut chat);
-        assert!(view.contains("usage: /switch"), "{view}");
-    }
-
-    #[test]
     fn switch_exact_id() {
         let mut chat = chat();
         chat.catalog = crate::engine::ModelCatalog::fixed(vec![
@@ -5775,10 +7101,12 @@ mod tests {
                 model: "anthropic/claude-opus-5".into()
             }))
         );
-        let view = frame_text(&mut chat);
-        assert!(
-            view.contains("switched to anthropic/claude-opus-5"),
-            "{view}"
+        // The command sends the switch; the engine's event is what confirms
+        // it, once.
+        assert!(confirmations(&chat).is_empty(), "{:?}", chat.lines);
+        assert_eq!(
+            confirmations_after_switch(&mut chat, "anthropic/claude-opus-5"),
+            ["model anthropic/claude-opus-5"]
         );
     }
 
