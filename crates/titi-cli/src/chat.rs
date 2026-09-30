@@ -312,6 +312,11 @@ pub struct Chat {
     /// transcript, the chips, the composer, the status row — is a token of it,
     /// so a theme change is a colour change on the whole screen.
     theme: Arc<Theme>,
+    /// The newest reply rendered, and what it was rendered from. A streaming
+    /// answer is rebuilt every time a delta lands, so the frame that draws it
+    /// again between two deltas reads these rows instead of re-parsing the
+    /// whole answer ([`Chat::assistant_rows`]).
+    reply_render: Option<ReplyRender>,
 }
 
 impl Chat {
@@ -365,6 +370,7 @@ impl Chat {
             scroll_offset: 0,
             last_transcript_height: 0,
             theme,
+            reply_render: None,
         }
     }
 
@@ -2534,6 +2540,44 @@ impl Chat {
         &self.lines
     }
 
+    /// The assistant's answer as frame rows, re-using the last render when
+    /// neither the answer nor the pane width has changed.
+    ///
+    /// `remember` marks the newest reply — the one still arriving. A delta
+    /// grows it and the screen redraws at 20 fps, so most frames ask for an
+    /// answer that has not moved; without the rows being kept here, every one
+    /// of those frames would parse and re-wrap the whole answer, which over a
+    /// long one is quadratic in its length. An older reply is settled: it is
+    /// rendered from source each frame, exactly as the plain block was before
+    /// the renderer existed.
+    ///
+    /// The source is kept next to the rows, so a cache hit cannot be a
+    /// different answer that happens to be the same length.
+    fn assistant_rows(
+        &mut self,
+        remember: bool,
+        text: &str,
+        width: usize,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        if remember
+            && let Some(cached) = &self.reply_render
+            && cached.width == width
+            && cached.source == text
+        {
+            return cached.rows.clone();
+        }
+        let rows = reply_rows(text, width, theme);
+        if remember {
+            self.reply_render = Some(ReplyRender {
+                source: text.to_owned(),
+                width,
+                rows: rows.clone(),
+            });
+        }
+        rows
+    }
+
     /// Puts a line in the transcript as if the user had typed and sent it.
     /// Replay has no keyboard, and a cast without its prompts is half a
     /// conversation.
@@ -4147,6 +4191,16 @@ struct PhotoPaint {
     image_row: u16,
 }
 
+/// One reply's rendered rows, kept so the frames between two deltas of a
+/// streaming answer do not re-render it ([`Chat::assistant_rows`]).
+struct ReplyRender {
+    /// The answer the rows were rendered from.
+    source: String,
+    /// The pane width they were rendered for: a resize re-renders.
+    width: usize,
+    rows: Vec<Line<'static>>,
+}
+
 fn transcript(
     chat: &mut Chat,
     width: u16,
@@ -4156,6 +4210,11 @@ fn transcript(
     let inner = (width as usize).saturating_sub(2).max(8);
     let max_cols = width.saturating_sub(8).max(8);
     let owned = chat.lines.clone();
+    // The newest answer is the one still arriving: it is the reply whose rows
+    // are worth keeping between frames (see `Chat::assistant_rows`).
+    let newest_reply = owned
+        .iter()
+        .rposition(|line| line.kind == LineKind::Assistant);
     let mut rows: Vec<TranscriptRow> = Vec::new();
     let mut links: Vec<(usize, LinkRow)> = Vec::new();
     for (index, line) in owned.iter().enumerate() {
@@ -4164,7 +4223,14 @@ fn transcript(
             rows.push(TranscriptRow::Text(Line::from("")));
         }
         let base = rows.len();
-        let (texts, line_links) = message_rows(line, inner, theme);
+        let (texts, line_links) = if line.kind == LineKind::Assistant {
+            (
+                chat.assistant_rows(newest_reply == Some(index), &line.text, inner, theme),
+                Vec::new(),
+            )
+        } else {
+            message_rows(line, inner, theme)
+        };
         for text in texts {
             rows.push(TranscriptRow::Text(text));
         }
@@ -4377,14 +4443,7 @@ fn message_rows(
             width,
             theme,
         ),
-        LineKind::Assistant => speech(
-            "titi",
-            ThemeColor::Accent,
-            ThemeColor::Text,
-            &line.text,
-            width,
-            theme,
-        ),
+        LineKind::Assistant => reply_rows(&line.text, width, theme),
         LineKind::Tool => chip(tool_chip(&line.text), theme, width),
         LineKind::Error => chip(
             ("✕", ThemeColor::Error, line.text.clone(), ThemeColor::Error),
@@ -4477,6 +4536,46 @@ fn wrap_url(url: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The rows a message body has besides its gutter: one rule for the plain
+/// block and for the markdown one, so an answer cannot re-wrap just because the
+/// markdown path took it.
+fn body_width(width: usize) -> usize {
+    width.saturating_sub(10).max(8)
+}
+
+/// A message block: the name in its own colour, a bar, then the body rows under
+/// the same gutter.
+///
+/// [`speech`] hands it one wrapped piece per row; the assistant's markdown path
+/// hands it rows that already carry their own styles, so neither caller can
+/// drift from the other's gutter.
+fn message_block(
+    name: &str,
+    label: ThemeColor,
+    theme: &Theme,
+    bodies: Vec<Vec<Span<'static>>>,
+) -> Vec<Line<'static>> {
+    // "you" and "titi" share a column so a short message stays one row.
+    let tag = format!("{name:<4}");
+    let mut rows = Vec::with_capacity(bodies.len());
+    for (index, body) in bodies.into_iter().enumerate() {
+        let mut row: Vec<Span<'static>> = Vec::with_capacity(body.len() + 3);
+        if index == 0 {
+            row.push(Span::styled("  ", page(theme)));
+            row.push(Span::styled(
+                tag.clone(),
+                fg(theme, label).add_modifier(Modifier::BOLD),
+            ));
+            row.push(Span::styled(" │ ", fg(theme, label)));
+        } else {
+            row.push(Span::styled("       │ ", fg(theme, label)));
+        }
+        row.extend(body);
+        rows.push(Line::from(row));
+    }
+    rows
+}
+
 fn speech(
     name: &str,
     label: ThemeColor,
@@ -4485,28 +4584,220 @@ fn speech(
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    // "you" and "titi" share a column so a short message stays one row.
-    let tag = format!("{name:<4}");
-    let wrap_at = width.saturating_sub(10).max(8);
-    let pieces = wrap_plain(text, wrap_at);
-    let mut rows = Vec::with_capacity(pieces.len());
-    for (index, piece) in pieces.into_iter().enumerate() {
-        let row = if index == 0 {
-            vec![
-                Span::styled("  ", page(theme)),
-                Span::styled(tag.clone(), fg(theme, label).add_modifier(Modifier::BOLD)),
-                Span::styled(" │ ", fg(theme, label)),
-                Span::styled(piece, fg(theme, body)),
-            ]
-        } else {
-            vec![
-                Span::styled("       │ ", fg(theme, label)),
-                Span::styled(piece, fg(theme, body)),
-            ]
-        };
-        rows.push(Line::from(row));
+    let bodies = wrap_plain(text, body_width(width))
+        .into_iter()
+        .map(|piece| vec![Span::styled(piece, fg(theme, body))])
+        .collect();
+    message_block(name, label, theme, bodies)
+}
+
+/// The assistant's answer as frame rows: markdown when the answer carries any,
+/// the plain block it has always been when it does not.
+///
+/// The answer is markdown from its first delta onwards, so the screen never
+/// shows the raw syntax and never swaps renderings mid-answer; a construct that
+/// is still half-typed (an unclosed fence, a lone `**`) renders literally until
+/// its marker arrives, which is the renderer's own reading of partial markdown.
+/// [`Chat::assistant_rows`] is what keeps that affordable while the answer is
+/// still arriving.
+fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    if !has_markdown(text) {
+        return speech(
+            "titi",
+            ThemeColor::Accent,
+            ThemeColor::Text,
+            text,
+            width,
+            theme,
+        );
     }
-    rows
+    let bodies = markdown_bodies(text, body_width(width), theme);
+    message_block("titi", ThemeColor::Accent, theme, bodies)
+}
+
+/// The renderer's rows as frame spans.
+///
+/// `render_markdown` styles by writing SGR into the row, and ratatui drops the
+/// control characters that travel inside a span, so the escapes have to come
+/// back out as [`Style`]s before a row can be drawn: a span carries the colour,
+/// never the sequence. Only the renderer's own styling is applied — nothing here
+/// wraps a row in a style of its own, so the two cannot fight.
+fn markdown_bodies(text: &str, width: usize, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+    // `width` descends from a `u16` pane, so the cast only undoes the widening.
+    titi_tui::markdown::render_markdown(text, theme, width as u16)
+        .into_iter()
+        .map(|row| sgr_row(&row))
+        .collect()
+}
+
+/// One rendered row — text with SGR — as ratatui spans. A run the renderer left
+/// unstyled keeps the style of the pane it is drawn on.
+fn sgr_row(row: &str) -> Vec<Span<'static>> {
+    let base = Style::default();
+    let mut style = base;
+    let mut spans = Vec::new();
+    for piece in titi_tui::width::spans(row) {
+        match piece {
+            titi_tui::width::Span::Text(text) if !text.is_empty() => {
+                spans.push(Span::styled(text.to_owned(), style));
+            }
+            titi_tui::width::Span::Text(_) => {}
+            titi_tui::width::Span::Escape(sequence) => apply_sgr(sequence, &mut style, base),
+        }
+    }
+    spans
+}
+
+/// Apply one SGR sequence to the running style.
+///
+/// The renderer emits only what the theme helpers and the width wrapper
+/// produce: a colour (`38;2;r;g;b`, `38;5;n`, `39`), a background (`48;…`,
+/// `49`), a full reset, and the bold, italic, underline, inverse and
+/// strikethrough switches. A `39`/`49` returns the channel to the style the row
+/// was drawn over rather than to the terminal default, so what the renderer
+/// left unstyled stays the pane's own colour.
+fn apply_sgr(sequence: &str, style: &mut Style, base: Style) {
+    let Some(params) = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|body| body.strip_suffix('m'))
+    else {
+        return;
+    };
+    let mut parts = params.split(';');
+    while let Some(part) = parts.next() {
+        match part {
+            "" | "0" => *style = base,
+            "1" => *style = style.add_modifier(Modifier::BOLD),
+            "3" => *style = style.add_modifier(Modifier::ITALIC),
+            "4" => *style = style.add_modifier(Modifier::UNDERLINED),
+            "7" => *style = style.add_modifier(Modifier::REVERSED),
+            "9" => *style = style.add_modifier(Modifier::CROSSED_OUT),
+            "22" => *style = style.remove_modifier(Modifier::BOLD),
+            "23" => *style = style.remove_modifier(Modifier::ITALIC),
+            "24" => *style = style.remove_modifier(Modifier::UNDERLINED),
+            "27" => *style = style.remove_modifier(Modifier::REVERSED),
+            "29" => *style = style.remove_modifier(Modifier::CROSSED_OUT),
+            "38" | "48" => {
+                let foreground = part == "38";
+                let colour = sgr_colour(&mut parts);
+                *style = if foreground {
+                    style.fg(colour)
+                } else {
+                    style.bg(colour)
+                };
+            }
+            "39" => style.fg = base.fg,
+            "49" => style.bg = base.bg,
+            _ => {}
+        }
+    }
+}
+
+/// The colour of a `38`/`48` group, the `2`/`5` selector already consumed:
+/// truecolor channels or a 256-palette index.
+fn sgr_colour(parts: &mut std::str::Split<'_, char>) -> Color {
+    match parts.next() {
+        Some("2") => {
+            let channel = |value: Option<&str>| value.and_then(|v| v.parse::<u8>().ok());
+            let r = channel(parts.next());
+            let g = channel(parts.next());
+            let b = channel(parts.next());
+            match (r, g, b) {
+                (Some(r), Some(g), Some(b)) => (r, g, b).into(),
+                _ => Color::Reset,
+            }
+        }
+        Some("5") => match parts.next().and_then(|value| value.parse::<u8>().ok()) {
+            Some(index) => Color::Indexed(index),
+            None => Color::Reset,
+        },
+        _ => Color::Reset,
+    }
+}
+
+/// Whether an answer carries markdown the renderer would consume.
+///
+/// The answer is rendered as markdown only when this is true: a reply that is
+/// not markdown — a one-liner, a plain summary — keeps the exact rows it had
+/// before the renderer existed, so nothing about it can change because a stray
+/// `*` or `_` looked like emphasis. The markers below are the ones
+/// [`titi_tui::markdown::render_markdown`] acts on.
+fn has_markdown(text: &str) -> bool {
+    text.lines().any(markdown_block) || has_inline_markdown(text)
+}
+
+/// A block construct on a row of its own, where the renderer drops the marker
+/// and redraws the row.
+fn markdown_block(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("```") || matches!(trimmed, "---" | "***" | "___") {
+        return true;
+    }
+    // A heading has to open the row, as the renderer requires.
+    let hashes = raw.chars().take_while(|ch| *ch == '#').count();
+    if hashes > 0 && (raw[hashes..].is_empty() || raw[hashes..].starts_with(' ')) {
+        return true;
+    }
+    raw.starts_with('>') || list_marker(raw).is_some()
+}
+
+/// The list marker of a row — `- `, `* ` or `N. ` after any indentation. The
+/// same three shapes the renderer splits a list item into.
+fn list_marker(raw: &str) -> Option<&str> {
+    let body = raw.trim_start_matches([' ', '\t']);
+    if body.starts_with("- ") || body.starts_with("* ") {
+        return Some(&body[..2]);
+    }
+    let digits = body.chars().take_while(char::is_ascii_digit).count();
+    (digits > 0 && body[digits..].starts_with(". ")).then(|| &body[..digits + 1])
+}
+
+/// The inline markers the renderer consumes wherever they sit: `` `code` ``,
+/// `**bold**`, `[text](url)`, and an emphasis pair.
+fn has_inline_markdown(text: &str) -> bool {
+    if text.matches('`').count() >= 2 || text.matches("**").count() >= 2 {
+        return true;
+    }
+    if text.contains('[') && text.contains("](") {
+        return true;
+    }
+    emphasised(text, '*') || emphasised(text, '_')
+}
+
+/// An emphasis pair — `*text*` or `_text_` — that is flanked the way CommonMark
+/// requires: a marker needs a word character beside it, and `_` also refuses to
+/// open or close inside a word, the rule the renderer's own underscore scan
+/// applies. `snake_case_name` and `2 * 3 * 4` therefore stay as they are
+/// instead of dragging the answer into the markdown path.
+fn emphasised(text: &str, marker: char) -> bool {
+    let cells: Vec<char> = text.chars().collect();
+    let mut open: Option<usize> = None;
+    for (at, cell) in cells.iter().enumerate() {
+        if *cell != marker {
+            continue;
+        }
+        let before = at.checked_sub(1).map(|index| cells[index]);
+        let after = cells.get(at + 1).copied();
+        match open {
+            None => {
+                if marker == '_' && !before.is_none_or(|ch| !ch.is_alphanumeric()) {
+                    continue;
+                }
+                if after.is_some_and(|ch| !ch.is_whitespace()) {
+                    open = Some(at);
+                }
+            }
+            Some(from) => {
+                if marker == '_' && !after.is_none_or(|ch| !ch.is_alphanumeric()) {
+                    continue;
+                }
+                if before.is_some_and(|ch| !ch.is_whitespace()) && at > from + 1 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn tool_chip(text: &str) -> (&'static str, ThemeColor, String, ThemeColor) {
@@ -8038,6 +8329,274 @@ mod tests {
             assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
             assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
         }
+    }
+
+    fn assistant_line(text: &str) -> TranscriptLine {
+        TranscriptLine {
+            kind: LineKind::Assistant,
+            text: text.to_owned(),
+        }
+    }
+
+    /// A frame's buffer, for a test that has to read a cell's own style.
+    fn frame_buffer(chat: &mut Chat, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => panic!("test backend: {error}"),
+        };
+        assert!(terminal.draw(|frame| draw(frame, chat)).is_ok());
+        terminal.backend().buffer().clone()
+    }
+
+    /// Where the first character of `needle` sits in a frame given as rows of
+    /// symbols: the column is the characters before it, since a frame row
+    /// carries no escapes.
+    fn cell_of(rows: &[String], needle: &str) -> Option<(u16, u16)> {
+        rows.iter().enumerate().find_map(|(y, row)| {
+            row.find(needle)
+                .map(|at| (row[..at].chars().count() as u16, y as u16))
+        })
+    }
+
+    /// The span that holds `needle`, so a test can read a row's styling.
+    fn span_with<'a>(rows: &'a [Line<'static>], needle: &str) -> &'a Span<'static> {
+        rows.iter()
+            .flat_map(|row| row.spans.iter())
+            .find(|span| span.content.contains(needle))
+            .unwrap_or_else(|| panic!("no span holds {needle:?}"))
+    }
+
+    fn reply_rows_of(text: &str, width: usize) -> Vec<Line<'static>> {
+        message_rows(&assistant_line(text), width, &test_theme()).0
+    }
+
+    /// A heading is rendered as the theme's heading, and its `#` run is syntax:
+    /// no hash reaches the screen. Level 2 carries bold, which the renderer
+    /// emits as one combined escape and the frame has to read back as a style.
+    #[test]
+    fn a_heading_in_a_reply_is_styled_without_its_hashes() {
+        let theme = test_theme();
+        let rows = reply_rows_of("## What is here", 80);
+        let texts = row_texts(&rows);
+        assert!(
+            texts.iter().all(|row| !row.contains('#')),
+            "a hash reached the screen: {texts:?}"
+        );
+        let heading = span_with(&rows, "What is here");
+        assert_eq!(heading.style.fg, fg(&theme, ThemeColor::MdHeading).fg);
+        assert!(
+            heading.style.has_modifier(Modifier::BOLD),
+            "level 2 has no bold: {:?}",
+            heading.style
+        );
+        // The label and the gutter are the plain block's, unchanged.
+        assert!(texts[0].starts_with("  titi │ "), "{texts:?}");
+        assert_eq!(
+            span_with(&rows, "titi").style,
+            fg(&theme, ThemeColor::Accent).add_modifier(Modifier::BOLD)
+        );
+    }
+
+    /// A fenced block is drawn as the renderer's box, with the language named
+    /// once on the top rule; the fence itself never reaches the screen, and the
+    /// box is narrower than the pane the reply is drawn in.
+    #[test]
+    fn a_fenced_block_in_a_reply_is_a_box() {
+        let theme = test_theme();
+        let reply = "before\n\n```rust\nlet plan = 1;\n```\n\nafter";
+        let rows = reply_rows_of(reply, 80);
+        let texts = row_texts(&rows);
+        assert!(
+            texts.iter().all(|row| !row.contains("```")),
+            "a fence reached the screen: {texts:?}"
+        );
+        let top = texts
+            .iter()
+            .find(|row| row.contains("╭"))
+            .unwrap_or_else(|| panic!("no box in {texts:?}"));
+        assert!(top.contains(" rust "), "the language is not named: {top:?}");
+        assert_eq!(
+            texts.iter().filter(|row| row.contains(" rust ")).count(),
+            1,
+            "the language is named more than once: {texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|row| row.contains('╰')).count(),
+            1,
+            "the box is not closed: {texts:?}"
+        );
+        assert!(texts.iter().any(|row| row.contains("let plan = 1;")));
+        assert_eq!(
+            span_with(&rows, "let plan = 1;").style.fg,
+            fg(&theme, ThemeColor::MdCodeBlock).fg
+        );
+        assert_eq!(
+            span_with(&rows, "╭").style.fg,
+            fg(&theme, ThemeColor::MdCodeBlockBorder).fg
+        );
+    }
+
+    /// A reply that is not markdown is the plain block, byte for byte: the same
+    /// spans, in the same styles, as the rendering the screen had before the
+    /// renderer existed.
+    #[test]
+    fn a_plain_reply_is_the_block_it_always_was() {
+        let theme = test_theme();
+        let rows = reply_rows_of("done", 80);
+        assert_eq!(
+            rows,
+            vec![Line::from(vec![
+                Span::styled("  ", page(&theme)),
+                Span::styled(
+                    "titi",
+                    fg(&theme, ThemeColor::Accent).add_modifier(Modifier::BOLD)
+                ),
+                Span::styled(" │ ", fg(&theme, ThemeColor::Accent)),
+                Span::styled("done", fg(&theme, ThemeColor::Text)),
+            ])]
+        );
+        // A long plain answer wraps exactly as `speech` wraps it, row for row.
+        let long = "word ".repeat(40);
+        assert_eq!(
+            reply_rows_of(&long, 60),
+            speech(
+                "titi",
+                ThemeColor::Accent,
+                ThemeColor::Text,
+                &long,
+                60,
+                &theme
+            )
+        );
+        // Arithmetic and identifiers are not emphasis.
+        for plain in ["2 * 3 * 4", "the snake_case_name field", "a_trailing_"] {
+            assert_eq!(
+                reply_rows_of(plain, 80),
+                speech(
+                    "titi",
+                    ThemeColor::Accent,
+                    ThemeColor::Text,
+                    plain,
+                    80,
+                    &theme
+                ),
+                "{plain:?}"
+            );
+        }
+    }
+
+    /// Inside a markdown reply, a styled run ends where its marker does: the
+    /// text after `**bold**` carries the pane's own colour, not the bold run's.
+    #[test]
+    fn a_bold_run_ends_where_its_marker_does() {
+        let rows = reply_rows_of("**bold** and plain", 80);
+        assert_eq!(row_texts(&rows)[0], "  titi │ bold and plain");
+        let bold = span_with(&rows, "bold");
+        assert!(bold.style.has_modifier(Modifier::BOLD), "{:?}", bold.style);
+        assert_eq!(bold.style.fg, None, "bold carries no colour of its own");
+        let plain = span_with(&rows, "and plain");
+        assert!(
+            !plain.style.has_modifier(Modifier::BOLD),
+            "the reset was lost: {:?}",
+            plain.style
+        );
+    }
+
+    /// A markdown reply is drawn inside the pane at every width, and its body
+    /// starts in the same column a plain reply's body does.
+    #[test]
+    fn a_markdown_reply_stays_inside_the_pane() {
+        let reply = "## Title\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n\n> quoted\n\nA paragraph that is long enough to wrap more than once at a narrow width, so the wrap has to be measured against the pane the row is drawn in.";
+        for width in [60usize, 80, 120] {
+            let rows = reply_rows_of(reply, width);
+            let texts = row_texts(&rows);
+            assert!(texts.len() > 4, "{width}: {texts:?}");
+            for (at, row) in texts.iter().enumerate() {
+                assert!(
+                    titi_tui::width::visible_width(row) <= width,
+                    "{width}: row {at} is {} wide: {row:?}",
+                    titi_tui::width::visible_width(row)
+                );
+            }
+            assert!(texts[0].starts_with("  titi │ Title"), "{width}: {texts:?}");
+            for row in &texts[1..] {
+                assert!(
+                    row.starts_with("       │ ") || row.trim().is_empty(),
+                    "{width}: a continuation row lost the gutter: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// The frame itself carries the reply's styling: the cells under a heading,
+    /// a code body and a list bullet hold the tokens the renderer assigned them,
+    /// and no syntax character reaches the screen.
+    #[test]
+    fn a_frame_draws_the_reply_with_the_renderers_tokens() {
+        let theme = test_theme();
+        let mut chat = chat();
+        let reply = "## Title\n\n- one\n\n```rust\nlet plan = 1;\n```";
+        chat.push(LineKind::Assistant, reply.to_owned());
+        let width = 80u16;
+        let height = 24u16;
+        let buffer = frame_buffer(&mut chat, width, height);
+        let symbols: Vec<String> = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let text = symbols.join("\n");
+        for syntax in ["##", "```", "- one"] {
+            assert!(
+                !text.contains(syntax),
+                "{syntax:?} reached the screen:\n{text}"
+            );
+        }
+        assert!(text.contains("  titi │ Title"), "{text}");
+        assert!(text.contains("let plan = 1;"), "{text}");
+
+        // Where a cell of a named run sits, it carries that run's token.
+        for (needle, token) in [
+            ("Title", ThemeColor::MdHeading),
+            ("let plan = 1;", ThemeColor::MdCodeBlock),
+            ("•", ThemeColor::MdListBullet),
+        ] {
+            let (x, y) = cell_of(&symbols, needle)
+                .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{text}"));
+            assert_eq!(
+                buffer[(x, y)].fg,
+                fg(&theme, token).fg.unwrap_or(Color::Reset),
+                "{needle:?} is not drawn in {token:?}"
+            );
+        }
+    }
+
+    /// The rows kept for the newest reply are only used for the reply they were
+    /// rendered from, at the width they were rendered for: an answer of the
+    /// same length, and the same answer in a wider pane, are both re-rendered.
+    #[test]
+    fn a_kept_reply_is_not_re_used_for_another_answer_or_width() {
+        let mut chat = chat();
+        let theme = test_theme();
+        let first = chat.assistant_rows(true, "# alpha", 40, &theme);
+        let same = chat.assistant_rows(true, "# alpha", 40, &theme);
+        assert_eq!(first, same, "the reply was rendered differently");
+        let other = chat.assistant_rows(true, "# bravo", 40, &theme);
+        assert_ne!(first, other, "another reply re-used the kept rows");
+        assert!(row_texts(&other).iter().any(|row| row.contains("bravo")));
+
+        // A wider pane wraps the same answer into fewer rows, so a pane that
+        // changed width cannot have been served from the kept rows.
+        let long = "word ".repeat(40);
+        let long = long.trim();
+        let narrow = chat.assistant_rows(true, long, 40, &theme);
+        let wide = chat.assistant_rows(true, long, 80, &theme);
+        assert_ne!(narrow, wide, "a wider pane re-used the kept rows");
+        assert!(
+            narrow.len() > wide.len(),
+            "the narrower pane wrapped into fewer rows: {} vs {}",
+            narrow.len(),
+            wide.len()
+        );
     }
 
     /// The URL of a sign-in note is never cut mid-token and never carries the
