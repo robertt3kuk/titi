@@ -98,6 +98,19 @@ pub struct ToolResult {
 pub trait ToolHandler: Send + Sync + 'static {
     fn definition(&self) -> ToolDefinition;
     async fn invoke(&self, args: serde_json::Value) -> ToolResult;
+
+    /// What this call is about to do, for a surface to show beside the tool's
+    /// name: `read docs/README.md`, `bash cargo test -p titi-core`.
+    ///
+    /// Presentation only, and by construction: the engine puts this on the
+    /// `ToolStarted` event and never sends it to the provider, so it can
+    /// neither spend the model's context nor answer for the tool. It is one row
+    /// on a screen, not a payload — keep it to a few words. `None`, the
+    /// default, means the tool has nothing to say beyond its own name.
+    fn describe(&self, args: &serde_json::Value) -> Option<String> {
+        let _ = args;
+        None
+    }
 }
 
 #[derive(Clone, Default)]

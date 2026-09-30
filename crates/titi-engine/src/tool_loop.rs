@@ -141,14 +141,22 @@ pub(crate) async fn execute_tools(
         if aborted.load(Ordering::SeqCst) {
             break;
         }
+        let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+        // What the tool says it is about to do, for a surface to show beside
+        // its name. Masked like the answer, and put on the event alone: the
+        // provider is never told it, so it cannot spend the model's context.
+        let detail = tools
+            .get(&call.name)
+            .and_then(|handler| handler.describe(&args))
+            .map(|detail| mask(&detail, mask_ips).into());
         let _ = events
             .send(EngineEvent::ToolStarted {
                 turn_id,
                 call_id: call.call_id.clone(),
                 name: call.name.clone(),
+                detail,
             })
             .await;
-        let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
         if TOUCHING_TOOLS.contains(&call.name.as_str())
             && let Some(path) = args.get("path").and_then(|value| value.as_str())
         {

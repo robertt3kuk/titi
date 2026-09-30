@@ -79,6 +79,28 @@ pub(crate) fn err(output: impl Into<String>) -> ToolResult {
     }
 }
 
+/// Cells a tool's description of a call may take: one row on a screen, beside a
+/// glyph and an elapsed time, not a payload.
+pub(crate) const DESCRIBE_MAX: usize = 60;
+
+/// One line describing a call, cut to `max` characters: control characters
+/// flattened (a command may hold a newline) and the tail dropped with an
+/// ellipsis rather than the whole description being refused.
+///
+/// The row that shows this measures cells; this is only the bound that keeps a
+/// description from becoming a payload.
+pub(crate) fn describe_line(text: &str, max: usize) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let mut out: String = flattened.chars().take(max).collect();
+    if flattened.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 /// A result with something for the surface to draw under the answer — a diff,
 /// today. The answer itself is unchanged, and the model never sees the detail:
 /// the engine keeps it out of the tool message.
@@ -233,6 +255,11 @@ impl ToolHandler for ReadFileTool {
         }
     }
 
+    fn describe(&self, args: &Value) -> Option<String> {
+        let path = arg_str(args, "path")?;
+        Some(format!("read {}", describe_line(&path, DESCRIBE_MAX)))
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let Some(path) = arg_str(&args, "path") else {
             return err("missing path");
@@ -269,6 +296,11 @@ impl ToolHandler for WriteFileTool {
             },
             approval: ApprovalTier::Write,
         }
+    }
+
+    fn describe(&self, args: &Value) -> Option<String> {
+        let path = arg_str(args, "path")?;
+        Some(format!("write {}", describe_line(&path, DESCRIBE_MAX)))
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -331,6 +363,11 @@ impl ToolHandler for EditFileTool {
         }
     }
 
+    fn describe(&self, args: &Value) -> Option<String> {
+        let path = arg_str(args, "path")?;
+        Some(format!("edit {}", describe_line(&path, DESCRIBE_MAX)))
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let Some(path) = arg_str(&args, "path") else {
             return err("missing path");
@@ -380,6 +417,11 @@ impl ToolHandler for GlobTool {
         }
     }
 
+    fn describe(&self, args: &Value) -> Option<String> {
+        let pattern = arg_str(args, "pattern")?;
+        Some(format!("glob {}", describe_line(&pattern, DESCRIBE_MAX)))
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let pattern = arg_str(&args, "pattern").unwrap_or_default();
         let mut matches = Vec::new();
@@ -413,6 +455,16 @@ impl ToolHandler for GrepTool {
             },
             approval: ApprovalTier::Read,
         }
+    }
+
+    fn describe(&self, args: &Value) -> Option<String> {
+        let pattern = arg_str(args, "pattern")?;
+        let mut line = format!("grep {}", describe_line(&pattern, DESCRIBE_MAX));
+        if let Some(path) = arg_str(args, "path") {
+            line.push(' ');
+            line.push_str(&describe_line(&path, DESCRIBE_MAX));
+        }
+        Some(line)
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -464,6 +516,11 @@ impl ToolHandler for BashTool {
             },
             approval: ApprovalTier::Exec,
         }
+    }
+
+    fn describe(&self, args: &Value) -> Option<String> {
+        let command = arg_str(args, "command")?;
+        Some(format!("bash {}", describe_line(&command, DESCRIBE_MAX)))
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -875,6 +932,74 @@ mod tests {
             .expect("the tool reported a detail")
             .lines()
             .collect()
+    }
+
+    /// A tool describes the call it is about to make, so a surface can say
+    /// what is being read or run rather than only which tool it is.
+    #[tokio::test]
+    async fn a_tool_describes_the_call_it_is_about_to_make() {
+        let root = temp_root();
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+        assert_eq!(
+            read.describe(&serde_json::json!({"path": "docs/README.md"}))
+                .as_deref(),
+            Some("read docs/README.md")
+        );
+        assert_eq!(
+            read.describe(&serde_json::json!({})),
+            None,
+            "no path, no call"
+        );
+
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        assert_eq!(
+            write
+                .describe(&serde_json::json!({"path": "notes/probe.txt", "content": "x"}))
+                .as_deref(),
+            Some("write notes/probe.txt")
+        );
+
+        let bash = BashTool {
+            root: root.clone(),
+            interrupt: Interrupt::new(),
+        };
+        assert_eq!(
+            bash.describe(&serde_json::json!({"command": "cargo test -p titi-core"}))
+                .as_deref(),
+            Some("bash cargo test -p titi-core")
+        );
+
+        let grep = GrepTool {
+            root,
+            policy: SensitivePolicy::default(),
+        };
+        assert_eq!(
+            grep.describe(&serde_json::json!({"pattern": "ToolResult", "path": "crates"}))
+                .as_deref(),
+            Some("grep ToolResult crates")
+        );
+
+        // A description stays one row: a long one is cut, a newline flattened.
+        let long = "x".repeat(DESCRIBE_MAX + 10);
+        let described = bash
+            .describe(&serde_json::json!({"command": long}))
+            .expect("a command is a call");
+        assert!(described.ends_with('…'), "{described}");
+        assert!(
+            described.chars().count() < long.chars().count() + 8,
+            "{described}"
+        );
+        let newline = bash
+            .describe(&serde_json::json!({"command": "echo one\necho two"}))
+            .expect("a command is a call");
+        assert_eq!(newline, "bash echo one echo two", "a newline is flattened");
     }
 
     /// An edit's answer stays the one line it always was, and the change it

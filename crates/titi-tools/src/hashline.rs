@@ -231,6 +231,14 @@ impl ToolHandler for HashlineEditTool {
         }
     }
 
+    fn describe(&self, args: &Value) -> Option<String> {
+        let path = arg_str(args, "path")?;
+        Some(format!(
+            "edit {}",
+            crate::fs::describe_line(&path, crate::fs::DESCRIBE_MAX)
+        ))
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         match self.apply(&args) {
             Ok(message) => ok(message),

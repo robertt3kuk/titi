@@ -26,6 +26,7 @@ fn stream() -> Vec<EngineEvent> {
             turn_id: TurnId(1),
             call_id: "call-1".into(),
             name: "read".into(),
+            detail: None,
         },
         EngineEvent::ToolFinished {
             turn_id: TurnId(1),

@@ -59,6 +59,7 @@ fn engine_events_render_stream_thinking_tools_and_agents() {
         turn_id,
         call_id: "call-1".into(),
         name: "read".into(),
+        detail: None,
     });
     app.ingest_engine_event(EngineEvent::AgentStarted {
         agent_id: "agent-1".into(),

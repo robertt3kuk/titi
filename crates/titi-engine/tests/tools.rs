@@ -742,3 +742,66 @@ async fn a_tool_detail_reaches_the_event_and_not_the_model() {
         );
     }
 }
+
+/// The description of a call reaches the surface and not the model: the event
+/// carries what the tool said it was doing, and the messages the provider reads
+/// back are the ones it read before this field existed.
+#[tokio::test]
+async fn a_tool_call_description_reaches_the_event_and_not_the_model() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("probe.txt"), "the file's own text\n").unwrap();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("read", r#"{"path":"probe.txt"}"#)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Yolo;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(Arc::clone(&transport) as _),
+        workspace_registry(workspace.path()),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "read it".into(),
+        })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let described = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolStarted { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .expect("the read call started");
+    assert_eq!(
+        described.as_deref(),
+        Some("read probe.txt"),
+        "the tool describes the call it is making"
+    );
+
+    // What the provider is handed: the tool's own output, and no trace of the
+    // description — the call's arguments are in the assistant message, and the
+    // description is the screen's alone.
+    let requests = transport.requests();
+    let messages = &requests.last().expect("the turn was sent back").messages;
+    let tool_message = messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("the tool message");
+    assert_eq!(
+        tool_message.content, "the file's own text\n",
+        "the tool message is exactly the tool's output"
+    );
+    for message in messages {
+        assert!(
+            !message.content.contains("read probe.txt"),
+            "the description leaked into a message: {:?}",
+            message.content
+        );
+    }
+}

@@ -106,6 +106,19 @@ impl ToolHandler for GitTool {
         }
     }
 
+    fn describe(&self, args: &Value) -> Option<String> {
+        let op = arg_str(args, "op")?;
+        let mut line = format!(
+            "git {}",
+            crate::fs::describe_line(&op, crate::fs::DESCRIBE_MAX)
+        );
+        if let Some(path) = arg_str(args, "path") {
+            line.push(' ');
+            line.push_str(&crate::fs::describe_line(&path, crate::fs::DESCRIBE_MAX));
+        }
+        Some(line)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         match self.run(args) {
             Ok(output) => ok(output),

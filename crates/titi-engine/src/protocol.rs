@@ -175,6 +175,11 @@ pub enum EngineEvent {
         turn_id: TurnId,
         call_id: SmolStr,
         name: SmolStr,
+        /// What the tool says it is about to do — `read docs/README.md` —
+        /// for a surface to show beside the name. Never sent to the provider:
+        /// the call's own arguments are already in the assistant message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<SmolStr>,
     },
     ToolApprovalNeeded {
         turn_id: TurnId,

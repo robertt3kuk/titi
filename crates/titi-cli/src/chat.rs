@@ -5931,6 +5931,7 @@ mod tests {
             turn_id: TurnId(3),
             call_id: "call-1".into(),
             name: "read".into(),
+            detail: None,
         });
         assert_eq!(
             call.log,
@@ -6553,6 +6554,7 @@ mod tests {
             turn_id: TurnId(1),
             call_id: "c1".into(),
             name: "bash".into(),
+            detail: None,
         });
         assert!(frame_text(&mut chat).contains("enter steers  ·  ctrl-c stops"));
     }
@@ -6668,6 +6670,7 @@ mod tests {
             turn_id: TurnId(1),
             call_id: "c1".into(),
             name: "read".into(),
+            detail: None,
         });
         let row = above_composer(&mut chat, 80, 20);
         assert!(row.contains("read ·"), "{row:?}");
@@ -6711,6 +6714,7 @@ mod tests {
             turn_id: TurnId(1),
             call_id: "c1".into(),
             name: "bash".into(),
+            detail: None,
         });
         chat.on_event(EngineEvent::ToolApprovalNeeded {
             turn_id: TurnId(1),
@@ -6741,6 +6745,7 @@ mod tests {
                 turn_id: TurnId(1),
                 call_id: "c1".into(),
                 name: "bash".into(),
+                detail: None,
             });
             let row = above_composer(chat, 80, 20);
             assert!(row.contains("bash ·"), "{row:?}");
@@ -6787,6 +6792,7 @@ mod tests {
             call_id: "c1".into(),
             name: "mcp__a_tool_name_that_is_far_too_long_for_any_narrow_screen_to_show_whole"
                 .into(),
+            detail: None,
         });
         for (width, height) in [(60u16, 20u16), (80, 20), (120, 30)] {
             let rows = frame_rows(&mut chat, width, height);
@@ -6831,6 +6837,7 @@ mod tests {
             turn_id: TurnId(1),
             call_id: "c1".into(),
             name: "bash".into(),
+            detail: None,
         });
         for (width, height) in [(20u16, 6u16), (16, 6), (60, 7), (16, 3)] {
             let rows = frame_rows(&mut chat, width, height);
@@ -9113,6 +9120,7 @@ mod tests {
             turn_id: TurnId(1),
             call_id: "c1".into(),
             name: "edit".into(),
+            detail: None,
         });
         chat.on_event(EngineEvent::ToolFinished {
             turn_id: TurnId(1),
@@ -9207,6 +9215,7 @@ mod tests {
                 turn_id: TurnId(1),
                 call_id: "c1".into(),
                 name: tool.into(),
+                detail: None,
             });
             chat.on_event(EngineEvent::ToolFinished {
                 turn_id: TurnId(1),
