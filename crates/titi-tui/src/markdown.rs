@@ -2,14 +2,24 @@
 //!
 //! # Markdown supported
 //!
-//! - Headings (`#` … `######`) — styled with `ThemeColor::MdHeading`
+//! No markdown syntax character reaches the screen: every construct is turned
+//! into theme colour plus SGR style, and every emitted row fits `width`.
+//!
+//! - Headings (`#` … `######`) — the `#` run is dropped; levels are told
+//!   apart by an SGR stack (1 bold+underline, 2 bold, 3 italic, 4 underline,
+//!   5 bold+italic, 6 italic+underline) over `ThemeColor::MdHeading`, with a
+//!   blank row before a heading that does not already start a block
 //! - Bold (`**text**`) — with `Theme::bold`
-//! - Italic (`*text*`) — with `Theme::italic`
+//! - Italic (`*text*`, `_text_`; `_` only opens at a word boundary) — with
+//!   `Theme::italic`
 //! - Inline code (`` `code` ``) — styled with `ThemeColor::MdCode`
-//! - Fenced code blocks (```` ```lang ````) — styled with `ThemeColor::MdCodeBlock`
-//! - Blockquotes (`> `) — styled with `ThemeColor::MdQuote` + `MdQuoteBorder`
-//! - Unordered lists (`- `, `* `) — styled with `ThemeColor::MdListBullet`
-//! - Ordered lists (`1. `) — numbered
+//! - Fenced code blocks (```` ```lang ````) — drawn as a box whose border is
+//!   `ThemeColor::MdCodeBlockBorder`, the language label appears once in the
+//!   top rule, and the body is `ThemeColor::MdCodeBlock`, hard-wrapped to fit
+//! - Blockquotes (`> `) — a `MdQuoteBorder` gutter plus `MdQuote` text
+//! - Unordered lists (`- `, `* `) — `ThemeColor::MdListBullet`, continuation
+//!   rows hang-indented under the first
+//! - Ordered lists (`1. `) — numbered, same hanging indent
 //! - Horizontal rules (`---`) — styled with `ThemeColor::MdHr`
 //! - Links (`[text](url)`) — text with `MdLink`, url with `MdLinkUrl`
 //! - Paragraphs — wrapped to `width`
@@ -22,7 +32,7 @@
 //! `SectionVisibility::apply` implements `/details <section> <mode>`.
 
 use crate::theme::{Theme, ThemeColor};
-use crate::width::wrap_text_with_ansi;
+use crate::width::{replace_tabs, visible_width, wrap_text_with_ansi};
 
 // ---------------------------------------------------------------------------
 // Section visibility
@@ -188,22 +198,34 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
             continue;
         }
 
-        // Heading.
-        if let Some(heading) = raw.strip_prefix('#') {
-            let level = heading.chars().take_while(|c| *c == '#').count() + 1;
-            let content = heading.trim_start_matches('#').trim();
-            let styled = style_inline(content, theme);
-            let prefix = "#".repeat(level);
-            // Bold for headings.
-            lines.push(theme.fg(ThemeColor::MdHeading, &format!("{prefix} {styled}")));
-            continue;
+        // Heading.  The `#` run is syntax, so it never reaches the screen;
+        // the level is carried by the SGR stack instead.
+        let hashes = raw.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 {
+            let rest = &raw[hashes..];
+            if rest.is_empty() || rest.starts_with(' ') {
+                let content = style_inline(rest.trim(), theme);
+                let body = styled(
+                    theme,
+                    ThemeColor::MdHeading,
+                    heading_styles(hashes),
+                    &content,
+                );
+                // A heading opens a block; give it a leading blank row unless
+                // it is the first row or one is already there.
+                if lines.last().is_some_and(|l| !l.is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.extend(wrap_text_with_ansi(&body, w));
+                continue;
+            }
         }
 
-        // Blockquote.
+        // Blockquote: a gutter, never a literal `>`.
         if let Some(content) = raw.strip_prefix('>') {
-            let content = content.trim_start();
+            let content = content.trim();
             let styled = style_inline(content, theme);
-            let wrapped = wrap_text_with_ansi(&styled, w.saturating_sub(4));
+            let wrapped = wrap_text_with_ansi(&styled, w.saturating_sub(2).max(1));
             for (i, wline) in wrapped.iter().enumerate() {
                 let border = if i == 0 { "▎ " } else { "  " };
                 lines.push(format!(
@@ -215,47 +237,26 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
             continue;
         }
 
-        // Unordered list.
-        if let Some(rest) = raw
-            .trim_start()
-            .strip_prefix("- ")
-            .or_else(|| raw.trim_start().strip_prefix("* "))
-        {
-            let content = style_inline(rest, theme);
-            let bullet = theme.fg(ThemeColor::MdListBullet, "•");
-            let wrapped = wrap_text_with_ansi(&content, w.saturating_sub(4));
+        // Lists (ordered and unordered, at any indent).  Continuation rows
+        // hang under the first so the markers of a level stay aligned.
+        if let Some((indent, marker, body)) = parse_list_item(raw) {
+            let indent = indent.min(w.saturating_sub(2));
+            let marker_w = visible_width(&marker);
+            let prefix_w = indent + marker_w + 1;
+            let body_w = w.saturating_sub(prefix_w).max(1);
+            let content = style_inline(body, theme);
+            let wrapped = wrap_text_with_ansi(&content, body_w);
+            let bullet = theme.fg(ThemeColor::MdListBullet, &marker);
+            let hang = " ".repeat(prefix_w);
+            let pad = " ".repeat(indent);
             for (i, wline) in wrapped.iter().enumerate() {
                 if i == 0 {
-                    lines.push(format!("{bullet} {wline}"));
+                    lines.push(format!("{pad}{bullet} {wline}"));
                 } else {
-                    lines.push(format!("  {wline}"));
+                    lines.push(format!("{hang}{wline}"));
                 }
             }
             continue;
-        }
-
-        // Ordered list.
-        if let Some(_) = raw
-            .trim_start()
-            .chars()
-            .next()
-            .filter(|c| c.is_ascii_digit())
-        {
-            if let Some(dot_pos) = raw.trim_start().find(". ") {
-                let num_str = raw.trim_start()[..dot_pos].to_owned();
-                let rest = raw.trim_start()[dot_pos + 2..].trim();
-                let content = style_inline(rest, theme);
-                let bullet = theme.fg(ThemeColor::MdListBullet, &format!("{num_str}."));
-                let wrapped = wrap_text_with_ansi(&content, w.saturating_sub(4));
-                for (i, wline) in wrapped.iter().enumerate() {
-                    if i == 0 {
-                        lines.push(format!("{bullet} {wline}"));
-                    } else {
-                        lines.push(format!("   {wline}"));
-                    }
-                }
-                continue;
-            }
         }
 
         // Empty line = paragraph break.
@@ -277,27 +278,144 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
     lines
 }
 
-/// Render a fenced code block.
-fn render_code_block(lines: &[&str], lang: &str, theme: &Theme, w: usize) -> Vec<String> {
+/// Render a fenced code block as a box spanning exactly `w` columns.
+///
+/// The language label rides in the top rule (once, never per line) and the
+/// body is hard-wrapped to the interior, so an over-long code line spills onto
+/// further interior rows instead of crossing the border.
+fn render_code_block(code: &[&str], lang: &str, theme: &Theme, w: usize) -> Vec<String> {
+    let bar = theme.fg(ThemeColor::MdCodeBlockBorder, "│");
+    let inner = w.saturating_sub(4);
     let mut out = Vec::new();
-    if !lang.is_empty() {
-        out.push(theme.fg(ThemeColor::MdCodeBlock, &format!("```{lang}")));
+    if inner == 0 {
+        // Too narrow for a frame: keep the body, drop the box.
+        for line in code {
+            let body = theme.fg(ThemeColor::MdCodeBlock, &replace_tabs(line));
+            out.extend(wrap_text_with_ansi(&body, w.max(1)));
+        }
+        return out;
     }
-    for line in lines {
-        out.push(theme.fg(ThemeColor::MdCodeBlock, line));
+    let head = if lang.is_empty() {
+        "─".to_owned()
+    } else {
+        format!("─ {lang} ")
+    };
+    let fill = w.saturating_sub(2 + visible_width(&head));
+    out.push(theme.fg(
+        ThemeColor::MdCodeBlockBorder,
+        &format!("╭{head}{}╮", "─".repeat(fill)),
+    ));
+    for line in code {
+        let body = theme.fg(ThemeColor::MdCodeBlock, &replace_tabs(line));
+        for row in wrap_text_with_ansi(&body, inner) {
+            let pad = " ".repeat(inner.saturating_sub(visible_width(&row)));
+            out.push(format!("{bar} {row}{pad} {bar}"));
+        }
     }
     out.push(theme.fg(
         ThemeColor::MdCodeBlockBorder,
-        &"─".repeat(w.saturating_sub(1)),
+        &format!("╰{}╯", "─".repeat(w.saturating_sub(2))),
     ));
     out
 }
 
+/// Inline text style that can be composed into one SGR open sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Style {
+    Bold,
+    Italic,
+    Underline,
+}
+
+impl Style {
+    fn on(self) -> &'static str {
+        match self {
+            Style::Bold => "1",
+            Style::Italic => "3",
+            Style::Underline => "4",
+        }
+    }
+
+    fn off(self) -> &'static str {
+        match self {
+            Style::Bold => "22",
+            Style::Italic => "23",
+            Style::Underline => "24",
+        }
+    }
+}
+
+/// The SGR stack per heading level: a level is told apart by style, since the
+/// `#` run itself is never printed.
+fn heading_styles(level: usize) -> &'static [Style] {
+    use Style::{Bold, Italic, Underline};
+    match level {
+        1 => &[Bold, Underline],
+        2 => &[Bold],
+        3 => &[Italic],
+        4 => &[Underline],
+        5 => &[Bold, Italic],
+        _ => &[Italic, Underline],
+    }
+}
+
+/// Wrap `text` in theme token `color` plus `styles`.
+///
+/// Opens with one combined SGR so `wrap_text_with_ansi` re-emits the whole
+/// style on a continued row, and closes each attribute on its own in reverse
+/// order so an enclosing span survives a nested one.
+fn styled(theme: &Theme, color: ThemeColor, styles: &[Style], text: &str) -> String {
+    if styles.is_empty() {
+        return theme.fg(color, text);
+    }
+    let fg = theme.get_fg_ansi(color);
+    // `\x1b[38;2;r;g;bm` / `\x1b[39m` -> `38;2;r;g;b` / `39`.
+    let params = fg
+        .strip_prefix("\x1b[")
+        .and_then(|s| s.strip_suffix('m'))
+        .unwrap_or("39");
+    let mut out = String::with_capacity(text.len() + 32);
+    out.push_str("\x1b[");
+    for s in styles {
+        out.push_str(s.on());
+        out.push(';');
+    }
+    out.push_str(params);
+    out.push('m');
+    out.push_str(text);
+    out.push_str("\x1b[39m");
+    for s in styles.iter().rev() {
+        out.push_str("\x1b[");
+        out.push_str(s.off());
+        out.push('m');
+    }
+    out
+}
+
+/// Split a list row into `(indent columns, marker, body)`.
+///
+/// Recognises `- `, `* `, and `N. ` after any leading indentation, so nested
+/// lists keep their depth instead of collapsing to column zero.
+fn parse_list_item(raw: &str) -> Option<(usize, String, &str)> {
+    let body = raw.trim_start_matches([' ', '\t']);
+    let indent = raw.len() - body.len();
+    if let Some(rest) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
+        return Some((indent, "•".to_owned(), rest.trim_end()));
+    }
+    let digits: &str = &body[..body.chars().take_while(char::is_ascii_digit).count()];
+    if !digits.is_empty()
+        && let Some(rest) = body[digits.len()..].strip_prefix(". ")
+    {
+        return Some((indent, format!("{digits}."), rest.trim_end()));
+    }
+    None
+}
+
 /// Style inline markdown in a single line of text.
 ///
-/// Handles `` `code` ``, `[text](url)`, `**bold**`, `*italic*`.  Processes
-/// the earliest marker first and recurses into prefixes so nested/staged
-/// markers (e.g. bold before an inline code span) all render.
+/// Handles `` `code` ``, `[text](url)`, `**bold**`, `*italic*` and
+/// `_italic_`.  Processes the earliest marker first and recurses into prefixes
+/// so nested/staged markers (e.g. bold before an inline code span) all render.
 fn style_inline(text: &str, theme: &Theme) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -306,6 +424,7 @@ fn style_inline(text: &str, theme: &Theme) -> String {
         let link_at = rest.find('[');
         let bold_at = rest.find("**");
         let italic_at = rest.find('*');
+        let underscore_at = underscore_italic_at(rest);
 
         // Earliest marker wins; on ties code > link > bold > italic.
         let mut best: Option<(usize, &str)> = None;
@@ -314,6 +433,7 @@ fn style_inline(text: &str, theme: &Theme) -> String {
             (link_at, "link"),
             (bold_at, "bold"),
             (italic_at, "italic"),
+            (underscore_at, "underscore"),
         ] {
             let Some(i) = i else { continue };
             if kind == "italic" && bold_at == Some(i) {
@@ -387,10 +507,47 @@ fn style_inline(text: &str, theme: &Theme) -> String {
                     out.push('*');
                 }
             }
+            "underscore" => {
+                rest = &rest[1..];
+                if let Some(end) = rest.find('_') {
+                    let inner = style_inline(&rest[..end], theme);
+                    out.push_str(&theme.italic(&inner));
+                    rest = &rest[end + 1..];
+                } else {
+                    out.push('_');
+                }
+            }
             _ => unreachable!(),
         }
     }
     out
+}
+
+/// Byte offset of the first `_` that can open emphasis: at a word boundary and
+/// followed by a matching `_` that itself ends at a word boundary.  Identifiers
+/// such as `snake_case_idents` are therefore left alone.
+fn underscore_italic_at(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('_') {
+        let open = from + offset;
+        let opens_at_boundary = !text[..open]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        if opens_at_boundary && let Some(offset) = text[open + 1..].find('_') {
+            let close = open + 1 + offset;
+            let closes_at_boundary = !text[close + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric);
+            // `__` is not a valid single-underscore closer.
+            if closes_at_boundary && !text[..close].ends_with('_') {
+                return Some(open);
+            }
+        }
+        from = open + 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -472,6 +629,67 @@ mod tests {
 
     // ---- Markdown rendering -----------------------------------------------
 
+    /// Distinct colour per markdown token, so a row assertion can tell the
+    /// heading, frame, body, bullet and quote spans apart.
+    fn colored_theme() -> Theme {
+        let mut fg = HashMap::new();
+        for (k, v) in [
+            ("mdHeading", "#ffcc00"),
+            ("mdCode", "#ff7b72"),
+            ("mdCodeBlock", "#c9d1d9"),
+            ("mdCodeBlockBorder", "#444444"),
+            ("mdQuote", "#8b949e"),
+            ("mdQuoteBorder", "#58a6ff"),
+            ("mdListBullet", "#ffcc00"),
+        ] {
+            fg.insert(k.to_string(), serde_json::json!(v));
+        }
+        Theme::new(
+            "colored".into(),
+            fg,
+            HashMap::new(),
+            crate::theme::ColorMode::Truecolor,
+            crate::theme::SymbolPreset::Unicode,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .expect("colored theme builds")
+    }
+
+    /// Rows with every escape sequence dropped, for structural assertions.
+    fn plain(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                crate::width::spans(l)
+                    .filter_map(|s| match s {
+                        crate::width::Span::Text(t) => Some(t),
+                        crate::width::Span::Escape(_) => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A realistic assistant answer using every construct the renderer knows.
+    const MIXED: &str = "\
+# Report
+
+Short paragraph with `code`, *emphasis* and **weight**.
+
+- first item
+  - nested item
+
+> quoted rule
+
+```rust
+let plan = app.plan_frame(input, height);
+let wider_than_the_renderer_width = plan + 1;
+```
+
+Done in `AGENTS.md`.";
+
     #[test]
     fn empty_text() {
         let lines = render_markdown("", &test_theme(), 80);
@@ -479,11 +697,44 @@ mod tests {
     }
 
     #[test]
-    fn heading_rendered() {
-        let theme = test_theme();
+    fn heading_has_no_hash_prefix() {
+        let theme = colored_theme();
         let lines = render_markdown("# Hello", &theme, 80);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("# Hello"));
+        assert_eq!(
+            lines,
+            vec!["\x1b[1;4;38;2;255;204;0mHello\x1b[39m\x1b[24m\x1b[22m".to_string()]
+        );
+    }
+
+    #[test]
+    fn heading_levels_are_distinguishable() {
+        let theme = colored_theme();
+        let l1 = render_markdown("# A", &theme, 80);
+        let l2 = render_markdown("## A", &theme, 80);
+        let l3 = render_markdown("### A", &theme, 80);
+        assert_eq!(plain(&l1), vec!["A"]);
+        assert_eq!(plain(&l2), vec!["A"]);
+        assert_eq!(plain(&l3), vec!["A"]);
+        assert!(l1[0].starts_with("\x1b[1;4;38;2;255;204;0m"), "{:?}", l1[0]);
+        assert!(l2[0].starts_with("\x1b[1;38;2;255;204;0m"), "{:?}", l2[0]);
+        assert!(l3[0].starts_with("\x1b[3;38;2;255;204;0m"), "{:?}", l3[0]);
+    }
+
+    #[test]
+    fn heading_opens_a_block_with_a_blank_row() {
+        let theme = test_theme();
+        assert_eq!(
+            plain(&render_markdown("text\n## Head", &theme, 80)),
+            vec!["text", "", "Head"]
+        );
+        assert_eq!(
+            plain(&render_markdown("# Head\n\ntext", &theme, 80)),
+            vec!["Head", "", "text"]
+        );
+        assert_eq!(
+            plain(&render_markdown("# A\n## B", &theme, 80)),
+            vec!["A", "", "B"]
+        );
     }
 
     #[test]
@@ -495,8 +746,7 @@ mod tests {
             lines[0].contains("\x1b[1m"),
             "bold should use ANSI bold: {lines:?}"
         );
-        theme.bold("bold");
-        // The bold ANSI escape should be present.
+        // The bold word itself must appear without its markers.
         assert!(lines[0].contains("bold"), "bold word should appear");
     }
 
@@ -521,6 +771,28 @@ mod tests {
             lines[0].contains("ffmpeg"),
             "code word should appear: {lines:?}"
         );
+    }
+
+    #[test]
+    fn inline_code_italic_and_bold_in_one_paragraph() {
+        let theme = colored_theme();
+        let lines = render_markdown("use `cargo test` *now* and **never** later", &theme, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "use \x1b[38;2;255;123;114mcargo test\x1b[39m \x1b[3mnow\x1b[23m \
+                 and \x1b[1mnever\x1b[22m later"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn underscore_italic_skips_identifiers() {
+        let theme = test_theme();
+        let lines = render_markdown("say _hello_ to snake_case_idents", &theme, 80);
+        assert_eq!(plain(&lines), vec!["say hello to snake_case_idents"]);
+        assert!(lines[0].contains("\x1b[3mhello\x1b[23m"), "{:?}", lines[0]);
     }
 
     #[test]
@@ -556,6 +828,32 @@ mod tests {
     }
 
     #[test]
+    fn nested_list_markers_align() {
+        let theme = test_theme();
+        let rows = plain(&render_markdown(
+            "- outer\n  - inner\n    - deeper\n10. tenth",
+            &theme,
+            80,
+        ));
+        assert_eq!(
+            rows,
+            vec!["• outer", "  • inner", "    • deeper", "10. tenth"]
+        );
+    }
+
+    #[test]
+    fn list_continuation_hangs_under_the_first_row() {
+        let theme = test_theme();
+        let rows = plain(&render_markdown("10. alpha beta gamma delta", &theme, 16));
+        // The wrap keeps the space it broke on; the hang indent follows the
+        // marker width, so `gamma` starts under `alpha`.
+        assert_eq!(rows, vec!["10. alpha beta ", "    gamma delta"]);
+        for row in render_markdown("10. alpha beta gamma delta", &theme, 16) {
+            assert!(visible_width(&row) <= 16, "{row:?}");
+        }
+    }
+
+    #[test]
     fn blockquote_rendered() {
         let theme = test_theme();
         let lines = render_markdown("> quoted text", &theme, 80);
@@ -565,13 +863,75 @@ mod tests {
     }
 
     #[test]
-    fn code_block_rendered() {
-        let theme = test_theme();
-        let lines = render_markdown("```rust\nfn main() {}\n```", &theme, 80);
-        assert!(
-            lines.iter().any(|l| l.contains("fn main()")),
-            "code block: {lines:?}"
+    fn blockquote_uses_a_gutter_not_a_literal_gt() {
+        let theme = colored_theme();
+        let lines = render_markdown("> one **two**", &theme, 80);
+        assert_eq!(
+            lines,
+            vec![
+                "\x1b[38;2;88;166;255m▎ \x1b[39m\x1b[38;2;139;148;158mone \x1b[1mtwo\x1b[22m\x1b[39m"
+                    .to_string()
+            ]
         );
+        assert!(!lines[0].contains('>'));
+    }
+
+    #[test]
+    fn code_block_draws_a_frame_with_the_language_once() {
+        let theme = colored_theme();
+        for w in [60usize, 80usize] {
+            let lines = render_markdown("```rust\nfn main() {}\n```", &theme, w as u16);
+            let expected = vec![
+                format!("\x1b[38;2;68;68;68m╭─ rust {}╮\x1b[39m", "─".repeat(w - 9)),
+                format!(
+                    "\x1b[38;2;68;68;68m│\x1b[39m \x1b[38;2;201;209;217mfn main() {{}}\x1b[39m{} \x1b[38;2;68;68;68m│\x1b[39m",
+                    " ".repeat(w - 16)
+                ),
+                format!("\x1b[38;2;68;68;68m╰{}╯\x1b[39m", "─".repeat(w - 2)),
+            ];
+            assert_eq!(lines, expected, "w={w}");
+            for row in &lines {
+                assert_eq!(visible_width(row), w, "w={w} row={row:?}");
+            }
+            assert_eq!(
+                plain(&lines)[0].matches("rust").count(),
+                1,
+                "language label is printed once, at w={w}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_without_language_has_a_plain_top_rule() {
+        let theme = colored_theme();
+        let lines = render_markdown("```\nlet x = 1;\n```", &theme, 60);
+        assert_eq!(
+            plain(&lines),
+            vec![
+                format!("╭{}╮", "─".repeat(58)),
+                format!("│ let x = 1;{} │", " ".repeat(46)),
+                format!("╰{}╯", "─".repeat(58)),
+            ]
+        );
+        for row in &lines {
+            assert_eq!(visible_width(row), 60, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn overlong_code_line_wraps_inside_the_frame() {
+        let theme = colored_theme();
+        let long = "a".repeat(70);
+        let lines = render_markdown(&format!("```\n{long}\n```"), &theme, 60);
+        assert_eq!(lines.len(), 4, "top, two body rows, bottom: {lines:?}");
+        for row in &lines {
+            assert_eq!(visible_width(row), 60, "{row:?}");
+        }
+        let rows = plain(&lines);
+        assert!(rows[0].starts_with("╭"));
+        assert_eq!(rows[1], format!("│ {} │", "a".repeat(56)));
+        assert_eq!(rows[2], format!("│ {}{} │", "a".repeat(14), " ".repeat(42)));
+        assert!(rows[3].starts_with("╰"));
     }
 
     #[test]
@@ -595,9 +955,8 @@ mod tests {
     fn multiple_heading_levels() {
         let theme = test_theme();
         let lines = render_markdown("## Subheading\n### Subsub", &theme, 80);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("## Subheading"));
-        assert!(lines[1].contains("### Subsub"));
+        assert_eq!(plain(&lines), vec!["Subheading", "", "Subsub"]);
+        assert!(lines.iter().all(|l| !l.contains('#')), "{lines:?}");
     }
 
     #[test]
@@ -606,5 +965,114 @@ mod tests {
         let lines = render_markdown("**bold** and *italic*", &theme, 80);
         assert!(lines[0].contains("\x1b[1m"), "bold marker");
         assert!(lines[0].contains("\x1b[3m"), "italic marker");
+    }
+
+    #[test]
+    fn mixed_document_renders_every_construct() {
+        let theme = colored_theme();
+        let lines = render_markdown(MIXED, &theme, 60);
+        assert_eq!(
+            plain(&lines),
+            vec![
+                "Report".to_string(),
+                String::new(),
+                "Short paragraph with code, emphasis and weight.".to_string(),
+                String::new(),
+                "• first item".to_string(),
+                "  • nested item".to_string(),
+                String::new(),
+                "▎ quoted rule".to_string(),
+                String::new(),
+                format!("╭─ rust {}╮", "─".repeat(51)),
+                format!(
+                    "│ let plan = app.plan_frame(input, height);{} │",
+                    " ".repeat(15)
+                ),
+                format!(
+                    "│ let wider_than_the_renderer_width = plan + 1;{} │",
+                    " ".repeat(11)
+                ),
+                format!("╰{}╯", "─".repeat(58)),
+                String::new(),
+                "Done in AGENTS.md.".to_string(),
+            ]
+        );
+        // No markdown syntax character reaches the screen.  (`_` is not in the
+        // list: it is legitimate content inside identifiers like
+        // `plan_frame`.)
+        for row in plain(&lines) {
+            for syntax in ['#', '`', '>', '*'] {
+                assert!(!row.contains(syntax), "{row:?} still carries {syntax:?}");
+            }
+        }
+        // Inline styles ride on SGR, not on literal markers.
+        assert!(
+            lines[2].contains("\x1b[38;2;255;123;114mcode\x1b[39m"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains("\x1b[3memphasis\x1b[23m"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(lines[2].contains("\x1b[1mweight\x1b[22m"), "{:?}", lines[2]);
+        assert!(
+            lines[0].starts_with("\x1b[1;4;38;2;255;204;0mReport"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[4].contains("\x1b[38;2;255;204;0m•\x1b[39m"),
+            "{:?}",
+            lines[4]
+        );
+        // Frame border and code body colours.
+        assert!(lines[9].contains("\x1b[38;2;68;68;68m"), "{:?}", lines[9]);
+        assert!(
+            lines[10].contains("\x1b[38;2;201;209;217m"),
+            "{:?}",
+            lines[10]
+        );
+    }
+
+    #[test]
+    fn wrapped_heading_keeps_its_style_without_broken_escapes() {
+        let theme = colored_theme();
+        let lines = render_markdown(
+            "# A heading that is long enough to wrap at forty columns `code`",
+            &theme,
+            40,
+        );
+        assert!(lines.len() >= 2, "should wrap: {lines:?}");
+        for row in &lines {
+            assert!(visible_width(row) <= 40, "{row:?}");
+            // The combined SGR is re-emitted after a break, so a continued
+            // heading row keeps the heading style.
+            assert!(row.starts_with("\x1b[1;4;"), "{row:?}");
+            // Stripping the escapes leaves no ESC behind: none was split.
+            assert!(
+                !plain(std::slice::from_ref(row))[0].contains('\x1b'),
+                "{row:?}"
+            );
+        }
+        assert!(
+            plain(&lines).concat().contains("code"),
+            "inline code survives the wrap: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn no_row_exceeds_the_pane_width() {
+        let theme = colored_theme();
+        for w in [20u16, 40, 60, 80, 120] {
+            for row in render_markdown(MIXED, &theme, w) {
+                assert!(
+                    visible_width(&row) <= w as usize,
+                    "w={w} width={} row={row:?}",
+                    visible_width(&row)
+                );
+            }
+        }
     }
 }

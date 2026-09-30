@@ -61,8 +61,9 @@ fn golden_plain_paragraph() {
 #[test]
 fn golden_heading_and_paragraph() {
     let got = golden_render("# Title\n\nBody text.");
-    // # Title is wrapped in mdHeading fg; Body is plain; blank line separates.
-    let expected = "\x1b[38;2;255;204;0m# Title\x1b[39m\n\nBody text.";
+    // The `#` run is dropped; H1 is bold+underline over mdHeading; the blank
+    // line separates the heading block from the paragraph.
+    let expected = "\x1b[1;4;38;2;255;204;0mTitle\x1b[39m\x1b[24m\x1b[22m\n\nBody text.";
     assert_eq!(
         got, expected,
         "\n--- got ---\n{got}\n--- want ---\n{expected}"
@@ -150,15 +151,34 @@ fn golden_blockquote() {
 #[test]
 fn golden_code_block() {
     let got = golden_render("```rust\nfn main() {}\n```");
-    assert!(got.contains("```rust"), "lang header: {got:?}");
-    assert!(got.contains("fn main() {}"), "code body: {got:?}");
-    assert!(got.contains('─'), "code block border: {got:?}");
+    // A box as wide as the pane: the language label rides in the top rule once
+    // (mdCodeBlockBorder), the body is mdCodeBlock, and both body rows plus
+    // the frame fill exactly 40 columns.
+    let border = "\x1b[38;2;68;68;68m";
+    let body = "\x1b[38;2;201;209;217m";
+    let expected = format!(
+        "{border}╭─ rust {}╮\x1b[39m\n\
+         {border}│\x1b[39m {body}fn main() {{}}\x1b[39m{} {border}│\x1b[39m\n\
+         {border}╰{}╯\x1b[39m",
+        "─".repeat(31),
+        " ".repeat(24),
+        "─".repeat(38),
+    );
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
 }
 
 #[test]
 fn golden_mixed_document() {
     let got = golden_render("# Title\n\nSome **bold** and `code` here.\n\n> A quote\n\n- item");
-    let expected = "\x1b[38;2;255;204;0m# Title\x1b[39m\n\nSome \x1b[1mbold\x1b[22m and \x1b[38;2;255;123;114mcode\x1b[39m here.\n\n\x1b[38;2;88;166;255m▎ \x1b[39m\x1b[38;2;139;148;158mA quote\x1b[39m\n\n\x1b[38;2;255;204;0m•\x1b[39m item";
+    // Every construct styled: heading (bold+underline mdHeading, no `#`),
+    // inline bold, inline code, quote gutter, bullet.
+    let expected = "\x1b[1;4;38;2;255;204;0mTitle\x1b[39m\x1b[24m\x1b[22m\n\n\
+         Some \x1b[1mbold\x1b[22m and \x1b[38;2;255;123;114mcode\x1b[39m here.\n\n\
+         \x1b[38;2;88;166;255m▎ \x1b[39m\x1b[38;2;139;148;158mA quote\x1b[39m\n\n\
+         \x1b[38;2;255;204;0m•\x1b[39m item";
     assert_eq!(
         got, expected,
         "\n--- got ---\n{got}\n--- want ---\n{expected}"
