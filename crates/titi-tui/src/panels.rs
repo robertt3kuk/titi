@@ -19,12 +19,17 @@ fn box_top(inner_w: usize) -> String {
 fn box_mid(inner_w: usize) -> String {
     format!("├{}┤", "─".repeat(inner_w))
 }
-pub(crate) fn box_bot(inner_w: usize) -> String {
+/// The bottom rule of a box `inner_w` cells wide.
+pub fn box_bot(inner_w: usize) -> String {
     format!("╰{}╯", "─".repeat(inner_w))
 }
 
 /// OMP `topBorder`: title inset into the top rule (`╭─ Title ────╮`).
-pub(crate) fn box_top_title(inner_w: usize, title: &str) -> String {
+///
+/// Public because a host that draws its own panel chrome — the live chat's
+/// pickers, whose input loop is its own — uses the same rule rather than
+/// spelling the corners itself.
+pub fn box_top_title(inner_w: usize, title: &str) -> String {
     if title.is_empty() {
         return box_top(inner_w);
     }

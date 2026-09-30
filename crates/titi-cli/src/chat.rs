@@ -3715,7 +3715,13 @@ fn repo_state(root: &Path) -> String {
 /// the screen after the masthead, one line of conversation and the composer,
 /// capped so a tall window never lets a picker eat the session it sits in.
 fn panel_body(total: u16) -> usize {
-    ((total as usize).saturating_sub(6)).clamp(PICKER_MIN_ROWS, PICKER_MAX_ROWS)
+    // Two of the room belongs to the box's rules, so the panel on screen is the
+    // same height it was before it had a frame.
+    ((total as usize)
+        .saturating_sub(6)
+        .clamp(PICKER_MIN_ROWS, PICKER_MAX_ROWS))
+    .saturating_sub(2)
+    .max(1)
 }
 
 /// Cells a row label may use: the panel has `room` and spends three of it on
@@ -3759,10 +3765,12 @@ struct PanelView {
 }
 
 impl PanelView {
-    /// Lines this takes, title and `… N more` included.
+    /// Rows this takes: the box's two rules, the window's rows and the
+    /// `… N more` rows. The title costs nothing here — it is inset in the top
+    /// rule — which is why the body is asked for two rows fewer than the box
+    /// is tall.
     fn height(&self) -> u16 {
-        (usize::from(self.title.is_some())
-            + self.window.count
+        (2 + self.window.count
             + usize::from(self.window.above > 0)
             + usize::from(self.window.below > 0)) as u16
     }
@@ -3939,19 +3947,22 @@ fn model_offer_label(offer: &ModelOffer, current: &str, room: usize) -> String {
     }
 }
 
-/// The picker above the composer. `view` carries its own window, so the rows
-/// drawn are exactly the rows the layout made room for.
-fn picker_panel(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> {
-    let room = (width as usize).saturating_sub(2).max(8);
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    if let Some(title) = &view.title {
-        rows.push(Line::from(Span::styled(
-            titi_tui::width::truncate_to_width(&format!(" {title}"), room),
-            fg(theme, ThemeColor::Dim),
-        )));
-    }
+/// The panel above the composer.
+///
+/// `view` carries its own window, so the rows drawn are exactly the rows the
+/// layout made room for. The look is the panel crate's (`titi_tui::panels`): a
+/// box whose title is inset in the top rule, a `▶` on the selected row, and —
+/// because the chat's pickers window a list where the crate's own panel scrolls
+/// a capped one — the crate's scrollbar beside the body when the list does not
+/// fit. The selected row also carries the theme's `SelectedBg`, so the
+/// highlight survives a terminal where the marker alone is easy to miss.
+fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> {
+    let width = width as usize;
+    let inner = width.saturating_sub(2).max(4);
+    let border = fg(theme, ThemeColor::Border);
+    let mut bodies: Vec<Vec<Span<'static>>> = Vec::new();
     if view.window.above > 0 {
-        rows.push(hidden_line(view.window.above, "above", room, theme));
+        bodies.push(hidden_spans(view.window.above, "above", inner, theme));
     }
     for (at, line) in view
         .lines
@@ -3960,39 +3971,81 @@ fn picker_panel(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'stati
         .skip(view.window.start)
         .take(view.window.count)
     {
-        let selected = view.selected == Some(at);
-        let (text, style) = match line {
-            PanelLine::Heading(text) => (
-                format!("  {text}"),
-                fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
-            ),
-            PanelLine::Row { text, .. } if selected => (
-                format!(" ▶ {text}"),
-                fg(theme, ThemeColor::CustomMessageLabel).add_modifier(Modifier::BOLD),
-            ),
-            PanelLine::Row { text, accent: true } => {
-                (format!("   {text}"), fg(theme, ThemeColor::Success))
-            }
-            PanelLine::Row { text, .. } => (format!("   {text}"), fg(theme, ThemeColor::Muted)),
-        };
-        rows.push(Line::from(Span::styled(
-            titi_tui::width::truncate_to_width(&text, room),
-            style,
-        )));
+        bodies.push(panel_row(line, view.selected == Some(at), inner, theme));
     }
     if view.window.below > 0 {
-        rows.push(hidden_line(view.window.below, "below", room, theme));
+        bodies.push(hidden_spans(view.window.below, "below", inner, theme));
     }
+
+    let mut rows: Vec<Line<'static>> = Vec::with_capacity(bodies.len() + 2);
+    // The rules carry no bar cell: the bar is exactly as tall as the body it
+    // scrolls.
+    rows.push(Line::from(Span::styled(
+        titi_tui::panels::box_top_title(inner, view.title.as_deref().unwrap_or("")),
+        border,
+    )));
+    for spans in bodies {
+        rows.push(Line::from(spans));
+    }
+    rows.push(Line::from(Span::styled(
+        titi_tui::panels::box_bot(inner),
+        border,
+    )));
     Paragraph::new(rows).style(page(theme))
 }
 
-/// `… 12 more below`: a windowed list says how much of itself is out of
-/// sight, rather than ending as if that were all of it.
-fn hidden_line(count: usize, side: &str, room: usize, theme: &Theme) -> Line<'static> {
-    Line::from(Span::styled(
-        titi_tui::width::truncate_to_width(&format!("   … {count} more {side}"), room),
-        fg(theme, ThemeColor::Dim),
-    ))
+/// One row inside the box: the border, the cursor's column and the label, with
+/// the fill out to the right border. A heading names a section rather than being
+/// a choice, so its own `▾` stands where a choice has its cursor and it is never
+/// selected; both put their label in the same column.
+fn panel_row(line: &PanelLine, selected: bool, inner: usize, theme: &Theme) -> Vec<Span<'static>> {
+    let (text, style) = match line {
+        PanelLine::Heading(text) => (
+            text.clone(),
+            fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
+        ),
+        PanelLine::Row { text, .. } if selected => (
+            format!("▶ {text}"),
+            fg(theme, ThemeColor::CustomMessageLabel).add_modifier(Modifier::BOLD),
+        ),
+        PanelLine::Row { text, accent: true } => {
+            (format!("  {text}"), fg(theme, ThemeColor::Success))
+        }
+        PanelLine::Row { text, .. } => (format!("  {text}"), fg(theme, ThemeColor::Muted)),
+    };
+    // The selected row keeps the marker *and* carries the theme's selection
+    // band: a marker is easy to miss on a terminal whose colours are dim.
+    let band = if selected {
+        style.bg(bg(theme, ThemeBg::SelectedBg))
+    } else {
+        style
+    };
+    // The content fills the cells between the borders: the cursor's two cells,
+    // the label, and the fill up to the right border.
+    let content = inner.saturating_sub(2);
+    let shown = titi_tui::width::truncate_to_width(&text, content.saturating_sub(2));
+    let pad = content.saturating_sub(titi_tui::width::visible_width(&shown));
+    vec![
+        Span::styled("│ ", fg(theme, ThemeColor::Border)),
+        Span::styled(format!("{shown}{}", " ".repeat(pad)), band),
+        Span::styled(" │", fg(theme, ThemeColor::Border)),
+    ]
+}
+
+/// `… N more above` inside the box: the dim row the window pays for, saying how
+/// much of the list is out of sight where the bar says where it is.
+fn hidden_spans(count: usize, side: &str, inner: usize, theme: &Theme) -> Vec<Span<'static>> {
+    let room = inner.saturating_sub(2);
+    let text = titi_tui::width::truncate_to_width(&format!("  … {count} more {side}"), room);
+    let pad = room.saturating_sub(titi_tui::width::visible_width(&text));
+    vec![
+        Span::styled("│ ", fg(theme, ThemeColor::Border)),
+        Span::styled(
+            format!("{text}{}", " ".repeat(pad)),
+            fg(theme, ThemeColor::Dim),
+        ),
+        Span::styled(" │", fg(theme, ThemeColor::Border)),
+    ]
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
@@ -4033,7 +4086,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     paint_photos(frame, cols[2], &photos, &theme);
     paint_links(frame, cols[2], &links);
     if let Some(view) = &panel {
-        frame.render_widget(picker_panel(view, cols[3].width, &theme), cols[3]);
+        frame.render_widget(panel_box(view, cols[3].width, &theme), cols[3]);
     }
     if let Some(status) = status {
         frame.render_widget(status, cols[4]);
@@ -6697,6 +6750,73 @@ mod tests {
             }))
         );
         assert_eq!(chat.model, "anthropic/claude-opus-5");
+    }
+
+    /// The picker above the composer is a box: the title sits inset in the top
+    /// rule, and the cursor's row carries the theme's selection band as well as
+    /// the marker, so the choice is legible on a terminal whose colours are dim.
+    #[test]
+    fn the_panel_is_a_titled_box_and_the_selected_row_carries_the_band() {
+        for width in [60u16, 80, 120] {
+            let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+            chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+                "openai/gpt-4.1".to_owned(),
+                "anthropic/claude-opus-5".to_owned(),
+            ]);
+            type_text(&mut chat, "/model");
+            chat.on_key(Key::Enter, Instant::now());
+
+            let buffer = frame_buffer(&mut chat, width, 20);
+            let theme = Arc::clone(&chat.theme);
+            let rows: Vec<String> = (0..20)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let (x, y) = cell_of(&rows, "╭─ models · 2")
+                .unwrap_or_else(|| panic!("{width}: no titled rule: {rows:?}"));
+            assert_eq!(x, 0, "{width}: the box starts at the left edge");
+            assert!(
+                rows[y as usize].trim_end().ends_with('╮'),
+                "{width}: the rule closes: {:?}",
+                rows[y as usize]
+            );
+
+            // The cursor's row: the marker, the theme's band across the row,
+            // and the role's own colour on the label.
+            let (mx, my) = cell_of(&rows, "▶ openai/gpt-4.1")
+                .unwrap_or_else(|| panic!("{width}: the cursor row is unmarked: {rows:?}"));
+            let band = bg(&theme, ThemeBg::SelectedBg);
+            let page_bg = bg(&theme, ThemeBg::StatusLineBg);
+            let rest: Vec<Style> = (2..width - 2).map(|x| buffer[(x, my)].style()).collect();
+            for (at, style) in rest.iter().enumerate() {
+                assert_eq!(
+                    style.bg.unwrap_or(Color::Reset),
+                    band,
+                    "{width}: column {at} of the cursor row is outside the band"
+                );
+            }
+            assert_eq!(
+                buffer[(mx, my)].fg,
+                fg(&theme, ThemeColor::CustomMessageLabel)
+                    .fg
+                    .unwrap_or(Color::Reset),
+                "{width}: the cursor row keeps its role's colour"
+            );
+
+            // A row the cursor is not on carries neither the marker nor a band,
+            // and the box closes under the last row.
+            let (x, y) = cell_of(&rows, "anthropic/claude-opus-5")
+                .unwrap_or_else(|| panic!("{width}: the other row is missing: {rows:?}"));
+            assert_eq!(
+                buffer[(x, y)].bg,
+                page_bg,
+                "{width}: a row the cursor is not on stays unbanded"
+            );
+            assert!(
+                rows[(y + 1) as usize].starts_with('╰'),
+                "{width}: the box closes above the composer: {:?}",
+                rows[(y + 1) as usize]
+            );
+        }
     }
 
     /// A long list is windowed around the cursor and says how much of itself
