@@ -7767,17 +7767,24 @@ mod tests {
     /// theme's `userMessageBg` across exactly its rows, `userMessageText` on the
     /// body, and the label's colour unchanged.
     ///
-    /// `dark` rather than titanium: titanium's `userMessageBg` is the same value
-    /// as the chrome behind it, so the band is drawn and invisible there — the
-    /// assertion has to be made on a palette where the two differ.
+    /// Run against the default preset and against `dark`: the palette titi
+    /// starts on by itself has to show the band, which `titanium` did not until
+    /// its `userMessageBg` was given a surface of its own.
     #[test]
     fn the_user_block_carries_its_own_surface() {
-        let theme = test_theme_named("dark");
+        for name in ["titanium", "dark"] {
+            assert_user_block_surface(name);
+        }
+    }
+
+    /// The band's extent and colours on one palette.
+    fn assert_user_block_surface(name: &str) {
+        let theme = test_theme_named(name);
         let band = bg(&theme, ThemeBg::UserMessageBg);
         let page_bg = bg(&theme, ThemeBg::StatusLineBg);
         assert_ne!(
             band, page_bg,
-            "this test needs a palette where the band shows"
+            "{name}: this test needs a palette where the band shows"
         );
 
         let mut chat = chat_with_theme(theme.clone());
@@ -7857,10 +7864,16 @@ mod tests {
     /// width, and nothing runs past the pane.
     #[test]
     fn the_band_covers_the_blocks_own_width() {
-        let theme = test_theme_named("dark");
-        let band = bg(&theme, ThemeBg::UserMessageBg);
+        for name in ["titanium", "dark"] {
+            assert_band_width(&test_theme_named(name), name);
+        }
+    }
+
+    /// The band's width at each pane size, on one palette.
+    fn assert_band_width(theme: &Arc<Theme>, name: &str) {
+        let band = bg(theme, ThemeBg::UserMessageBg);
         for width in [60u16, 80, 120] {
-            let mut chat = chat_with_theme(theme.clone());
+            let mut chat = chat_with_theme(Arc::clone(theme));
             chat.push(LineKind::User, "word ".repeat(30));
             let buffer = frame_buffer(&mut chat, width, 30);
             let mut banded = 0;
@@ -7870,12 +7883,12 @@ mod tests {
                     assert_ne!(
                         buffer[(width - 1, y)].bg,
                         band,
-                        "{width}: the band reached the pane's edge"
+                        "{name} at {width}: the band reached the pane's edge"
                     );
                     assert_eq!(
                         buffer[(width - 3, y)].bg,
                         band,
-                        "{width}: the band stopped short of the layout's width"
+                        "{name} at {width}: the band stopped short of the layout's width"
                     );
                 }
             }

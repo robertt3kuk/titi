@@ -411,6 +411,49 @@ fn every_builtin_theme_loads() {
     }
 }
 
+/// The presets titi's own auto slots use — `titanium` for a dark terminal,
+/// `light` for a light one (`appearance::AUTO_DARK_THEME` / `AUTO_LIGHT_THEME`)
+/// — have to give the user's own block a surface of its own.
+///
+/// The live screen paints the band behind a user's question with
+/// `userMessageBg`; when that token resolves to the same value as the chrome
+/// behind it (`statusLineBg`) the band is drawn and invisible, which is what
+/// titanium did until this was caught. Seven of the hundred shipped presets
+/// collapse the two, and the two titi starts on by itself may not be among
+/// them.
+///
+/// The second half is the other way the band can fail: a surface the body
+/// cannot be read on. `userMessageText` is empty in both presets, so the body
+/// is the terminal default the theme resolves for a dark page (`#e5e5e7`).
+#[test]
+fn the_auto_theme_slots_show_the_user_block() {
+    for name in [appearance::AUTO_DARK_THEME, appearance::AUTO_LIGHT_THEME] {
+        let theme = loader::load_theme(name, &loader::CreateThemeOptions::default())
+            .unwrap_or_else(|e| panic!("theme {name} failed to load: {e}"));
+        let band = theme.get_bg_hex(ThemeBg::UserMessageBg);
+        let page = theme.get_bg_hex(ThemeBg::StatusLineBg);
+        assert_ne!(
+            band, page,
+            "{name}: the user block's band is the same as the page behind it ({band})"
+        );
+        let body = theme.get_color_hex(ThemeColor::UserMessageText);
+        let band_luma = color::relative_luminance(&band)
+            .unwrap_or_else(|| panic!("{name}: {band} is not a colour"));
+        let body_luma = color::relative_luminance(&body)
+            .unwrap_or_else(|| panic!("{name}: {body} is not a colour"));
+        let (lighter, darker) = if body_luma > band_luma {
+            (body_luma, band_luma)
+        } else {
+            (band_luma, body_luma)
+        };
+        let ratio = (lighter + 0.05) / (darker + 0.05);
+        assert!(
+            ratio >= 4.5,
+            "{name}: the body on the band is {ratio:.2}:1 ({body} on {band})"
+        );
+    }
+}
+
 #[test]
 fn dark_and_light_load_through_loader() {
     let dark =
