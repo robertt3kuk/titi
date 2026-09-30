@@ -5010,19 +5010,52 @@ fn welcome_row(spans: Vec<Span<'static>>, inner: usize, theme: &Theme) -> Line<'
     Line::from(row)
 }
 
+/// Cells a fact's label takes.
+const WELCOME_LABEL: usize = 9;
+
 /// A labelled fact: the label in the dim token, the value in the body text.
+///
+/// A value too long for the row keeps its tail behind an ellipsis — the leaf of
+/// a path and the last segment of a model id are what a reader needs — rather
+/// than being cut at whatever cell the row happens to end on.
 fn welcome_fact(label: &str, value: &str, room: usize, theme: &Theme) -> Vec<Span<'static>> {
-    let label_width = 9;
     vec![
         Span::styled(
-            titi_tui::width::truncate_to_width(&format!("{label:<label_width$}"), label_width),
+            titi_tui::width::truncate_to_width(&format!("{label:<WELCOME_LABEL$}"), WELCOME_LABEL),
             fg(theme, ThemeColor::Dim),
         ),
         Span::styled(
-            titi_tui::width::truncate_to_width(value, room.saturating_sub(label_width)),
+            fit_tail(value, room.saturating_sub(WELCOME_LABEL)),
             fg(theme, ThemeColor::Text),
         ),
     ]
+}
+
+/// The width `spans` take.
+fn welcome_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| titi_tui::width::visible_width(&span.content))
+        .sum()
+}
+
+/// A fact row with an optional second fact behind it.
+///
+/// The tail is stated whole or not at all: a branch or a credential word cut in
+/// half says something that is not true — a detached HEAD's short sha would read
+/// as whatever cells happened to fit — and a welcome box that cannot fit the git
+/// state is better off without it, exactly as the masthead is.
+fn welcome_with_tail(
+    mut spans: Vec<Span<'static>>,
+    tail: Option<Vec<Span<'static>>>,
+    room: usize,
+) -> Vec<Span<'static>> {
+    if let Some(tail) = tail
+        && welcome_width(&spans) + welcome_width(&tail) <= room
+    {
+        spans.extend(tail);
+    }
+    spans
 }
 
 /// The welcome box's body at one degradation level.
@@ -5054,22 +5087,31 @@ fn welcome_body(
         }
     }
     if level < 5 && !facts.model.is_empty() {
-        let mut spans = welcome_fact("model", &facts.model, room, theme);
-        if let Some(credential) = &facts.credential {
-            spans.push(Span::styled(
+        let spans = welcome_fact("model", &facts.model, room, theme);
+        let credential = facts.credential.as_ref().map(|credential| {
+            vec![Span::styled(
                 format!("  ·  {credential}"),
                 fg(theme, ThemeColor::Dim),
-            ));
-        }
-        body.push(welcome_row(spans, inner, theme));
+            )]
+        });
+        body.push(welcome_row(
+            welcome_with_tail(spans, credential, room),
+            inner,
+            theme,
+        ));
     }
     if level < 2 && !facts.path.is_empty() {
-        let mut spans = welcome_fact("dir", &facts.path, room, theme);
-        if let Some(git) = &facts.git {
-            spans.push(Span::styled("  ·  ", fg(theme, ThemeColor::Dim)));
-            spans.extend(welcome_git(git, theme));
-        }
-        body.push(welcome_row(spans, inner, theme));
+        let spans = welcome_fact("dir", &facts.path, room, theme);
+        let git = facts.git.as_ref().map(|git| {
+            let mut tail = vec![Span::styled("  ·  ", fg(theme, ThemeColor::Dim))];
+            tail.extend(welcome_git(git, theme));
+            tail
+        });
+        body.push(welcome_row(
+            welcome_with_tail(spans, git, room),
+            inner,
+            theme,
+        ));
     }
     if level == 0 && !facts.sessions.is_empty() {
         for (at, (name, current)) in facts.sessions.iter().enumerate() {
@@ -7420,6 +7462,34 @@ mod tests {
         frame_rows(chat, width, height).join("\n")
     }
 
+    /// What the box states for the directory: the path the snapshot gives, or
+    /// its leaf behind the ellipsis a row shortens a long value to.
+    fn states_path(frame: &str, path: &str) -> bool {
+        frame.contains(path)
+            || (frame.contains('…')
+                && !path.is_empty()
+                && frame.contains(path.rsplit('/').next().unwrap_or(path)))
+    }
+
+    /// A branch is on screen whole or not at all: four cells of one is not a
+    /// branch, whatever the row's width happened to leave.
+    fn states_branch_whole(frame: &str, branch: &str) -> bool {
+        frame.contains(branch) || !frame.contains(&branch.chars().take(4).collect::<String>())
+    }
+
+    /// The text of the box's row carrying `label`.
+    fn row_with_label(body: &[Line<'static>], label: &str) -> String {
+        body.iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains(label))
+            .unwrap_or_else(|| panic!("no {label} row in {body:?}"))
+    }
+
     /// The first screen states the build, the model behind the next turn, what
     /// stands behind that model, and the directory — each read from the source
     /// that owns it — inside the panel crate's chrome.
@@ -7447,13 +7517,13 @@ mod tests {
                 "{width}: with the credential /keys reads for it: {frame}"
             );
             assert!(
-                frame.contains(&snapshot.path),
+                states_path(&frame, &snapshot.path),
                 "{width}: the directory the masthead reads: {frame}"
             );
             if let Some(branch) = &snapshot.git_branch {
                 assert!(
-                    frame.contains(branch),
-                    "{width}: and its git state: {frame}"
+                    states_branch_whole(&frame, branch),
+                    "{width}: and its git state, whole or not at all: {frame}"
                 );
             }
             for expected in ["enter  send", "alt+m  models", "ctrl-c  quit"] {
@@ -7505,6 +7575,93 @@ mod tests {
             frame.contains(&session_row_text(&named, true)),
             "the box marks the session on screen the way the switcher does: {frame}"
         );
+    }
+
+    /// A fact's tail is stated whole or dropped whole. A detached HEAD's short
+    /// sha, cut where the row happens to end, reads as whatever cells fitted —
+    /// so the box gives the git state up rather than print half of it, the way
+    /// the masthead gives it up when the pane is narrow. A value too long for
+    /// its row keeps its informative end behind an ellipsis, never a bare cut.
+    #[test]
+    fn the_welcome_box_states_a_fact_whole_or_not_at_all() {
+        let theme = test_theme();
+        let facts = WelcomeFacts {
+            version: "0.0.0",
+            model: "opencode-go/glm-5.3-flash".to_owned(),
+            credential: Some("key".to_owned()),
+            path: "/tmp/titi".to_owned(),
+            git: Some(WelcomeGit {
+                branch: "636c207".to_owned(),
+                unstaged: 2,
+                staged: 0,
+                untracked: 0,
+            }),
+            sessions: Vec::new(),
+        };
+        let inner = 62;
+        let room = inner - 3;
+
+        let wide = welcome_body(&facts, 0, inner, &theme);
+        let row = row_with_label(&wide, "dir");
+        assert!(
+            row.contains("/tmp/titi") && row.contains("636c207") && row.contains("*2"),
+            "a row with room states the fact and its tail: {row}"
+        );
+        let row = row_with_label(&wide, "model");
+        assert!(
+            row.contains("opencode-go/glm-5.3-flash") && row.contains("key"),
+            "{row}"
+        );
+
+        // No room for the branch: it goes, the directory stays.
+        let long_path = WelcomeFacts {
+            path: format!("/{}", "deep/".repeat(12)),
+            ..facts.clone()
+        };
+        let row = row_with_label(&welcome_body(&long_path, 0, inner, &theme), "dir");
+        assert!(
+            !row.contains("636c207"),
+            "the branch is gone, not cut: {row}"
+        );
+        assert!(!row.contains("636c"), "and no part of it is left: {row}");
+        assert!(
+            row.contains('…'),
+            "the path itself is shortened honestly: {row}"
+        );
+        assert!(row.contains("deep"), "to something still readable: {row}");
+
+        // Same for the credential word.
+        let long_model = WelcomeFacts {
+            model: "x".repeat(room),
+            ..facts.clone()
+        };
+        let row = row_with_label(&welcome_body(&long_model, 0, inner, &theme), "model");
+        assert!(
+            !row.contains("key"),
+            "the credential word is not cut either: {row}"
+        );
+        assert!(
+            row.contains('…'),
+            "and the model keeps its informative end: {row}"
+        );
+
+        // The boundary is exact: the row is `room` cells, the label 9, and this
+        // git tail is 15 (`  ·  ` + `636c207` + ` *2`).
+        let fits = WelcomeFacts {
+            path: "p".repeat(35),
+            ..facts.clone()
+        };
+        let row = row_with_label(&welcome_body(&fits, 0, inner, &theme), "dir");
+        assert!(
+            row.contains("636c207") && row.contains("*2"),
+            "a tail that fits to the cell is stated: {row}"
+        );
+        let over = WelcomeFacts {
+            path: "p".repeat(36),
+            ..facts.clone()
+        };
+        let row = row_with_label(&welcome_body(&over, 0, inner, &theme), "dir");
+        assert!(!row.contains("636c207"), "and one cell over is not: {row}");
     }
 
     /// The credential word is the model picker's, not a second vocabulary.
