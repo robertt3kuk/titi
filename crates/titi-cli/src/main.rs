@@ -13,6 +13,8 @@ usage: titi [options]
   --goal <text>               run the coder/reviewer goal loop headless and exit
                               0 (pass), 1 (partial) or 3 (fail) for CI
   --approval <mode>           always-ask | write | yolo (default: write)
+  --theme <name>              paint with a palette for this run; bare /theme
+                              in the chat lists them and remembers a choice
   --mode <mode>               agent | plan | duck (default: agent)
                               plan: read-only tools; duck: repo-blind chat
   --record <path.ompcast>     record this session's events to a cast file
@@ -46,6 +48,7 @@ fn main() -> io::Result<()> {
     let mut replay_fast = false;
     let mut approval = titi_tools::ApprovalMode::Write;
     let mut mode = titi_engine::protocol::SessionMode::Agent;
+    let mut theme: Option<String> = None;
     // Collected: `--login` needs to look at the next argument without eating
     // it, and `Skip<Args>` is not cloneable.
     let mut args = std::env::args()
@@ -137,6 +140,19 @@ fn main() -> io::Result<()> {
                     std::process::exit(2);
                 }
             }
+        } else if arg == "--theme" {
+            let Some(raw) = args.next() else {
+                eprintln!("usage: titi --theme <name>  (bare /theme in the chat opens the list)");
+                std::process::exit(2);
+            };
+            if !titi_cli::app::theme_names()
+                .iter()
+                .any(|known| known == &raw)
+            {
+                eprintln!("{}\n\n{USAGE}", titi_cli::app::unknown_theme(&raw));
+                std::process::exit(2);
+            }
+            theme = Some(raw);
         } else if arg == "--mode" {
             let Some(raw) = args.next() else {
                 eprintln!("usage: titi --mode <agent|plan|duck>");
@@ -289,5 +305,5 @@ fn main() -> io::Result<()> {
         },
         None => None,
     };
-    titi_cli::chat::run(engine, session_log, models, session_id, cast, None)
+    titi_cli::chat::run(engine, session_log, models, session_id, cast, theme)
 }
