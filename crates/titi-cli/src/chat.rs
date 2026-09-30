@@ -3958,7 +3958,14 @@ fn model_offer_label(offer: &ModelOffer, current: &str, room: usize) -> String {
 /// highlight survives a terminal where the marker alone is easy to miss.
 fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> {
     let width = width as usize;
-    let inner = width.saturating_sub(2).max(4);
+    let body =
+        view.window.count + usize::from(view.window.above > 0) + usize::from(view.window.below > 0);
+    // The bar takes the pane's last column, and only when there is something to
+    // scroll to (`thumb_span` answers `None` when the list fits), so the box
+    // gives that column up only when the bar is there.
+    let bar = panel_bar(view, body, theme);
+    let box_width = width.saturating_sub(usize::from(bar.is_some())).max(8);
+    let inner = box_width.saturating_sub(2).max(4);
     let border = fg(theme, ThemeColor::Border);
     let mut bodies: Vec<Vec<Span<'static>>> = Vec::new();
     if view.window.above > 0 {
@@ -3984,8 +3991,12 @@ fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> 
         titi_tui::panels::box_top_title(inner, view.title.as_deref().unwrap_or("")),
         border,
     )));
-    for spans in bodies {
-        rows.push(Line::from(spans));
+    for (at, spans) in bodies.into_iter().enumerate() {
+        let mut row = spans;
+        if let Some(cell) = bar.as_ref().and_then(|cells| cells.get(at)) {
+            row.push(cell.clone());
+        }
+        rows.push(Line::from(row));
     }
     rows.push(Line::from(Span::styled(
         titi_tui::panels::box_bot(inner),
@@ -4046,6 +4057,28 @@ fn hidden_spans(count: usize, side: &str, inner: usize, theme: &Theme) -> Vec<Sp
         ),
         Span::styled(" │", fg(theme, ThemeColor::Border)),
     ]
+}
+
+/// The crate's scrollbar beside a panel body, or `None` when the list fits: one
+/// cell per body row, the thumb tracking the window. The crate's `render` is the
+/// same cells as ANSI for a host that emits text; this host paints a ratatui
+/// buffer, so it takes the cells and applies the theme's colours itself.
+fn panel_bar(view: &PanelView, body: usize, theme: &Theme) -> Option<Vec<Span<'static>>> {
+    let total = view.lines.len();
+    titi_tui::scrollbar::thumb_span(body, view.window.start, view.window.count, total)?;
+    Some(
+        titi_tui::scrollbar::cells(theme, body, view.window.start, view.window.count, total)
+            .into_iter()
+            .map(|(glyph, thumb)| {
+                let token = if thumb {
+                    ThemeColor::Accent
+                } else {
+                    ThemeColor::Muted
+                };
+                Span::styled(glyph, fg(theme, token))
+            })
+            .collect(),
+    )
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
@@ -6817,6 +6850,105 @@ mod tests {
                 rows[(y + 1) as usize]
             );
         }
+    }
+
+    /// The bar beside the panel body is the crate's scrollbar: it takes the
+    /// pane's last column only when the list does not fit, and its thumb follows
+    /// the window as the cursor walks the list.
+    #[test]
+    fn the_panel_bar_appears_only_when_the_list_overflows_and_tracks_the_selection() {
+        let width = 80u16;
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        let theme = Arc::clone(&chat.theme);
+        let border = fg(&theme, ThemeColor::Border).fg.unwrap_or(Color::Reset);
+
+        // Two rows fit: no bar, so the box's border is the pane's last column.
+        let buffer = frame_buffer(&mut chat, width, 20);
+        let rows: Vec<String> = (0..20)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let (_, y) = cell_of(&rows, "╭─ models · 2").expect("a titled rule");
+        assert_eq!(
+            buffer[(width - 1, y)].symbol(),
+            "╮",
+            "the box reaches the pane's edge when nothing is hidden"
+        );
+        assert_eq!(
+            buffer[(width - 1, y + 1)].fg,
+            border,
+            "and its border there"
+        );
+
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(
+            (0..30)
+                .map(|at| format!("openai/gpt-4.{at}"))
+                .collect::<Vec<_>>(),
+        );
+        type_text(&mut chat, "/model");
+        chat.on_key(Key::Enter, Instant::now());
+        let theme = Arc::clone(&chat.theme);
+        let accent = fg(&theme, ThemeColor::Accent).fg.unwrap_or(Color::Reset);
+        let muted = fg(&theme, ThemeColor::Muted).fg.unwrap_or(Color::Reset);
+
+        // Thirty-one lines with nine in the window, plus the two `… N more`
+        // rows: the thumb covers three of the eleven body rows at the top, and
+        // the track runs on below them.
+        let (buffer, body) = panel_frame_and_body(&mut chat, width);
+        assert_eq!(
+            bar_thumb_rows(&buffer, width, body),
+            [0, 1, 2],
+            "the thumb starts at the top"
+        );
+        assert_eq!(
+            buffer[(width - 1, body + 5)].fg,
+            muted,
+            "and the track runs on below it"
+        );
+        assert_eq!(
+            buffer[(width - 1, body)].symbol(),
+            "█",
+            "the thumb is a solid cell"
+        );
+
+        for _ in 0..15 {
+            chat.on_key(Key::Down, Instant::now());
+        }
+        let (buffer, body) = panel_frame_and_body(&mut chat, width);
+        assert_eq!(
+            bar_thumb_rows(&buffer, width, body),
+            [5, 6, 7],
+            "the thumb moved down with the window"
+        );
+        assert_eq!(
+            accent,
+            fg(&theme, ThemeColor::Accent).fg.unwrap_or(Color::Reset)
+        );
+    }
+
+    /// A frame and the row just under the panel's top rule.
+    fn panel_frame_and_body(chat: &mut Chat, width: u16) -> (ratatui::buffer::Buffer, u16) {
+        let buffer = frame_buffer(chat, width, 20);
+        let rows: Vec<String> = (0..20)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let (_, y) = cell_of(&rows, "╭─ models · 30").expect("the model panel is open");
+        (buffer, y + 1)
+    }
+
+    /// The body rows the bar's thumb covers, read from the pane's last column.
+    fn bar_thumb_rows(buffer: &ratatui::buffer::Buffer, width: u16, body: u16) -> Vec<u16> {
+        let theme = test_theme();
+        let accent = fg(&theme, ThemeColor::Accent).fg.unwrap_or(Color::Reset);
+        (0..11u16)
+            .filter(|at| buffer[(width - 1, body + at)].fg == accent)
+            .collect()
     }
 
     /// A long list is windowed around the cursor and says how much of itself

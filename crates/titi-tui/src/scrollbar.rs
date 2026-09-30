@@ -63,14 +63,39 @@ pub fn thumb_span(height: usize, offset: usize, visible: usize, total: usize) ->
     Some((start.min(travel), length))
 }
 
-/// The scrollbar's cells for a track `height` rows tall: one styled cell per
-/// row, each exactly one column wide.
+/// The scrollbar's cells for a track `height` rows tall: each one's glyph and
+/// whether it is the thumb.
 ///
-/// The rows covered by the thumb (see [`thumb_span`]) carry the thumb glyph
-/// in [`ThemeColor::Accent`]; the rest carry the track glyph in
-/// [`ThemeColor::Muted`]. When there is no bar to draw, every cell is a plain
-/// space, so the caller can paint the vector as-is and keep the column's
-/// geometry. `height == 0` yields an empty vector.
+/// This is what a host painting its own buffer needs, since it owns the theme's
+/// colours already; [`render`] is the same cells encoded as ANSI for a host
+/// that emits text. When there is no bar to draw, every cell is a plain space,
+/// so the caller can paint the vector as-is and keep the column's geometry.
+/// `height == 0` yields an empty vector.
+pub fn cells(
+    theme: &Theme,
+    height: usize,
+    offset: usize,
+    visible: usize,
+    total: usize,
+) -> Vec<(String, bool)> {
+    let Some((start, length)) = thumb_span(height, offset, visible, total) else {
+        return vec![(" ".to_string(), false); height];
+    };
+    let thumb = pick(theme, THUMB_SYMBOL, THUMB_FALLBACK).to_string();
+    let track = pick(theme, TRACK_SYMBOL, TRACK_FALLBACK).to_string();
+    (0..height)
+        .map(|row| {
+            if row >= start && row < start + length {
+                (thumb.clone(), true)
+            } else {
+                (track.clone(), false)
+            }
+        })
+        .collect()
+}
+
+/// The scrollbar's cells, one ANSI-styled string per row: the thumb in
+/// [`ThemeColor::Accent`], the track in [`ThemeColor::Muted`].
 pub fn render(
     theme: &Theme,
     height: usize,
@@ -78,19 +103,17 @@ pub fn render(
     visible: usize,
     total: usize,
 ) -> Vec<String> {
-    let Some((start, length)) = thumb_span(height, offset, visible, total) else {
+    if thumb_span(height, offset, visible, total).is_none() {
+        // No bar to draw: plain spaces, so a caller can paint the column as-is.
         return vec![" ".to_string(); height];
-    };
-    let thumb_glyph = pick(theme, THUMB_SYMBOL, THUMB_FALLBACK);
-    let track_glyph = pick(theme, TRACK_SYMBOL, TRACK_FALLBACK);
-    let thumb = theme.fg(ThemeColor::Accent, thumb_glyph);
-    let track = theme.fg(ThemeColor::Muted, track_glyph);
-    (0..height)
-        .map(|row| {
-            if row >= start && row < start + length {
-                thumb.clone()
+    }
+    cells(theme, height, offset, visible, total)
+        .into_iter()
+        .map(|(glyph, thumb)| {
+            if thumb {
+                theme.fg(ThemeColor::Accent, &glyph)
             } else {
-                track.clone()
+                theme.fg(ThemeColor::Muted, &glyph)
             }
         })
         .collect()
