@@ -3967,6 +3967,16 @@ fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
     Some(command_panel(chat, total))
 }
 
+/// A session's row, named the same way wherever a session is offered: its id,
+/// and the mark that says the screen is already on it.
+fn session_row_text(id: &str, current: bool) -> String {
+    if current {
+        format!("{id}  ✓ current")
+    } else {
+        id.to_owned()
+    }
+}
+
 /// The Ctrl+X switcher: one row per stored session, newest first, the session
 /// on screen marked where the model browser marks the model in use.
 fn session_panel(chat: &Chat, total: u16) -> PanelView {
@@ -3974,11 +3984,7 @@ fn session_panel(chat: &Chat, total: u16) -> PanelView {
         .session_choices()
         .into_iter()
         .map(|id| PanelLine::Row {
-            text: if id == chat.session_id {
-                format!("{id}  ✓ current")
-            } else {
-                id
-            },
+            text: session_row_text(&id, id == chat.session_id),
             accent: false,
         })
         .collect();
@@ -4245,7 +4251,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
         frame.render_widget(roster(chat, &theme), cols[1]);
     }
     let (body, photos, links) = if chat.lines.is_empty() {
-        (empty_state(cols[2].height, &theme), Vec::new(), Vec::new())
+        (
+            empty_state(chat, cols[2].width, cols[2].height, &theme),
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
         transcript(chat, cols[2].width, cols[2].height, &theme)
     };
@@ -4912,25 +4922,243 @@ fn cut_keeping_seconds(fact: &WorkFact, room: usize) -> String {
     )
 }
 
-fn empty_state(height: u16, theme: &Theme) -> Paragraph<'static> {
-    let block = 5usize;
-    let pad = (height as usize).saturating_sub(block) / 2;
-    let mut rows = vec![Line::from(""); pad];
+/// The width the welcome box asks the pane for before the pane has its say.
+const WELCOME_WIDTH: u16 = 64;
+
+/// Recent sessions the welcome box names before it stops.
+const WELCOME_SESSIONS: usize = 3;
+
+/// What the first screen states, every fact read from the source the surface
+/// that owns it reads: the catalog plus the credential reader behind `/keys`,
+/// the status-bar snapshot behind the masthead, and the session list behind
+/// `/sessions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WelcomeFacts {
+    version: &'static str,
+    /// The model that will answer this turn, and what stands behind it.
+    model: String,
+    credential: Option<String>,
+    path: String,
+    git: Option<WelcomeGit>,
+    /// Recent sessions, newest first, and whether the screen is already on one.
+    sessions: Vec<(String, bool)>,
+}
+
+/// The git fact of the welcome box, in the same shape the masthead states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WelcomeGit {
+    branch: String,
+    unstaged: u32,
+    staged: u32,
+    untracked: u32,
+}
+
+/// The facts the first screen can state right now.
+///
+/// A fact that is not available is `None` or empty, and the box omits it rather
+/// than printing a placeholder: the credential of a provider that holds none,
+/// the git state of a directory that is not a checkout, the session list of an
+/// agent directory that has no sessions yet.
+fn welcome_facts(chat: &Chat) -> WelcomeFacts {
+    let snapshot = masthead_snapshot(chat);
+    // The credential chip is the one the model picker wears (`oauth` for a
+    // subscription, `key` for an API key, `env` for a variable), read through
+    // the same reader `/keys` uses. A model the catalog does not offer has no
+    // provider to ask, so there is no chip.
+    let credential = model_rows(chat)
+        .into_iter()
+        .find(|row| row.id == chat.model)
+        .and_then(|row| row.credential);
+    WelcomeFacts {
+        version: titi_tui::VERSION,
+        model: chat.model.clone(),
+        credential,
+        path: snapshot.path.clone(),
+        git: snapshot.git_branch.clone().map(|branch| WelcomeGit {
+            branch,
+            unstaged: snapshot.git_unstaged,
+            staged: snapshot.git_staged,
+            untracked: snapshot.git_untracked,
+        }),
+        sessions: chat
+            .session_choices()
+            .into_iter()
+            .take(WELCOME_SESSIONS)
+            .map(|id| {
+                let current = id == chat.session_id;
+                (id, current)
+            })
+            .collect(),
+    }
+}
+
+/// One row of the welcome box: the borders, the content, and the fill out to the
+/// right border, so every row is exactly `inner + 2` cells wide.
+fn welcome_row(spans: Vec<Span<'static>>, inner: usize, theme: &Theme) -> Line<'static> {
+    let used: usize = spans
+        .iter()
+        .map(|span| titi_tui::width::visible_width(&span.content))
+        .sum();
+    let mut row = vec![Span::styled("│ ", fg(theme, ThemeColor::Border))];
+    row.extend(spans);
+    let fill = inner.saturating_sub(2 + used);
+    row.push(Span::styled(
+        format!("{} ", " ".repeat(fill)),
+        Style::default(),
+    ));
+    row.push(Span::styled("│", fg(theme, ThemeColor::Border)));
+    Line::from(row)
+}
+
+/// A labelled fact: the label in the dim token, the value in the body text.
+fn welcome_fact(label: &str, value: &str, room: usize, theme: &Theme) -> Vec<Span<'static>> {
+    let label_width = 9;
+    vec![
+        Span::styled(
+            titi_tui::width::truncate_to_width(&format!("{label:<label_width$}"), label_width),
+            fg(theme, ThemeColor::Dim),
+        ),
+        Span::styled(
+            titi_tui::width::truncate_to_width(value, room.saturating_sub(label_width)),
+            fg(theme, ThemeColor::Text),
+        ),
+    ]
+}
+
+/// The welcome box's body at one degradation level.
+///
+/// Level 0 is everything. Each level gives one thing up — the recent sessions,
+/// then the working directory, then the blank rows between the facts, then the
+/// tagline, then the model — because on a short pane the brand with the version
+/// beside it in the title, and the chords at the foot, are what a first screen
+/// is for; a blank row is not a fact, so it goes before the last two do.
+fn welcome_body(
+    facts: &WelcomeFacts,
+    level: u8,
+    inner: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let room = inner.saturating_sub(3);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if level < 4 {
+        body.push(welcome_row(
+            vec![Span::styled(
+                "say what you want done",
+                fg(theme, ThemeColor::Muted),
+            )],
+            inner,
+            theme,
+        ));
+        if level < 3 {
+            body.push(welcome_row(Vec::new(), inner, theme));
+        }
+    }
+    if level < 5 && !facts.model.is_empty() {
+        let mut spans = welcome_fact("model", &facts.model, room, theme);
+        if let Some(credential) = &facts.credential {
+            spans.push(Span::styled(
+                format!("  ·  {credential}"),
+                fg(theme, ThemeColor::Dim),
+            ));
+        }
+        body.push(welcome_row(spans, inner, theme));
+    }
+    if level < 2 && !facts.path.is_empty() {
+        let mut spans = welcome_fact("dir", &facts.path, room, theme);
+        if let Some(git) = &facts.git {
+            spans.push(Span::styled("  ·  ", fg(theme, ThemeColor::Dim)));
+            spans.extend(welcome_git(git, theme));
+        }
+        body.push(welcome_row(spans, inner, theme));
+    }
+    if level == 0 && !facts.sessions.is_empty() {
+        for (at, (name, current)) in facts.sessions.iter().enumerate() {
+            // The first row carries the label; the rest align under it, so a
+            // list of sessions reads as one fact rather than several.
+            let label = if at == 0 { "recent" } else { "" };
+            let mut spans = welcome_fact(label, name, room, theme);
+            // The same mark in the same words as the switcher's row: one namer,
+            // so a session is never named two ways on one screen.
+            if *current {
+                spans.push(Span::styled("  ✓ current", fg(theme, ThemeColor::Success)));
+            }
+            body.push(welcome_row(spans, inner, theme));
+        }
+    }
+    if level < 3 {
+        body.push(welcome_row(Vec::new(), inner, theme));
+    }
+    body.push(welcome_row(
+        vec![Span::styled(welcome_hint(), fg(theme, ThemeColor::Dim))],
+        inner,
+        theme,
+    ));
+    body
+}
+
+/// The chords the live screen answers to, and no others: the model picker's
+/// chord is the one the crate's table binds and the live mapper yields, not the
+/// `/model` command or a chord that reaches nothing.
+fn welcome_hint() -> &'static str {
+    "enter  send      alt+m  models      ctrl-c  quit"
+}
+
+/// The git state as the masthead states it: the branch, then one mark per kind
+/// of change, in the crate's status-line tokens.
+fn welcome_git(git: &WelcomeGit, theme: &Theme) -> Vec<Span<'static>> {
+    let dirty = git.unstaged > 0 || git.staged > 0 || git.untracked > 0;
+    let token = if dirty {
+        ThemeColor::StatusLineGitDirty
+    } else {
+        ThemeColor::StatusLineGitClean
+    };
+    let mut spans = vec![Span::styled(git.branch.clone(), fg(theme, token))];
+    for (count, mark, token) in [
+        (git.unstaged, "*", ThemeColor::StatusLineDirty),
+        (git.staged, "+", ThemeColor::StatusLineStaged),
+        (git.untracked, "?", ThemeColor::StatusLineUntracked),
+    ] {
+        if count > 0 {
+            spans.push(Span::styled(format!(" {mark}{count}"), fg(theme, token)));
+        }
+    }
+    spans
+}
+
+/// The first screen: what titi is and how to start, in the panel crate's chrome
+/// — the same box the pickers wear — centred in the pane.
+///
+/// This is an empty state, not a panel: it is drawn only while the transcript
+/// has no line, it never asks for more room than the pane has, and on a short
+/// pane it gives facts up through [`welcome_body`]'s levels rather than let the
+/// composer's rows be squeezed by a paragraph that cannot fit.
+fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph<'static> {
+    let box_width = (width as usize).min(WELCOME_WIDTH as usize).max(16);
+    let inner = box_width.saturating_sub(2).max(8);
+    let facts = welcome_facts(chat);
+    let room = (height as usize).saturating_sub(2);
+    let mut body = welcome_body(&facts, 0, inner, theme);
+    for level in 1..=5 {
+        if body.len() <= room {
+            break;
+        }
+        body = welcome_body(&facts, level, inner, theme);
+    }
+    let mut rows = vec![Line::from(Span::styled(
+        titi_tui::panels::box_top_title(inner, &format!("titi {}", facts.version)),
+        fg(theme, ThemeColor::Border),
+    ))];
+    rows.extend(body);
     rows.push(Line::from(Span::styled(
-        "titi",
-        fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
+        titi_tui::panels::box_bot(inner),
+        fg(theme, ThemeColor::Border),
     )));
-    rows.push(Line::from(""));
-    rows.push(Line::from(Span::styled(
-        "say what you want done",
-        fg(theme, ThemeColor::Muted),
-    )));
-    rows.push(Line::from(""));
-    rows.push(Line::from(Span::styled(
-        "enter  send      /model  switch      ctrl-c  quit",
-        fg(theme, ThemeColor::Dim),
-    )));
-    Paragraph::new(rows)
+    // Centred in the pane, and never taller than it: a pane with no room for the
+    // box at all shows nothing rather than a paragraph cut in half.
+    let pad = (height as usize).saturating_sub(rows.len()) / 2;
+    let mut lines = vec![Line::from(""); pad];
+    lines.extend(rows);
+    Paragraph::new(lines)
         .alignment(Alignment::Center)
         .style(page(theme))
 }
@@ -7175,6 +7403,257 @@ mod tests {
             !frame.contains("newer question"),
             "and not the other one: {frame}"
         );
+    }
+
+    /// A chat on a temp agent directory with one model and a key stored for it:
+    /// the facts the welcome box reads are the test's own, not this machine's.
+    fn welcome_chat() -> (tempfile::TempDir, Chat) {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec!["openai/gpt-4.1".to_owned()]);
+        crate::secrets::store_key(&chat.agent_dir, "openai", "sk-test").expect("store a key");
+        (dir, chat)
+    }
+
+    /// A frame as one string at `width` x `height`, for a test that is about
+    /// which rows are on screen rather than about a row's cells.
+    fn frame_at(chat: &mut Chat, width: u16, height: u16) -> String {
+        frame_rows(chat, width, height).join("\n")
+    }
+
+    /// The first screen states the build, the model behind the next turn, what
+    /// stands behind that model, and the directory — each read from the source
+    /// that owns it — inside the panel crate's chrome.
+    #[test]
+    fn the_welcome_box_names_the_build_the_model_and_the_directory() {
+        let (_dir, mut chat) = welcome_chat();
+        let snapshot = masthead_snapshot(&chat);
+        for width in [60u16, 80, 120] {
+            let rows = frame_rows(&mut chat, width, 20);
+            let frame = rows.join("\n");
+            assert!(
+                frame.contains(&format!("titi {}", titi_tui::VERSION)),
+                "{width}: the build is named: {frame}"
+            );
+            assert!(
+                frame.contains("say what you want done"),
+                "{width}: and what to do: {frame}"
+            );
+            assert!(
+                frame.contains(&chat.model),
+                "{width}: the model that will answer: {frame}"
+            );
+            assert!(
+                frame.contains("·  key"),
+                "{width}: with the credential /keys reads for it: {frame}"
+            );
+            assert!(
+                frame.contains(&snapshot.path),
+                "{width}: the directory the masthead reads: {frame}"
+            );
+            if let Some(branch) = &snapshot.git_branch {
+                assert!(
+                    frame.contains(branch),
+                    "{width}: and its git state: {frame}"
+                );
+            }
+            for expected in ["enter  send", "alt+m  models", "ctrl-c  quit"] {
+                assert!(
+                    frame.contains(expected),
+                    "{width}: the chords that work are advertised: {expected} missing from {frame}"
+                );
+            }
+            // The box is a box, centred in the pane, and no row runs past it.
+            let top = rows
+                .iter()
+                .find(|row| row.contains("╭─ titi"))
+                .unwrap_or_else(|| panic!("{width}: no titled rule: {frame}"));
+            let left = top.chars().count() - top.trim_start().chars().count();
+            assert_eq!(
+                left,
+                (width as usize - titi_tui::width::visible_width(top.trim())) / 2,
+                "{width}: the box is centred: {top:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("╰")),
+                "{width}: and it closes: {frame}"
+            );
+            for row in &rows {
+                assert_eq!(
+                    titi_tui::width::visible_width(row),
+                    width as usize,
+                    "{width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A session is named on the welcome box the way the switcher names it.
+    #[test]
+    fn the_welcome_box_names_a_session_as_the_switcher_does() {
+        let (_dir, mut chat) = welcome_chat();
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
+        let named = store
+            .create(titi_core::session::SessionMeta {
+                title: Some("named".to_owned()),
+                bot_id: None,
+                source: Some("cli".to_owned()),
+            })
+            .expect("create");
+        chat.session_id = named.clone();
+        let frame = frame_at(&mut chat, 80, 20);
+        assert!(
+            frame.contains(&session_row_text(&named, true)),
+            "the box marks the session on screen the way the switcher does: {frame}"
+        );
+    }
+
+    /// The credential word is the model picker's, not a second vocabulary.
+    #[test]
+    fn the_welcome_box_states_a_subscription_as_oauth() {
+        let (_dir, mut chat) = welcome_chat();
+        crate::secrets::remove_key(&chat.agent_dir, "openai").expect("remove the key");
+        crate::secrets::store_oauth(
+            &chat.agent_dir,
+            "openai",
+            &titi_providers::oauth::OAuthTokens {
+                access: "sk-test".to_owned(),
+                refresh: Some("sk-test".to_owned()),
+                expires_at: None,
+                account_id: None,
+                email: None,
+                org_id: None,
+                org_name: None,
+            },
+        )
+        .expect("store a sign-in");
+        let frame = frame_at(&mut chat, 80, 20);
+        assert!(
+            frame.contains("·  oauth"),
+            "a subscription reads as oauth: {frame}"
+        );
+        assert!(!frame.contains("·  key"), "and not as a key: {frame}");
+    }
+
+    /// The welcome box is an empty state: one transcript line takes the screen,
+    /// and emptying the transcript brings it back — a rewind to nothing, or a
+    /// switch to a session with no history.
+    #[test]
+    fn the_welcome_box_yields_the_screen_to_a_line() {
+        let (_dir, mut chat) = welcome_chat();
+        assert!(frame_at(&mut chat, 80, 20).contains("say what you want done"));
+
+        chat.push(LineKind::User, "hello".to_owned());
+        let frame = frame_at(&mut chat, 80, 20);
+        assert!(
+            !frame.contains("say what you want done"),
+            "one line is enough to take the screen: {frame}"
+        );
+        assert!(frame.contains("hello"), "{frame}");
+
+        chat.show_history(&[]);
+        assert!(
+            frame_at(&mut chat, 80, 20).contains("say what you want done"),
+            "and an empty transcript brings it back"
+        );
+    }
+
+    /// A session with no history yet — a fresh agent directory — has no list to
+    /// offer, so the box states the facts it does have and no empty heading.
+    #[test]
+    fn a_session_with_no_history_shows_no_list() {
+        let (_dir, mut chat) = welcome_chat();
+        assert!(
+            chat.session_choices().is_empty(),
+            "a fresh directory has no sessions to list"
+        );
+        let frame = frame_at(&mut chat, 80, 20);
+        assert!(!frame.contains("recent"), "no list is offered: {frame}");
+        assert!(frame.contains(&chat.model), "but the model is: {frame}");
+        assert!(frame.contains("dir"), "and the directory: {frame}");
+    }
+
+    /// A short pane gives the box down in one order — the session list, then
+    /// the directory, then the blank rows, then the tagline, then the model. The
+    /// brand with the build beside it, and the chords, outlast all of them.
+    #[test]
+    fn a_short_pane_gives_the_welcome_box_down_in_order() {
+        let (_dir, mut chat) = welcome_chat();
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
+        for title in ["one", "two"] {
+            let id = store
+                .create(titi_core::session::SessionMeta {
+                    title: Some(title.to_owned()),
+                    bot_id: None,
+                    source: Some("cli".to_owned()),
+                })
+                .expect("create");
+            store.append(&id, Role::User, title).expect("append");
+        }
+
+        let roomy = frame_at(&mut chat, 80, 20);
+        for expected in ["recent", "dir", "say what you want done", "model"] {
+            assert!(
+                roomy.contains(expected),
+                "a roomy pane has {expected}: {roomy}"
+            );
+        }
+
+        // One fact at a time, from the least to the most load-bearing.
+        let no_sessions = frame_at(&mut chat, 80, 14);
+        assert!(
+            !no_sessions.contains("recent"),
+            "the list goes first: {no_sessions}"
+        );
+        assert!(
+            no_sessions.contains("dir"),
+            "the directory is still there: {no_sessions}"
+        );
+
+        let no_directory = frame_at(&mut chat, 80, 12);
+        assert!(
+            !no_directory.contains("dir"),
+            "then the directory: {no_directory}"
+        );
+        assert!(
+            no_directory.contains("say what you want done"),
+            "the tagline is still there: {no_directory}"
+        );
+        assert!(
+            no_directory.contains("model") && no_directory.contains("alt+m  models"),
+            "and so are the model and the chords: {no_directory}"
+        );
+
+        // Then the blank rows go, which buys the tagline its place back: three
+        // facts and no spacing is what a five-row pane can hold.
+        let tight = frame_at(&mut chat, 80, 10);
+        assert!(
+            !tight.contains("recent") && !tight.contains("dir"),
+            "{tight}"
+        );
+        assert!(
+            tight.contains("say what you want done")
+                && tight.contains("model")
+                && tight.contains("alt+m  models"),
+            "the tagline, the model and the chords stay: {tight}"
+        );
+
+        // And on a pane with room for the hints alone, the brand stays with them.
+        let bare = frame_at(&mut chat, 80, 8);
+        assert!(
+            !bare.contains("say what you want done") && !bare.contains("model    "),
+            "even the tagline and the model's row go: {bare}"
+        );
+        assert!(
+            bare.contains(&format!("titi {}", titi_tui::VERSION)),
+            "the brand and the build are never given up: {bare}"
+        );
+        assert!(
+            bare.contains("enter  send")
+                && bare.contains("alt+m  models")
+                && bare.contains("ctrl-c  quit"),
+            "and neither are the chords: {bare}"
+        );
+        assert!(bare.contains("╰"), "the box still closes: {bare}");
     }
 
     /// The picker above the composer is a box: the title sits inset in the top
