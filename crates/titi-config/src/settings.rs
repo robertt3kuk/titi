@@ -65,6 +65,17 @@ pub const PROJECT_SUBPATH: &str = ".titi/config.yml";
 /// empty state is merely named the same way everywhere.
 pub const NO_SETTINGS_NOTE: &str = "built-in defaults only";
 
+/// The theme the user chose for a dark terminal, by preset name.
+///
+/// `theme.dark` and [`THEME_LIGHT_KEY`] are the two slots the appearance probe
+/// picks between — the terminal reports a background, the slot for it is read,
+/// and the crate's own pick (`titanium` dark, `light` light) stands when the
+/// slot is unset. That is what `auto` means: nothing in these keys.
+pub const THEME_DARK_KEY: &str = "theme.dark";
+
+/// The theme the user chose for a light terminal. See [`THEME_DARK_KEY`].
+pub const THEME_LIGHT_KEY: &str = "theme.light";
+
 impl Settings {
     /// Discover and load all layers.
     ///

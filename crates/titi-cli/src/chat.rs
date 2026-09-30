@@ -2906,6 +2906,7 @@ pub fn run(
     catalog: crate::engine::ModelCatalog,
     session_id: String,
     mut cast: Option<crate::ompcast::CastWriter>,
+    theme_name: Option<String>,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -2917,7 +2918,12 @@ pub fn run(
     // the terminal's appearance onto the dark (`titanium`) or light slot and
     // lets `{agent_dir}/themes/<name>.json` stand in for any name the built-in
     // registry does not have.
-    let theme = crate::app::default_theme().map_err(io::Error::other)?;
+    let theme = crate::app::theme_for(
+        &titi_config::agent_dir(),
+        &crate::app::current_workspace(),
+        theme_name.as_deref(),
+    )
+    .map_err(io::Error::other)?;
     let mut chat = Chat::new(model, &session_id, theme);
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the

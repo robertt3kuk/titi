@@ -289,5 +289,5 @@ fn main() -> io::Result<()> {
         },
         None => None,
     };
-    titi_cli::chat::run(engine, session_log, models, session_id, cast)
+    titi_cli::chat::run(engine, session_log, models, session_id, cast, None)
 }
