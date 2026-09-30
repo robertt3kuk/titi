@@ -186,6 +186,11 @@ pub enum EngineEvent {
         call_id: SmolStr,
         output: SmolStr,
         is_error: bool,
+        /// What a surface may show besides `output` — a diff of what the tool
+        /// changed, today. It never reaches the provider: the tool message
+        /// carries `output` alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<SmolStr>,
     },
     AgentStarted {
         agent_id: SmolStr,

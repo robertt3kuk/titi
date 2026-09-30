@@ -650,3 +650,95 @@ async fn tool_output_is_masked_before_the_trajectory_records_it() {
     );
     assert!(recorded, "the trajectory recorded this call's result");
 }
+
+/// The workspace tools, so the loop is driven by the real `write`.
+fn workspace_registry(root: &std::path::Path) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    for tool in titi_tools::workspace_tools(root) {
+        tools.register(Arc::from(tool));
+    }
+    tools
+}
+
+/// A tool's detail is for the surface, never for the model: the event carries
+/// the diff, the answer the provider reads back is the one line it always was,
+/// and a secret the diff quotes is masked out of both.
+#[tokio::test]
+async fn a_tool_detail_reaches_the_event_and_not_the_model() {
+    let workspace = tempfile::tempdir().unwrap();
+    let secret = "sk-test-0000000000000000";
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events(
+            "write",
+            r#"{"path":"probe.txt","content":"TOKEN=sk-test-0000000000000000\n"}"#,
+        )),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Yolo;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(Arc::clone(&transport) as _),
+        workspace_registry(workspace.path()),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "write".into(),
+        })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let (output, is_error, detail) = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished {
+                output,
+                is_error,
+                detail,
+                ..
+            } => Some((output.to_string(), *is_error, detail.clone())),
+            _ => None,
+        })
+        .expect("the write tool reported a result");
+    assert!(!is_error, "the write failed: {output}");
+    assert_eq!(
+        output.lines().count(),
+        1,
+        "the answer is the one line it has always been: {output}"
+    );
+    let detail = detail.expect("the write reported a diff for the screen");
+    assert!(
+        detail.contains("+TOKEN="),
+        "the diff holds the change: {detail}"
+    );
+    assert!(
+        detail.contains("[redacted]"),
+        "a secret the diff quotes is masked: {detail}"
+    );
+    assert!(!detail.contains(secret), "the secret is gone: {detail}");
+
+    // What the provider is handed: the tool message of the last request.
+    let requests = transport.requests();
+    let tool_message = requests
+        .last()
+        .expect("the turn was sent back to the provider")
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("the tool message");
+    assert!(
+        tool_message.content.contains("wrote"),
+        "the answer is there: {:?}",
+        tool_message.content
+    );
+    for leaked in ["--- a/", "+TOKEN=", "[redacted]", secret] {
+        assert!(
+            !tool_message.content.contains(leaked),
+            "{leaked:?} leaked into the model's tool message: {:?}",
+            tool_message.content
+        );
+    }
+}

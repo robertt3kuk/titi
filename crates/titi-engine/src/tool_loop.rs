@@ -177,6 +177,7 @@ pub(crate) async fn execute_tools(
                 call_id: call.call_id.clone(),
                 output: error.to_string().into(),
                 is_error: true,
+                detail: None,
             },
             Some(Ok(path)) => {
                 let result = invoke_one(
@@ -205,10 +206,17 @@ pub(crate) async fn execute_tools(
                 .await
             }
         };
-        // Everything below goes to the provider, the transcript, and the
-        // session file. A key or a server address the tool printed stops here.
+        // The answer goes to the provider, the transcript and the session file;
+        // a key or a server address the tool printed stops here. The detail is
+        // masked with it — a diff quotes what the tool wrote — and goes to the
+        // event alone: the model never reads a presentation detail, so it can
+        // never spend the context or answer for the tool.
         let result = Executed {
             output: mask(&result.output, mask_ips).into(),
+            detail: result
+                .detail
+                .as_deref()
+                .map(|detail| mask(detail, mask_ips).into()),
             ..result
         };
         if let Some(recorder) = trajectory.lock().await.as_mut() {
@@ -224,6 +232,7 @@ pub(crate) async fn execute_tools(
                 call_id: result.call_id.clone(),
                 output: result.output.clone(),
                 is_error: result.is_error,
+                detail: result.detail.clone(),
             })
             .await;
         messages.push(ChatMessage {
@@ -246,6 +255,9 @@ fn mask(output: &str, mask_ips: bool) -> String {
 struct Executed {
     call_id: SmolStr,
     output: SmolStr,
+    /// The tool's presentation detail, if it reported one. Deliberately absent
+    /// from the tool message pushed to the provider.
+    detail: Option<SmolStr>,
     is_error: bool,
 }
 
@@ -263,6 +275,7 @@ async fn invoke_one(
             call_id: call.call_id,
             output: format!("unknown tool {}", call.name).into(),
             is_error: true,
+            detail: None,
         };
     };
     let tier = tools.approval_tier(&call.name);
@@ -285,15 +298,21 @@ async fn invoke_one(
                 call_id: call.call_id,
                 output: "tool invocation denied".into(),
                 is_error: true,
+                detail: None,
             };
         }
     }
     let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
-    let ToolResult { output, is_error } = handler.invoke(args).await;
+    let ToolResult {
+        output,
+        is_error,
+        detail,
+    } = handler.invoke(args).await;
     Executed {
         call_id: call.call_id,
         output,
         is_error,
+        detail,
     }
 }
 

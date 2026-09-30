@@ -32,6 +32,7 @@ fn stream() -> Vec<EngineEvent> {
             call_id: "call-1".into(),
             output: "[package]".into(),
             is_error: false,
+            detail: None,
         },
         EngineEvent::TurnFinished {
             turn_id: TurnId(1),
@@ -127,6 +128,7 @@ fn a_masked_tool_output_keeps_the_key_out_of_the_cast() {
             call_id: "call-1".into(),
             output: masked.into(),
             is_error: false,
+            detail: None,
         })
         .expect("event records");
     writer.flush().expect("the cast flushes");

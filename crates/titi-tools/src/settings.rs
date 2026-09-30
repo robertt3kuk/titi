@@ -47,6 +47,7 @@ impl ToolHandler for SettingsTool {
                 return ToolResult {
                     output: "missing string key 'key'".into(),
                     is_error: true,
+                    detail: None,
                 };
             }
         };
@@ -55,6 +56,7 @@ impl ToolHandler for SettingsTool {
             return ToolResult {
                 output: "changing this setting via tool is blocked for security reasons".into(),
                 is_error: true,
+                detail: None,
             };
         }
 
@@ -65,18 +67,21 @@ impl ToolHandler for SettingsTool {
                     return ToolResult {
                         output: format!("value: {}\nsource: {}", val, source).into(),
                         is_error: false,
+                        detail: None,
                     };
                 }
                 Ok(None) => {
                     return ToolResult {
                         output: "not set".into(),
                         is_error: false,
+                        detail: None,
                     };
                 }
                 Err(e) => {
                     return ToolResult {
                         output: format!("failed to read settings: {}", e).into(),
                         is_error: true,
+                        detail: None,
                     };
                 }
             }
@@ -106,17 +111,20 @@ impl ToolHandler for SettingsTool {
                     ToolResult {
                         output: "applied after restart".into(),
                         is_error: false,
+                        detail: None,
                     }
                 } else {
                     ToolResult {
                         output: "applied".into(),
                         is_error: false,
+                        detail: None,
                     }
                 }
             }
             Err(e) => ToolResult {
                 output: e.into(),
                 is_error: true,
+                detail: None,
             },
         }
     }

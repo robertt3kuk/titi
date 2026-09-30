@@ -93,10 +93,12 @@ impl ToolHandler for MemoryTool {
             Ok(output) => ToolResult {
                 output: output.into(),
                 is_error: false,
+                detail: None,
             },
             Err(reason) => ToolResult {
                 output: reason.into(),
                 is_error: true,
+                detail: None,
             },
         }
     }

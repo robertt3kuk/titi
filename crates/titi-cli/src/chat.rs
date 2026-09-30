@@ -5593,6 +5593,7 @@ mod tests {
             call_id: "call-1".into(),
             output: "[package]".into(),
             is_error: false,
+            detail: None,
         });
         assert_eq!(
             result.log,
@@ -6324,6 +6325,7 @@ mod tests {
             call_id: "c2".into(),
             output: "something else".into(),
             is_error: false,
+            detail: None,
         });
         let row = above_composer(&mut chat, 80, 20);
         assert!(row.contains("read ·"), "{row:?}");
@@ -6333,6 +6335,7 @@ mod tests {
             call_id: "c1".into(),
             output: "fn main() {}".into(),
             is_error: false,
+            detail: None,
         });
         let row = above_composer(&mut chat, 80, 20);
         assert!(row.contains("streaming"), "{row:?}");

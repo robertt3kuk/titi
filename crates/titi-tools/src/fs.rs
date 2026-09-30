@@ -67,6 +67,7 @@ pub(crate) fn ok(output: impl Into<String>) -> ToolResult {
     ToolResult {
         output: output.into().into(),
         is_error: false,
+        detail: None,
     }
 }
 
@@ -74,6 +75,126 @@ pub(crate) fn err(output: impl Into<String>) -> ToolResult {
     ToolResult {
         output: output.into().into(),
         is_error: true,
+        detail: None,
+    }
+}
+
+/// A result with something for the surface to draw under the answer — a diff,
+/// today. The answer itself is unchanged, and the model never sees the detail:
+/// the engine keeps it out of the tool message.
+pub(crate) fn ok_with_detail(output: impl Into<String>, detail: String) -> ToolResult {
+    ToolResult {
+        output: output.into().into(),
+        is_error: false,
+        detail: Some(detail.into()),
+    }
+}
+
+/// Context lines a diff keeps on each side of a change: enough to place the
+/// change in its file without dragging the file along.
+const DIFF_CONTEXT: usize = 3;
+
+/// A unified diff of `before` → `after`, or `None` when no line changed.
+///
+/// One hunk: the unchanged head and tail of the two texts are dropped and
+/// [`DIFF_CONTEXT`] lines are kept around the changed middle. The change cannot
+/// outgrow the strings the model sent in the very call being reported, so the
+/// diff is complete rather than sampled — and it is the shape
+/// `titi_tui::diff::render_diff` reads, so a screen can draw it.
+pub(crate) fn unified_diff(path: &str, before: &str, after: &str) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    // Each line keeps its terminator: the last line of a file with no final
+    // newline is then a different line from the same text with one, which is
+    // what the `\ No newline at end of file` marker is for.
+    let old = text_lines(before);
+    let new = text_lines(after);
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let first = head.saturating_sub(DIFF_CONTEXT);
+    let old_end = (old.len() - tail + DIFF_CONTEXT).min(old.len());
+    let new_end = (new.len() - tail + DIFF_CONTEXT).min(new.len());
+    let mut diff = String::new();
+    diff.push_str(&side("---", 'a', path, !old.is_empty()));
+    diff.push_str(&side("+++", 'b', path, !new.is_empty()));
+    diff.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        hunk_start(first, old_end - first),
+        old_end - first,
+        hunk_start(first, new_end - first),
+        new_end - first,
+    ));
+    for line in &old[first..head] {
+        push_body_line(&mut diff, ' ', line);
+    }
+    for line in &old[head..old.len() - tail] {
+        push_body_line(&mut diff, '-', line);
+    }
+    for line in &new[head..new.len() - tail] {
+        push_body_line(&mut diff, '+', line);
+    }
+    for line in &new[new.len() - tail..new_end] {
+        push_body_line(&mut diff, ' ', line);
+    }
+    Some(diff)
+}
+
+/// The lines of `text`, each with its terminator, and no line at all for an
+/// empty text — an empty file has no first line to remove or add.
+fn text_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
+/// A `---`/`+++` header: `/dev/null` for a side the change creates or deletes,
+/// which a diff reader takes as unnamed.
+fn side(marker: &str, letter: char, path: &str, present: bool) -> String {
+    if present {
+        format!("{marker} {letter}/{path}\n")
+    } else {
+        format!("{marker} /dev/null\n")
+    }
+}
+
+/// The first line a hunk covers: one-based, except that a side with no lines
+/// starts at its own zero (git writes `-0,0` for a file that did not exist).
+fn hunk_start(first: usize, count: usize) -> usize {
+    first + usize::from(count > 0)
+}
+
+/// One body row, plus the marker that says the line carries no newline of its
+/// own — the row a reader needs to tell `x\n` from `x`.
+fn push_body_line(diff: &mut String, marker: char, line: &str) {
+    diff.push(marker);
+    match line.strip_suffix('\n') {
+        Some(text) => {
+            diff.push_str(text);
+            diff.push('\n');
+        }
+        None => {
+            diff.push_str(line);
+            diff.push_str("\n\\ No newline at end of file\n");
+        }
+    }
+}
+
+/// The text a write is about to replace: empty for a path that is not there,
+/// and `None` for one that exists but does not read as text — the diff would
+/// have to be invented, so none is reported.
+fn replacing_text(path: &Path) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
     }
 }
 
@@ -157,15 +278,25 @@ impl ToolHandler for WriteFileTool {
         let Some(content) = arg_str(&args, "content") else {
             return err("missing content");
         };
-        match jail_path(&self.root, &path).and_then(|path| {
-            if let Some(parent) = path.parent() {
+        match jail_path(&self.root, &path).and_then(|resolved| {
+            // What the write replaces is read here, for the diff: this is the
+            // only moment that text exists.
+            let before = replacing_text(&resolved);
+            if let Some(parent) = resolved.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
             }
-            fs::write(&path, content).map_err(|error| error.to_string())?;
-            self.cache.invalidate(&path);
-            Ok(path.display().to_string())
+            fs::write(&resolved, &content).map_err(|error| error.to_string())?;
+            self.cache.invalidate(&resolved);
+            Ok((resolved.display().to_string(), before))
         }) {
-            Ok(written) => ok(format!("wrote {written}")),
+            Ok((written, before)) => {
+                // The answer is the one line it always was; the diff is the
+                // surface's to draw, and the model never reads it.
+                match before.and_then(|before| unified_diff(&path, &before, &content)) {
+                    Some(diff) => ok_with_detail(format!("wrote {written}"), diff),
+                    None => ok(format!("wrote {written}")),
+                }
+            }
             Err(error) => err(error),
         }
     }
@@ -210,16 +341,19 @@ impl ToolHandler for EditFileTool {
         let Some(new) = arg_str(&args, "new_string") else {
             return err("missing new_string");
         };
-        match readable_path(&self.root, &path, &self.policy).and_then(|path| {
-            let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        match readable_path(&self.root, &path, &self.policy).and_then(|resolved| {
+            let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
             if !content.contains(&old) {
                 return Err("old_string not found".into());
             }
             let updated = content.replacen(&old, &new, 1);
-            fs::write(&path, updated).map_err(|error| error.to_string())?;
-            Ok(())
+            fs::write(&resolved, &updated).map_err(|error| error.to_string())?;
+            Ok(unified_diff(&path, &content, &updated))
         }) {
-            Ok(()) => ok("edited"),
+            Ok(diff) => match diff {
+                Some(diff) => ok_with_detail("edited", diff),
+                None => ok("edited"),
+            },
             Err(error) => err(error),
         }
     }
@@ -730,6 +864,192 @@ mod tests {
             .await;
         assert!(!edited.is_error);
         assert_eq!(fs::read_to_string(root.join("note.txt")).unwrap(), "beta");
+    }
+
+    /// The lines of a result's presentation detail, so a test asserts on the
+    /// diff without unwrapping it at every step.
+    fn detail_lines(result: &ToolResult) -> Vec<&str> {
+        result
+            .detail
+            .as_deref()
+            .expect("the tool reported a detail")
+            .lines()
+            .collect()
+    }
+
+    /// An edit's answer stays the one line it always was, and the change it
+    /// made travels beside it as a detail — a diff of exactly the lines it
+    /// touched, which the model never reads.
+    #[tokio::test]
+    async fn edit_reports_the_diff_of_the_lines_it_changed() {
+        let root = temp_root();
+        fs::write(root.join("note.txt"), "alpha\nkeep\nbeta\n").unwrap();
+        let edit = EditFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+        let result = edit
+            .invoke(serde_json::json!({
+                "path": "note.txt",
+                "old_string": "beta",
+                "new_string": "gamma"
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).unwrap(),
+            "alpha\nkeep\ngamma\n"
+        );
+        assert_eq!(
+            result.output, "edited",
+            "the answer is the one line the model has always read"
+        );
+        assert_eq!(
+            detail_lines(&result),
+            [
+                "--- a/note.txt",
+                "+++ b/note.txt",
+                "@@ -1,3 +1,3 @@",
+                " alpha",
+                " keep",
+                "-beta",
+                "+gamma",
+            ]
+        );
+    }
+
+    /// A write's answer stays one line, and what it replaced travels beside it
+    /// as a detail: a file it created reads as an addition against
+    /// `/dev/null`.
+    #[tokio::test]
+    async fn write_reports_the_diff_against_what_it_replaced() {
+        let root = temp_root();
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let created = write
+            .invoke(serde_json::json!({"path": "fresh.txt", "content": "one\ntwo\n"}))
+            .await;
+        assert!(!created.is_error, "{}", created.output);
+        assert!(
+            created.output.ends_with("fresh.txt"),
+            "the answer names the file and nothing else: {:?}",
+            created.output
+        );
+        assert_eq!(
+            detail_lines(&created),
+            [
+                "--- /dev/null",
+                "+++ b/fresh.txt",
+                "@@ -0,0 +1,2 @@",
+                "+one",
+                "+two",
+            ]
+        );
+
+        let rewritten = write
+            .invoke(serde_json::json!({"path": "fresh.txt", "content": "one\nthree\n"}))
+            .await;
+        assert!(!rewritten.is_error, "{}", rewritten.output);
+        assert_eq!(
+            rewritten.output.lines().count(),
+            1,
+            "the answer stays one line: {}",
+            rewritten.output
+        );
+        assert!(
+            rewritten
+                .detail
+                .as_deref()
+                .is_some_and(|diff| diff.contains("-two\n+three")),
+            "{:?}",
+            rewritten.detail
+        );
+    }
+
+    /// A write that changes nothing reports only its summary, and so does a
+    /// file the diff cannot be drawn from.
+    #[tokio::test]
+    async fn a_write_with_no_change_reports_no_diff() {
+        let root = temp_root();
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let written = write
+            .invoke(serde_json::json!({"path": "same.txt", "content": "alpha\n"}))
+            .await;
+        assert!(!written.is_error, "{}", written.output);
+        let again = write
+            .invoke(serde_json::json!({"path": "same.txt", "content": "alpha\n"}))
+            .await;
+        assert_eq!(
+            again.output.lines().count(),
+            1,
+            "an unchanged write must stay one line: {}",
+            again.output
+        );
+    }
+
+    /// The diff generator itself: one hunk, the context around the change, the
+    /// exact hunk counts, and the marker that says a line has no newline.
+    #[test]
+    fn a_diff_is_one_hunk_with_context_and_exact_counts() {
+        let same = unified_diff("x.txt", "a\nb\nc\n", "a\nb\nc\n");
+        assert!(same.is_none(), "an unchanged text has no diff");
+        assert!(unified_diff("x.txt", "", "").is_none());
+
+        let changed = unified_diff("x.txt", "a\nb\nc\nd\ne\n", "a\nb\nX\nd\ne\n").unwrap();
+        assert_eq!(
+            changed,
+            "--- a/x.txt\n+++ b/x.txt\n@@ -1,5 +1,5 @@\n a\n b\n-c\n+X\n d\n e\n"
+        );
+
+        let created = unified_diff("tails/x.txt", "", "one\n").unwrap();
+        assert_eq!(
+            created,
+            "--- /dev/null\n+++ b/tails/x.txt\n@@ -0,0 +1,1 @@\n+one\n"
+        );
+
+        let deleted = unified_diff("gone.txt", "one\n", "").unwrap();
+        assert_eq!(
+            deleted,
+            "--- a/gone.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-one\n"
+        );
+
+        // The last line of a file with no final newline is a line of its own,
+        // and the marker says so.
+        let unterminated = unified_diff("x.txt", "a", "a\n").unwrap();
+        assert_eq!(
+            unterminated,
+            "--- a/x.txt\n+++ b/x.txt\n@@ -1,1 +1,1 @@\n-a\n\\ No newline at end of file\n+a\n"
+        );
+
+        // A change deep in a long file keeps three lines of context and no
+        // more, and the hunk counts cover what it emits.
+        let long: String = (0..40).map(|n| format!("line {n}\n")).collect();
+        let mut edited = long.clone();
+        edited = edited.replace("line 20\n", "changed\n");
+        let deep = unified_diff("long.txt", &long, &edited).unwrap();
+        let lines: Vec<&str> = deep.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "--- a/long.txt",
+                "+++ b/long.txt",
+                "@@ -18,7 +18,7 @@",
+                " line 17",
+                " line 18",
+                " line 19",
+                "-line 20",
+                "+changed",
+                " line 21",
+                " line 22",
+                " line 23",
+            ]
+        );
     }
 
     #[tokio::test]

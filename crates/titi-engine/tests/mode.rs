@@ -290,6 +290,7 @@ impl titi_tools::ToolHandler for FakeNetworkTool {
         titi_tools::ToolResult {
             output: "one result".into(),
             is_error: false,
+            detail: None,
         }
     }
 }

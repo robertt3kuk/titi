@@ -80,8 +80,18 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
+    /// What the model is told. The tool message the provider sees is this, and
+    /// nothing else.
     pub output: SmolStr,
     pub is_error: bool,
+    /// What a surface should show *besides* the answer — a diff of what the
+    /// tool changed, today.
+    ///
+    /// Presentation only, and by construction: the engine puts this on the
+    /// event a surface reads and keeps it out of the tool message, so it can
+    /// neither spend the model's context nor answer for the tool. A tool that
+    /// has nothing extra to show leaves it empty.
+    pub detail: Option<SmolStr>,
 }
 
 #[async_trait]
@@ -181,6 +191,7 @@ impl ToolHandler for EchoTool {
         ToolResult {
             output: text.into(),
             is_error: false,
+            detail: None,
         }
     }
 }
@@ -213,6 +224,7 @@ impl ToolHandler for ShellProbeTool {
         ToolResult {
             output: format!("ran {command}").into(),
             is_error: false,
+            detail: None,
         }
     }
 }
@@ -257,6 +269,7 @@ mod tests {
             ToolResult {
                 output: "".into(),
                 is_error: false,
+                detail: None,
             }
         }
     }
