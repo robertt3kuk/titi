@@ -80,6 +80,62 @@ fn body_width(width: usize, indent: usize) -> usize {
     width.saturating_sub(indent + BODY_MARGIN)
 }
 
+/// The surface a transcript block is drawn on: the page, or the band behind the
+/// user's own question.
+///
+/// The band spans the column range every block is laid out in — the transcript's
+/// own width, two cells clear of the pane's edge — and exactly the rows the
+/// block occupies, so it cannot run into a neighbouring block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Page,
+    User,
+}
+
+/// The style a block's own furniture carries — its air, its bar, the cells that
+/// pad a row out to the layout's width.
+fn surface_style(surface: Surface, theme: &Theme) -> Style {
+    match surface {
+        Surface::Page => page(theme),
+        Surface::User => Style::default().bg(bg(theme, ThemeBg::UserMessageBg)),
+    }
+}
+
+/// A token's colour on a block's surface. The user's band keeps the theme's
+/// `userMessageText` for the body and the label's own colour; both have to sit
+/// on the band rather than on the page behind it.
+fn on_surface(surface: Surface, theme: &Theme, token: ThemeColor) -> Style {
+    let style = fg(theme, token);
+    match surface {
+        Surface::Page => style,
+        Surface::User => style.bg(bg(theme, ThemeBg::UserMessageBg)),
+    }
+}
+
+/// Pad a row out to the layout's width when the block is on a band, so the band
+/// covers the whole row. A block on the page needs nothing: the pane paints it.
+fn banded(
+    mut spans: Vec<Span<'static>>,
+    surface: Surface,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Span<'static>> {
+    if surface == Surface::Page {
+        return spans;
+    }
+    let used: usize = spans
+        .iter()
+        .map(|span| titi_tui::width::visible_width(&span.content))
+        .sum();
+    if let Some(rest) = width.checked_sub(used).filter(|rest| *rest > 0) {
+        spans.push(Span::styled(
+            " ".repeat(rest),
+            surface_style(surface, theme),
+        ));
+    }
+    spans
+}
+
 /// The pieces a message block opens with, and what a wrapped row hangs under:
 /// the air before the label, the label, the bar after it, and the hang.
 ///
@@ -4956,10 +5012,14 @@ fn message_rows(
         return link_note(head, url, instructions, theme, width);
     }
     let rows = match line.kind {
+        // The user's own question is the one block with a surface of its own:
+        // the theme's `userMessageBg` behind it, `userMessageText` on top, and
+        // the label's colour unchanged.
         LineKind::User => speech(
             "you",
             ThemeColor::CustomMessageLabel,
-            ThemeColor::Text,
+            ThemeColor::UserMessageText,
+            Surface::User,
             &line.text,
             width,
             theme,
@@ -5074,7 +5134,9 @@ fn speech_width(width: usize) -> usize {
 fn message_block(
     name: &str,
     label: ThemeColor,
+    surface: Surface,
     theme: &Theme,
+    width: usize,
     bodies: Vec<Vec<Span<'static>>>,
 ) -> Vec<Line<'static>> {
     let (air, tag, bar, hang) = message_gutter(name);
@@ -5084,17 +5146,20 @@ fn message_block(
         if index == 0 {
             // The label carries the weight; the air before it and the bar after
             // it do not, so the three are styled apart rather than as one run.
-            row.push(Span::styled(air.clone(), page(theme)));
+            row.push(Span::styled(air.clone(), surface_style(surface, theme)));
             row.push(Span::styled(
                 tag.clone(),
-                fg(theme, label).add_modifier(Modifier::BOLD),
+                on_surface(surface, theme, label).add_modifier(Modifier::BOLD),
             ));
-            row.push(Span::styled(bar.clone(), fg(theme, label)));
+            row.push(Span::styled(bar.clone(), on_surface(surface, theme, label)));
         } else {
-            row.push(Span::styled(hang.clone(), fg(theme, label)));
+            row.push(Span::styled(
+                hang.clone(),
+                on_surface(surface, theme, label),
+            ));
         }
         row.extend(body);
-        rows.push(Line::from(row));
+        rows.push(Line::from(banded(row, surface, theme, width)));
     }
     rows
 }
@@ -5103,15 +5168,16 @@ fn speech(
     name: &str,
     label: ThemeColor,
     body: ThemeColor,
+    surface: Surface,
     text: &str,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let bodies = wrap_plain(text, speech_width(width))
         .into_iter()
-        .map(|piece| vec![Span::styled(piece, fg(theme, body))])
+        .map(|piece| vec![Span::styled(piece, on_surface(surface, theme, body))])
         .collect();
-    message_block(name, label, theme, bodies)
+    message_block(name, label, surface, theme, width, bodies)
 }
 
 /// The assistant's answer as frame rows: markdown when the answer carries any,
@@ -5129,13 +5195,21 @@ fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
             "titi",
             ThemeColor::Accent,
             ThemeColor::Text,
+            Surface::Page,
             text,
             width,
             theme,
         );
     }
     let bodies = markdown_bodies(text, speech_width(width), theme);
-    message_block("titi", ThemeColor::Accent, theme, bodies)
+    message_block(
+        "titi",
+        ThemeColor::Accent,
+        Surface::Page,
+        theme,
+        width,
+        bodies,
+    )
 }
 
 /// The renderer's rows as frame spans.
@@ -5815,8 +5889,14 @@ mod tests {
     use titi_engine::TurnId;
     use titi_providers::StopReason;
 
+    /// A chat with the theme a test names, for the ones that need a palette
+    /// where two tokens are two different colours.
+    fn chat_with_theme(theme: Arc<Theme>) -> Chat {
+        Chat::new("openai/gpt-4.1", "session-123", theme)
+    }
+
     fn chat() -> Chat {
-        Chat::new("openai/gpt-4.1", "session-123", test_theme())
+        chat_with_theme(test_theme())
     }
 
     /// A built-in theme, with the colour depth pinned so an assertion is about
@@ -7571,6 +7651,7 @@ mod tests {
                 "titi",
                 ThemeColor::Accent,
                 ThemeColor::Text,
+                Surface::Page,
                 &long,
                 60,
                 &theme,
@@ -7679,6 +7760,129 @@ mod tests {
                     "air inside one turn's body between {joined:?}: {gaps:?}"
                 );
             }
+        }
+    }
+
+    /// The user's own question is the one block on a surface of its own: the
+    /// theme's `userMessageBg` across exactly its rows, `userMessageText` on the
+    /// body, and the label's colour unchanged.
+    ///
+    /// `dark` rather than titanium: titanium's `userMessageBg` is the same value
+    /// as the chrome behind it, so the band is drawn and invisible there — the
+    /// assertion has to be made on a palette where the two differ.
+    #[test]
+    fn the_user_block_carries_its_own_surface() {
+        let theme = test_theme_named("dark");
+        let band = bg(&theme, ThemeBg::UserMessageBg);
+        let page_bg = bg(&theme, ThemeBg::StatusLineBg);
+        assert_ne!(
+            band, page_bg,
+            "this test needs a palette where the band shows"
+        );
+
+        let mut chat = chat_with_theme(theme.clone());
+        chat.push(LineKind::User, "word ".repeat(20));
+        chat.push(LineKind::Assistant, "All green.".to_owned());
+
+        let buffer = frame_buffer(&mut chat, 80, 30);
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let user_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains("word word"))
+            .map(|(at, _)| at)
+            .collect();
+        assert!(user_rows.len() >= 2, "the question wrapped: {rows:?}");
+
+        // The band covers every row of the block, to the layout's width.
+        let layout = 78;
+        for at in &user_rows {
+            for x in [0, 40, layout - 1] {
+                assert_eq!(
+                    buffer[(x as u16, *at as u16)].bg,
+                    band,
+                    "row {at} column {x} is not on the band"
+                );
+            }
+            assert_ne!(
+                buffer[(79, *at as u16)].bg,
+                band,
+                "the band ran to the pane's last column"
+            );
+        }
+        // The body and the label keep their own colours, on the band.
+        let (x, y) = cell_of(&rows, "word").expect("the question is on screen");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            fg(&theme, ThemeColor::UserMessageText)
+                .fg
+                .unwrap_or(Color::Reset)
+        );
+        assert_eq!(buffer[(x, y)].bg, band);
+        let (x, y) = cell_of(&rows, "you").expect("the label is on screen");
+        assert_eq!(
+            buffer[(x, y)].fg,
+            fg(&theme, ThemeColor::CustomMessageLabel)
+                .fg
+                .unwrap_or(Color::Reset),
+            "the label's colour changed"
+        );
+        assert_eq!(buffer[(x, y)].bg, band, "the label is not on the band");
+
+        // The rows around it are not banded: the air, and the answer.
+        let after = user_rows.last().expect("a row") + 1;
+        assert!(
+            rows[after].trim().is_empty(),
+            "no air after the block: {rows:?}"
+        );
+        assert_eq!(
+            buffer[(0, after as u16)].bg,
+            page_bg,
+            "the air is on the band"
+        );
+        let answer = rows
+            .iter()
+            .position(|row| row.contains("All green"))
+            .expect("the answer is on screen");
+        assert_eq!(
+            buffer[(0, answer as u16)].bg,
+            page_bg,
+            "the answer is on the band"
+        );
+    }
+
+    /// The band is exactly as wide as the block's own column range at any pane
+    /// width, and nothing runs past the pane.
+    #[test]
+    fn the_band_covers_the_blocks_own_width() {
+        let theme = test_theme_named("dark");
+        let band = bg(&theme, ThemeBg::UserMessageBg);
+        for width in [60u16, 80, 120] {
+            let mut chat = chat_with_theme(theme.clone());
+            chat.push(LineKind::User, "word ".repeat(30));
+            let buffer = frame_buffer(&mut chat, width, 30);
+            let mut banded = 0;
+            for y in 0..30 {
+                if buffer[(0, y)].bg == band {
+                    banded += 1;
+                    assert_ne!(
+                        buffer[(width - 1, y)].bg,
+                        band,
+                        "{width}: the band reached the pane's edge"
+                    );
+                    assert_eq!(
+                        buffer[(width - 3, y)].bg,
+                        band,
+                        "{width}: the band stopped short of the layout's width"
+                    );
+                }
+            }
+            assert!(
+                banded >= 2,
+                "{width}: the block did not wrap: {banded} rows"
+            );
         }
     }
 
@@ -9627,6 +9831,7 @@ mod tests {
                 "titi",
                 ThemeColor::Accent,
                 ThemeColor::Text,
+                Surface::Page,
                 &long,
                 60,
                 &theme
@@ -9640,6 +9845,7 @@ mod tests {
                     "titi",
                     ThemeColor::Accent,
                     ThemeColor::Text,
+                    Surface::Page,
                     plain,
                     80,
                     &theme
