@@ -19,6 +19,7 @@ pub mod overlay;
 pub mod panels;
 pub mod recap;
 pub mod renderer;
+pub mod scrollbar;
 pub mod selection;
 pub mod slash;
 pub mod space_hold;
