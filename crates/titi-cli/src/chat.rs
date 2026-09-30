@@ -457,6 +457,8 @@ pub struct Chat {
     login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
     session_picker: Option<usize>,
+    /// `/theme`: the palettes this build carries, filtered by typing.
+    theme_picker: Option<ThemePicker>,
     /// The model browser bare `/model` and bare `/switch` open; `None` =
     /// closed.
     model_picker: Option<ModelPicker>,
@@ -533,6 +535,7 @@ impl Chat {
             picker: 0,
             login_picker: None,
             session_picker: None,
+            theme_picker: None,
             model_picker: None,
             skills: Vec::new(),
             kitty: false,
@@ -619,6 +622,9 @@ impl Chat {
         }
         if self.login_for.is_some() {
             return self.login_key(key);
+        }
+        if self.theme_picker.is_some() {
+            return self.theme_picker_key(key, now);
         }
         if self.session_picker.is_some() {
             return self.session_picker_key(key, now);
@@ -1209,6 +1215,7 @@ impl Chat {
             "login" => self.login(args),
             "logout" => self.logout(args),
             "keys" | "whoami" => self.keys(),
+            "theme" => self.theme(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
             _ => {
@@ -1799,6 +1806,183 @@ impl Chat {
                 self.model_picker = None;
                 self.on_key(other, now)
             }
+        }
+    }
+
+    /// Typing while the theme picker is up. Like the model browser: arrows
+    /// move, Enter applies, a printable key narrows, Backspace takes back a
+    /// character, and Esc closes without touching the theme the screen is on —
+    /// including one the cursor has been arrowed past.
+    fn theme_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_theme_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_theme_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_theme_picker(),
+            Key::Esc => {
+                match self.theme_picker.as_mut() {
+                    Some(picker) if !picker.query.is_empty() => {
+                        picker.query.clear();
+                        picker.selected = 0;
+                    }
+                    _ => self.theme_picker = None,
+                }
+                self.disarm();
+                Applied::none()
+            }
+            Key::Backspace
+                if self
+                    .theme_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.query.is_empty()) =>
+            {
+                if let Some(picker) = self.theme_picker.as_mut() {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                if let Some(picker) = self.theme_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            other => {
+                self.theme_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_theme_picker(&mut self, delta: isize) {
+        let Some(picker) = self.theme_picker.as_mut() else {
+            return;
+        };
+        let len = picker.matched().len();
+        if len == 0 {
+            return;
+        }
+        let current = picker.selected % len;
+        picker.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter on a row: the palette the next frame is painted with, remembered
+    /// for this appearance slot.
+    fn accept_theme_picker(&mut self) -> Applied {
+        let Some(picker) = self.theme_picker.take() else {
+            return Applied::none();
+        };
+        match picker.selected_name().map(str::to_owned) {
+            Some(name) => self.apply_theme(&name),
+            None => {
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "no theme matches \"{}\"; try /theme to see the list",
+                        picker.query
+                    ),
+                );
+                Applied::none()
+            }
+        }
+    }
+
+    /// `/theme [name]`: bare opens the picker, a name applies it directly.
+    fn theme(&mut self, args: &str) -> Applied {
+        let name = args.trim();
+        if name.is_empty() {
+            self.theme_picker = Some(ThemePicker::open());
+            return Applied::none();
+        }
+        self.apply_theme(name)
+    }
+
+    /// Applies a palette and remembers it — `auto` to go back to the terminal
+    /// probe's own pick.
+    ///
+    /// The name is checked before anything is written, so a typo is neither
+    /// remembered nor painted; the write happens before the swap, so the screen
+    /// never shows a theme the next run would not; and the swap is followed by
+    /// a repaint the moment this returns, which is the frame after the key.
+    fn apply_theme(&mut self, name: &str) -> Applied {
+        let workspace = crate::app::current_workspace();
+        let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
+        let key = crate::app::theme_slot(&inputs);
+        let mut settings =
+            match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[]) {
+                Ok(settings) => settings,
+                Err(reason) => {
+                    self.push(LineKind::Error, format!("theme: {reason}"));
+                    return Applied::none();
+                }
+            };
+        let auto = name == THEME_AUTO;
+        if !auto && !crate::app::theme_names().iter().any(|known| known == name) {
+            self.push(LineKind::Error, crate::app::unknown_theme(name));
+            return Applied::none();
+        }
+        let written = if auto {
+            settings.reset(key)
+        } else {
+            settings.set(key, serde_json::json!(name))
+        };
+        if let Err(reason) = written {
+            self.push(LineKind::Error, format!("theme: not saved ({reason})"));
+            return Applied::none();
+        }
+        match crate::app::theme_for(&self.agent_dir, &workspace, None) {
+            Ok(theme) => {
+                self.theme = theme;
+                let shown = self.theme_state().name;
+                let note = if auto {
+                    format!("theme {shown} (auto)")
+                } else {
+                    format!("theme {shown}")
+                };
+                self.push(LineKind::Note, note);
+                Applied::none()
+            }
+            Err(reason) => {
+                self.push(LineKind::Error, reason);
+                Applied::none()
+            }
+        }
+    }
+
+    /// What the screen is showing and why: the palette's name, and whether it
+    /// is the user's own choice for this appearance slot or the probe's pick.
+    ///
+    /// Pure: it reads the settings and the terminal probe, and loads nothing, so
+    /// the picker can mark its row without touching the palette on screen.
+    fn theme_state(&self) -> ThemeState {
+        let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
+        let chosen = titi_config::settings::Settings::load(
+            &self.agent_dir,
+            &crate::app::current_workspace(),
+            &[],
+        )
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get(crate::app::theme_slot(&inputs))
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+        ThemeState {
+            name: chosen.clone().unwrap_or_else(|| {
+                titi_tui::theme::appearance::resolve_auto_theme(
+                    titi_tui::theme::appearance::AUTO_DARK_THEME,
+                    titi_tui::theme::appearance::AUTO_LIGHT_THEME,
+                    &inputs,
+                )
+            }),
+            chosen,
         }
     }
 
@@ -3039,6 +3223,10 @@ const COMMANDS: &[Command] = &[
         about: "which providers have a key or a sign-in",
     },
     Command {
+        name: "theme",
+        about: "choose a palette (bare opens the picker)",
+    },
+    Command {
         name: "usage",
         about: "show token usage",
     },
@@ -3848,6 +4036,14 @@ fn panel_label_room(width: u16) -> usize {
     (width as usize).saturating_sub(2).max(8).saturating_sub(3)
 }
 
+/// What the screen is showing: the palette's name and, when the user chose it
+/// for this appearance slot, which choice it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemeState {
+    name: String,
+    chosen: Option<String>,
+}
+
 /// One line above the composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PanelLine {
@@ -3958,6 +4154,9 @@ fn panel_view(
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.theme_picker.is_some() {
+        return Some(theme_panel(chat, total));
+    }
     if chat.session_picker.is_some() {
         return Some(session_panel(chat, total));
     }
@@ -3983,6 +4182,51 @@ fn session_row_text(id: &str, current: bool) -> String {
     }
 }
 
+/// The `/theme` picker: the palettes this build carries, `auto` first, the one
+/// the screen is on marked where the model browser marks the model in use.
+fn theme_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(picker) = chat.theme_picker.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let state = chat.theme_state();
+    let matched = picker.matched();
+    let lines: Vec<PanelLine> = matched
+        .iter()
+        .map(|at| {
+            let name = picker.names[*at].as_str();
+            let current = if state.chosen.is_some() {
+                state.chosen.as_deref() == Some(name)
+            } else {
+                name == THEME_AUTO
+            };
+            PanelLine::Row {
+                text: if current {
+                    format!("{name}  ✓ current")
+                } else {
+                    name.to_owned()
+                },
+                accent: false,
+            }
+        })
+        .collect();
+    let title = if picker.query.is_empty() {
+        format!("themes · {}", lines.len().min(picker.names.len()))
+    } else {
+        format!(
+            "themes · {} of {} · {}",
+            lines.len(),
+            picker.names.len(),
+            picker.query
+        )
+    };
+    panel_view(
+        Some(title),
+        lines,
+        Some(picker.selected % matched.len().max(1)),
+        panel_body(total),
+    )
+}
+
 /// The Ctrl+X switcher: one row per stored session, newest first, the session
 /// on screen marked where the model browser marks the model in use.
 fn session_panel(chat: &Chat, total: u16) -> PanelView {
@@ -3996,6 +4240,53 @@ fn session_panel(chat: &Chat, total: u16) -> PanelView {
         .collect();
     let title = format!("sessions · {}", lines.len());
     panel_view(Some(title), lines, chat.session_picker, panel_body(total))
+}
+
+/// The row that stands for the probe's own pick rather than a palette: it is
+/// what a user who never chose a theme has, and what `/theme auto` goes back to.
+const THEME_AUTO: &str = "auto";
+
+/// The `/theme` picker: every palette this build carries — the crate's registry
+/// plus `{agent_dir}/themes` — with `auto` first for the probe's own pick.
+///
+/// The query filters the way the model browser's does, so a name can be typed
+/// down to one row without knowing where it is in a list of a hundred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemePicker {
+    names: Vec<String>,
+    query: String,
+    selected: usize,
+}
+
+impl ThemePicker {
+    fn open() -> Self {
+        let mut names = vec![THEME_AUTO.to_owned()];
+        names.extend(titi_tui::theme::loader::get_available_themes());
+        Self {
+            names,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    /// The rows the query keeps, best score first and the list's own order
+    /// breaking ties, so a list that is re-filtered never jumps between frames.
+    fn matched(&self) -> Vec<usize> {
+        let mut scored: Vec<(i32, usize)> = self
+            .names
+            .iter()
+            .enumerate()
+            .filter_map(|(at, name)| fuzzy_score(&self.query, name).map(|score| (score, at)))
+            .collect();
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        scored.into_iter().map(|(_, at)| at).collect()
+    }
+
+    fn selected_name(&self) -> Option<&str> {
+        let matched = self.matched();
+        let at = *matched.get(self.selected % matched.len().max(1))?;
+        self.names.get(at).map(String::as_str)
+    }
 }
 
 /// The bare-`/login` picker: a provider and a method per row. Nothing is
@@ -7453,6 +7744,268 @@ mod tests {
         );
     }
 
+    /// The crate's theme is a process-wide global, so the tests that change it
+    /// take this lock. Nothing else in this binary touches the global: every
+    /// other test hands its chat its own palette.
+    static THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
+        THEME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The palettes this build carries, in the picker's own shape.
+    fn theme_frame(chat: &mut Chat) -> String {
+        frame_at(chat, 80, 20)
+    }
+
+    /// `/theme` lists every palette the build carries, and typing narrows it.
+    #[test]
+    fn the_theme_picker_lists_every_palette_and_filters_by_name() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let all = crate::app::theme_names();
+        assert!(all.len() > 50, "the registry is the list: {}", all.len());
+
+        type_text(&mut chat, "/theme");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none(), "opening a picker runs nothing");
+        let frame = theme_frame(&mut chat);
+        assert!(frame.contains("themes ·"), "{frame}");
+        assert!(
+            frame.contains("auto  ✓ current"),
+            "with nothing chosen, the mark is on the probe's own pick: {frame}"
+        );
+        // The window shows a slice of a hundred rows; the list behind it is the
+        // whole registry, with `auto` in front of it.
+        let picker = chat.theme_picker.as_ref().expect("open");
+        assert_eq!(
+            picker.names.len(),
+            all.len() + 1,
+            "every palette this build carries is a row"
+        );
+        for name in ["titanium", "alabaster", "dark-gruvbox"] {
+            assert!(
+                picker.names.iter().any(|row| row == name),
+                "{name} is missing"
+            );
+        }
+
+        // A query brings one into the window; esc clears it without closing,
+        // the way the model browser's does.
+        type_text(&mut chat, "titan");
+        let frame = theme_frame(&mut chat);
+        assert!(
+            frame.contains("titanium"),
+            "the query brings a preset up: {frame}"
+        );
+        assert!(
+            frame.contains("themes · 1 of 101 · titan"),
+            "and the title says what it is showing: {frame}"
+        );
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(
+            chat.theme_picker.is_some(),
+            "esc clears the query before it closes the picker"
+        );
+
+        type_text(&mut chat, "gruv");
+        let frame = theme_frame(&mut chat);
+        assert!(frame.contains("dark-gruvbox"), "{frame}");
+        assert!(frame.contains("light-gruvbox"), "{frame}");
+        assert!(
+            !frame.contains("alabaster"),
+            "a name the query drops is gone: {frame}"
+        );
+        assert!(
+            frame.contains(" of "),
+            "the title counts what it shows: {frame}"
+        );
+
+        // A query that matches nothing is refused, not applied.
+        type_text(&mut chat, "zzzz");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none(), "nothing is applied");
+        let last = chat.lines.last().expect("a line");
+        assert_eq!(last.kind, LineKind::Error, "{:?}", chat.lines);
+        assert!(last.text.contains("no theme matches"), "{}", last.text);
+        assert!(
+            chat.theme_picker.is_none(),
+            "and the picker closed on the answer"
+        );
+    }
+
+    /// Enter applies a palette to the very next frame, it is remembered, and
+    /// Esc leaves the one on screen alone — including a row the cursor was
+    /// arrowed past.
+    #[test]
+    fn enter_applies_a_theme_and_esc_keeps_the_one_on_screen() {
+        let _guard = theme_lock();
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let workspace = crate::app::current_workspace();
+        chat.theme = crate::app::theme_for(dir.path(), &workspace, None).expect("a theme");
+        let before_frame = theme_frame(&mut chat);
+        let before_bg = frame_buffer(&mut chat, 80, 20)[(0, 0)].bg;
+
+        // Open, walk past rows, leave: nothing about the screen changes.
+        type_text(&mut chat, "/theme");
+        chat.on_key(Key::Enter, Instant::now());
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(
+            theme_frame(&mut chat),
+            before_frame,
+            "esc leaves the screen as it was"
+        );
+        assert_eq!(
+            frame_buffer(&mut chat, 80, 20)[(0, 0)].bg,
+            before_bg,
+            "and the palette with it"
+        );
+
+        // `/theme <name>` applies one: the next frame is painted in it.
+        let applied = chat.slash("/theme alabaster").expect("the command parses");
+        assert!(applied.effect.is_none(), "a palette is a local change");
+        let after_bg = frame_buffer(&mut chat, 80, 20)[(0, 0)].bg;
+        assert_ne!(
+            after_bg, before_bg,
+            "the frame is painted in the new palette"
+        );
+        let frame = theme_frame(&mut chat);
+        assert!(frame.contains("theme alabaster"), "and it says so: {frame}");
+        let expected = titi_tui::theme::loader::load_theme("alabaster", &theme_options())
+            .expect("alabaster is a preset of this build");
+        assert_eq!(
+            after_bg,
+            rgb(&expected.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg)),
+            "and the palette is that preset's, cell for cell"
+        );
+
+        // Remembered for the appearance slot the terminal reports, and read
+        // back at startup.
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), &workspace, &[]).expect("settings");
+        let key =
+            crate::app::theme_slot(&titi_tui::theme::appearance::AppearanceInputs::from_env());
+        assert_eq!(
+            settings
+                .get(key)
+                .and_then(|value| value.as_str().map(str::to_owned)),
+            Some("alabaster".to_owned()),
+            "the choice is remembered in {key}"
+        );
+        let reloaded = crate::app::theme_for(dir.path(), &workspace, None).expect("a theme");
+        assert_eq!(
+            reloaded.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            expected.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            "and the next run starts on it"
+        );
+
+        // `auto` is the absence of a choice, not a palette.
+        chat.slash("/theme auto").expect("the command parses");
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), &workspace, &[]).expect("settings");
+        assert_eq!(settings.get(key), None, "auto clears the slot");
+        let auto = theme_frame(&mut chat);
+        assert!(auto.contains("(auto)"), "{auto}");
+    }
+
+    /// A theme this build does not carry is refused by name, never silently
+    /// replaced by another palette, and the refusal names what there is.
+    #[test]
+    fn an_unknown_theme_is_refused_by_name() {
+        let reason = crate::app::theme_named("nope").expect_err("nope is not a theme");
+        assert!(reason.contains("unknown theme nope"), "{reason}");
+        assert!(
+            reason.contains(&crate::app::theme_names().len().to_string()),
+            "the refusal counts what exists: {reason}"
+        );
+        assert!(
+            reason.contains("/theme"),
+            "and says where the list is: {reason}"
+        );
+
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.slash("/theme nope").expect("the command parses");
+        let last = chat.lines.last().expect("a line");
+        assert_eq!(last.kind, LineKind::Error, "{:?}", chat.lines);
+        assert!(last.text.contains("unknown theme nope"), "{}", last.text);
+    }
+
+    /// With nothing set, the screen resolves exactly as it did before there was
+    /// a setting: the crate's own pick for the appearance the terminal reports.
+    #[test]
+    fn auto_is_the_absence_of_a_choice() {
+        let _guard = theme_lock();
+        let dir = tempfile::tempdir().expect("temp");
+        let workspace = crate::app::current_workspace();
+        let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
+        let picked = crate::app::theme_for(dir.path(), &workspace, None).expect("auto");
+        let expected = titi_tui::theme::loader::load_theme(
+            &titi_tui::theme::appearance::resolve_auto_theme(
+                titi_tui::theme::appearance::AUTO_DARK_THEME,
+                titi_tui::theme::appearance::AUTO_LIGHT_THEME,
+                &inputs,
+            ),
+            &theme_options(),
+        )
+        .expect("the crate's own pick loads");
+        assert_eq!(
+            picked.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            expected.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            "auto is the crate's pick, not a new default"
+        );
+
+        // Both slots set: whichever appearance the terminal reports, that name
+        // is what the screen shows.
+        let mut settings =
+            titi_config::settings::Settings::load(dir.path(), &workspace, &[]).expect("settings");
+        settings
+            .set(
+                titi_config::settings::THEME_DARK_KEY,
+                serde_json::json!("alabaster"),
+            )
+            .expect("write");
+        settings
+            .set(
+                titi_config::settings::THEME_LIGHT_KEY,
+                serde_json::json!("alabaster"),
+            )
+            .expect("write");
+        let chosen = crate::app::theme_for(dir.path(), &workspace, None).expect("chosen");
+        let alabaster =
+            titi_tui::theme::loader::load_theme("alabaster", &theme_options()).expect("alabaster");
+        assert_eq!(
+            chosen.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            alabaster.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            "the setting is read at startup"
+        );
+
+        // `--theme` wins over the setting for one run.
+        let forced =
+            crate::app::theme_for(dir.path(), &workspace, Some("titanium")).expect("a named theme");
+        let titanium =
+            titi_tui::theme::loader::load_theme("titanium", &theme_options()).expect("titanium");
+        assert_eq!(
+            forced.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            titanium.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
+            "the flag overrides the setting"
+        );
+        assert!(
+            crate::app::theme_for(dir.path(), &workspace, Some("nope")).is_err(),
+            "and an unknown name is refused"
+        );
+    }
+
+    /// The default the rest of the CLI builds its theme with.
+    fn theme_options() -> titi_tui::theme::loader::CreateThemeOptions {
+        titi_tui::theme::loader::CreateThemeOptions {
+            mode: Some(titi_tui::theme::ColorMode::Truecolor),
+            ..Default::default()
+        }
+    }
+
     /// A chat on a temp agent directory with one model and a key stored for it:
     /// the facts the welcome box reads are the test's own, not this machine's.
     fn welcome_chat() -> (tempfile::TempDir, Chat) {
@@ -9374,10 +9927,11 @@ mod tests {
             let did_something = applied.effect.is_some()
                 || applied.log.is_some()
                 || chat.lines.len() > lines_before
-                // A picker is an answer too: `/model` and `/login` open one
-                // instead of printing.
+                // A picker is an answer too: `/model`, `/login` and `/theme`
+                // open one instead of printing.
                 || chat.model_picker.is_some()
-                || chat.login_picker.is_some();
+                || chat.login_picker.is_some()
+                || chat.theme_picker.is_some();
             assert!(
                 did_something,
                 "/{} does nothing (no effect, no log, no output)",
