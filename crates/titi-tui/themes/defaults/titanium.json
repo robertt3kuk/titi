@@ -12,7 +12,8 @@
 		"warningAmber": "#ffb347",
 		"readoutGreen": "#00ff88",
 		"alertRed": "#ff4757",
-		"subtleGray": "#2a3038"
+		"subtleGray": "#2a3038",
+		"deepTitanium": "#323841"
 	},
 	"colors": {
 		"accent": "electricBlue",
@@ -27,7 +28,7 @@
 		"text": "",
 		"thinkingText": "dimAluminum",
 		"selectedBg": "deepBlue",
-		"userMessageBg": "brushedTitanium",
+		"userMessageBg": "deepTitanium",
 		"userMessageText": "",
 		"customMessageBg": "subtleGray",
 		"customMessageText": "",
