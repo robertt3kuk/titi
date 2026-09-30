@@ -37,6 +37,19 @@ use crate::session_log::SessionLog;
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
 
+/// Columns a tool block's continuation rows sit under, the diff's rows
+/// included: the chip's mark and its space.
+const DIFF_INSET: usize = 5;
+
+/// Rows of a diff the screen draws before it stops and says what it hid.
+///
+/// A pane shows about twenty rows at a time, so two hundred is ten screens of
+/// scrollback inside one transcript line; the transcript is rebuilt on every
+/// frame, and an unbounded settled block would be paid for every frame for a
+/// body nobody is reading. What is hidden is counted exactly, and the whole
+/// result is in the session file.
+const DIFF_MAX_ROWS: usize = 200;
+
 /// Deadline for the `git` call behind `/git` and `/diagnose`. The screen is
 /// blocked while it runs, so it is far shorter than the git tool's own
 /// minute: a hook waiting on a terminal this process never gives it must
@@ -148,6 +161,9 @@ pub enum LineKind {
     User,
     Assistant,
     Tool,
+    /// A tool result's unified diff, drawn by the diff renderer rather than as
+    /// a chip (`crates/titi-tui/src/diff.rs`).
+    Diff,
     Error,
     Note,
 }
@@ -159,6 +175,7 @@ impl LineKind {
             LineKind::User => "you",
             LineKind::Assistant => "titi",
             LineKind::Tool => "tool",
+            LineKind::Diff => "diff",
             LineKind::Error => "error",
             LineKind::Note => "note",
         }
@@ -610,6 +627,7 @@ impl Chat {
                 call_id,
                 output,
                 is_error,
+                detail,
                 ..
             } => {
                 // Only the call that owns the row may end it: a late
@@ -624,20 +642,28 @@ impl Chat {
                     // where it stood.
                     self.phase = WorkPhase::Streaming;
                 }
-                let preview = one_line(&output, TOOL_PREVIEW);
-                let text = if is_error {
-                    format!("tool error  {preview}")
-                } else if preview.is_empty() {
-                    "tool done".to_owned()
+                if let Some(detail) = detail {
+                    // A tool that has something to show besides its answer:
+                    // the diff of what it changed today. It is presentation
+                    // only — the model was told the answer alone — and the
+                    // renderer decides what to draw from it.
+                    self.push(LineKind::Diff, detail.to_string());
                 } else {
-                    format!("tool done  {preview}")
-                };
-                let kind = if is_error {
-                    LineKind::Error
-                } else {
-                    LineKind::Tool
-                };
-                self.push(kind, text);
+                    let preview = one_line(&output, TOOL_PREVIEW);
+                    let text = if is_error {
+                        format!("tool error  {preview}")
+                    } else if preview.is_empty() {
+                        "tool done".to_owned()
+                    } else {
+                        format!("tool done  {preview}")
+                    };
+                    let kind = if is_error {
+                        LineKind::Error
+                    } else {
+                        LineKind::Tool
+                    };
+                    self.push(kind, text);
+                }
                 // `output` is what the engine masked before it emitted the
                 // event, so no secret reaches the session file here.
                 Applied {
@@ -4445,6 +4471,7 @@ fn message_rows(
         ),
         LineKind::Assistant => reply_rows(&line.text, width, theme),
         LineKind::Tool => chip(tool_chip(&line.text), theme, width),
+        LineKind::Diff => diff_rows(&line.text, theme, width),
         LineKind::Error => chip(
             ("✕", ThemeColor::Error, line.text.clone(), ThemeColor::Error),
             theme,
@@ -4829,6 +4856,64 @@ fn tool_chip(text: &str) -> (&'static str, ThemeColor, String, ThemeColor) {
         );
     }
     ("▸", ThemeColor::Warning, text.to_owned(), ThemeColor::Muted)
+}
+
+/// A tool result that carries a detail: the chip names the file the diff
+/// touches, and the renderer's rows follow under the block's inset.
+///
+/// A detail the renderer cannot read as a diff is still shown — a chip with
+/// what the tool wanted drawn — so nothing a tool reported is dropped.
+fn diff_rows(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(diff) = titi_tui::diff::render_diff(text, theme, diff_width(width) as u16) else {
+        return chip(
+            (
+                "✓",
+                ThemeColor::Success,
+                one_line(text, TOOL_PREVIEW),
+                ThemeColor::Muted,
+            ),
+            theme,
+            width,
+        );
+    };
+    let detail = diff.path.unwrap_or_else(|| "diff".to_owned());
+    let mut rows = chip(
+        ("✓", ThemeColor::Success, detail, ThemeColor::Muted),
+        theme,
+        width,
+    );
+    let shown = diff.rows.len().min(DIFF_MAX_ROWS);
+    for row in &diff.rows[..shown] {
+        rows.push(diff_row(row, theme));
+    }
+    if diff.rows.len() > shown {
+        rows.push(diff_note(
+            &format!("… {} more diff lines", diff.rows.len() - shown),
+            theme,
+        ));
+    }
+    rows
+}
+
+/// The columns a diff's rows have: the block's inset is spent before them, so a
+/// row the renderer cut to this width still fits inside the pane.
+fn diff_width(width: usize) -> usize {
+    width.saturating_sub(DIFF_INSET).max(8)
+}
+
+/// One renderer row, inset under the block's chip.
+fn diff_row(row: &str, theme: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::styled(" ".repeat(DIFF_INSET), page(theme))];
+    spans.extend(sgr_row(row));
+    Line::from(spans)
+}
+
+/// The dim row that says how much of a long diff the screen did not draw.
+fn diff_note(text: &str, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ".repeat(DIFF_INSET), page(theme)),
+        Span::styled(text.to_owned(), fg(theme, ThemeColor::Dim)),
+    ])
 }
 
 /// A marked block: the mark opens the first row, every following row is
@@ -8600,6 +8685,227 @@ mod tests {
             narrow.len(),
             wide.len()
         );
+    }
+
+    /// An `edit` result the tool reports with a diff becomes a diff line: the
+    /// chip row names the file, and the rows under it are the renderer's, in
+    /// the diff tokens.
+    #[test]
+    fn an_edit_result_is_drawn_as_its_file_and_its_diff() {
+        let theme = test_theme();
+        let mut chat = chat();
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "edit".into(),
+        });
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            output: "edited".into(),
+            is_error: false,
+            detail: Some(edit_result().into()),
+        });
+        let line = chat.transcript().last().expect("a line").clone();
+        assert_eq!(line.kind, LineKind::Diff, "{:?}", line);
+        assert_eq!(
+            line.text,
+            edit_result(),
+            "the diff line carries the detail, and only the detail"
+        );
+
+        let rows = message_rows(&line, 80, &theme).0;
+        let texts = row_texts(&rows);
+        assert!(texts[0].contains("notes/kept.txt"), "{texts:?}");
+        assert_eq!(texts[0], "   ✓ notes/kept.txt", "{texts:?}");
+        assert!(
+            texts.iter().any(|row| row.contains("removed_line")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|row| row.contains("added_line")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|row| row.contains("@@ -1,3 +1,3 @@")),
+            "the hunk header is drawn: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|row| row.contains("+++ ") || row.contains("--- ")),
+            "the file headers are the chip's job: {texts:?}"
+        );
+
+        // The frame's own cells carry the diff tokens.
+        let buffer = frame_buffer(&mut chat, 80, 24);
+        let symbols: Vec<String> = (0..24)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        for (needle, token) in [
+            ("removed_line", ThemeColor::ToolDiffRemoved),
+            ("added_line", ThemeColor::ToolDiffAdded),
+            ("line one", ThemeColor::ToolDiffContext),
+        ] {
+            let (x, y) =
+                cell_of(&symbols, needle).unwrap_or_else(|| panic!("{needle:?} is not on screen"));
+            assert_eq!(
+                buffer[(x, y)].fg,
+                fg(&theme, token).fg.unwrap_or(Color::Reset),
+                "{needle:?} is not drawn in {token:?}"
+            );
+        }
+    }
+
+    /// The diff an edit reports as its detail, and the tests draw.
+    fn edit_result() -> &'static str {
+        "--- a/notes/kept.txt\n\
+         +++ b/notes/kept.txt\n\
+         @@ -1,3 +1,3 @@\n line one\n-removed_line\n+added_line\n line three\n"
+    }
+
+    /// The detail decides, not the tool's name or the shape of the answer: a
+    /// result that carries one is a diff line even from a tool nobody expects a
+    /// diff from, and an `edit` that reports none — or an answer that merely
+    /// looks like a diff — stays the chip it always was.
+    #[test]
+    fn only_a_result_with_a_detail_becomes_a_diff_line() {
+        let cases: [(&str, &str, Option<&str>, bool); 4] = [
+            (
+                "read",
+                "the file\n-removed_line\n+added_line\n",
+                None,
+                false,
+            ),
+            ("edit", "edited", None, false),
+            ("edit", "edited", Some(edit_result()), true),
+            (
+                "write",
+                "wrote out.txt",
+                Some("--- /dev/null\n+++ b/out.txt\n@@ -0,0 +1,1 @@\n+one\n"),
+                true,
+            ),
+        ];
+        for (tool, output, detail, expected) in cases {
+            let mut chat = chat();
+            chat.on_event(EngineEvent::ToolStarted {
+                turn_id: TurnId(1),
+                call_id: "c1".into(),
+                name: tool.into(),
+            });
+            chat.on_event(EngineEvent::ToolFinished {
+                turn_id: TurnId(1),
+                call_id: "c1".into(),
+                output: output.into(),
+                is_error: false,
+                detail: detail.map(Into::into),
+            });
+            let line = chat.transcript().last().expect("a line");
+            assert_eq!(
+                line.kind == LineKind::Diff,
+                expected,
+                "{tool}: {:?}",
+                line.kind
+            );
+            if let Some(detail) = detail
+                && expected
+            {
+                assert_eq!(line.text, detail, "{tool}: the detail is the line");
+            }
+            // The chip the screen draws when there is no detail keeps saying
+            // what it always said.
+            if !expected {
+                let rows = message_rows(line, 80, &test_theme()).0;
+                assert!(
+                    row_texts(&rows)[0].starts_with("   ✓ "),
+                    "{tool}: {:?}",
+                    row_texts(&rows)
+                );
+            }
+        }
+    }
+
+    /// A tool result that is not a diff is the chip it has always been, byte
+    /// for byte: the same spans, in the same styles.
+    #[test]
+    fn a_result_without_a_diff_is_the_chip_it_always_was() {
+        let theme = test_theme();
+        let rows = message_rows(
+            &TranscriptLine {
+                kind: LineKind::Tool,
+                text: "tool done  read".to_owned(),
+            },
+            80,
+            &theme,
+        )
+        .0;
+        assert_eq!(
+            rows,
+            vec![Line::from(vec![
+                Span::styled("   ", page(&theme)),
+                Span::styled("✓", fg(&theme, ThemeColor::Success)),
+                Span::styled(" ", page(&theme)),
+                Span::styled("read", fg(&theme, ThemeColor::Muted)),
+            ])]
+        );
+    }
+
+    /// A diff line the renderer cannot read as a diff falls back to the plain
+    /// chip: the result is still on screen, and nothing is invented.
+    #[test]
+    fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
+        let theme = test_theme();
+        let line = TranscriptLine {
+            kind: LineKind::Diff,
+            text: "not a diff at all\nsecond line".to_owned(),
+        };
+        let rows = message_rows(&line, 80, &theme).0;
+        assert_eq!(
+            row_texts(&rows)[0],
+            "   ✓ not a diff at all second line",
+            "the summary is flattened into the chip"
+        );
+    }
+
+    /// A diff block keeps every row inside the pane at 60, 80 and 120 columns:
+    /// the renderer is handed the pane minus the block's inset.
+    #[test]
+    fn a_diff_block_stays_inside_the_pane() {
+        let line = TranscriptLine {
+            kind: LineKind::Diff,
+            text: edit_result().to_owned(),
+        };
+        for width in [60usize, 80, 120] {
+            let rows = message_rows(&line, width, &test_theme()).0;
+            let texts = row_texts(&rows);
+            assert!(texts.len() > 4, "{width}: {texts:?}");
+            for (at, row) in texts.iter().enumerate() {
+                assert!(
+                    titi_tui::width::visible_width(row) <= width,
+                    "{width}: row {at} is {} wide: {row:?}",
+                    titi_tui::width::visible_width(row)
+                );
+            }
+        }
+    }
+
+    /// A diff longer than the cap is cut where the cap says, and the row that
+    /// says how much is left counts exactly what the screen did not draw.
+    #[test]
+    fn a_very_long_diff_is_capped_and_says_so() {
+        let mut text = String::from("edited\n--- a/big.txt\n+++ b/big.txt\n@@ -0,0 +1,300 @@\n");
+        for line in 0..300 {
+            text.push_str(&format!("+line {line}\n"));
+        }
+        let line = TranscriptLine {
+            kind: LineKind::Diff,
+            text,
+        };
+        let rows = row_texts(&message_rows(&line, 80, &test_theme()).0);
+        // The chip row, `DIFF_MAX_ROWS` renderer rows, then the note.
+        assert_eq!(rows.len(), DIFF_MAX_ROWS + 2, "{:?}", rows.len());
+        let last = rows.last().expect("a note");
+        assert_eq!(last.trim(), "… 101 more diff lines", "{last:?}");
     }
 
     /// The URL of a sign-in note is never cut mid-token and never carries the
