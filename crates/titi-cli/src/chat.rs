@@ -225,6 +225,10 @@ enum WorkPhase {
     Tool {
         call_id: String,
         name: String,
+        /// What the tool said it was about to do (`read docs/README.md`), when
+        /// it had anything to say: the call's arguments are the model's, and
+        /// this is the tool's own one-line description of them.
+        detail: Option<String>,
         since: Instant,
     },
 }
@@ -595,10 +599,16 @@ impl Chat {
                 self.phase = WorkPhase::Thinking;
                 Applied::none()
             }
-            EngineEvent::ToolStarted { call_id, name, .. } => {
+            EngineEvent::ToolStarted {
+                call_id,
+                name,
+                detail,
+                ..
+            } => {
                 self.phase = WorkPhase::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
+                    detail: detail.as_ref().map(ToString::to_string),
                     since: Instant::now(),
                 };
                 self.push(LineKind::Tool, format!("tool {name}"));
@@ -4346,65 +4356,188 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
     // The masthead's `needs you` is the session state; this row says what the
     // person is being asked about, and the composer below says what to press.
     if let Some(pending) = &chat.approval {
-        return Some(work_line(
-            "⚠",
-            &format!("needs you · {}", pending.name),
-            ThemeColor::Warning,
-            width,
-            theme,
-        ));
+        return Some(
+            Paragraph::new(work_line(
+                "⚠",
+                &WorkFact {
+                    wording: format!("needs you · {}", pending.name),
+                    argument: None,
+                    compact: "needs you".to_owned(),
+                    seconds: None,
+                },
+                ThemeColor::Warning,
+                width,
+                theme,
+            ))
+            .style(page(theme)),
+        );
     }
     let elapsed = chat.turn_elapsed().unwrap_or_default();
     let (glyph, fact, color) = match &chat.phase {
+        // The three states are told apart by colour as well as by glyph: the
+        // activity spinner in the accent the rest of the screen uses for a
+        // running turn, a tool in the theme's own token for a tool's title,
+        // and an approval in the warning token.
         WorkPhase::Waiting => (
             spinner_frame(elapsed),
-            format!("waiting for the first token · {}", elapsed_label(elapsed)),
+            WorkFact {
+                // Long on purpose — it says what is being waited for — and the
+                // row shortens it itself when the pane is narrow.
+                wording: "waiting for the first token".to_owned(),
+                argument: None,
+                compact: "waiting".to_owned(),
+                seconds: Some(elapsed_label(elapsed)),
+            },
             ThemeColor::Accent,
         ),
         WorkPhase::Streaming => (
             spinner_frame(elapsed),
-            format!(
-                "streaming · {} · {} chars",
-                elapsed_label(elapsed),
-                chat.reply.chars().count()
-            ),
+            WorkFact {
+                wording: format!("streaming · {} chars", chat.reply.chars().count()),
+                argument: None,
+                compact: "streaming".to_owned(),
+                seconds: Some(elapsed_label(elapsed)),
+            },
             ThemeColor::Accent,
         ),
         WorkPhase::Thinking => (
             spinner_frame(elapsed),
-            format!(
-                "thinking · {} · {} chars",
-                elapsed_label(elapsed),
-                chat.thinking.chars().count()
-            ),
-            ThemeColor::CustomMessageLabel,
+            WorkFact {
+                wording: format!("thinking · {} chars", chat.thinking.chars().count()),
+                argument: None,
+                compact: "thinking".to_owned(),
+                seconds: Some(elapsed_label(elapsed)),
+            },
+            ThemeColor::Accent,
         ),
-        WorkPhase::Tool { name, since, .. } => (
+        WorkPhase::Tool {
+            name,
+            detail,
+            since,
+            ..
+        } => (
             "⚙",
-            format!("{name} · {}", elapsed_label(since.elapsed())),
-            ThemeColor::CustomMessageLabel,
+            tool_fact(name, detail.as_deref(), &elapsed_label(since.elapsed())),
+            ThemeColor::ToolTitle,
         ),
     };
-    Some(work_line(glyph, &fact, color, width, theme))
+    Some(Paragraph::new(work_line(glyph, &fact, color, width, theme)).style(page(theme)))
 }
 
-/// One status row, cut to the screen with an ellipsis. A row that does not fit
-/// is truncated here rather than wrapped: a wrapped line would push the
-/// composer down and read as part of the conversation.
+/// One fact of the status row, in the forms the pane can shorten it to.
+struct WorkFact {
+    /// What the row says in full: `waiting for the first token`,
+    /// `streaming · 335 chars`, `needs you · write`, a tool's name.
+    wording: String,
+    /// The rest of a tool's own sentence — the argument of the call
+    /// (`docs/README.md`), shown after the wording with a space. It is the
+    /// first thing to go: the tool's name still says what kind of call it is.
+    argument: Option<String>,
+    /// The wording the row falls back to before it cuts anything: short enough
+    /// to fit almost any pane.
+    compact: String,
+    /// The elapsed time, or nothing for a row with no clock.
+    seconds: Option<String>,
+}
+
+/// A running tool's fact: what the tool said about the call it is making
+/// (`read docs/README.md`), split into the tool's name and the rest.
+///
+/// The split is the trait's own convention (`ToolHandler::describe` starts with
+/// the tool's name), so the row can shorten the *argument* — the thing that
+/// tells two `read` calls apart — without inventing a second description.
+fn tool_fact(name: &str, described: Option<&str>, seconds: &str) -> WorkFact {
+    let (wording, argument) = match described.and_then(|text| text.split_once(' ')) {
+        Some((head, rest)) => (head.to_owned(), Some(rest.to_owned())),
+        None => (described.unwrap_or(name).to_owned(), None),
+    };
+    WorkFact {
+        wording,
+        argument,
+        compact: name.to_owned(),
+        seconds: Some(seconds.to_owned()),
+    }
+}
+
+/// One status row: the activity glyph, one fact, and the elapsed seconds.
+///
+/// The fact is shortened before it is cut, so a narrow pane loses words rather
+/// than whole facts. In order:
+///
+/// 1. the wording with the argument (`read docs/README.md · 0.4s`)
+/// 2. the argument shortened to its head (`read docs/… · 0.4s`)
+/// 3. the wording without the argument (`read · 0.4s`)
+/// 4. the compact wording (`waiting · 0.1s`)
+/// 5. the compact wording cut with an ellipsis — and the seconds kept whole,
+///    because the moving clock is what says the screen is alive.
+///
+/// A row that does not fit is cut here rather than wrapped: a wrapped line
+/// would push the composer down and read as part of the conversation.
 fn work_line(
     glyph: &str,
-    fact: &str,
+    fact: &WorkFact,
     color: ThemeColor,
     width: u16,
     theme: &Theme,
-) -> Paragraph<'static> {
-    let row = format!(" {glyph} {fact}");
-    let room = (width as usize).saturating_sub(1);
-    let mut text = titi_tui::width::truncate_to_width(&row, room.max(1));
-    if titi_tui::width::visible_width(&row) > room.max(1) {
-        text.push('…');
+) -> Line<'static> {
+    let head = format!(" {glyph} ");
+    let room = (width as usize)
+        .saturating_sub(titi_tui::width::visible_width(&head))
+        .max(1);
+    let with_seconds = |wording: &str| match fact.seconds.as_deref() {
+        Some(seconds) if !seconds.is_empty() => format!("{wording} · {seconds}"),
+        _ => wording.to_owned(),
+    };
+    let mut forms = Vec::new();
+    match &fact.argument {
+        Some(argument) => {
+            // The tool's own sentence, with the seconds as its own clause.
+            forms.push(with_seconds(&format!("{} {argument}", fact.wording)));
+            forms.push(with_seconds(&format!(
+                "{} {}",
+                fact.wording,
+                short_argument(argument)
+            )));
+        }
+        None => forms.push(with_seconds(&fact.wording)),
     }
-    Paragraph::new(Line::from(Span::styled(text, fg(theme, color)))).style(page(theme))
+    forms.push(with_seconds(&fact.wording));
+    forms.push(with_seconds(&fact.compact));
+    let fact = forms
+        .into_iter()
+        .find(|form| titi_tui::width::visible_width(form) <= room)
+        .unwrap_or_else(|| cut_keeping_seconds(fact, room));
+    Line::from(Span::styled(format!("{head}{fact}"), fg(theme, color)))
+}
+
+/// The shortened argument: the leading segment of a path, or the first word of
+/// a command — `docs/README.md` becomes `docs/…`, `cargo test -p titi-core`
+/// becomes `cargo …`. Either way it still says *what kind* of thing the call is
+/// about, which is what a glance at the row is for.
+fn short_argument(argument: &str) -> String {
+    match argument.find(['/', ' ']) {
+        Some(at) => format!("{}…", &argument[..at + 1]),
+        None => argument.to_owned(),
+    }
+}
+
+/// The last resort: the compact wording cut, with the seconds kept whole.
+///
+/// A pane too narrow even for that — under about eleven cells, which no
+/// terminal has — cuts the row, seconds and all: there is nothing left to give.
+fn cut_keeping_seconds(fact: &WorkFact, room: usize) -> String {
+    let tail = match fact.seconds.as_deref() {
+        Some(seconds) if !seconds.is_empty() => format!(" · {seconds}"),
+        _ => String::new(),
+    };
+    let wording = room.saturating_sub(titi_tui::width::visible_width(&tail) + 1);
+    titi_tui::width::truncate_to_width(
+        &format!(
+            "{}…{tail}",
+            titi_tui::width::truncate_to_width(&fact.compact, wording)
+        ),
+        room,
+    )
 }
 
 fn empty_state(height: u16, theme: &Theme) -> Paragraph<'static> {
@@ -6909,11 +7042,24 @@ mod tests {
             column_of(&with, "blue-otter"),
             "the name moved:\n{without}\n{with}"
         );
-        assert!(
-            without.trim_end() == without.trim_end() && !without.contains('%'),
-            "the slot is drawn but blank before a report: {without:?}"
+        // The slot is drawn either way: the tail after the last separator has
+        // the same width in both lines — that is what the two column
+        // assertions above are measuring through — and holds nothing until a
+        // report arrives, then the digits in the same place.
+        let after_separator = |line: &str| {
+            let at = line.rfind('>').expect("the separator before the slot") + 1;
+            line[at..].to_owned()
+        };
+        assert_eq!(
+            titi_tui::width::visible_width(&after_separator(&without)),
+            titi_tui::width::visible_width(&after_separator(&with)),
+            "the context slot moved:\n{without}\n{with}"
         );
-        assert!(with.trim_end().ends_with("3%"), "{with:?}");
+        assert!(
+            after_separator(&without).trim().is_empty(),
+            "the slot is blank before a report: {without:?}"
+        );
+        assert_eq!(after_separator(&with).trim(), "3%", "{with:?}");
         for line in [&without, &with] {
             assert_eq!(titi_tui::width::visible_width(line), 80, "{line:?}");
         }
@@ -7027,6 +7173,222 @@ mod tests {
             last = at;
         }
         assert!(!row.contains('…'), "nothing is cut at 100 columns: {row:?}");
+    }
+
+    /// A row of the status line, as the text a terminal would show.
+    fn work_row_text(glyph: &str, fact: &WorkFact, color: ThemeColor, width: u16) -> String {
+        row_texts(&[work_line(glyph, fact, color, width, &test_theme())]).remove(0)
+    }
+
+    /// The colour a row paints itself with.
+    fn work_row_color(
+        glyph: &str,
+        fact: &WorkFact,
+        color: ThemeColor,
+        width: u16,
+    ) -> Option<Color> {
+        work_line(glyph, fact, color, width, &test_theme())
+            .spans
+            .first()
+            .and_then(|span| span.style.fg)
+    }
+
+    /// Each state of the row is told apart by its token, not only by its glyph:
+    /// activity in the accent, a running tool in the theme's own tool-title
+    /// token, and an approval in the warning one.
+    #[test]
+    fn each_state_of_the_row_has_its_own_token() {
+        let theme = test_theme();
+        let fact = |wording: &str| WorkFact {
+            wording: wording.to_owned(),
+            argument: None,
+            compact: wording.to_owned(),
+            seconds: Some("0.1s".to_owned()),
+        };
+        let activity = work_row_color("*", &fact("streaming"), ThemeColor::Accent, 80);
+        let tool = work_row_color(
+            "\u{2699}",
+            &tool_fact("read", Some("read docs/README.md"), "0.1s"),
+            ThemeColor::ToolTitle,
+            80,
+        );
+        let approval = work_row_color("\u{26a0}", &fact("needs you"), ThemeColor::Warning, 80);
+        assert_eq!(activity, fg(&theme, ThemeColor::Accent).fg);
+        assert_eq!(tool, fg(&theme, ThemeColor::ToolTitle).fg);
+        assert_eq!(approval, fg(&theme, ThemeColor::Warning).fg);
+        // The three are visibly different states, not three words in one
+        // colour: this is the defect the plan's §3.5 names.
+        for (left, right) in [(activity, tool), (tool, approval), (activity, approval)] {
+            assert_ne!(left, right, "two states share a colour");
+        }
+    }
+
+    /// The frames of the four live states, with the token each is painted with:
+    /// this is the whole claim of the step, read off the screen rather than off
+    /// a helper.
+    #[test]
+    fn the_frame_paints_each_state_with_its_own_token() {
+        let theme = test_theme();
+        /// Drives a chat into one state of the row.
+        type Drive = fn(&mut Chat);
+        let states: [(&str, Drive, ThemeColor); 5] = [
+            (
+                "waiting",
+                |chat| {
+                    chat.on_event(EngineEvent::TurnStarted {
+                        turn_id: TurnId(1),
+                        model: "openai/gpt-4.1".into(),
+                    });
+                },
+                ThemeColor::Accent,
+            ),
+            (
+                "streaming",
+                |chat| {
+                    chat.on_event(EngineEvent::TurnStarted {
+                        turn_id: TurnId(1),
+                        model: "openai/gpt-4.1".into(),
+                    });
+                    chat.on_event(EngineEvent::StreamDelta {
+                        turn_id: TurnId(1),
+                        text: "hello".into(),
+                    });
+                },
+                ThemeColor::Accent,
+            ),
+            (
+                "thinking",
+                |chat| {
+                    chat.on_event(EngineEvent::TurnStarted {
+                        turn_id: TurnId(1),
+                        model: "openai/gpt-4.1".into(),
+                    });
+                    chat.on_event(EngineEvent::ThinkingDelta {
+                        turn_id: TurnId(1),
+                        text: "weighing it".into(),
+                    });
+                },
+                ThemeColor::Accent,
+            ),
+            (
+                "tool",
+                |chat| {
+                    chat.on_event(EngineEvent::TurnStarted {
+                        turn_id: TurnId(1),
+                        model: "openai/gpt-4.1".into(),
+                    });
+                    chat.on_event(EngineEvent::ToolStarted {
+                        turn_id: TurnId(1),
+                        call_id: "c1".into(),
+                        name: "read".into(),
+                        detail: Some("read docs/README.md".into()),
+                    });
+                },
+                ThemeColor::ToolTitle,
+            ),
+            (
+                "needs you",
+                |chat| {
+                    chat.on_event(EngineEvent::ToolStarted {
+                        turn_id: TurnId(1),
+                        call_id: "c1".into(),
+                        name: "write".into(),
+                        detail: Some("write notes/probe.txt".into()),
+                    });
+                    chat.on_event(EngineEvent::ToolApprovalNeeded {
+                        turn_id: TurnId(1),
+                        call_id: "c1".into(),
+                        name: "write".into(),
+                    });
+                },
+                ThemeColor::Warning,
+            ),
+        ];
+        for (label, drive, token) in states {
+            let mut chat = chat();
+            drive(&mut chat);
+            let row = above_composer(&mut chat, 80, 20);
+            let buffer = frame_buffer(&mut chat, 80, 20);
+            let symbols: Vec<String> = (0..20)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let (x, y) = cell_of(&symbols, row.trim())
+                .unwrap_or_else(|| panic!("{label}: the row is not on screen: {row:?}"));
+            assert_eq!(
+                buffer[(x, y)].fg,
+                fg(&theme, token).fg.unwrap_or(Color::Reset),
+                "{label} is not painted in {token:?}: {row:?}"
+            );
+        }
+    }
+
+    /// A tool's row carries what the tool said it was doing, and falls back to
+    /// its name alone when it had nothing to say.
+    #[test]
+    fn a_tool_row_carries_the_call_or_the_name_alone() {
+        let described = tool_fact("read", Some("read docs/README.md"), "0.4s");
+        assert_eq!(
+            work_row_text("\u{2699}", &described, ThemeColor::ToolTitle, 80),
+            " \u{2699} read docs/README.md · 0.4s"
+        );
+        let bare = tool_fact("read", None, "0.4s");
+        assert_eq!(
+            work_row_text("\u{2699}", &bare, ThemeColor::ToolTitle, 80),
+            " \u{2699} read · 0.4s"
+        );
+        // A description that is only a word has no argument to show.
+        let wordy = tool_fact("git", Some("git"), "0.2s");
+        assert_eq!(
+            work_row_text("\u{2699}", &wordy, ThemeColor::ToolTitle, 80),
+            " \u{2699} git · 0.2s"
+        );
+    }
+
+    /// The row shortens the fact instead of cutting it, and the seconds are the
+    /// last thing to go — the moving clock is what says the screen is alive.
+    #[test]
+    fn a_narrow_work_row_shortens_the_fact_and_keeps_the_seconds() {
+        let tool = tool_fact("read", Some("read docs/README.md"), "0.4s");
+        let row = |width: u16| work_row_text("\u{2699}", &tool, ThemeColor::ToolTitle, width);
+        assert_eq!(
+            row(80),
+            " \u{2699} read docs/README.md · 0.4s",
+            "the whole fact"
+        );
+        assert_eq!(
+            row(25),
+            " \u{2699} read docs/… · 0.4s",
+            "the argument's head"
+        );
+        assert_eq!(row(19), " \u{2699} read · 0.4s", "the argument goes");
+
+        let waiting = WorkFact {
+            wording: "waiting for the first token".to_owned(),
+            argument: None,
+            compact: "waiting".to_owned(),
+            seconds: Some("0.1s".to_owned()),
+        };
+        let waiting_row = |width: u16| work_row_text("*", &waiting, ThemeColor::Accent, width);
+        assert_eq!(
+            waiting_row(40),
+            " * waiting for the first token · 0.1s",
+            "the long wording while it fits"
+        );
+        assert_eq!(waiting_row(30), " * waiting · 0.1s", "the compact wording");
+        let cut = waiting_row(12);
+        assert!(cut.ends_with("· 0.1s"), "the seconds stay whole: {cut:?}");
+        assert!(cut.contains('…'), "the wording is what was cut: {cut:?}");
+
+        // And never wider than the pane, at any width.
+        for width in 8..=120u16 {
+            for fact in [&tool, &waiting] {
+                let text = work_row_text("\u{2699}", fact, ThemeColor::ToolTitle, width);
+                assert!(
+                    titi_tui::width::visible_width(&text) <= width as usize,
+                    "{width}: {text:?}"
+                );
+            }
+        }
     }
 
     /// A provider that refused the key contributes no models and looks
