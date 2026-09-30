@@ -212,6 +212,10 @@ pub enum Key {
     Enter,
     CtrlC,
     CtrlD,
+    /// `app.session.switch`: ctrl+x.
+    CtrlX,
+    /// `app.model.select`: alt+m.
+    AltM,
     Esc,
     Up,
     Down,
@@ -451,6 +455,8 @@ pub struct Chat {
     picker: usize,
     /// Highlight in the bare-`/login` subscription picker; `None` = closed.
     login_picker: Option<usize>,
+    /// Ctrl+X: the session the screen is on, in the list of stored sessions.
+    session_picker: Option<usize>,
     /// The model browser bare `/model` and bare `/switch` open; `None` =
     /// closed.
     model_picker: Option<ModelPicker>,
@@ -526,6 +532,7 @@ impl Chat {
             login_driver: None,
             picker: 0,
             login_picker: None,
+            session_picker: None,
             model_picker: None,
             skills: Vec::new(),
             kitty: false,
@@ -613,6 +620,9 @@ impl Chat {
         if self.login_for.is_some() {
             return self.login_key(key);
         }
+        if self.session_picker.is_some() {
+            return self.session_picker_key(key, now);
+        }
         if self.login_picker.is_some() {
             return self.login_picker_key(key, now);
         }
@@ -625,6 +635,11 @@ impl Chat {
                 Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
             }
             Key::CtrlC => self.arm_quit(now),
+            Key::CtrlX => self.open_session_picker(),
+            Key::AltM => {
+                self.open_model_picker();
+                Applied::none()
+            }
             Key::CtrlD if self.input.is_empty() => Applied::effect(ChatEffect::Quit),
             Key::Up if self.picking() => {
                 self.move_picker(-1);
@@ -1610,6 +1625,98 @@ impl Chat {
             other => {
                 self.login_picker = None;
                 self.on_key(other, now)
+            }
+        }
+    }
+
+    /// Ctrl+X: the sessions this agent directory holds — the list `/sessions`
+    /// shows — with the row the screen is on selected.
+    fn open_session_picker(&mut self) -> Applied {
+        let sessions = self.session_choices();
+        if sessions.is_empty() {
+            self.push(LineKind::Note, "no sessions to switch to".to_owned());
+            return Applied::none();
+        }
+        self.session_picker = Some(
+            sessions
+                .iter()
+                .position(|id| *id == self.session_id)
+                .unwrap_or(0),
+        );
+        Applied::none()
+    }
+
+    fn session_choices(&self) -> Vec<String> {
+        crate::app::list_sessions_from(&self.agent_dir)
+    }
+
+    /// Typing while the session switcher is up. Like the login picker: arrows
+    /// move, Enter switches, Esc closes, and anything else closes and is
+    /// handled as composer input.
+    fn session_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_session_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_session_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_session_picker(),
+            Key::Esc => {
+                self.session_picker = None;
+                Applied::none()
+            }
+            other => {
+                self.session_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_session_picker(&mut self, delta: isize) {
+        let len = self.session_choices().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.session_picker.unwrap_or(0) % len;
+        self.session_picker = Some((current as isize + delta).rem_euclid(len as isize) as usize);
+    }
+
+    /// Enter on a session: its history replaces the screen and the engine is
+    /// told to replay it, the way a rewind does. Moving the id without the
+    /// history would leave the model on a conversation the screen is not
+    /// showing.
+    fn accept_session_picker(&mut self) -> Applied {
+        let choice = self
+            .session_picker
+            .and_then(|at| self.session_choices().get(at).cloned());
+        self.session_picker = None;
+        let Some(id) = choice else {
+            return Applied::none();
+        };
+        if id == self.session_id {
+            return Applied::none();
+        }
+        match crate::app::session_history(&self.agent_dir, &id) {
+            Ok(messages) => {
+                self.show_history(&messages);
+                self.session_id = id.clone();
+                self.session_label = stored_session_title(&self.agent_dir, &id);
+                self.turn_active = false;
+                self.turn_started = None;
+                self.phase = WorkPhase::Waiting;
+                self.approval = None;
+                self.push(LineKind::Note, format!("session {id}"));
+                Applied::send(EngineCommand::RestoreHistory { messages }, None)
+            }
+            Err(reason) => {
+                self.push(
+                    LineKind::Error,
+                    format!("session {id}: history not restored ({reason})"),
+                );
+                Applied::none()
             }
         }
     }
@@ -2795,7 +2902,7 @@ impl Chat {
 /// every prompt the user sends, in the order the screen saw them.
 pub fn run(
     mut engine: Engine,
-    session_log: Option<SessionLog>,
+    mut session_log: Option<SessionLog>,
     catalog: crate::engine::ModelCatalog,
     session_id: String,
     mut cast: Option<crate::ompcast::CastWriter>,
@@ -2849,6 +2956,11 @@ pub fn run(
         if pump(&mut engine, &mut chat, &session_log, &mut cast)? {
             break Ok(());
         }
+        // The screen can end up on another session mid-run (the switcher does),
+        // and the file this run appends to has to move with it: a transcript
+        // written to the session the user left is a conversation that is lost
+        // when it is resumed.
+        session_log = session_log_for(session_log, &chat);
     };
     if let Some(reporter) = &herdr_reporter {
         reporter.report(AgentState::Idle, None);
@@ -3840,6 +3952,9 @@ fn panel_view(
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.session_picker.is_some() {
+        return Some(session_panel(chat, total));
+    }
     if chat.login_picker.is_some() {
         return Some(login_panel(chat, total));
     }
@@ -3850,6 +3965,25 @@ fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
         return None;
     }
     Some(command_panel(chat, total))
+}
+
+/// The Ctrl+X switcher: one row per stored session, newest first, the session
+/// on screen marked where the model browser marks the model in use.
+fn session_panel(chat: &Chat, total: u16) -> PanelView {
+    let lines: Vec<PanelLine> = chat
+        .session_choices()
+        .into_iter()
+        .map(|id| PanelLine::Row {
+            text: if id == chat.session_id {
+                format!("{id}  ✓ current")
+            } else {
+                id
+            },
+            accent: false,
+        })
+        .collect();
+    let title = format!("sessions · {}", lines.len());
+    panel_view(Some(title), lines, chat.session_picker, panel_body(total))
 }
 
 /// The bare-`/login` picker: a provider and a method per row. Nothing is
@@ -5838,6 +5972,11 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
     match code {
         KeyCode::Char('c') if control => Some(Key::CtrlC),
         KeyCode::Char('d') if control => Some(Key::CtrlD),
+        // The crate's table binds `app.session.switch` to ctrl+x and
+        // `app.model.select` to alt+m; a live screen that drops the modifier
+        // leaves both chords with nothing to reach.
+        KeyCode::Char('x') if control => Some(Key::CtrlX),
+        KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
         KeyCode::Char(ch) if !control && !modifiers.contains(KeyModifiers::ALT) => {
             Some(Key::Char(ch))
         }
@@ -5948,6 +6087,24 @@ fn dispatch(
         }
         None => false,
     }
+}
+
+/// The log a run should be appending to, given the session the screen is on.
+///
+/// The log is opened for one session id and stamps every write with it, so a run
+/// whose screen has moved — `Ctrl+X` and Enter — has to re-open it for the new
+/// session. A run whose writes were already off stays off: the start path said
+/// so once, and turning them on mid-run would be a different promise.
+fn session_log_for(log: Option<SessionLog>, chat: &Chat) -> Option<SessionLog> {
+    let log = log?;
+    if log.session_id() == chat.session_id {
+        return Some(log);
+    }
+    let opened = SessionLog::open(&chat.agent_dir, &chat.session_id);
+    if opened.is_none() {
+        eprintln!("session: transcript writes are off (store unavailable)");
+    }
+    opened
 }
 
 fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<LogWrite>) {
@@ -6783,6 +6940,241 @@ mod tests {
             }))
         );
         assert_eq!(chat.model, "anthropic/claude-opus-5");
+    }
+
+    /// The crate's table binds `app.session.switch` to ctrl+x and
+    /// `app.model.select` to alt+m. A live screen whose mapping drops the
+    /// modifier leaves both chords unreachable, so the mapping itself is
+    /// asserted here, and not only through the screen.
+    #[test]
+    fn the_crates_chords_reach_the_live_screen() {
+        assert_eq!(
+            map_key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            Some(Key::CtrlX),
+            "ctrl+x is the session switcher"
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('m'), KeyModifiers::ALT),
+            Some(Key::AltM),
+            "alt+m opens the model selector"
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('m'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            Some(Key::AltM),
+            "a shifted chord is still the chord"
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('m'), KeyModifiers::NONE),
+            Some(Key::Char('m')),
+            "and a bare m is still a character"
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            Some(Key::Char('x'))
+        );
+    }
+
+    /// Alt+m reaches the model browser from the composer, exactly as bare
+    /// `/model` does.
+    #[test]
+    fn alt_m_opens_the_model_browser() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.catalog = crate::engine::ModelCatalog::fixed(vec![
+            "openai/gpt-4.1".to_owned(),
+            "anthropic/claude-opus-5".to_owned(),
+        ]);
+        type_text(&mut chat, "half-typed words");
+        chat.on_key(Key::AltM, Instant::now());
+        assert!(chat.model_picker.is_some(), "alt+m opens the browser");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▾ openai"), "and it is the browser: {frame}");
+        assert!(
+            frame.contains("half-typed words"),
+            "the composer keeps its text: {frame}"
+        );
+    }
+
+    /// The file a run appends to follows the screen.
+    ///
+    /// The log is opened for one session id and stamps every write with it, and
+    /// nothing re-opened it: after a switch the new session stayed empty for the
+    /// rest of the run while the screen showed its history, and resuming it
+    /// later replayed nothing. The write after the switch must land in the new
+    /// session's file, and the file the screen left must gain nothing.
+    #[test]
+    fn the_session_log_follows_the_switch() {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("session store");
+        let create = |title: &str| {
+            store
+                .create(titi_core::session::SessionMeta {
+                    title: Some(title.to_owned()),
+                    bot_id: None,
+                    source: Some("cli".to_owned()),
+                })
+                .expect("create")
+        };
+        // The session the run starts on, with a file of its own, and another to
+        // switch to.
+        let left_behind = create("left");
+        store
+            .append(&left_behind, Role::User, "left question")
+            .expect("append");
+        let other = create("other");
+        store
+            .append(&other, Role::User, "other question")
+            .expect("append");
+        store
+            .append(&other, Role::Assistant, "other answer")
+            .expect("append");
+        let mut chat = Chat::new("openai/gpt-4.1", &left_behind, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        // The run opens its log for the session it started on.
+        let log = SessionLog::open(dir.path(), &left_behind).expect("a log");
+        let mut log = session_log_for(Some(log), &chat);
+        assert!(
+            log.is_some(),
+            "a run that started with a log keeps one while the screen has not moved"
+        );
+        record(
+            &mut chat,
+            &log,
+            Some(LogWrite::text(Role::User, "before the switch".to_owned())),
+        );
+        let before =
+            std::fs::read_to_string(dir.path().join(format!("sessions/{left_behind}.jsonl")))
+                .expect("the session on screen is written");
+
+        // The screen switches to the other session, exactly as Ctrl+X does.
+        chat.session_picker = Some(
+            chat.session_choices()
+                .iter()
+                .position(|id| *id == other)
+                .expect("the other session is offered"),
+        );
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.session_id, other, "the screen moved");
+
+        // The next write follows it.
+        log = session_log_for(log, &chat);
+        assert_eq!(
+            log.as_ref().map(SessionLog::session_id),
+            Some(other.as_str()),
+            "the log is on the session on screen"
+        );
+        record(
+            &mut chat,
+            &log,
+            Some(LogWrite::text(Role::User, "after the switch".to_owned())),
+        );
+
+        let moved = std::fs::read_to_string(dir.path().join(format!("sessions/{other}.jsonl")))
+            .expect("the new session is written");
+        assert!(
+            moved.contains("after the switch"),
+            "the write after the switch is in the new session: {moved}"
+        );
+        assert!(
+            !moved.contains("before the switch"),
+            "and not the message that came before it: {moved}"
+        );
+        let left =
+            std::fs::read_to_string(dir.path().join(format!("sessions/{left_behind}.jsonl")))
+                .expect("the session the screen left is still there");
+        assert_eq!(
+            left, before,
+            "the session the screen left gains nothing after the switch"
+        );
+    }
+
+    /// Ctrl+X lists the stored sessions, marks the one on screen, and Enter
+    /// switches: the session's history replaces the screen and the engine is
+    /// told to replay it, as a rewind does. Esc closes without switching.
+    #[test]
+    fn ctrl_x_switches_sessions() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("session store");
+        let older = store
+            .create(titi_core::session::SessionMeta {
+                title: Some("older".to_owned()),
+                bot_id: None,
+                source: Some("cli".to_owned()),
+            })
+            .expect("create older");
+        store
+            .append(&older, Role::User, "older question")
+            .expect("append");
+        store
+            .append(&older, Role::Assistant, "older answer")
+            .expect("append");
+        let newer = store
+            .create(titi_core::session::SessionMeta {
+                title: Some("newer".to_owned()),
+                bot_id: None,
+                source: Some("cli".to_owned()),
+            })
+            .expect("create newer");
+        store
+            .append(&newer, Role::User, "newer question")
+            .expect("append");
+
+        chat.on_key(Key::CtrlX, Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("sessions · 2"),
+            "both sessions are listed: {frame}"
+        );
+        assert!(
+            frame.contains(&older),
+            "the older session is a row: {frame}"
+        );
+        assert!(
+            frame.contains(&newer),
+            "the newer session is a row: {frame}"
+        );
+
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(
+            !frame_text(&mut chat).contains("sessions · 2"),
+            "esc closes it"
+        );
+
+        // Walk the cursor onto the older session and take it.
+        chat.on_key(Key::CtrlX, Instant::now());
+        for _ in 0..3 {
+            if frame_text(&mut chat).contains(&format!("▶ {older}")) {
+                break;
+            }
+            chat.on_key(Key::Down, Instant::now());
+        }
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::RestoreHistory { messages })) => {
+                assert_eq!(
+                    messages
+                        .iter()
+                        .map(|message| message.content.trim().to_owned())
+                        .collect::<Vec<_>>(),
+                    ["older question", "older answer"],
+                    "the engine replays the session that was chosen"
+                );
+            }
+            other => panic!("switching a session restores its history, got {other:?}"),
+        }
+        assert_eq!(
+            chat.session_id, older,
+            "the screen is on the chosen session"
+        );
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("older question"),
+            "the transcript is its history: {frame}"
+        );
+        assert!(
+            !frame.contains("newer question"),
+            "and not the other one: {frame}"
+        );
     }
 
     /// The picker above the composer is a box: the title sits inset in the top
