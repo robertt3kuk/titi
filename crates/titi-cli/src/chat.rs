@@ -38,9 +38,79 @@ use crate::session_log::SessionLog;
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
 
-/// Columns a tool block's continuation rows sit under, the diff's rows
-/// included: the chip's mark and its space.
-const DIFF_INSET: usize = 5;
+// ---------------------------------------------------------------------------
+// The transcript's geometry
+// ---------------------------------------------------------------------------
+//
+// One place decides where a transcript block's rows sit and how much room its
+// body has. There are two kinds of block and so two indents — a message opens
+// with its label (`  you  │ `), a marked block with its mark (`   ▸ `) — and
+// every block kind, the markdown answer and the diff under a tool chip
+// included, reads its indent and its width from here. Nothing else spells an
+// indent of its own.
+//
+// The rows of a sign-in note's URL are the one deliberate exception: they are
+// flush left on purpose, so together they spell the URL (`link_note`).
+
+/// Cells a message block's body starts at, on its first row and on every
+/// wrapped one: `  you  │ ` and `       │ `.
+///
+/// The bar's cells, the label's four and the air before them make it up;
+/// `message_gutter` builds the pieces from this, and the tests measure that
+/// they add up to it.
+const MESSAGE_INDENT: usize = 9;
+
+/// The bar a message block carries after its label, and at the end of every
+/// wrapped row: one space, the bar, one space.
+const MESSAGE_BAR: &str = " │ ";
+
+/// Cells a marked block's body starts at: `   ▸ ` and the five cells a wrapped
+/// row hangs under.
+const MARK_INDENT: usize = 5;
+
+/// One cell kept clear of the layout's right edge, so a body never touches it.
+const BODY_MARGIN: usize = 1;
+
+/// The columns a body has at `width`, sitting at `indent`: the layout less the
+/// indent, less the margin.
+///
+/// A caller floors the result — a chip wraps at four columns where a message
+/// wraps at eight — but none subtracts for itself.
+fn body_width(width: usize, indent: usize) -> usize {
+    width.saturating_sub(indent + BODY_MARGIN)
+}
+
+/// The pieces a message block opens with, and what a wrapped row hangs under:
+/// the air before the label, the label, the bar after it, and the hang.
+///
+/// The three openers add up to [`MESSAGE_INDENT`] cells, and so does the hang.
+fn message_gutter(name: &str) -> (String, String, String, String) {
+    // "you" and "titi" share a column so a short message stays one row.
+    let tag = format!("{name:<4}");
+    let air = " ".repeat(
+        MESSAGE_INDENT
+            .saturating_sub(tag.chars().count() + titi_tui::width::visible_width(MESSAGE_BAR)),
+    );
+    (
+        air,
+        tag,
+        MESSAGE_BAR.to_owned(),
+        format!("{:width$}│ ", "", width = MESSAGE_INDENT - 2),
+    )
+}
+
+/// The pieces a marked block opens with, and what a wrapped row hangs under:
+/// the cells before the mark, the mark, the space after it, and the hang.
+///
+/// Both the three openers and the hang are [`MARK_INDENT`] cells.
+fn mark_gutter(mark: &str) -> (String, String, String, String) {
+    (
+        " ".repeat(MARK_INDENT - 2),
+        mark.to_owned(),
+        " ".to_owned(),
+        " ".repeat(MARK_INDENT),
+    )
+}
 
 /// Rows of a diff the screen draws before it stops and says what it hid.
 ///
@@ -237,6 +307,28 @@ impl WorkPhase {
     /// Whether this phase is the given tool call, still running.
     fn is_tool(&self, call_id: &str) -> bool {
         matches!(self, Self::Tool { call_id: running, .. } if running == call_id)
+    }
+}
+
+/// The writer a transcript block belongs to, for the air between blocks.
+///
+/// The user's own question is one writer; everything a turn produces — the
+/// assistant's text, its tool chips, the diffs under them, its notes and errors
+/// — is the other. Air goes where the writer changes, and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockRole {
+    User,
+    Turn,
+}
+
+impl LineKind {
+    /// Which writer this block came from. Every kind but the user's own message
+    /// belongs to the turn the assistant is running.
+    fn block_role(self) -> BlockRole {
+        match self {
+            LineKind::User => BlockRole::User,
+            _ => BlockRole::Turn,
+        }
     }
 }
 
@@ -4418,7 +4510,11 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
         } => (
             "⚙",
             tool_fact(name, detail.as_deref(), &elapsed_label(since.elapsed())),
-            ThemeColor::ToolTitle,
+            // `toolOutput`, not `toolTitle`: five of the shipped themes set
+            // `toolTitle` to the same value as `accent` or `warning`, and only
+            // one sets `toolOutput` to either — the row has to read as a third
+            // state whatever palette is loaded.
+            ThemeColor::ToolOutput,
         ),
     };
     Some(Paragraph::new(work_line(glyph, &fact, color, width, theme)).style(page(theme)))
@@ -4639,8 +4735,12 @@ fn transcript(
     let mut rows: Vec<TranscriptRow> = Vec::new();
     let mut links: Vec<(usize, LinkRow)> = Vec::new();
     for (index, line) in owned.iter().enumerate() {
-        let gap = matches!(line.kind, LineKind::User | LineKind::Assistant) && index > 0;
-        if gap && !rows.is_empty() {
+        // Air where the writer changes, and nowhere else: one turn's own
+        // blocks — its text, its tool chips, the diffs under them, its notes —
+        // stay one body, and a wrapped row is not a block of its own.
+        let changes_writer =
+            index > 0 && owned[index - 1].kind.block_role() != line.kind.block_role();
+        if changes_writer && !rows.is_empty() {
             rows.push(TranscriptRow::Text(Line::from("")));
         }
         let base = rows.len();
@@ -4925,7 +5025,7 @@ fn link_note(
     if !instructions.is_empty() {
         // The continuation shape [`chip`] would have given the third
         // paragraph: five spaces under the text column, no mark of its own.
-        let room = width.saturating_sub(6).max(4);
+        let room = body_width(width, MARK_INDENT).max(4);
         for piece in wrap_plain(instructions, room) {
             rows.push(Line::from(vec![
                 Span::styled("     ", page(theme)),
@@ -4961,8 +5061,8 @@ fn wrap_url(url: &str, width: usize) -> Vec<String> {
 /// The rows a message body has besides its gutter: one rule for the plain
 /// block and for the markdown one, so an answer cannot re-wrap just because the
 /// markdown path took it.
-fn body_width(width: usize) -> usize {
-    width.saturating_sub(10).max(8)
+fn speech_width(width: usize) -> usize {
+    body_width(width, MESSAGE_INDENT).max(8)
 }
 
 /// A message block: the name in its own colour, a bar, then the body rows under
@@ -4977,20 +5077,21 @@ fn message_block(
     theme: &Theme,
     bodies: Vec<Vec<Span<'static>>>,
 ) -> Vec<Line<'static>> {
-    // "you" and "titi" share a column so a short message stays one row.
-    let tag = format!("{name:<4}");
+    let (air, tag, bar, hang) = message_gutter(name);
     let mut rows = Vec::with_capacity(bodies.len());
     for (index, body) in bodies.into_iter().enumerate() {
         let mut row: Vec<Span<'static>> = Vec::with_capacity(body.len() + 3);
         if index == 0 {
-            row.push(Span::styled("  ", page(theme)));
+            // The label carries the weight; the air before it and the bar after
+            // it do not, so the three are styled apart rather than as one run.
+            row.push(Span::styled(air.clone(), page(theme)));
             row.push(Span::styled(
                 tag.clone(),
                 fg(theme, label).add_modifier(Modifier::BOLD),
             ));
-            row.push(Span::styled(" │ ", fg(theme, label)));
+            row.push(Span::styled(bar.clone(), fg(theme, label)));
         } else {
-            row.push(Span::styled("       │ ", fg(theme, label)));
+            row.push(Span::styled(hang.clone(), fg(theme, label)));
         }
         row.extend(body);
         rows.push(Line::from(row));
@@ -5006,7 +5107,7 @@ fn speech(
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let bodies = wrap_plain(text, body_width(width))
+    let bodies = wrap_plain(text, speech_width(width))
         .into_iter()
         .map(|piece| vec![Span::styled(piece, fg(theme, body))])
         .collect();
@@ -5033,7 +5134,7 @@ fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
             theme,
         );
     }
-    let bodies = markdown_bodies(text, body_width(width), theme);
+    let bodies = markdown_bodies(text, speech_width(width), theme);
     message_block("titi", ThemeColor::Accent, theme, bodies)
 }
 
@@ -5293,12 +5394,12 @@ fn diff_rows(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
 /// The columns a diff's rows have: the block's inset is spent before them, so a
 /// row the renderer cut to this width still fits inside the pane.
 fn diff_width(width: usize) -> usize {
-    width.saturating_sub(DIFF_INSET).max(8)
+    width.saturating_sub(MARK_INDENT).max(8)
 }
 
 /// One renderer row, inset under the block's chip.
 fn diff_row(row: &str, theme: &Theme) -> Line<'static> {
-    let mut spans = vec![Span::styled(" ".repeat(DIFF_INSET), page(theme))];
+    let mut spans = vec![Span::styled(" ".repeat(MARK_INDENT), page(theme))];
     spans.extend(sgr_row(row));
     Line::from(spans)
 }
@@ -5306,7 +5407,7 @@ fn diff_row(row: &str, theme: &Theme) -> Line<'static> {
 /// The dim row that says how much of a long diff the screen did not draw.
 fn diff_note(text: &str, theme: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(" ".repeat(DIFF_INSET), page(theme)),
+        Span::styled(" ".repeat(MARK_INDENT), page(theme)),
         Span::styled(text.to_owned(), fg(theme, ThemeColor::Dim)),
     ])
 }
@@ -5324,20 +5425,23 @@ fn chip(
     width: usize,
 ) -> Vec<Line<'static>> {
     let (mark, mark_color, text, text_color) = parts;
-    let room = width.saturating_sub(6).max(4);
+    let room = body_width(width, MARK_INDENT).max(4);
     let pieces = wrap_plain(&text, room);
+    let (air, mark, after, hang) = mark_gutter(mark);
     let mut rows = Vec::with_capacity(pieces.len());
     for (index, piece) in pieces.into_iter().enumerate() {
         let row = if index == 0 {
+            // The mark keeps its own colour; the cells before it and the space
+            // after it belong to the page.
             vec![
-                Span::styled("   ", page(theme)),
-                Span::styled(mark.to_owned(), fg(theme, mark_color)),
-                Span::styled(" ", page(theme)),
+                Span::styled(air.clone(), page(theme)),
+                Span::styled(mark.clone(), fg(theme, mark_color)),
+                Span::styled(after.clone(), page(theme)),
                 Span::styled(piece, fg(theme, text_color)),
             ]
         } else {
             vec![
-                Span::styled("     ", page(theme)),
+                Span::styled(hang.clone(), page(theme)),
                 Span::styled(piece, fg(theme, text_color)),
             ]
         };
@@ -7209,12 +7313,12 @@ mod tests {
         let tool = work_row_color(
             "\u{2699}",
             &tool_fact("read", Some("read docs/README.md"), "0.1s"),
-            ThemeColor::ToolTitle,
+            ThemeColor::ToolOutput,
             80,
         );
         let approval = work_row_color("\u{26a0}", &fact("needs you"), ThemeColor::Warning, 80);
         assert_eq!(activity, fg(&theme, ThemeColor::Accent).fg);
-        assert_eq!(tool, fg(&theme, ThemeColor::ToolTitle).fg);
+        assert_eq!(tool, fg(&theme, ThemeColor::ToolOutput).fg);
         assert_eq!(approval, fg(&theme, ThemeColor::Warning).fg);
         // The three are visibly different states, not three words in one
         // colour: this is the defect the plan's §3.5 names.
@@ -7284,7 +7388,7 @@ mod tests {
                         detail: Some("read docs/README.md".into()),
                     });
                 },
-                ThemeColor::ToolTitle,
+                ThemeColor::ToolOutput,
             ),
             (
                 "needs you",
@@ -7328,18 +7432,18 @@ mod tests {
     fn a_tool_row_carries_the_call_or_the_name_alone() {
         let described = tool_fact("read", Some("read docs/README.md"), "0.4s");
         assert_eq!(
-            work_row_text("\u{2699}", &described, ThemeColor::ToolTitle, 80),
+            work_row_text("\u{2699}", &described, ThemeColor::ToolOutput, 80),
             " \u{2699} read docs/README.md · 0.4s"
         );
         let bare = tool_fact("read", None, "0.4s");
         assert_eq!(
-            work_row_text("\u{2699}", &bare, ThemeColor::ToolTitle, 80),
+            work_row_text("\u{2699}", &bare, ThemeColor::ToolOutput, 80),
             " \u{2699} read · 0.4s"
         );
         // A description that is only a word has no argument to show.
         let wordy = tool_fact("git", Some("git"), "0.2s");
         assert_eq!(
-            work_row_text("\u{2699}", &wordy, ThemeColor::ToolTitle, 80),
+            work_row_text("\u{2699}", &wordy, ThemeColor::ToolOutput, 80),
             " \u{2699} git · 0.2s"
         );
     }
@@ -7349,7 +7453,7 @@ mod tests {
     #[test]
     fn a_narrow_work_row_shortens_the_fact_and_keeps_the_seconds() {
         let tool = tool_fact("read", Some("read docs/README.md"), "0.4s");
-        let row = |width: u16| work_row_text("\u{2699}", &tool, ThemeColor::ToolTitle, width);
+        let row = |width: u16| work_row_text("\u{2699}", &tool, ThemeColor::ToolOutput, width);
         assert_eq!(
             row(80),
             " \u{2699} read docs/README.md · 0.4s",
@@ -7382,10 +7486,197 @@ mod tests {
         // And never wider than the pane, at any width.
         for width in 8..=120u16 {
             for fact in [&tool, &waiting] {
-                let text = work_row_text("\u{2699}", fact, ThemeColor::ToolTitle, width);
+                let text = work_row_text("\u{2699}", fact, ThemeColor::ToolOutput, width);
                 assert!(
                     titi_tui::width::visible_width(&text) <= width as usize,
                     "{width}: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The column a row's body starts in: where its first word begins, with the
+    /// gutter measured as the cells before it.
+    fn body_column(row: &str, first_word: &str) -> usize {
+        let at = row
+            .find(first_word)
+            .unwrap_or_else(|| panic!("{first_word:?} is not in {row:?}"));
+        titi_tui::width::visible_width(&row[..at])
+    }
+
+    /// The transcript's geometry is one rule: the gutters measure what the
+    /// indents say, and every block kind starts its body in its kind's column —
+    /// on its first row and on every row it wraps to, the markdown answer and
+    /// the diff included.
+    #[test]
+    fn the_geometry_is_one_rule() {
+        let (air, tag, bar, hang) = message_gutter("you");
+        assert_eq!(
+            titi_tui::width::visible_width(&format!("{air}{tag}{bar}")),
+            MESSAGE_INDENT,
+            "the message gutter's pieces do not add up"
+        );
+        assert_eq!(
+            titi_tui::width::visible_width(&hang),
+            MESSAGE_INDENT,
+            "a wrapped message row does not hang under its body"
+        );
+        let (air, mark, after, hang) = mark_gutter("\u{25b8}");
+        assert_eq!(
+            titi_tui::width::visible_width(&format!("{air}{mark}{after}")),
+            MARK_INDENT,
+            "the mark gutter's pieces do not add up"
+        );
+        assert_eq!(
+            titi_tui::width::visible_width(&hang),
+            MARK_INDENT,
+            "a wrapped mark row does not hang under its body"
+        );
+
+        let theme = test_theme();
+        let long = "word ".repeat(30);
+        let wrapped = |kind: LineKind, text: String, indent: usize| {
+            let rows = row_texts(&message_rows(&TranscriptLine { kind, text }, 60, &theme).0);
+            assert!(rows.len() >= 2, "{kind:?} did not wrap: {rows:?}");
+            for (at, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    body_column(row, "word"),
+                    indent,
+                    "{kind:?} row {at} starts in the wrong column: {row:?}"
+                );
+            }
+        };
+        for kind in [
+            LineKind::User,
+            LineKind::Tool,
+            LineKind::Error,
+            LineKind::Note,
+        ] {
+            let text = match kind {
+                LineKind::Tool => format!("tool done  {long}"),
+                _ => long.clone(),
+            };
+            let indent = if kind == LineKind::User {
+                MESSAGE_INDENT
+            } else {
+                MARK_INDENT
+            };
+            wrapped(kind, text, indent);
+        }
+
+        // The plain message block and the markdown one are the same block: an
+        // answer cannot re-wrap because the renderer took it.
+        for rows in [
+            speech(
+                "titi",
+                ThemeColor::Accent,
+                ThemeColor::Text,
+                &long,
+                60,
+                &theme,
+            ),
+            message_rows(
+                &TranscriptLine {
+                    kind: LineKind::Assistant,
+                    text: format!("## {long}"),
+                },
+                60,
+                &theme,
+            )
+            .0,
+        ] {
+            let rows = row_texts(&rows);
+            assert!(rows.len() >= 2, "{rows:?}");
+            for (at, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    body_column(row, "word"),
+                    MESSAGE_INDENT,
+                    "an answer row starts in the wrong column ({at}): {row:?}"
+                );
+            }
+        }
+
+        // A diff's rows sit at the mark's inset, and its chip's mark at the
+        // column a chip's own mark has.
+        let rows = row_texts(
+            &message_rows(
+                &TranscriptLine {
+                    kind: LineKind::Diff,
+                    text: edit_result().to_owned(),
+                },
+                60,
+                &theme,
+            )
+            .0,
+        );
+        assert!(rows.len() >= 2, "{rows:?}");
+        let mark_column = MARK_INDENT - 2;
+        assert_eq!(
+            body_column(&rows[0], "\u{2713}"),
+            mark_column,
+            "the diff's chip is not a chip: {:?}",
+            rows[0]
+        );
+        for row in &rows[1..] {
+            assert!(
+                row.starts_with(&" ".repeat(MARK_INDENT)),
+                "a diff row is not at the mark's inset: {row:?}"
+            );
+        }
+    }
+
+    /// Air lands where the writer changes, and nowhere else: not between a
+    /// turn's own text and its tool chips, not between a chip and the diff under
+    /// it, not between a note and the answer it belongs to.
+    #[test]
+    fn air_lands_on_a_role_change_and_nowhere_else() {
+        let mut chat = chat();
+        chat.push(LineKind::User, "what is in the repo?".to_owned());
+        chat.push(LineKind::Assistant, "## Files".to_owned());
+        chat.push(LineKind::Tool, "tool done  read".to_owned());
+        chat.push(LineKind::Diff, edit_result().to_owned());
+        chat.push(LineKind::Note, "a note".to_owned());
+        chat.push(LineKind::User, "and the tests?".to_owned());
+        chat.push(LineKind::Assistant, "All green.".to_owned());
+
+        let rows = frame_rows(&mut chat, 80, 30);
+        // Every blank row with content above and below it that is not the
+        // composer's frame, as what it sits between.
+        let gaps: Vec<(String, String)> = rows
+            .windows(3)
+            .filter(|triple| {
+                triple[1].trim().is_empty()
+                    && !triple[0].trim().is_empty()
+                    && !triple[2].trim().is_empty()
+                    && !triple[2].starts_with('╭')
+            })
+            .map(|triple| (triple[0].trim().to_owned(), triple[2].trim().to_owned()))
+            .collect();
+        assert_eq!(gaps.len(), 3, "air in the wrong places: {gaps:?}");
+        assert!(
+            gaps.iter()
+                .any(|(above, below)| above.contains("what is in the repo?")
+                    && below.contains("Files")),
+            "no air between the question and the answer: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|(above, below)| above.contains("a note") && below.contains("and the tests?")),
+            "no air between the turn and the next question: {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|(above, below)| above.contains("and the tests?")
+                    && below.contains("All green")),
+            "no air between the question and the answer: {gaps:?}"
+        );
+        // And none inside the turn: the reply, its chip, its diff and its note
+        // are one body.
+        for (above, below) in &gaps {
+            for joined in [("Files", "read"), ("read", "@@"), ("@@", "a note")] {
+                assert!(
+                    !(above.contains(joined.0) && below.contains(joined.1)),
+                    "air inside one turn's body between {joined:?}: {gaps:?}"
                 );
             }
         }
