@@ -216,7 +216,11 @@ pub fn replay<W: Write>(path: &Path, pace: Pace, out: &mut W) -> Result<(), Cast
 /// The records drive [`Chat`], so the text, the tool chips and the notices are
 /// the ones the session showed; only the terminal is missing.
 pub fn play<W: Write>(records: &[CastRecord], pace: Pace, out: &mut W) -> Result<(), CastError> {
-    let mut chat = Chat::new("replay", "replay");
+    // Replay colours nothing, but the [`Chat`] it drives carries the theme the
+    // live screen would have drawn with, resolved the same way.
+    let theme = crate::app::default_theme()
+        .map_err(|reason| CastError::Io(std::io::Error::other(reason)))?;
+    let mut chat = Chat::new("replay", "replay", theme);
     let mut shown = 0;
     let mut last = 0;
     for record in records {

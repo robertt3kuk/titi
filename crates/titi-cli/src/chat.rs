@@ -26,6 +26,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
+use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::herdr::{self, AgentState};
@@ -307,10 +308,14 @@ pub struct Chat {
     hub_open: bool,
     scroll_offset: usize,
     last_transcript_height: usize,
+    /// The active theme. Every colour the screen draws — the masthead, the
+    /// transcript, the chips, the composer, the status row — is a token of it,
+    /// so a theme change is a colour change on the whole screen.
+    theme: Arc<Theme>,
 }
 
 impl Chat {
-    pub fn new(model: impl Into<String>, session_id: &str) -> Self {
+    pub fn new(model: impl Into<String>, session_id: &str, theme: Arc<Theme>) -> Self {
         let model = model.into();
         Self {
             lines: Vec::new(),
@@ -359,6 +364,7 @@ impl Chat {
             hub_open: false,
             scroll_offset: 0,
             last_transcript_height: 0,
+            theme,
         }
     }
 
@@ -2567,7 +2573,13 @@ pub fn run(
         .first()
         .cloned()
         .unwrap_or_else(|| "model".to_owned());
-    let mut chat = Chat::new(model, &session_id);
+    // The screen's colours come from the theme, so the theme is resolved before
+    // the first frame: the same resolver the rest of the CLI uses, which maps
+    // the terminal's appearance onto the dark (`titanium`) or light slot and
+    // lets `{agent_dir}/themes/<name>.json` stand in for any name the built-in
+    // registry does not have.
+    let theme = crate::app::default_theme().map_err(io::Error::other)?;
+    let mut chat = Chat::new(model, &session_id, theme);
     chat.catalog = catalog;
     chat.skills = discovered_skills(&chat.agent_dir);
     let detect = titi_tui::image::PlaceholderDetect::from_env();
@@ -3693,17 +3705,17 @@ fn model_offer_label(offer: &ModelOffer, current: &str, room: usize) -> String {
 
 /// The picker above the composer. `view` carries its own window, so the rows
 /// drawn are exactly the rows the layout made room for.
-fn picker_panel(view: &PanelView, width: u16, ink: &Ink) -> Paragraph<'static> {
+fn picker_panel(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> {
     let room = (width as usize).saturating_sub(2).max(8);
     let mut rows: Vec<Line<'static>> = Vec::new();
     if let Some(title) = &view.title {
         rows.push(Line::from(Span::styled(
             titi_tui::width::truncate_to_width(&format!(" {title}"), room),
-            ink.fg(ink.dim),
+            fg(theme, ThemeColor::Dim),
         )));
     }
     if view.window.above > 0 {
-        rows.push(hidden_line(view.window.above, "above", room, ink));
+        rows.push(hidden_line(view.window.above, "above", room, theme));
     }
     for (at, line) in view
         .lines
@@ -3716,14 +3728,16 @@ fn picker_panel(view: &PanelView, width: u16, ink: &Ink) -> Paragraph<'static> {
         let (text, style) = match line {
             PanelLine::Heading(text) => (
                 format!("  {text}"),
-                ink.fg(ink.accent).add_modifier(Modifier::BOLD),
+                fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
             ),
             PanelLine::Row { text, .. } if selected => (
                 format!(" ▶ {text}"),
-                ink.fg(ink.gold).add_modifier(Modifier::BOLD),
+                fg(theme, ThemeColor::CustomMessageLabel).add_modifier(Modifier::BOLD),
             ),
-            PanelLine::Row { text, accent: true } => (format!("   {text}"), ink.fg(ink.green)),
-            PanelLine::Row { text, .. } => (format!("   {text}"), ink.fg(ink.muted)),
+            PanelLine::Row { text, accent: true } => {
+                (format!("   {text}"), fg(theme, ThemeColor::Success))
+            }
+            PanelLine::Row { text, .. } => (format!("   {text}"), fg(theme, ThemeColor::Muted)),
         };
         rows.push(Line::from(Span::styled(
             titi_tui::width::truncate_to_width(&text, room),
@@ -3731,31 +3745,34 @@ fn picker_panel(view: &PanelView, width: u16, ink: &Ink) -> Paragraph<'static> {
         )));
     }
     if view.window.below > 0 {
-        rows.push(hidden_line(view.window.below, "below", room, ink));
+        rows.push(hidden_line(view.window.below, "below", room, theme));
     }
-    Paragraph::new(rows).style(ink.page())
+    Paragraph::new(rows).style(page(theme))
 }
 
 /// `… 12 more below`: a windowed list says how much of itself is out of
 /// sight, rather than ending as if that were all of it.
-fn hidden_line(count: usize, side: &str, room: usize, ink: &Ink) -> Line<'static> {
+fn hidden_line(count: usize, side: &str, room: usize, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         titi_tui::width::truncate_to_width(&format!("   … {count} more {side}"), room),
-        ink.fg(ink.dim),
+        fg(theme, ThemeColor::Dim),
     ))
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     let area = frame.area();
-    let ink = Ink::titanium();
-    frame.render_widget(Block::default().style(ink.page()), area);
+    // The theme is cloned out of the chat: the helpers below borrow the chat
+    // mutably (the transcript clips its own scroll), and a second borrow of
+    // `chat.theme` cannot live across that.
+    let theme = Arc::clone(&chat.theme);
+    frame.render_widget(Block::default().style(page(&theme)), area);
     if area.height < 6 || area.width < 16 {
         return;
     }
     let panel = panel_view_for(chat, area.height, area.width);
     let picker_h = panel.as_ref().map(PanelView::height).unwrap_or(0);
     let roster_h = roster_height(chat, area.height);
-    let status = work_row(chat, area.width, &ink);
+    let status = work_row(chat, area.width, &theme);
     let cols = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(roster_h),
@@ -3767,25 +3784,25 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
         Constraint::Length(4),
     ])
     .split(area);
-    frame.render_widget(masthead(chat, cols[0].width, &ink), cols[0]);
+    frame.render_widget(masthead(chat, cols[0].width, &theme), cols[0]);
     if roster_h > 0 {
-        frame.render_widget(roster(chat, &ink), cols[1]);
+        frame.render_widget(roster(chat, &theme), cols[1]);
     }
     let (body, photos, links) = if chat.lines.is_empty() {
-        (empty_state(cols[2].height, &ink), Vec::new(), Vec::new())
+        (empty_state(cols[2].height, &theme), Vec::new(), Vec::new())
     } else {
-        transcript(chat, cols[2].width, cols[2].height, &ink)
+        transcript(chat, cols[2].width, cols[2].height, &theme)
     };
     frame.render_widget(body, cols[2]);
-    paint_photos(frame, cols[2], &photos, &ink);
+    paint_photos(frame, cols[2], &photos, &theme);
     paint_links(frame, cols[2], &links);
     if let Some(view) = &panel {
-        frame.render_widget(picker_panel(view, cols[3].width, &ink), cols[3]);
+        frame.render_widget(picker_panel(view, cols[3].width, &theme), cols[3]);
     }
     if let Some(status) = status {
         frame.render_widget(status, cols[4]);
     }
-    frame.render_widget(composer(chat, cols[5].width, &ink), cols[5]);
+    frame.render_widget(composer(chat, cols[5].width, &theme), cols[5]);
 }
 
 /// Rows the roster panel takes: one per peer plus its heading, capped so a
@@ -3800,70 +3817,91 @@ fn roster_height(chat: &Chat, total: u16) -> u16 {
 }
 
 /// Who is on the hub right now, this session marked as itself.
-fn roster(chat: &Chat, ink: &Ink) -> Paragraph<'static> {
+fn roster(chat: &Chat, theme: &Theme) -> Paragraph<'static> {
     let mine = chat.hub.agent_id().unwrap_or_default().to_owned();
     let mut rows = vec![Line::from(Span::styled(
         format!(" hub · {} peer(s)", chat.hub.peers().len()),
-        ink.fg(ink.accent).add_modifier(Modifier::BOLD),
+        fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
     ))];
     if chat.hub.peers().is_empty() {
         rows.push(Line::from(Span::styled(
             "  nobody here · /join connects",
-            ink.fg(ink.dim),
+            fg(theme, ThemeColor::Dim),
         )));
     }
     for peer in chat.hub.peers() {
         let (mark, color) = if peer == &mine {
-            ("you", ink.gold)
+            ("you", ThemeColor::CustomMessageLabel)
         } else {
-            ("·", ink.muted)
+            ("·", ThemeColor::Muted)
         };
         rows.push(Line::from(vec![
-            Span::styled(format!("  {mark} "), ink.fg(color)),
-            Span::styled(peer.clone(), ink.fg(ink.text)),
+            Span::styled(format!("  {mark} "), fg(theme, color)),
+            Span::styled(peer.clone(), fg(theme, ThemeColor::Text)),
         ]));
     }
-    Paragraph::new(rows).style(ink.page())
+    Paragraph::new(rows).style(page(theme))
 }
 
-/// Dark red. Body text stays warm white so a long reply is still readable.
-struct Ink {
-    page: Color,
-    card: Color,
-    line: Color,
-    text: Color,
-    muted: Color,
-    dim: Color,
-    accent: Color,
-    gold: Color,
-    green: Color,
-    amber: Color,
-    red: Color,
+// Every colour on this screen is a token of the active theme, one per role the
+// palette here used to hold:
+//
+//   accent             the brand, the assistant, a running turn, the caret,
+//                      picker headings
+//   customMessageLabel the user's own name, the thinking phase, a pending
+//                      tool, the highlighted picker row — the theme's colour
+//                      for a message that is not the assistant's
+//   warning            needs you: an approval, a pause, a sign-in, and a
+//                      pending tool's mark
+//   success            a tool that finished
+//   error              a failed tool or a failed command
+//   text               the body of a message and of the composer
+//   muted              the right half of the masthead, a finished tool's
+//                      detail, an unselected picker row
+//   dim                the ready state, a composer caption, a note, the empty
+//                      state's hint
+//   border             the composer's frame while idle
+//   statusLineBg       the screen behind everything
+//   customMessageBg    the composer's own surface, the one raised surface the
+//                      theme has to spare; `userMessageBg` belongs to the
+//                      user's block
+
+/// One theme colour token as a ratatui style. The theme resolves a token to
+/// CSS hex, so this is the only place a token becomes a terminal colour.
+fn fg(theme: &Theme, token: ThemeColor) -> Style {
+    Style::default().fg(rgb(&theme.get_color_hex(token)))
 }
 
-impl Ink {
-    fn titanium() -> Self {
-        Self {
-            page: Color::Rgb(18, 8, 10),
-            card: Color::Rgb(36, 16, 20),
-            line: Color::Rgb(92, 42, 50),
-            text: Color::Rgb(255, 236, 234),
-            muted: Color::Rgb(196, 150, 154),
-            dim: Color::Rgb(132, 90, 96),
-            accent: Color::Rgb(255, 64, 84),
-            gold: Color::Rgb(255, 176, 176),
-            green: Color::Rgb(125, 211, 168),
-            amber: Color::Rgb(255, 120, 128),
-            red: Color::Rgb(255, 96, 112),
-        }
-    }
+/// One theme background token as a ratatui colour.
+fn bg(theme: &Theme, token: ThemeBg) -> Color {
+    rgb(&theme.get_bg_hex(token))
+}
 
-    fn page(&self) -> Style {
-        Style::default().bg(self.page).fg(self.text)
-    }
+/// The screen behind everything: the theme's chrome surface with its body text
+/// on it. The status-line background is the one surface token that stands for
+/// the whole screen, and it is darker than every other one in the presets.
+fn page(theme: &Theme) -> Style {
+    Style::default()
+        .bg(bg(theme, ThemeBg::StatusLineBg))
+        .fg(rgb(&theme.get_color_hex(ThemeColor::Text)))
+}
 
-    fn fg(&self, color: Color) -> Style {
-        Style::default().fg(color)
+/// The composer's own surface: the theme's raised panel colour with body text
+/// on it. `userMessageBg` belongs to the user's own block and is not spent
+/// here.
+fn surface(theme: &Theme) -> Style {
+    Style::default()
+        .bg(bg(theme, ThemeBg::CustomMessageBg))
+        .fg(rgb(&theme.get_color_hex(ThemeColor::Text)))
+}
+
+/// A resolved token hex as a ratatui colour. A token the theme resolves to the
+/// terminal default still answers with a hex (`get_color_hex`), so the fallback
+/// only covers a hex a theme cannot resolve at all.
+fn rgb(hex: &str) -> Color {
+    match titi_tui::theme::color::hex_to_rgb(hex) {
+        Some(rgb) => (rgb.r, rgb.g, rgb.b).into(),
+        None => Color::Reset,
     }
 }
 
@@ -3878,7 +3916,7 @@ fn elapsed_label(elapsed: Duration) -> String {
     format!("{:.1}s", elapsed.as_secs_f64())
 }
 
-fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
+fn masthead(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
     let state = if chat.approval.is_some() {
         "needs you"
     } else if chat.login_for.is_some() {
@@ -3891,11 +3929,11 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
         "ready"
     };
     let state_color = if chat.approval.is_some() || chat.paused || chat.login_for.is_some() {
-        ink.amber
+        ThemeColor::Warning
     } else if chat.turn_active {
-        ink.accent
+        ThemeColor::Accent
     } else {
-        ink.dim
+        ThemeColor::Dim
     };
     let ctx = match chat.context_percent {
         Some(percent) => format!("  {percent}%"),
@@ -3942,12 +3980,15 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
     let used = fixed + titi_tui::width::visible_width(&right);
     let gap = (width as usize).saturating_sub(used).max(1);
     let line = Line::from(vec![
-        Span::styled(left, ink.fg(ink.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(mid, ink.fg(state_color)),
-        Span::styled(" ".repeat(gap), ink.page()),
-        Span::styled(right, ink.fg(ink.muted)),
+        Span::styled(
+            left,
+            fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(mid, fg(theme, state_color)),
+        Span::styled(" ".repeat(gap), page(theme)),
+        Span::styled(right, fg(theme, ThemeColor::Muted)),
     ]);
-    Paragraph::new(line).style(ink.page())
+    Paragraph::new(line).style(page(theme))
 }
 
 /// The live status row, drawn on the single line between the conversation and
@@ -3964,7 +4005,7 @@ fn masthead(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
 /// seconds of a turn are spent in `Waiting` with nothing to show for them.
 /// The glyph and the seconds are the whole signal there, and they are the
 /// reason this row exists.
-fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
+fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>> {
     if !chat.turn_active && chat.approval.is_none() {
         return None;
     }
@@ -3976,9 +4017,9 @@ fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
         return Some(work_line(
             "⚠",
             &format!("needs you · {}", pending.name),
-            ink.amber,
+            ThemeColor::Warning,
             width,
-            ink,
+            theme,
         ));
     }
     let elapsed = chat.turn_elapsed().unwrap_or_default();
@@ -3986,7 +4027,7 @@ fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
         WorkPhase::Waiting => (
             spinner_frame(elapsed),
             format!("waiting for the first token · {}", elapsed_label(elapsed)),
-            ink.accent,
+            ThemeColor::Accent,
         ),
         WorkPhase::Streaming => (
             spinner_frame(elapsed),
@@ -3995,7 +4036,7 @@ fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
                 elapsed_label(elapsed),
                 chat.reply.chars().count()
             ),
-            ink.accent,
+            ThemeColor::Accent,
         ),
         WorkPhase::Thinking => (
             spinner_frame(elapsed),
@@ -4004,51 +4045,57 @@ fn work_row(chat: &Chat, width: u16, ink: &Ink) -> Option<Paragraph<'static>> {
                 elapsed_label(elapsed),
                 chat.thinking.chars().count()
             ),
-            ink.gold,
+            ThemeColor::CustomMessageLabel,
         ),
         WorkPhase::Tool { name, since, .. } => (
             "⚙",
             format!("{name} · {}", elapsed_label(since.elapsed())),
-            ink.gold,
+            ThemeColor::CustomMessageLabel,
         ),
     };
-    Some(work_line(glyph, &fact, color, width, ink))
+    Some(work_line(glyph, &fact, color, width, theme))
 }
 
 /// One status row, cut to the screen with an ellipsis. A row that does not fit
 /// is truncated here rather than wrapped: a wrapped line would push the
 /// composer down and read as part of the conversation.
-fn work_line(glyph: &str, fact: &str, color: Color, width: u16, ink: &Ink) -> Paragraph<'static> {
+fn work_line(
+    glyph: &str,
+    fact: &str,
+    color: ThemeColor,
+    width: u16,
+    theme: &Theme,
+) -> Paragraph<'static> {
     let row = format!(" {glyph} {fact}");
     let room = (width as usize).saturating_sub(1);
     let mut text = titi_tui::width::truncate_to_width(&row, room.max(1));
     if titi_tui::width::visible_width(&row) > room.max(1) {
         text.push('…');
     }
-    Paragraph::new(Line::from(Span::styled(text, ink.fg(color)))).style(ink.page())
+    Paragraph::new(Line::from(Span::styled(text, fg(theme, color)))).style(page(theme))
 }
 
-fn empty_state(height: u16, ink: &Ink) -> Paragraph<'static> {
+fn empty_state(height: u16, theme: &Theme) -> Paragraph<'static> {
     let block = 5usize;
     let pad = (height as usize).saturating_sub(block) / 2;
     let mut rows = vec![Line::from(""); pad];
     rows.push(Line::from(Span::styled(
         "titi",
-        ink.fg(ink.accent).add_modifier(Modifier::BOLD),
+        fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
     )));
     rows.push(Line::from(""));
     rows.push(Line::from(Span::styled(
         "say what you want done",
-        ink.fg(ink.muted),
+        fg(theme, ThemeColor::Muted),
     )));
     rows.push(Line::from(""));
     rows.push(Line::from(Span::styled(
         "enter  send      /model  switch      ctrl-c  quit",
-        ink.fg(ink.dim),
+        fg(theme, ThemeColor::Dim),
     )));
     Paragraph::new(rows)
         .alignment(Alignment::Center)
-        .style(ink.page())
+        .style(page(theme))
 }
 
 struct Photo {
@@ -4104,7 +4151,7 @@ fn transcript(
     chat: &mut Chat,
     width: u16,
     height: u16,
-    ink: &Ink,
+    theme: &Theme,
 ) -> (Paragraph<'static>, Vec<PhotoPaint>, Vec<LinkPaint>) {
     let inner = (width as usize).saturating_sub(2).max(8);
     let max_cols = width.saturating_sub(8).max(8);
@@ -4117,7 +4164,7 @@ fn transcript(
             rows.push(TranscriptRow::Text(Line::from("")));
         }
         let base = rows.len();
-        let (texts, line_links) = message_rows(line, inner, ink);
+        let (texts, line_links) = message_rows(line, inner, theme);
         for text in texts {
             rows.push(TranscriptRow::Text(text));
         }
@@ -4180,14 +4227,14 @@ fn transcript(
             }
         }
     }
-    (Paragraph::new(lines).style(ink.page()), photos, paints)
+    (Paragraph::new(lines).style(page(theme)), photos, paints)
 }
 
 fn paint_photos(
     frame: &mut ratatui::Frame<'_>,
     area: ratatui::layout::Rect,
     photos: &[PhotoPaint],
-    ink: &Ink,
+    theme: &Theme,
 ) {
     if photos.is_empty() {
         return;
@@ -4212,8 +4259,8 @@ fn paint_photos(
                 column as usize,
                 photo.image_row as usize,
             ));
-            cell.set_fg(Color::Rgb(red, green, blue));
-            cell.set_bg(ink.page);
+            cell.set_fg((red, green, blue).into());
+            cell.set_bg(bg(theme, ThemeBg::StatusLineBg));
         }
     }
 }
@@ -4314,19 +4361,41 @@ fn consider_image(found: &mut Vec<String>, raw: &str) {
 fn message_rows(
     line: &TranscriptLine,
     width: usize,
-    ink: &Ink,
+    theme: &Theme,
 ) -> (Vec<Line<'static>>, Vec<LinkRow>) {
     if line.kind == LineKind::Note
         && let Some((head, url, instructions)) = login_link(&line.text)
     {
-        return link_note(head, url, instructions, ink, width);
+        return link_note(head, url, instructions, theme, width);
     }
     let rows = match line.kind {
-        LineKind::User => speech("you", ink.gold, ink.text, &line.text, width, ink),
-        LineKind::Assistant => speech("titi", ink.accent, ink.text, &line.text, width, ink),
-        LineKind::Tool => chip(tool_chip(&line.text, ink), ink, width),
-        LineKind::Error => chip(("✕", ink.red, line.text.clone(), ink.red), ink, width),
-        LineKind::Note => chip(("·", ink.dim, line.text.clone(), ink.dim), ink, width),
+        LineKind::User => speech(
+            "you",
+            ThemeColor::CustomMessageLabel,
+            ThemeColor::Text,
+            &line.text,
+            width,
+            theme,
+        ),
+        LineKind::Assistant => speech(
+            "titi",
+            ThemeColor::Accent,
+            ThemeColor::Text,
+            &line.text,
+            width,
+            theme,
+        ),
+        LineKind::Tool => chip(tool_chip(&line.text), theme, width),
+        LineKind::Error => chip(
+            ("✕", ThemeColor::Error, line.text.clone(), ThemeColor::Error),
+            theme,
+            width,
+        ),
+        LineKind::Note => chip(
+            ("·", ThemeColor::Dim, line.text.clone(), ThemeColor::Dim),
+            theme,
+            width,
+        ),
     };
     (rows, Vec::new())
 }
@@ -4355,10 +4424,14 @@ fn link_note(
     head: &str,
     url: &str,
     instructions: &str,
-    ink: &Ink,
+    theme: &Theme,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<LinkRow>) {
-    let mut rows = chip(("·", ink.dim, head.to_owned(), ink.dim), ink, width);
+    let mut rows = chip(
+        ("·", ThemeColor::Dim, head.to_owned(), ThemeColor::Dim),
+        theme,
+        width,
+    );
     let mut links = Vec::new();
     for piece in wrap_url(url, width) {
         links.push(LinkRow {
@@ -4366,7 +4439,7 @@ fn link_note(
             url: url.to_owned(),
             text: piece.clone(),
         });
-        rows.push(Line::from(Span::styled(piece, ink.fg(ink.dim))));
+        rows.push(Line::from(Span::styled(piece, fg(theme, ThemeColor::Dim))));
     }
     if !instructions.is_empty() {
         // The continuation shape [`chip`] would have given the third
@@ -4374,8 +4447,8 @@ fn link_note(
         let room = width.saturating_sub(6).max(4);
         for piece in wrap_plain(instructions, room) {
             rows.push(Line::from(vec![
-                Span::styled("     ", ink.page()),
-                Span::styled(piece, ink.fg(ink.dim)),
+                Span::styled("     ", page(theme)),
+                Span::styled(piece, fg(theme, ThemeColor::Dim)),
             ]));
         }
     }
@@ -4406,11 +4479,11 @@ fn wrap_url(url: &str, width: usize) -> Vec<String> {
 
 fn speech(
     name: &str,
-    label: Color,
-    body: Color,
+    label: ThemeColor,
+    body: ThemeColor,
     text: &str,
     width: usize,
-    ink: &Ink,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     // "you" and "titi" share a column so a short message stays one row.
     let tag = format!("{name:<4}");
@@ -4420,15 +4493,15 @@ fn speech(
     for (index, piece) in pieces.into_iter().enumerate() {
         let row = if index == 0 {
             vec![
-                Span::styled("  ", ink.page()),
-                Span::styled(tag.clone(), ink.fg(label).add_modifier(Modifier::BOLD)),
-                Span::styled(" │ ", ink.fg(label)),
-                Span::styled(piece, ink.fg(body)),
+                Span::styled("  ", page(theme)),
+                Span::styled(tag.clone(), fg(theme, label).add_modifier(Modifier::BOLD)),
+                Span::styled(" │ ", fg(theme, label)),
+                Span::styled(piece, fg(theme, body)),
             ]
         } else {
             vec![
-                Span::styled("       │ ", ink.fg(label)),
-                Span::styled(piece, ink.fg(body)),
+                Span::styled("       │ ", fg(theme, label)),
+                Span::styled(piece, fg(theme, body)),
             ]
         };
         rows.push(Line::from(row));
@@ -4436,11 +4509,16 @@ fn speech(
     rows
 }
 
-fn tool_chip(text: &str, ink: &Ink) -> (&'static str, Color, String, Color) {
+fn tool_chip(text: &str) -> (&'static str, ThemeColor, String, ThemeColor) {
     // The engine records "tool <name>" and "tool done  <preview>".
     // The screen says the same thing without the debug prefix.
     if let Some(rest) = text.strip_prefix("tool error") {
-        return ("✕", ink.red, rest.trim().to_owned(), ink.red);
+        return (
+            "✕",
+            ThemeColor::Error,
+            rest.trim().to_owned(),
+            ThemeColor::Error,
+        );
     }
     if let Some(rest) = text.strip_prefix("tool done") {
         let detail = rest.trim();
@@ -4449,12 +4527,17 @@ fn tool_chip(text: &str, ink: &Ink) -> (&'static str, Color, String, Color) {
         } else {
             detail.to_owned()
         };
-        return ("✓", ink.green, body, ink.muted);
+        return ("✓", ThemeColor::Success, body, ThemeColor::Muted);
     }
     if let Some(rest) = text.strip_prefix("tool ") {
-        return ("▸", ink.amber, rest.trim().to_owned(), ink.gold);
+        return (
+            "▸",
+            ThemeColor::Warning,
+            rest.trim().to_owned(),
+            ThemeColor::CustomMessageLabel,
+        );
     }
-    ("▸", ink.amber, text.to_owned(), ink.muted)
+    ("▸", ThemeColor::Warning, text.to_owned(), ThemeColor::Muted)
 }
 
 /// A marked block: the mark opens the first row, every following row is
@@ -4464,7 +4547,11 @@ fn tool_chip(text: &str, ink: &Ink) -> (&'static str, Color, String, Color) {
 /// each push one — so the text is split on its own newlines and every piece
 /// is wrapped to the pane, exactly as [`speech`] does. Truncating to one row
 /// threw everything past the first screen width away.
-fn chip(parts: (&str, Color, String, Color), ink: &Ink, width: usize) -> Vec<Line<'static>> {
+fn chip(
+    parts: (&str, ThemeColor, String, ThemeColor),
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
     let (mark, mark_color, text, text_color) = parts;
     let room = width.saturating_sub(6).max(4);
     let pieces = wrap_plain(&text, room);
@@ -4472,15 +4559,15 @@ fn chip(parts: (&str, Color, String, Color), ink: &Ink, width: usize) -> Vec<Lin
     for (index, piece) in pieces.into_iter().enumerate() {
         let row = if index == 0 {
             vec![
-                Span::styled("   ", ink.page()),
-                Span::styled(mark.to_owned(), ink.fg(mark_color)),
-                Span::styled(" ", ink.page()),
-                Span::styled(piece, ink.fg(text_color)),
+                Span::styled("   ", page(theme)),
+                Span::styled(mark.to_owned(), fg(theme, mark_color)),
+                Span::styled(" ", page(theme)),
+                Span::styled(piece, fg(theme, text_color)),
             ]
         } else {
             vec![
-                Span::styled("     ", ink.page()),
-                Span::styled(piece, ink.fg(text_color)),
+                Span::styled("     ", page(theme)),
+                Span::styled(piece, fg(theme, text_color)),
             ]
         };
         rows.push(Line::from(row));
@@ -4488,13 +4575,13 @@ fn chip(parts: (&str, Color, String, Color), ink: &Ink, width: usize) -> Vec<Lin
     rows
 }
 
-fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
+fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
     let (border, caption_color) = if chat.approval.is_some() || chat.login_for.is_some() {
-        (ink.amber, ink.amber)
+        (ThemeColor::Warning, ThemeColor::Warning)
     } else if chat.turn_active {
-        (ink.accent, ink.accent)
+        (ThemeColor::Accent, ThemeColor::Accent)
     } else {
-        (ink.line, ink.dim)
+        (ThemeColor::Border, ThemeColor::Dim)
     };
     let caption = titi_tui::width::truncate_to_width(
         &composer_caption(chat),
@@ -4503,12 +4590,16 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(ink.fg(border))
+        .border_style(fg(theme, border))
         .title_bottom(
-            Line::from(Span::styled(format!(" {caption} "), ink.fg(caption_color))).centered(),
+            Line::from(Span::styled(
+                format!(" {caption} "),
+                fg(theme, caption_color),
+            ))
+            .centered(),
         )
         .padding(Padding::horizontal(1))
-        .style(Style::default().bg(ink.card).fg(ink.text));
+        .style(surface(theme));
     let inner = (width as usize).saturating_sub(6).max(4);
     let line = if let Some(pending) = &chat.approval {
         Line::from(Span::styled(
@@ -4516,7 +4607,7 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
                 &format!("{}   y allow    n refuse", pending.name),
                 inner,
             ),
-            ink.fg(ink.amber).add_modifier(Modifier::BOLD),
+            fg(theme, ThemeColor::Warning).add_modifier(Modifier::BOLD),
         ))
     } else if let Some(provider) = &chat.login_for {
         let device = chat
@@ -4533,13 +4624,13 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
             format!("paste the {provider} key")
         };
         let color = if chat.input.is_empty() {
-            ink.dim
+            ThemeColor::Dim
         } else {
-            ink.text
+            ThemeColor::Text
         };
         Line::from(vec![
-            Span::styled("› ", ink.fg(ink.accent)),
-            Span::styled(shown, ink.fg(color)),
+            Span::styled("› ", fg(theme, ThemeColor::Accent)),
+            Span::styled(shown, fg(theme, color)),
         ])
     } else if chat.input.is_empty() {
         let placeholder = if chat.paused {
@@ -4550,15 +4641,15 @@ fn composer(chat: &Chat, width: u16, ink: &Ink) -> Paragraph<'static> {
             "ask titi…"
         };
         Line::from(vec![
-            Span::styled("› ", ink.fg(ink.accent)),
-            Span::styled(placeholder, ink.fg(ink.dim)),
+            Span::styled("› ", fg(theme, ThemeColor::Accent)),
+            Span::styled(placeholder, fg(theme, ThemeColor::Dim)),
         ])
     } else {
         let room = inner.saturating_sub(4).max(1);
         Line::from(vec![
-            Span::styled("› ", ink.fg(ink.accent)),
-            Span::styled(fit_tail(&chat.input, room), ink.fg(ink.text)),
-            Span::styled("▍", ink.fg(ink.accent)),
+            Span::styled("› ", fg(theme, ThemeColor::Accent)),
+            Span::styled(fit_tail(&chat.input, room), fg(theme, ThemeColor::Text)),
+            Span::styled("▍", fg(theme, ThemeColor::Accent)),
         ])
     };
     Paragraph::new(line).block(block)
@@ -4842,7 +4933,28 @@ mod tests {
     use titi_providers::StopReason;
 
     fn chat() -> Chat {
-        Chat::new("openai/gpt-4.1", "session-123")
+        Chat::new("openai/gpt-4.1", "session-123", test_theme())
+    }
+
+    /// A built-in theme, with the colour depth pinned so an assertion is about
+    /// the theme's tokens and not about this machine's `TERM`. Built-in names
+    /// win over `{agent_dir}/themes` (`theme::loader::load_theme_json_in`), so
+    /// a custom theme on the machine that runs the tests cannot change them.
+    fn test_theme_named(name: &str) -> Arc<Theme> {
+        let options = titi_tui::theme::loader::CreateThemeOptions {
+            mode: Some(titi_tui::theme::ColorMode::Truecolor),
+            ..Default::default()
+        };
+        let theme = titi_tui::theme::loader::load_theme(name, &options);
+        match theme {
+            Ok(theme) => Arc::new(theme),
+            Err(reason) => panic!("built-in theme {name}: {reason}"),
+        }
+    }
+
+    /// The dark slot the live screen lands on by default (`AUTO_DARK_THEME`).
+    fn test_theme() -> Arc<Theme> {
+        test_theme_named("titanium")
     }
 
     fn frame_text(chat: &mut Chat) -> String {
@@ -4855,7 +4967,7 @@ mod tests {
     /// dropping it would take the agent directory away mid-test.
     fn picker_chat(model: &str, session: &str) -> (tempfile::TempDir, Chat) {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new(model, session);
+        let mut chat = Chat::new(model, session, test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         (dir, chat)
     }
@@ -5803,7 +5915,7 @@ mod tests {
     #[test]
     fn an_idle_screen_has_no_status_row() {
         let mut chat = chat();
-        assert!(work_row(&chat, 80, &Ink::titanium()).is_none());
+        assert!(work_row(&chat, 80, &test_theme()).is_none());
         let rows = frame_rows(&mut chat, 80, 24);
         // The composer still starts where it did: four rows from the bottom.
         assert!(rows[20].starts_with('╭'), "{:?}", rows[20]);
@@ -5994,7 +6106,7 @@ mod tests {
         });
         let row = above_composer(&mut finished, 80, 20);
         assert!(!row.contains("bash ·"), "{row:?}");
-        assert!(work_row(&finished, 80, &Ink::titanium()).is_none());
+        assert!(work_row(&finished, 80, &test_theme()).is_none());
 
         let mut failed = chat();
         started(&mut failed);
@@ -6003,12 +6115,12 @@ mod tests {
             message: "no such model".into(),
             reason: titi_providers::ErrorReason::Rejected,
         });
-        assert!(work_row(&failed, 80, &Ink::titanium()).is_none());
+        assert!(work_row(&failed, 80, &test_theme()).is_none());
 
         let mut cancelled = chat();
         started(&mut cancelled);
         cancelled.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) });
-        assert!(work_row(&cancelled, 80, &Ink::titanium()).is_none());
+        assert!(work_row(&cancelled, 80, &test_theme()).is_none());
     }
 
     /// A long tool name is cut with an ellipsis on the row, never wrapped:
@@ -6969,7 +7081,7 @@ mod tests {
     #[test]
     fn login_masks_the_key_and_stores_it() {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/login openai");
         chat.on_key(Key::Enter, Instant::now());
@@ -6998,7 +7110,7 @@ mod tests {
     fn logout_forgets_the_stored_key() {
         let dir = tempfile::tempdir().expect("temp");
         crate::secrets::store_key(dir.path(), "openai", "sk-test").expect("store");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/logout openai");
         chat.on_key(Key::Enter, Instant::now());
@@ -7013,7 +7125,7 @@ mod tests {
     #[test]
     fn an_inline_login_does_not_echo_the_key() {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/login openai sk-one-line");
         let applied = chat.on_key(Key::Enter, Instant::now());
@@ -7053,7 +7165,7 @@ mod tests {
     #[test]
     fn bare_login_paints_the_subscription_picker() {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         chat.set_login_driver(Arc::new(NoNetworkFlow));
 
@@ -7082,7 +7194,7 @@ mod tests {
     #[test]
     fn the_device_login_asks_for_no_code() {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         chat.set_login_driver(Arc::new(NoNetworkFlow));
 
@@ -7106,7 +7218,7 @@ mod tests {
     #[test]
     fn login_for_an_oauth_provider_enters_code_mode() {
         let dir = tempfile::tempdir().expect("temp");
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         chat.set_login_driver(Arc::new(NoNetworkFlow));
 
@@ -7158,7 +7270,7 @@ mod tests {
     #[test]
     fn login_accepts_a_provider_the_config_declares() {
         let dir = agent_dir_with_extra_provider();
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/login zai");
         chat.on_key(Key::Enter, Instant::now());
@@ -7181,7 +7293,7 @@ mod tests {
     #[test]
     fn keys_lists_a_provider_the_config_declares() {
         let dir = agent_dir_with_extra_provider();
-        let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/keys");
         chat.on_key(Key::Enter, Instant::now());
@@ -7242,7 +7354,7 @@ mod tests {
         store.append(&id, Role::User, "keep").expect("keep");
         store.checkpoint(&id).expect("checkpoint");
         store.append(&id, Role::User, "drop").expect("drop");
-        let mut chat = Chat::new("openai/gpt-4.1", &id);
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
         chat.agent_dir = dir.path().to_path_buf();
         type_text(&mut chat, "/rewind");
         let applied = chat.on_key(Key::Enter, Instant::now());
@@ -7869,12 +7981,12 @@ mod tests {
     /// threw everything past the first screen width away.
     #[test]
     fn a_multi_line_note_is_one_row_per_line() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         let line = TranscriptLine {
             kind: LineKind::Note,
             text: "alpha\nbeta\n\ngamma".to_owned(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &ink).0);
+        let rows = row_texts(&message_rows(&line, 40, &theme).0);
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(rows[0].contains("alpha"), "{rows:?}");
         assert!(rows[1].contains("beta"), "{rows:?}");
@@ -7886,7 +7998,7 @@ mod tests {
     /// pane — the old renderer dropped the tail instead.
     #[test]
     fn a_long_note_wraps_within_the_width() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         let words = std::iter::repeat_n("token", 60)
             .collect::<Vec<_>>()
             .join(" ");
@@ -7894,7 +8006,7 @@ mod tests {
             kind: LineKind::Note,
             text: words.clone(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &ink).0);
+        let rows = row_texts(&message_rows(&line, 40, &theme).0);
         assert!(rows.len() >= 8, "{rows:?}");
         for row in &rows {
             assert!(
@@ -7916,13 +8028,13 @@ mod tests {
     /// An error and a tool chip split the same way a note does.
     #[test]
     fn errors_and_tool_chips_split_too() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         for kind in [LineKind::Error, LineKind::Tool] {
             let line = TranscriptLine {
                 kind,
                 text: "first\nsecond".to_owned(),
             };
-            let rows = row_texts(&message_rows(&line, 40, &ink).0);
+            let rows = row_texts(&message_rows(&line, 40, &theme).0);
             assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
             assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
         }
@@ -7933,7 +8045,7 @@ mod tests {
     /// rows join back to the URL byte for byte.
     #[test]
     fn a_long_login_url_is_one_slice_per_row() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         let url = format!(
             "https://auth.openai.com/oauth/authorize?client_id=app_EMoamEEZ73f0CkXaXp7hrann\
              &response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
@@ -7946,7 +8058,7 @@ mod tests {
                 "login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"
             ),
         };
-        let (rows, links) = message_rows(&line, 78, &ink);
+        let (rows, links) = message_rows(&line, 78, &theme);
         let texts = row_texts(&rows);
         assert!(
             links.len() >= 4,
@@ -7980,7 +8092,7 @@ mod tests {
     /// A URL that fits one row is one link row, and the row is the URL.
     #[test]
     fn a_short_login_url_is_one_row() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         let url = "https://auth.openai.com/codex/device";
         let line = TranscriptLine {
             kind: LineKind::Note,
@@ -7988,7 +8100,7 @@ mod tests {
                 "login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"
             ),
         };
-        let (rows, links) = message_rows(&line, 78, &ink);
+        let (rows, links) = message_rows(&line, 78, &theme);
         assert_eq!(links.len(), 1, "{:?}", row_texts(&rows));
         assert_eq!(row_texts(&rows)[links[0].row], url);
         assert_eq!(links[0].url, url);
@@ -7998,7 +8110,7 @@ mod tests {
     /// even when its text happens to hold a URL.
     #[test]
     fn other_lines_get_no_link_rows() {
-        let ink = Ink::titanium();
+        let theme = test_theme();
         for (kind, text) in [
             (
                 LineKind::Note,
@@ -8022,7 +8134,7 @@ mod tests {
                 kind,
                 text: text.to_owned(),
             };
-            let (_, links) = message_rows(&line, 78, &ink);
+            let (_, links) = message_rows(&line, 78, &theme);
             assert!(links.is_empty(), "{kind:?} {text:?} grew a link: {links:?}");
         }
     }
@@ -8181,6 +8293,96 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Every colour a frame's cells carry, foreground and background, in row
+    /// order.
+    fn frame_colors(chat: &mut Chat, width: u16, height: u16) -> Vec<(Color, Color)> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => panic!("test backend: {error}"),
+        };
+        assert!(terminal.draw(|frame| draw(frame, chat)).is_ok());
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| (cell.fg, cell.bg))
+            .collect()
+    }
+
+    /// A screen of every kind of row, so one frame exercises every colour role
+    /// the chat has: a user block, a pending tool, a finished tool, an error and
+    /// a note, under the masthead, the composer and its caption.
+    fn colored_chat(theme: Arc<Theme>) -> Chat {
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", theme);
+        chat.push(LineKind::User, "hi".to_owned());
+        chat.push(LineKind::Tool, "tool bash".to_owned());
+        chat.push(LineKind::Tool, "tool done  read".to_owned());
+        chat.push(LineKind::Error, "broken".to_owned());
+        chat.push(LineKind::Note, "a note".to_owned());
+        chat
+    }
+
+    /// Every colour the live screen draws is a token of the active theme: the
+    /// same frame under two themes carries two palettes, each theme's own
+    /// accent lands in the cells, and each role resolves to the value its
+    /// theme file declares.
+    #[test]
+    fn a_frame_takes_every_colour_from_the_theme() {
+        let mut titanium = colored_chat(test_theme_named("titanium"));
+        let mut light = colored_chat(test_theme_named("light"));
+        let titanium_colors = frame_colors(&mut titanium, 80, 20);
+        let light_colors = frame_colors(&mut light, 80, 20);
+        assert_ne!(
+            titanium_colors, light_colors,
+            "the frame ignored the theme it was given"
+        );
+
+        // The accent lands in the cells, and the same role under the other
+        // theme is the other theme's accent: the wiring, not just a palette.
+        assert!(
+            titanium_colors
+                .iter()
+                .any(|(fg, _)| *fg == Color::Rgb(0, 180, 255)),
+            "titanium's accent is not on the screen"
+        );
+        assert!(
+            light_colors
+                .iter()
+                .any(|(fg, _)| *fg == Color::Rgb(90, 128, 128)),
+            "light's accent is not on the screen"
+        );
+
+        // The escapes those cells become are crossterm's, not the screen's —
+        // and crossterm honours `NO_COLOR` through a process-wide switch
+        // (`style::force_color_output`), which a test has no business throwing
+        // for every other test in this binary. The colour a cell carries is the
+        // part this module decides, so that is what is asserted.
+
+        // One role per token, with the token's own value: the theme files
+        // declare these, and a change to one has to be a change here too.
+        let theme = test_theme_named("titanium");
+        for (token, rgb) in [
+            (ThemeColor::Accent, (0, 180, 255)),               // electricBlue
+            (ThemeColor::CustomMessageLabel, (212, 192, 144)), // titaniumGold
+            (ThemeColor::Warning, (255, 179, 71)),             // warningAmber
+            (ThemeColor::Success, (0, 255, 136)),              // readoutGreen
+            (ThemeColor::Error, (255, 71, 87)),                // alertRed
+            (ThemeColor::Muted, (156, 163, 176)),              // dimAluminum
+            (ThemeColor::Dim, (107, 114, 128)),
+            (ThemeColor::Border, (42, 48, 56)), // subtleGray
+            // `text` is the terminal default on a dark page; the theme answers
+            // with the dark default so the screen never loses its body colour.
+            (ThemeColor::Text, (229, 229, 231)),
+        ] {
+            let (r, g, b) = rgb;
+            assert_eq!(fg(&theme, token).fg, Some(Color::Rgb(r, g, b)), "{token:?}");
+        }
+        assert_eq!(bg(&theme, ThemeBg::StatusLineBg), Color::Rgb(15, 18, 22));
+        assert_eq!(bg(&theme, ThemeBg::CustomMessageBg), Color::Rgb(42, 48, 56));
     }
 
     /// A backend that keeps what it was given, so a test can read the bytes

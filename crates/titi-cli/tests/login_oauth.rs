@@ -62,7 +62,8 @@ impl LoginDriver for FakeLogin {
 }
 
 fn chat(agent_dir: &Path) -> Chat {
-    let mut chat = Chat::new("openai/gpt-4.1", "session-123");
+    let theme = titi_cli::app::default_theme().expect("a theme resolves");
+    let mut chat = Chat::new("openai/gpt-4.1", "session-123", theme);
     chat.set_agent_dir(agent_dir);
     chat
 }
