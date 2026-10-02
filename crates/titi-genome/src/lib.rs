@@ -43,7 +43,9 @@ pub struct FileRecord {
 
 /// A name exported by more than this many files is ambiguous under name-only
 /// resolution, so it carries neither edges nor a user count. One definition
-/// site means a mention can only mean that file.
+/// site means a mention that survived collection can only mean that file.
+/// A method call or a std-qualified path is not such a mention: `path.join`
+/// is not a use of the file that uniquely exports `join`.
 pub const MAX_DEFINERS: usize = 1;
 
 /// One symbol the workspace defines, and who leans on it.

@@ -262,6 +262,7 @@ const KEYWORDS: &[&str] = &[
     "yield",
     // Common standard-library and test identifiers that are never project symbols.
     "assert",
+    "env",
     "expect",
     "format",
     "get",
@@ -326,45 +327,141 @@ const UBIQUITOUS: &[&str] = &[
     "Weak",
 ];
 
-/// Distinct *usage sites* the file mentions: calls (`name(`), path-qualified
-/// names (`::name`, `.name`) and capitalized type or constructor names. Bare
-/// lowercase identifiers are deliberately not collected — a local variable
-/// named `path` is not a dependency on whatever file exports `path`, and
-/// collecting them made the graph count locals instead of symbols.
+/// Qualifiers that name a std or prelude type or module. `Path::join` is a
+/// method of `Path`, not a use of whatever file uniquely exports `join`.
+/// `hub::join` still counts: the qualifier is a project module.
+///
+/// `Path`, `PathBuf`, `Vec`, `Option`, `Result`, `String`, `HashMap` and
+/// `HashSet` are already in [`UBIQUITOUS`] and are qualifiers through that
+/// list. The names here are the std modules and types that are not themselves
+/// ubiquitous symbols, but must not qualify a project export either.
+const STD_QUALIFIERS: &[&str] = &[
+    "OsStr",
+    "OsString",
+    "char",
+    "iter",
+    "slice",
+    "str",
+    "thread",
+];
+
+fn is_std_qualifier(name: &str) -> bool {
+    STD_QUALIFIERS.contains(&name) || UBIQUITOUS.contains(&name)
+}
+
+/// Distinct *usage sites* the file mentions: bare calls (`name(`), path-qualified
+/// names whose qualifier is not std (`hub::join`), and capitalized type or
+/// constructor names.
+///
+/// A call preceded by `.` is a method call (`path.join(`). A path whose
+/// qualifier is std (`Path::join`) is the same collision. Neither is a use of
+/// whatever file uniquely exports that name — name-only resolution cannot tell
+/// them apart. Bare lowercase identifiers are not collected: a local named
+/// `path` is not a dependency on whatever file exports `path`.
 fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
-    static SITES: OnceLock<Vec<Regex>> = OnceLock::new();
-    let sites = SITES.get_or_init(|| {
-        vec![
-            // A call: `digest(`, `store::open(`, `self.foo(`. A bare field read
-            // (`.path`) is deliberately absent: it is a struct member, not a
-            // reference to whatever file exports a symbol of that name.
-            Regex::new(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\(").expect("call regex"),
-            // A path-qualified name.
-            Regex::new(r"::([A-Za-z_][A-Za-z0-9_]{2,})").expect("path regex"),
-            // A capitalized identifier: a type, enum variant or constructor.
-            Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").expect("type regex"),
-        ]
+    static CALL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\(").expect("call regex")
     });
+    static PATH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"::\s*([A-Za-z_][A-Za-z0-9_]{2,})").expect("path regex")
+    });
+    static TYPE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").expect("type regex"));
+
     let own: HashSet<&str> = exports.iter().map(String::as_str).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
-    for site in sites {
-        for cap in site.captures_iter(source) {
-            let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if own.contains(name)
-                || KEYWORDS.contains(&name)
-                || UBIQUITOUS.contains(&name)
-                || !seen.insert(name.to_owned())
-            {
-                continue;
-            }
-            out.push(name.to_owned());
-            if out.len() >= MAX_REFS {
-                return out;
-            }
+
+    for cap in CALL.captures_iter(source) {
+        let Some(matched) = cap.get(1) else {
+            continue;
+        };
+        // `path.join(` and `Path::join(` are not bare calls. The path pass
+        // decides the latter; a dot means a method and is never a use.
+        if preceded_by_dot(source, matched.start())
+            || preceded_by_path_sep(source, matched.start())
+        {
+            continue;
+        }
+        if record_ref(matched.as_str(), &own, &mut seen, &mut out) {
+            return out;
+        }
+    }
+    for cap in PATH.captures_iter(source) {
+        let Some(matched) = cap.get(1) else {
+            continue;
+        };
+        if qualifier_before(source, matched.start()).is_some_and(is_std_qualifier) {
+            continue;
+        }
+        if record_ref(matched.as_str(), &own, &mut seen, &mut out) {
+            return out;
+        }
+    }
+    for cap in TYPE.captures_iter(source) {
+        let Some(matched) = cap.get(1) else {
+            continue;
+        };
+        if record_ref(matched.as_str(), &own, &mut seen, &mut out) {
+            return out;
         }
     }
     out
+}
+
+fn record_ref(
+    name: &str,
+    own: &HashSet<&str>,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+) -> bool {
+    if own.contains(name)
+        || KEYWORDS.contains(&name)
+        || UBIQUITOUS.contains(&name)
+        || !seen.insert(name.to_owned())
+    {
+        return false;
+    }
+    out.push(name.to_owned());
+    out.len() >= MAX_REFS
+}
+
+fn skip_ascii_ws_before(source: &str, index: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = index;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+fn preceded_by_dot(source: &str, name_start: usize) -> bool {
+    let i = skip_ascii_ws_before(source, name_start);
+    i > 0 && source.as_bytes()[i - 1] == b'.'
+}
+
+fn preceded_by_path_sep(source: &str, name_start: usize) -> bool {
+    let i = skip_ascii_ws_before(source, name_start);
+    i >= 2 && source.as_bytes()[i - 2] == b':' && source.as_bytes()[i - 1] == b':'
+}
+
+/// Identifier immediately before `::name`, if the match is path-qualified.
+fn qualifier_before(source: &str, name_start: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    let mut i = skip_ascii_ws_before(source, name_start);
+    if i < 2 || bytes[i - 2] != b':' || bytes[i - 1] != b':' {
+        return None;
+    }
+    i = skip_ascii_ws_before(source, i - 2);
+    let end = i;
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    if i == end {
+        None
+    } else {
+        source.get(i..end)
+    }
 }
 
 /// Declaration regexes for languages whose imports are path-shaped.

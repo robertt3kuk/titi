@@ -294,10 +294,11 @@ fn a_unique_name_resolves_to_its_single_definition() {
     );
 }
 
-/// Declarations a line-anchored pattern could not see now carry edges — an
-/// indented Python method, a member of an exported TS class — and ones it
-/// saw but should not have (a block-commented function, a `def` inside a
-/// docstring) no longer become symbols.
+/// Nested declarations are real exports — an indented Python method, a member
+/// of an exported TS class — and text that only looks like a declaration (a
+/// block comment, a `def` inside a docstring) is not. A receiver call is not a
+/// use: name-only resolution cannot tell `store.reconcile_ledger()` from
+/// `path.join()`. A bare call of the same export still is.
 #[test]
 fn nested_declarations_become_symbols_and_quoted_ones_do_not() {
     let dir = tempfile::tempdir().unwrap();
@@ -315,6 +316,11 @@ fn nested_declarations_become_symbols_and_quoted_ones_do_not() {
     );
     write(
         root,
+        "app/direct.py",
+        "def run():\n    reconcile_ledger()\n",
+    );
+    write(
+        root,
         "web/client.ts",
         "export class Client {\n  dispatchEnvelope(body: string) {}\n}\n\
          /*\nexport function ghostHandler() {}\n*/\n",
@@ -324,14 +330,26 @@ fn nested_declarations_become_symbols_and_quoted_ones_do_not() {
         "web/page.ts",
         "export function open(c: any) { c.dispatchEnvelope(\"x\"); }\n",
     );
+    write(
+        root,
+        "web/direct.ts",
+        "export function open() { dispatchEnvelope(\"x\"); }\n",
+    );
 
     let genome = Genome::index(root).unwrap();
 
-    assert_eq!(genome.symbols["reconcile_ledger"].users, 1);
     assert_eq!(
         genome.symbols["reconcile_ledger"].files,
         vec!["app/service.py"]
     );
+    assert!(
+        !genome.files["app/caller.py"]
+            .used_symbols
+            .contains(&"reconcile_ledger".to_owned()),
+        "a method call is not a use: {:?}",
+        genome.files["app/caller.py"].used_symbols
+    );
+    assert_eq!(genome.symbols["reconcile_ledger"].users, 1);
     assert_eq!(genome.symbols["dispatchEnvelope"].users, 1);
     assert_eq!(genome.dependents["app/service.py"], 1);
     assert_eq!(genome.dependents["web/client.ts"], 1);
@@ -365,4 +383,81 @@ fn language_detection_covers_the_indexed_extensions() {
     ] {
         assert_eq!(Language::from_path(path), expected, "{path}");
     }
+}
+
+#[test]
+fn method_calls_and_std_paths_are_not_uses_of_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/hub.rs", "pub fn join() {}\n");
+    write(
+        root,
+        "src/caller.rs",
+        "pub fn run(path: &Path) {\n    \
+         let _ = path.join(\"x\");\n    \
+         let _ = Path::join(...);\n}\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(
+        genome.symbols["join"].users, 0,
+        "std-shaped mentions are not users"
+    );
+    assert!(
+        !genome.files["src/caller.rs"]
+            .used_symbols
+            .contains(&"join".to_owned()),
+        "used_symbols: {:?}",
+        genome.files["src/caller.rs"].used_symbols
+    );
+    assert_eq!(
+        genome.dependents["src/hub.rs"], 0,
+        "those mentions must not edge the caller to the exporter"
+    );
+}
+
+#[test]
+fn a_module_qualified_call_is_still_a_symbol_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/hub.rs", "pub fn join() {}\n");
+    write(
+        root,
+        "src/caller.rs",
+        "pub fn run() { let _ = hub::join(); }\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(genome.symbols["join"].users, 1);
+    assert!(
+        genome.files["src/caller.rs"]
+            .used_symbols
+            .contains(&"join".to_owned()),
+        "used_symbols: {:?}",
+        genome.files["src/caller.rs"].used_symbols
+    );
+    assert_eq!(genome.dependents["src/hub.rs"], 1);
+}
+
+#[test]
+fn a_unique_type_mention_still_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/fallback.rs", "pub struct FallbackChain;\n");
+    write(
+        root,
+        "src/caller.rs",
+        "pub fn run(chain: FallbackChain) {}\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(genome.symbols["FallbackChain"].users, 1);
+    assert!(
+        genome.files["src/caller.rs"]
+            .used_symbols
+            .contains(&"FallbackChain".to_owned()),
+        "used_symbols: {:?}",
+        genome.files["src/caller.rs"].used_symbols
+    );
+    assert_eq!(genome.dependents["src/fallback.rs"], 1);
 }
