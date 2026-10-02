@@ -52,8 +52,9 @@ One exception: check TUI changes by hand as well, in a real terminal with
 `tui-smoke`). A live model turn needs a provider key that the user sets with
 `titi --set-key`. Never ask for the key or handle it yourself.
 
-To map the code without compiling, run `titi-map <path> <N>` (skill
-`genome-map`).
+To map the code, run `cargo run -p titi-genome --example map -- <path> <N>`
+(skill `genome-map`); `~/bin/titi-map` is the optional prebuilt binary the
+skill documents, which may be older than the source.
 
 ## Code style
 
