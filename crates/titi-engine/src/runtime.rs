@@ -155,23 +155,57 @@ async fn genome_map(
     .await
 }
 
+/// The working-tree diff, off the async threads. Not a repo, no git, or a
+/// call that does not finish in time is no snapshot — the turn still runs.
+async fn working_tree_diff(root: Option<PathBuf>) -> Option<crate::difftrack::DiffSnapshot> {
+    let root = root?;
+    tokio::task::spawn_blocking(move || crate::difftrack::capture(&root))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// The turn's moving context, pinned to the message it was built for.
 ///
-/// Both blocks are rebuilt from scratch every turn. In the system prompt
+/// These blocks are rebuilt from scratch every turn. In the system prompt
 /// they sat in front of the entire conversation, so one re-ranked file cost
 /// the provider's cache every token behind them. Here they only ever
 /// precede the prompt they belong to, and they stay attached to it when it
 /// ages into history: everything the previous turn sent stays byte for byte
 /// where it was, which is the only thing a prefix cache asks for.
-fn prompt_with_context(prompt: &str, recalled: Option<&str>, genome: Option<&str>) -> SmolStr {
-    let mut parts = Vec::with_capacity(3);
-    parts.extend(recalled.filter(|block| !block.is_empty()));
-    parts.extend(genome.filter(|block| !block.is_empty()));
+///
+/// `diff` is the working-tree snapshot for this turn. Empty or absent, the
+/// bytes are what they were before the snapshot existed.
+fn prompt_with_context(
+    prompt: &str,
+    recalled: Option<&str>,
+    genome: Option<&str>,
+    diff: Option<&str>,
+) -> SmolStr {
+    let diff = diff.and_then(render_diff);
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    if let Some(block) = recalled.filter(|block| !block.is_empty()) {
+        parts.push(block);
+    }
+    if let Some(block) = genome.filter(|block| !block.is_empty()) {
+        parts.push(block);
+    }
+    if let Some(block) = diff.as_deref() {
+        parts.push(block);
+    }
     if parts.is_empty() {
         return prompt.into();
     }
     parts.push(prompt);
     parts.join("\n\n").into()
+}
+
+/// `<diff>` after the genome block. Whitespace-only text is not a snapshot.
+fn render_diff(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(format!("<diff>\n{}\n</diff>", text.trim_matches('\n')))
 }
 
 #[cfg(test)]
@@ -198,10 +232,63 @@ mod tests {
 
     #[test]
     fn the_volatile_blocks_sit_in_front_of_the_prompt() {
-        let built = prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"));
+        let built =
+            prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"), None);
         assert_eq!(built, "<recall/>\n\n<genome/>\n\nfix the parser");
-        assert_eq!(prompt_with_context("bare", None, None), "bare");
-        assert_eq!(prompt_with_context("bare", Some(""), None), "bare");
+        assert_eq!(prompt_with_context("bare", None, None, None), "bare");
+        assert_eq!(prompt_with_context("bare", Some(""), None, None), "bare");
+    }
+
+    #[test]
+    fn a_diff_block_follows_the_genome_and_is_absent_without_a_snapshot() {
+        let added = "+fn added_for_the_turn() {}";
+        let with = prompt_with_context(
+            "fix the parser",
+            Some("<recall/>"),
+            Some("<genome/>"),
+            Some(added),
+        );
+        assert!(with.contains("<diff>"), "{with}");
+        assert!(with.contains(added), "{with}");
+        assert!(with.contains("</diff>"), "{with}");
+        assert_eq!(
+            with.as_str(),
+            [
+                "<recall/>",
+                "<genome/>",
+                "<diff>\n+fn added_for_the_turn() {}\n</diff>",
+                "fix the parser",
+            ]
+            .join("\n\n")
+        );
+        let genome_at = with.find("<genome/>").expect("genome");
+        let diff_at = with.find("<diff>").expect("diff");
+        let prompt_at = with.find("fix the parser").expect("prompt");
+        assert!(genome_at < diff_at && diff_at < prompt_at, "{with}");
+
+        let without =
+            prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"), None);
+        assert_eq!(without, "<recall/>\n\n<genome/>\n\nfix the parser");
+        assert!(!without.contains("<diff>"), "{without}");
+        assert_eq!(
+            prompt_with_context(
+                "fix the parser",
+                Some("<recall/>"),
+                Some("<genome/>"),
+                Some(""),
+            ),
+            without
+        );
+        assert_eq!(
+            prompt_with_context(
+                "fix the parser",
+                Some("<recall/>"),
+                Some("<genome/>"),
+                Some(" \n"),
+            ),
+            without
+        );
+        assert_eq!(prompt_with_context("bare", None, None, None), "bare");
     }
 
     /// The reason the blocks moved out of the system prompt: what one turn
@@ -211,7 +298,7 @@ mod tests {
     #[test]
     fn a_turn_leaves_the_previous_turns_messages_untouched() {
         let system = SmolStr::new("identity, project rules, skills");
-        let first = prompt_with_context("first", Some("<recall v1/>"), Some("<genome v1/>"));
+        let first = prompt_with_context("first", Some("<recall v1/>"), Some("<genome v1/>"), None);
         let turn_one = vec![
             message(Role::System, &system),
             message(Role::User, &first),
@@ -219,7 +306,8 @@ mod tests {
         ];
 
         let history = visible_history(turn_one.clone(), Some(&system));
-        let second = prompt_with_context("second", Some("<recall v2/>"), Some("<genome v2/>"));
+        let second =
+            prompt_with_context("second", Some("<recall v2/>"), Some("<genome v2/>"), None);
         let mut turn_two = vec![message(Role::System, &system)];
         turn_two.extend(history);
         turn_two.push(message(Role::User, &second));
@@ -1211,9 +1299,9 @@ impl EngineRuntime {
     /// Everything here is static for the life of the session, and that is
     /// the point: this text sits in front of the whole conversation, so a
     /// single byte moving in it invalidates the provider's cache for every
-    /// token behind it. The two parts that are rebuilt every turn — the
-    /// recalled memory and the genome map — ride on the newest user message
-    /// instead (see [`prompt_with_context`]).
+    /// token behind it. The parts rebuilt every turn — recalled memory, the
+    /// genome map, and the working-tree diff — ride on the newest user
+    /// message instead (see [`prompt_with_context`]).
     ///
     /// A missing agent directory degrades to whatever is left rather than
     /// failing the turn. Project rules and skills are their own sections:
@@ -1702,20 +1790,34 @@ async fn run_turn(
     let mut previous_model: Option<SmolStr> = None;
     // Built once for the turn, in front of the prompt it belongs to. A
     // fallback model reuses it: rebuilding per attempt would send two
-    // different requests for one question.
+    // different requests for one question. The diff is captured first so
+    // its paths are in the touched set the map reads.
+    // Duck mode is repo-blind: a diff is the repository, the same way the
+    // map is. Plan mode still sees it — a plan about an edit needs the edit.
+    let snapshot = if config.mode == crate::protocol::SessionMode::Duck {
+        None
+    } else {
+        working_tree_diff(config.workspace_root.clone()).await
+    };
+    if let Some(snapshot) = &snapshot {
+        let mut edited = touched.lock().await;
+        for path in &snapshot.files {
+            edited.insert(path.clone());
+        }
+    }
+    let recalled = recalled_memory(config.agent_dir.clone(), &touched).await;
+    let genome = genome_map(
+        config.genome_root.clone(),
+        config.genome_limit,
+        &genome,
+        &touched,
+    )
+    .await;
     let contextual_prompt = prompt_with_context(
         &prompt,
-        recalled_memory(config.agent_dir.clone(), &touched)
-            .await
-            .as_deref(),
-        genome_map(
-            config.genome_root.clone(),
-            config.genome_limit,
-            &genome,
-            &touched,
-        )
-        .await
-        .as_deref(),
+        recalled.as_deref(),
+        genome.as_deref(),
+        snapshot.as_ref().map(|shot| shot.text.as_str()),
     );
 
     // Per turn, not per model: rounds a fallback leaves behind were paid for.

@@ -5,6 +5,7 @@ pub mod agents;
 pub mod claims;
 pub mod compaction;
 pub mod council;
+pub mod difftrack;
 pub mod findings;
 pub mod goal;
 pub mod judgment;
