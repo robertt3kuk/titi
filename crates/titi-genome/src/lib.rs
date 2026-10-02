@@ -6,7 +6,8 @@
 //! the same `(→N)` dependent count, so "what depends on this" answers in
 //! symbol terms instead of only file terms.
 //!
-//! Spec: `docs/research/reference-product-port/README.md` (E3).
+//! The research note that used to specify this graph is gone; the paragraphs
+//! above are the description.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

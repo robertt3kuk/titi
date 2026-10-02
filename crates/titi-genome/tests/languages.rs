@@ -1,6 +1,6 @@
 //! E3: language coverage and the symbol-level graph.
 //!
-//! Spec: `docs/research/reference-product-port/README.md` (E3).
+//! The research note that used to specify this coverage is gone.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
