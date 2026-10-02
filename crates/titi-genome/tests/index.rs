@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use titi_genome::Genome;
 
@@ -397,4 +398,37 @@ fn angle_bracket_names_cannot_forge_the_frame() {
         "an angle-bracket name must not reach the frame: {projected}"
     );
     assert_eq!(projected.matches("</genome>").count(), 1, "{projected}");
+}
+
+#[test]
+fn a_recently_modified_file_is_marked_recent_not_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/live.rs", "pub fn live() {}\n");
+    write(root, "src/stale.rs", "pub fn stale() {}\n");
+    let stale_at = SystemTime::now()
+        .checked_sub(Duration::from_secs(49 * 3600))
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(root.join("src/stale.rs"))
+        .unwrap()
+        .set_modified(stale_at)
+        .unwrap();
+
+    let genome = Genome::index(root).unwrap();
+    let projected = genome.project(4);
+    assert!(
+        projected.contains("src/live.rs:(→0) [RECENT]"),
+        "{projected}"
+    );
+    assert!(projected.contains("src/stale.rs:(→0)\n"), "{projected}");
+    assert!(
+        !projected.contains("[NEW]"),
+        "the marker means recently modified, not newly created: {projected}"
+    );
+    assert!(
+        !projected.contains("src/stale.rs:(→0) [RECENT]"),
+        "a file older than 48h is not recent: {projected}"
+    );
 }

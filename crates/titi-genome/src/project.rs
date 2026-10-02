@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use crate::Genome;
 
+/// Files modified within this window are marked `[RECENT]`. That means
+/// recently modified, not newly created.
 const NEW_WINDOW: Duration = Duration::from_secs(48 * 3600);
 
 /// Multiplier applied to files the session just edited or read, so the map
@@ -36,7 +38,7 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>) -> Strin
     for (path, _) in ranked {
         let file = &genome.files[path];
         let dependents = genome.dependents.get(&file.path).copied().unwrap_or(0);
-        let new = file
+        let recent = file
             .mtime
             .elapsed()
             .ok()
@@ -45,8 +47,8 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>) -> Strin
         out.push_str(":(→");
         out.push_str(&dependents.to_string());
         out.push(')');
-        if new {
-            out.push_str(" [NEW]");
+        if recent {
+            out.push_str(" [RECENT]");
         }
         out.push('\n');
         // `+Name (users)` — how many files lean on that symbol. That is the
