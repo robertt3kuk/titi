@@ -97,21 +97,25 @@ Before each turn the index is refreshed and rendered with
 src/lib.rs:(→12)
   +Genome (9)
   +render (4)
-src/runtime.rs:(→3) [NEW]
+src/runtime.rs:(→3) [RECENT]
   +EngineRuntime (7)
 </genome>
 ```
 
 - `(→N)` — files that depend on this one (file and symbol edges).
-- `[NEW]` — mtime within `NEW_WINDOW = 48 * 3600` seconds.
-- `+Name (users)` — up to 8 exports per file, sorted by user count: the
-  symbol-level blast radius next to the file-level `(→N)`.
+- `[RECENT]` — recently modified: mtime within `NEW_WINDOW = 48 * 3600`
+  seconds, which is not the same as newly created.
+- `+Name (users)` — up to 4 exports per file, sorted by user count, and an
+  export nobody uses is omitted: the symbol-level blast radius next to the
+  file-level `(→N)`.
 - Files the session read or edited get `TOUCHED_BOOST = 3.0`, so the map
   follows the work. An unknown touched path does not change the order
   (tested).
 - Paths containing `<` or `>` are dropped, so a file name cannot forge the
   closing tag — prompt-injection hygiene.
-- File limit: `EngineConfig::genome_limit`, default 24.
+- File limit: `EngineConfig::genome_limit`, default 24, overridden by the
+  `genome.limit` setting (1..=64, the project `.titi/config.yml` winning);
+  `TITI_NO_GENOME=1` drops the map.
 
 **Why it matters:** on the first turn the model already sees the core files
 ranked, how risky each is to touch, which symbols have real reach, and

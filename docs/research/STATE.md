@@ -8,6 +8,19 @@
 
 Обновляется после каждого шага. Новая сессия начинает отсюда.
 
+## Карта репозитория (Genome): маркер, счётчик и лимит (2026-10-02, отлендилось)
+
+Восемь коммитов по карте в промпте, по одному на правку:
+
+- `ae1aa96` fix(genome): ignore method calls when counting symbol uses — вызовы методов и std-квалифицированные пути больше не считаются использованием символа: `path.join` и `Path::join` — не использование уникального `join`, а `hub::join` — по-прежнему использование;
+- `9437b5d` fix(genome): mark recently modified files as recent — маркер `[RECENT]` вместо `[NEW]`: «недавно изменён», а не «недавно создан», окно те же 48 часов (`NEW_WINDOW`, `crates/titi-genome/src/project.rs:6`);
+- `ba6343b` fix(genome): drop unused exports from the prompt map — в промпте не больше четырёх экспортов на файл (`PROMPT_EXPORTS`), экспорт с нулём пользователей не показывается, ранжирование файлов не изменилось;
+- `5038c0f` feat(cli): read genome.limit from settings — лимит файлов из настройки `genome.limit` (1..=64, умолчание 24, проектный `.titi/config.yml` побеждает);
+- `05548f8` docs(cli): document genome.limit and TITI_NO_GENOME — `--help` называет и настройку, и переменную;
+- `e253ffa` docs(genome): drop the citation of a missing spec, `5829ada` style(genome): rustfmt the symbol filter, `da47710` docs(agents): point genome mapping at the crate example — доки и стиль.
+
+Измерения в [prompt-cache.md](prompt-cache.md) сняты, когда маркер назывался `[NEW]`; строка маркера теперь `[RECENT]`, окно не менялось, поэтому тиканье осталось. `docs/ARCHITECTURE.md` описывает карту уже с `[RECENT]`, четырьмя экспортами и `genome.limit`.
+
 ## OAuth-вход в провайдера (2026-09-28, живой вход Codex пройден)
 
 Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забраны дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция); порт — таблица констант Rust и свой поток поверх неё.
