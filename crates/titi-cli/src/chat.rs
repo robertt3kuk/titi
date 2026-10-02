@@ -1275,6 +1275,7 @@ impl Chat {
             "council" => self.council(args),
             "graph" => self.graph(args),
             "memory" => self.memory(args),
+            "genome" => self.genome(args),
             "usage" => self.usage(),
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
@@ -1361,6 +1362,78 @@ impl Chat {
                 Applied::none()
             }
         }
+    }
+    fn genome(&mut self, args: &str) -> Applied {
+        // The same effective view the engine reads, so a note cannot disagree
+        // with what a run would do: project `.titi/config.yml` wins.
+        let workspace = crate::app::current_workspace();
+        let settings = match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[])
+        {
+            Ok(settings) => Some(settings),
+            Err(reason) => {
+                // A broken config is one error line, not a panic; the note
+                // about the switch still states what the load could salvage.
+                self.push(
+                    LineKind::Error,
+                    format!("genome: config load said: {reason}"),
+                );
+                None
+            }
+        };
+
+        let (bound, rest) = match args.split_once(char::is_whitespace) {
+            Some((cmd, rest)) => (cmd, rest.trim()),
+            None => (args, ""),
+        };
+        match bound {
+            "" => {
+                self.push(
+                    LineKind::Note,
+                    crate::engine::genome_note(&settings, &self.agent_dir),
+                );
+            }
+            "on" | "off" => {
+                let enabled = bound == "on";
+                match genome_set_enabled(settings, enabled) {
+                    // The refreshed view is what a later status reads, so the
+                    // note is the file's own word, not the input echoed back.
+                    Ok(saved) => self.push(
+                        LineKind::Note,
+                        if saved { "genome: on" } else { "genome: off" }.to_owned(),
+                    ),
+                    Err(why) => self.push(LineKind::Error, format!("genome: not saved ({why})")),
+                };
+            }
+            "limit" => match rest.parse::<i64>() {
+                // Out of range or not an integer is refused before anything
+                // is written, so a typo cannot seed `genome.limit` with a
+                // value every later run has to ignore.
+                Ok(n) if (1..=64).contains(&n) => match genome_set_limit(settings, n) {
+                    Ok(()) => self.push(LineKind::Note, format!("genome limit: {n}")),
+                    Err(why) => self.push(LineKind::Error, format!("genome: not saved ({why})")),
+                },
+                _ => {
+                    self.push(
+                        LineKind::Error,
+                        "genome limit: expected an integer from 1 to 64".to_owned(),
+                    );
+                }
+            },
+            "check" | "lsp" => {
+                self.push(
+                    LineKind::Note,
+                    "genome: check and lsp are not wired in this build".to_owned(),
+                );
+            }
+            name => {
+                self.push(LineKind::Error, format!("genome: unknown command {name}"));
+                self.push(
+                    LineKind::Error,
+                    "usage: titi genome [on|off|limit <n>|check|lsp]".to_owned(),
+                );
+            }
+        }
+        Applied::none()
     }
     fn fork(&mut self) -> Applied {
         self.session_note(crate::app::fork_session(&self.agent_dir, &self.session_id))
@@ -3362,6 +3435,10 @@ const COMMANDS: &[Command] = &[
         about: "list, search, or forget memories",
     },
     Command {
+        name: "genome",
+        about: "manage the prompt map: on, off, or limit",
+    },
+    Command {
         name: "advisor",
         about: "a toolless second opinion on this conversation",
     },
@@ -4226,6 +4303,36 @@ fn panel_window(len: usize, selected: usize, room: usize) -> PanelWindow {
         }
         room -= 1;
     }
+}
+
+/// Writes `genome.enabled` on the chat's own view: the canonical agent file,
+/// never the project's `.titi`, which this API cannot write.
+fn genome_set_enabled(
+    settings: Option<titi_config::settings::Settings>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let mut settings = settings.ok_or_else(|| "config could not be loaded".to_owned())?;
+    settings
+        .set(
+            titi_config::settings::GENOME_ENABLED_KEY,
+            serde_json::json!(enabled),
+        )
+        .map_err(|why| why.to_string())?;
+    Ok(enabled)
+}
+
+/// Writes `genome.limit` after the range check, on the same canonical file.
+fn genome_set_limit(
+    settings: Option<titi_config::settings::Settings>,
+    limit: i64,
+) -> Result<(), String> {
+    let mut settings = settings.ok_or_else(|| "config could not be loaded".to_owned())?;
+    settings
+        .set(
+            titi_config::settings::GENOME_LIMIT_KEY,
+            serde_json::json!(limit),
+        )
+        .map_err(|why| why.to_string())
 }
 
 /// One window of `room` rows around `selected`, before the `… N more` lines
@@ -12469,6 +12576,127 @@ mod tests {
             chat.lines
                 .iter()
                 .any(|line| line.text.contains("no such role @unknown"))
+        );
+    }
+
+    /// `/genome off` writes a false `genome.enabled` on the agent's own
+    /// config, and a following `/genome` note reads its own file back: the
+    /// note is the file's word, not the input echoed.
+    #[test]
+    fn genome_off_persists_and_the_next_note_reads_it_back() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/genome off");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(chat.lines.iter().any(|line| line.text == "genome: off"));
+        let config = std::fs::read_to_string(chat.agent_dir.join("config.yml")).unwrap();
+        assert_eq!(config, "genome:\n  enabled: false\n");
+
+        chat.lines.clear();
+        type_text(&mut chat, "/genome");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        let note = chat
+            .lines
+            .iter()
+            .find(|line| line.text.contains("genome: off"))
+            .expect("the status note names the off state");
+        assert!(note.text.contains("reason: setting"), "{}", note.text);
+        assert!(note.text.contains("limit: 24"), "{}", note.text);
+    }
+
+    /// An in-range `/genome limit` persists on its own key and the note
+    /// reports it; the limit is not coupled to the enabled state.
+    #[test]
+    fn genome_limit_persists_and_is_reported() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/genome limit 4");
+        chat.on_key(Key::Enter, Instant::now());
+        let config = std::fs::read_to_string(chat.agent_dir.join("config.yml")).unwrap();
+        assert!(config.contains("limit: 4"), "{config}");
+        assert!(!config.contains("enabled"), "{config}");
+
+        chat.lines.clear();
+        type_text(&mut chat, "/genome");
+        chat.on_key(Key::Enter, Instant::now());
+        let note = chat
+            .lines
+            .iter()
+            .find(|line| line.text.contains("limit: 4"))
+            .expect("the note states the saved cap");
+        assert!(note.text.contains("genome: on"), "{}", note.text);
+    }
+
+    /// An out-of-range `/genome limit` writes nothing and says the range.
+    #[test]
+    fn genome_limit_out_of_range_is_refused_without_a_write() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/genome limit 0");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(
+            !chat.agent_dir.join("config.yml").exists(),
+            "nothing was written"
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "genome limit: expected an integer from 1 to 64")
+        );
+    }
+
+    /// `check` and `lsp` are named as verbs this build does not wire; the
+    /// chat never pretends to run a server.
+    #[test]
+    fn genome_check_and_lsp_say_they_are_not_wired() {
+        for verb in ["check", "lsp"] {
+            let dir = tempfile::tempdir().expect("temp");
+            let mut chat = chat();
+            chat.agent_dir = dir.path().to_path_buf();
+            std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+            type_text(&mut chat, &format!("/genome {verb}"));
+            chat.on_key(Key::Enter, Instant::now());
+            assert!(
+                chat.lines
+                    .iter()
+                    .any(|line| line.text == "genome: check and lsp are not wired in this build"),
+                "verb {verb}: {:?}",
+                chat.lines
+            );
+        }
+    }
+
+    /// An unknown `/genome` word names itself and shows the usage line.
+    #[test]
+    fn genome_unknown_subcommand_shows_usage() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/genome wat");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "genome: unknown command wat")
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "usage: titi genome [on|off|limit <n>|check|lsp]")
         );
     }
 

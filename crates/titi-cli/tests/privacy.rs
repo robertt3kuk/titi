@@ -116,3 +116,75 @@ fn genome_limit_out_of_range_or_not_integer_keeps_default() {
         assert_eq!(genome_limit_from(&settings), 24, "for {raw:?}");
     }
 }
+
+#[test]
+fn genome_enabled_from_missing_key() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(titi_cli::engine::genome_enabled_from(&settings));
+}
+
+#[test]
+fn genome_enabled_from_bool_true() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &agent.path().join("config.yml"),
+        "genome:\n  enabled: true\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(titi_cli::engine::genome_enabled_from(&settings));
+}
+
+#[test]
+fn genome_enabled_from_bool_false() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &agent.path().join("config.yml"),
+        "genome:\n  enabled: false\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+}
+
+#[test]
+fn genome_enabled_from_string_off() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &agent.path().join("config.yml"),
+        "genome:\n  enabled: \"off\"\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+}
+
+#[test]
+fn genome_enabled_from_string_maybe() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &agent.path().join("config.yml"),
+        "genome:\n  enabled: \"maybe\"\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(titi_cli::engine::genome_enabled_from(&settings));
+}
+
+#[test]
+fn genome_enabled_project_overrides_global() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(
+        &agent.path().join("config.yml"),
+        "genome:\n  enabled: true\n",
+    );
+    write(
+        &project.path().join(PROJECT_SUBPATH),
+        "genome:\n  enabled: false\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+}

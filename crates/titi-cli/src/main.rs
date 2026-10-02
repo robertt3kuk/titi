@@ -27,10 +27,19 @@ usage: titi [options]
   --device                    with --login: use the device code, no callback server
   --help, -h                  this text
 
+  titi genome [on|off|limit <n>|check|lsp]
+                              manage the prompt map build: on, off, or a file cap
+                              (default: on, cap is 24; setting wins over default,
+                              TITI_NO_GENOME=1 forces off for one run)
+
 genome.limit in the agent config.yml or the project .titi/config.yml
 (project wins) caps the map: an integer from 1 to 64; unset keeps 24,
 out of range or not an integer keeps 24. TITI_NO_GENOME=1 omits the
 map for one run without touching the limit.
+
+genome.enabled in the agent config.yml or project .titi/config.yml
+(project wins) turns the prompt map on or off; unset means on,
+TITI_NO_GENOME=1 forces off for one run without touching this setting.
 
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. y / n answers a write or a shell prompt.
@@ -42,6 +51,17 @@ move, enter picks, tab fills, esc closes.
 ";
 
 fn main() -> io::Result<()> {
+    // `titi genome` never reaches the engine and never needs a model key, so
+    // it is short-circuited before the flag loop touched it or could mistake
+    // its subcommands for positionals.
+    if titi_cli::genome_cmd::run(
+        &titi_config::agent_dir(),
+        &titi_cli::app::current_workspace(),
+    )
+    .is_some()
+    {
+        return Ok(());
+    }
     let mut headless = false;
     let mut prompt: Option<String> = None;
     let mut goal: Option<String> = None;

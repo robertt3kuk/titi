@@ -510,6 +510,65 @@ pub fn genome_limit_from(settings: &titi_config::settings::Settings) -> usize {
         .map_or(24, |limit| limit as usize)
 }
 
+/// Whether the genome prompt map is enabled from settings; `genome.enabled` as a boolean.
+///
+/// Missing key → true (default on). JSON bool true/false → that. String `on`/`true`/`yes` →
+/// true, `off`/`false`/`no` → false (ascii case-insensitive). Anything else (number, array,
+/// `maybe`) → true (do not refuse startup). The `TITI_NO_GENOME` env var is handled separately,
+/// at engine startup, and takes precedence over this setting.
+pub fn genome_enabled_from(settings: &titi_config::settings::Settings) -> bool {
+    match settings.get(titi_config::settings::GENOME_ENABLED_KEY) {
+        None => true, // unset means on
+        Some(value) => {
+            if let Some(b) = value.as_bool() {
+                b
+            } else if let Some(s) = value.as_str() {
+                let lower = s.to_ascii_lowercase();
+                match lower.as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    _ => true, // anything else defaults to on
+                }
+            } else {
+                true // numbers, arrays, etc. default to on
+            }
+        }
+    }
+}
+
+/// The status note `/genome` prints: the four facts as plain lines.
+///
+/// One formatter is shared by the chat and `titi genome`, so a note cannot
+/// disagree with what the terminal command prints for the same directory.
+/// `reason` is about the *key*: a fresh directory that loads fine reads
+/// `default`, and the env switch says so ahead of everything else.
+pub fn genome_note(
+    settings: &Option<titi_config::settings::Settings>,
+    agent_dir: &std::path::Path,
+) -> String {
+    let enabled = settings.as_ref().is_none_or(genome_enabled_from);
+    let key_set = settings
+        .as_ref()
+        .and_then(|s| s.resolve_source(titi_config::settings::GENOME_ENABLED_KEY))
+        .is_some();
+    let (state, reason) = if std::env::var_os("TITI_NO_GENOME").is_some() {
+        ("off", "TITI_NO_GENOME")
+    } else if key_set {
+        if enabled {
+            ("on", "setting")
+        } else {
+            ("off", "setting")
+        }
+    } else {
+        ("on", "default")
+    };
+    let limit = settings.as_ref().map(genome_limit_from).unwrap_or(24);
+    format!(
+        "genome: {state}\nreason: {reason}\nlimit: {limit}\nconfig: {}",
+        agent_dir.join("config.yml").display()
+    )
+}
+
 pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "always-ask" | "ask" => Ok(ApprovalMode::AlwaysAsk),
@@ -591,7 +650,12 @@ pub fn start_engine_with(
     }
     engine_config.fallback_models = models.iter().skip(1).map(|id| id.clone().into()).collect();
     let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    if std::env::var_os("TITI_NO_GENOME").is_none() {
+    // Load settings early so genome.enabled can be checked.
+    let agent_dir = titi_config::agent_dir();
+    let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
+    // Clear genome_root if TITI_NO_GENOME env is set or genome.enabled is false.
+    let genome_enabled = settings.as_ref().map_or(true, genome_enabled_from);
+    if std::env::var_os("TITI_NO_GENOME").is_none() && genome_enabled {
         engine_config.genome_root = Some(workspace.clone());
     }
     // A subagent runs the same tool loop as the main turn, in the workspace,
@@ -605,8 +669,6 @@ pub fn start_engine_with(
     // builds a ToolAgentRunner and hands it its own claims, touched set and
     // read cache. Passing a StreamingAgentRunner here would take its place and
     // leave the subagent unable to call a single tool.
-    let agent_dir = titi_config::agent_dir();
-    let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
     // A config that fails to load keeps the strict defaults.
     let (sensitive, mask_ips) = settings
         .as_ref()

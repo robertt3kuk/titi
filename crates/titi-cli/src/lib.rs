@@ -2,6 +2,7 @@ pub mod app;
 pub mod chat;
 pub mod engine;
 pub mod first_frame;
+pub mod genome_cmd;
 pub mod git_checkpoint;
 pub mod headless;
 pub mod herdr;
