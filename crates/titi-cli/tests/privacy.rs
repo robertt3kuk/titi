@@ -1,10 +1,13 @@
 //! Privacy settings: the user's config decides, a project can only tighten.
+//!
+//! `genome.limit` shares the same load path: an out-of-range or non-integer
+//! value keeps the engine default instead of failing startup.
 
 #![allow(clippy::unwrap_used)]
 
 use std::path::Path;
 
-use titi_cli::engine::privacy_policy;
+use titi_cli::engine::{genome_limit_from, privacy_policy};
 use titi_config::settings::{PROJECT_SUBPATH, Settings};
 
 fn write(path: &Path, text: &str) {
@@ -67,4 +70,49 @@ fn the_user_can_loosen_their_own_privacy() {
     assert!(!mask_ips);
     assert!(!policy.blocks(Path::new(".env.test")));
     assert!(policy.blocks(Path::new(".env")));
+}
+
+#[test]
+fn genome_limit_read_from_settings() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(&agent.path().join("config.yml"), "genome:\n  limit: 4\n");
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert_eq!(genome_limit_from(&settings), 4);
+}
+
+#[test]
+fn a_project_can_set_its_own_genome_limit() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(&agent.path().join("config.yml"), "genome:\n  limit: 4\n");
+    write(
+        &project.path().join(PROJECT_SUBPATH),
+        "genome:\n  limit: 8\n",
+    );
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert_eq!(genome_limit_from(&settings), 8);
+}
+
+#[test]
+fn genome_limit_missing_keeps_default() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert_eq!(genome_limit_from(&settings), 24);
+}
+
+#[test]
+fn genome_limit_out_of_range_or_not_integer_keeps_default() {
+    for raw in [
+        "genome:\n  limit: 0\n",
+        "genome:\n  limit: 65\n",
+        "genome:\n  limit: no\n",
+    ] {
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write(&agent.path().join("config.yml"), raw);
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert_eq!(genome_limit_from(&settings), 24, "for {raw:?}");
+    }
 }

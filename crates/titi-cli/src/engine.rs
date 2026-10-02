@@ -485,6 +485,21 @@ pub fn privacy_policy(settings: &titi_config::settings::Settings) -> (SensitiveP
     (SensitivePolicy::new(extra, allow), mask_ips)
 }
 
+/// Genome prompt-map cap from settings; `genome.limit` as a plain integer.
+///
+/// Read through the effective view, so a project's `.titi/config.yml` may set
+/// it: unlike privacy and approval, the cap is not a latch a cloned repo must
+/// not loosen. Anything but an integer in 1..=64 — missing key, failed load,
+/// wrong type, out of range — keeps the engine default: a bad cap must not
+/// stop startup.
+pub fn genome_limit_from(settings: &titi_config::settings::Settings) -> usize {
+    settings
+        .get(titi_config::settings::GENOME_LIMIT_KEY)
+        .and_then(|value| value.as_i64())
+        .filter(|limit| (1..=64).contains(limit))
+        .map_or(24, |limit| limit as usize)
+}
+
 pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "always-ask" | "ask" => Ok(ApprovalMode::AlwaysAsk),
@@ -589,6 +604,9 @@ pub fn start_engine_with(
         .unwrap_or_else(|| (SensitivePolicy::default(), true));
     engine_config.sensitive = sensitive.clone();
     engine_config.mask_ips = mask_ips;
+    if let Some(settings) = &settings {
+        engine_config.genome_limit = genome_limit_from(settings);
+    }
     let mut tools = ToolRegistry::new();
     // One cache for the main turn and every subagent it spawns.
     let read_cache = titi_tools::ReadCache::default();

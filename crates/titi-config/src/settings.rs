@@ -76,6 +76,13 @@ pub const THEME_DARK_KEY: &str = "theme.dark";
 /// The theme the user chose for a light terminal. See [`THEME_DARK_KEY`].
 pub const THEME_LIGHT_KEY: &str = "theme.light";
 
+/// How many files the genome prompt map keeps.
+///
+/// Unset means the engine default (`EngineConfig::new` picks it, currently 24).
+/// This crate does not own that number — the constant is a key name, not a
+/// second source of the default, so it deliberately carries no value.
+pub const GENOME_LIMIT_KEY: &str = "genome.limit";
+
 impl Settings {
     /// Discover and load all layers.
     ///
