@@ -7,6 +7,10 @@ use crate::Genome;
 /// recently modified, not newly created.
 const NEW_WINDOW: Duration = Duration::from_secs(48 * 3600);
 
+/// Symbol lines shown under one file in the prompt map. File ranking is
+/// untouched. An export nobody uses is omitted: a zero is not a blast radius.
+const PROMPT_EXPORTS: usize = 4;
+
 /// Multiplier applied to files the session just edited or read, so the map
 /// follows the work instead of the static graph alone.
 const TOUCHED_BOOST: f64 = 3.0;
@@ -51,23 +55,23 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>) -> Strin
             out.push_str(" [RECENT]");
         }
         out.push('\n');
-        // `+Name (users)` — how many files lean on that symbol. That is the
-        // symbol-level blast radius, next to the file-level `(→N)`.
-        let mut exports: Vec<&String> = file.exports.iter().collect();
-        exports.sort_by(|a, b| {
-            let ua = genome.symbols.get(*a).map_or(0, |s| s.users);
-            let ub = genome.symbols.get(*b).map_or(0, |s| s.users);
-            ub.cmp(&ua).then_with(|| a.cmp(b))
-        });
-        for name in exports.into_iter().take(8) {
-            let users = genome.symbols.get(name).map_or(0, |s| s.users);
+        // `+Name (users)` — files that lean on that symbol, highest first.
+        // Unused exports are omitted, and at most four are shown.
+        let mut ranked_exports: Vec<(&String, usize)> = file
+            .exports
+            .iter()
+            .filter_map(|name| {
+                let users = genome.symbols.get(name).map_or(0, |s| s.users);
+                (users > 0).then_some((name, users))
+            })
+            .collect();
+        ranked_exports.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (name, users) in ranked_exports.into_iter().take(PROMPT_EXPORTS) {
             out.push_str("  +");
             out.push_str(name);
-            if users > 0 {
-                out.push_str(" (");
-                out.push_str(&users.to_string());
-                out.push(')');
-            }
+            out.push_str(" (");
+            out.push_str(&users.to_string());
+            out.push(')');
             out.push('\n');
         }
     }

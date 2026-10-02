@@ -249,11 +249,61 @@ fn the_projection_carries_symbol_user_counts() {
         "the symbol's user count must reach the map:\n{projected}"
     );
     assert!(
-        projected.contains("+rarely_seen\n"),
-        "an unused symbol carries no count:\n{projected}"
+        !projected.contains("rarely_seen"),
+        "an unused export is absent from the prompt map:\n{projected}"
     );
     // `digest` is referenced by two files, so hub.rs is depended on by both.
     assert_eq!(genome.dependents["src/hub.rs"], 2);
+}
+
+#[test]
+fn the_prompt_map_omits_unused_exports_and_caps_symbols() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/hub.rs",
+        "pub fn alpha() {}\n\
+         pub fn beta() {}\n\
+         pub fn gamma() {}\n\
+         pub fn delta() {}\n\
+         pub fn epsilon() {}\n\
+         pub fn unused_export() {}\n",
+    );
+    write(
+        root,
+        "src/a.rs",
+        "pub fn a() { alpha(); beta(); gamma(); delta(); epsilon(); }\n",
+    );
+    write(
+        root,
+        "src/b.rs",
+        "pub fn b() { alpha(); beta(); gamma(); delta(); }\n",
+    );
+    write(root, "src/c.rs", "pub fn c() { alpha(); beta(); gamma(); }\n");
+    write(root, "src/d.rs", "pub fn d() { alpha(); beta(); }\n");
+    write(root, "src/e.rs", "pub fn e() { alpha(); }\n");
+
+    let genome = Genome::index(root).unwrap();
+    let projected = genome.project(8);
+    let symbols: Vec<&str> = projected
+        .lines()
+        .skip_while(|line| !line.starts_with("src/hub.rs"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  +"))
+        .collect();
+    assert_eq!(
+        symbols,
+        [
+            "  +alpha (5)",
+            "  +beta (4)",
+            "  +gamma (3)",
+            "  +delta (2)",
+        ],
+        "{projected}"
+    );
+    assert!(!projected.contains("epsilon"), "{projected}");
+    assert!(!projected.contains("unused_export"), "{projected}");
 }
 
 #[test]
