@@ -27,6 +27,11 @@ usage: titi [options]
   --device                    with --login: use the device code, no callback server
   --help, -h                  this text
 
+genome.limit in the agent config.yml or the project .titi/config.yml
+(project wins) caps the map: an integer from 1 to 64; unset keeps 24,
+out of range or not an integer keeps 24. TITI_NO_GENOME=1 omits the
+map for one run without touching the limit.
+
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. y / n answers a write or a shell prompt.
 /model switches to the next model that has a key. Bare /login opens a picker

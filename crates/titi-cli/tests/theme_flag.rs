@@ -47,3 +47,16 @@ fn help_documents_the_theme_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--theme <name>"), "{stdout}");
 }
+
+/// `--help` names the genome cap and the off switch, so they are
+/// discoverable without reading the code.
+#[test]
+fn help_documents_genome_settings() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_titi"))
+        .arg("--help")
+        .output()
+        .expect("the binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("genome.limit"), "{stdout}");
+    assert!(stdout.contains("TITI_NO_GENOME=1"), "{stdout}");
+}
