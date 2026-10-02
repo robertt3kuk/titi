@@ -336,13 +336,7 @@ const UBIQUITOUS: &[&str] = &[
 /// list. The names here are the std modules and types that are not themselves
 /// ubiquitous symbols, but must not qualify a project export either.
 const STD_QUALIFIERS: &[&str] = &[
-    "OsStr",
-    "OsString",
-    "char",
-    "iter",
-    "slice",
-    "str",
-    "thread",
+    "OsStr", "OsString", "char", "iter", "slice", "str", "thread",
 ];
 
 fn is_std_qualifier(name: &str) -> bool {
@@ -359,12 +353,10 @@ fn is_std_qualifier(name: &str) -> bool {
 /// them apart. Bare lowercase identifiers are not collected: a local named
 /// `path` is not a dependency on whatever file exports `path`.
 fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
-    static CALL: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\(").expect("call regex")
-    });
-    static PATH: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"::\s*([A-Za-z_][A-Za-z0-9_]{2,})").expect("path regex")
-    });
+    static CALL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\(").expect("call regex"));
+    static PATH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"::\s*([A-Za-z_][A-Za-z0-9_]{2,})").expect("path regex"));
     static TYPE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").expect("type regex"));
 
@@ -378,8 +370,7 @@ fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
         };
         // `path.join(` and `Path::join(` are not bare calls. The path pass
         // decides the latter; a dot means a method and is never a use.
-        if preceded_by_dot(source, matched.start())
-            || preceded_by_path_sep(source, matched.start())
+        if preceded_by_dot(source, matched.start()) || preceded_by_path_sep(source, matched.start())
         {
             continue;
         }
@@ -457,11 +448,7 @@ fn qualifier_before(source: &str, name_start: usize) -> Option<&str> {
     while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
         i -= 1;
     }
-    if i == end {
-        None
-    } else {
-        source.get(i..end)
-    }
+    if i == end { None } else { source.get(i..end) }
 }
 
 /// Declaration regexes for languages whose imports are path-shaped.

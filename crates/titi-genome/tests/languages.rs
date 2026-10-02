@@ -280,7 +280,11 @@ fn the_prompt_map_omits_unused_exports_and_caps_symbols() {
         "src/b.rs",
         "pub fn b() { alpha(); beta(); gamma(); delta(); }\n",
     );
-    write(root, "src/c.rs", "pub fn c() { alpha(); beta(); gamma(); }\n");
+    write(
+        root,
+        "src/c.rs",
+        "pub fn c() { alpha(); beta(); gamma(); }\n",
+    );
     write(root, "src/d.rs", "pub fn d() { alpha(); beta(); }\n");
     write(root, "src/e.rs", "pub fn e() { alpha(); }\n");
 
