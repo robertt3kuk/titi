@@ -34,9 +34,10 @@ map for one run without touching the limit.
 
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. y / n answers a write or a shell prompt.
-/model switches to the next model that has a key. Bare /login opens a picker
-of the subscriptions you can sign in to; /login <provider> [key|device] goes
-straight to one. A / at the start of the line lists commands; up and down
+Bare /model (or alt+m) opens a picker of the models by provider, and typing
+filters it; /model <name> switches straight to one. Ctrl+X switches
+sessions. Bare /login opens a picker of the subscriptions you can sign in
+to; /login <provider> [key|device] goes straight to one. A / at the start of the line lists commands; up and down
 move, enter picks, tab fills, esc closes.
 ";
 
