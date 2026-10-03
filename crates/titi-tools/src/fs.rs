@@ -814,7 +814,8 @@ impl ToolHandler for GrepTool {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Directory to search. Default: the workspace."
+                            "description": "File or directory to search. \
+                                            Default: the workspace."
                         },
                         "glob": {
                             "type": "string",
@@ -869,16 +870,31 @@ impl ToolHandler for GrepTool {
             Ok(files) => files,
             Err(error) => return err(error),
         };
-        let start = arg_str(&args, "path")
-            .and_then(|path| jail_path(&self.root, &path).ok())
-            .unwrap_or_else(|| self.root.clone());
+        // `jail_path` answers canonical paths; the root they are shown
+        // relative to must be canonical too, or a searched file would be
+        // named by its absolute path.
+        let root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let path = arg_str(&args, "path");
+        let start = path
+            .as_deref()
+            .and_then(|path| jail_path(&self.root, path).ok())
+            .unwrap_or_else(|| root.clone());
         let query = GrepQuery {
             regex,
             files,
             policy: &self.policy,
         };
         let mut hits = Hits::default();
-        grep_walk(&self.root, &start, &query, &mut hits);
+        if start.is_file() {
+            if let Some(path) = &path
+                && let Err(error) = readable_path(&self.root, path, &self.policy)
+            {
+                return err(error);
+            }
+            grep_file(&root, &start, &query, &mut hits);
+        } else {
+            grep_walk(&root, &start, &query, &mut hits);
+        }
         if hits.more > 0 {
             hits.lines.push(format!("… {} more matches", hits.more));
         }
@@ -1056,26 +1072,32 @@ fn grep_walk(root: &Path, dir: &Path, query: &GrepQuery, hits: &mut Hits) {
             grep_walk(root, &path, query, hits);
             continue;
         }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        if query.policy.blocks(relative) {
+        grep_file(root, &path, query, hits);
+    }
+}
+
+/// One file's hits, unless it holds credentials, falls outside the glob, or
+/// is not UTF-8.
+fn grep_file(root: &Path, path: &Path, query: &GrepQuery, hits: &mut Hits) {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if query.policy.blocks(relative) {
+        return;
+    }
+    let shown = slash_path(relative);
+    if !query.files.matches(&shown) {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    for (index, line) in content.lines().enumerate() {
+        if !query.regex.is_match(line) {
             continue;
         }
-        let shown = slash_path(relative);
-        if !query.files.matches(&shown) {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (index, line) in content.lines().enumerate() {
-            if !query.regex.is_match(line) {
-                continue;
-            }
-            if hits.lines.len() < GREP_MAX_MATCHES {
-                hits.lines.push(format!("{shown}:{}:{line}", index + 1));
-            } else {
-                hits.more += 1;
-            }
+        if hits.lines.len() < GREP_MAX_MATCHES {
+            hits.lines.push(format!("{shown}:{}:{line}", index + 1));
+        } else {
+            hits.more += 1;
         }
     }
 }
@@ -1981,6 +2003,28 @@ mod tests {
             .as_deref(),
             Some("grep fn \\w+ crates -g *.rs -i")
         );
+    }
+
+    /// A path naming a file searches that file, and a credential file named
+    /// outright is refused the way a read of it is.
+    #[tokio::test]
+    async fn grep_searches_the_one_file_its_path_names() {
+        let grep = grep_fixture();
+        assert_eq!(
+            grep_lines(
+                &grep,
+                serde_json::json!({"pattern": "eedle", "ignore_case": true, "path": "src/a.rs"})
+            )
+            .await,
+            ["src/a.rs:4:// Needle in code"]
+        );
+
+        fs::write(grep.root.join(".env"), "API_KEY=sk-test-0000000000000000\n").unwrap();
+        let secret = grep
+            .invoke(serde_json::json!({"pattern": "API_KEY", "path": ".env"}))
+            .await;
+        assert!(secret.is_error, "{}", secret.output);
+        assert!(!secret.output.contains("sk-test"), "{}", secret.output);
     }
 
     #[tokio::test]
