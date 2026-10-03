@@ -780,6 +780,10 @@ fn slash_path(relative: &Path) -> String {
         .join("/")
 }
 
+/// Matching lines a grep answer lists before it says how many more there
+/// were.
+const GREP_MAX_MATCHES: usize = 500;
+
 pub struct GrepTool {
     pub root: PathBuf,
     /// Which files hold credentials and are skipped.
@@ -792,12 +796,35 @@ impl ToolHandler for GrepTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "grep".into(),
-                description: "Search workspace files for a substring".into(),
+                description: format!(
+                    "Search workspace files for lines matching a regular expression \
+                     (Rust regex syntax; a plain word matches itself). Answers \
+                     `path:line:text` in path order, at most {GREP_MAX_MATCHES} lines. \
+                     Credential files and files that are not UTF-8 are skipped."
+                )
+                .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
-                        "path": { "type": "string" }
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression matched against each line. \
+                                            Escape `( ) [ ] { } . * + ? | ^ $ \\` with `\\` \
+                                            to match the character itself."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to search. Default: the workspace."
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Search only files matching this glob, as the \
+                                            glob tool reads it: `*.rs`, `src/**/*.toml`."
+                        },
+                        "ignore_case": {
+                            "type": "boolean",
+                            "description": "Match regardless of case. Default false."
+                        }
                     },
                     "required": ["pattern"]
                 }),
@@ -813,6 +840,13 @@ impl ToolHandler for GrepTool {
             line.push(' ');
             line.push_str(&describe_line(&path, DESCRIBE_MAX));
         }
+        if let Some(glob) = arg_str(args, "glob") {
+            line.push_str(" -g ");
+            line.push_str(&describe_line(&glob, DESCRIBE_MAX));
+        }
+        if arg_bool(args, "ignore_case") == Some(true) {
+            line.push_str(" -i");
+        }
         Some(line)
     }
 
@@ -820,13 +854,51 @@ impl ToolHandler for GrepTool {
         let Some(pattern) = arg_str(&args, "pattern") else {
             return err("missing pattern");
         };
+        let regex = match regex::RegexBuilder::new(&pattern)
+            .case_insensitive(arg_bool(&args, "ignore_case").unwrap_or(false))
+            .build()
+        {
+            Ok(regex) => regex,
+            Err(error) => {
+                return err(format!(
+                    "{error}\nescape a special character with `\\` to match it literally"
+                ));
+            }
+        };
+        let files = match PathFilter::new(&arg_str(&args, "glob").unwrap_or_default()) {
+            Ok(files) => files,
+            Err(error) => return err(error),
+        };
         let start = arg_str(&args, "path")
             .and_then(|path| jail_path(&self.root, &path).ok())
             .unwrap_or_else(|| self.root.clone());
-        let mut hits = Vec::new();
-        grep_walk(&self.root, &start, &pattern, &self.policy, &mut hits);
-        ok(hits.join("\n"))
+        let query = GrepQuery {
+            regex,
+            files,
+            policy: &self.policy,
+        };
+        let mut hits = Hits::default();
+        grep_walk(&self.root, &start, &query, &mut hits);
+        if hits.more > 0 {
+            hits.lines.push(format!("… {} more matches", hits.more));
+        }
+        ok(hits.lines.join("\n"))
     }
+}
+
+/// What a grep looks for, and in which files.
+struct GrepQuery<'a> {
+    regex: Regex,
+    files: PathFilter,
+    policy: &'a SensitivePolicy,
+}
+
+/// The hits a grep answers with, and a count of those past
+/// [`GREP_MAX_MATCHES`], which are counted but never formatted.
+#[derive(Default)]
+struct Hits {
+    lines: Vec<String>,
+    more: usize,
 }
 
 pub struct BashTool {
@@ -959,17 +1031,15 @@ fn walk(root: &Path, dir: &Path, filter: &PathFilter, out: &mut Vec<String>) {
     }
 }
 
-fn grep_walk(
-    root: &Path,
-    dir: &Path,
-    pattern: &str,
-    policy: &SensitivePolicy,
-    out: &mut Vec<String>,
-) {
+fn grep_walk(root: &Path, dir: &Path, query: &GrepQuery, hits: &mut Hits) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    // In name order, so the hits that survive the cap are the same on every
+    // file system.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
         let path = entry.path();
         let Ok(kind) = entry.file_type() else {
             continue;
@@ -983,19 +1053,28 @@ fn grep_walk(
             {
                 continue;
             }
-            grep_walk(root, &path, pattern, policy, out);
+            grep_walk(root, &path, query, hits);
             continue;
         }
         let relative = path.strip_prefix(root).unwrap_or(&path);
-        if policy.blocks(relative) {
+        if query.policy.blocks(relative) {
+            continue;
+        }
+        let shown = slash_path(relative);
+        if !query.files.matches(&shown) {
             continue;
         }
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
         for (index, line) in content.lines().enumerate() {
-            if line.contains(pattern) {
-                out.push(format!("{}:{}:{line}", relative.display(), index + 1));
+            if !query.regex.is_match(line) {
+                continue;
+            }
+            if hits.lines.len() < GREP_MAX_MATCHES {
+                hits.lines.push(format!("{shown}:{}:{line}", index + 1));
+            } else {
+                hits.more += 1;
             }
         }
     }
@@ -1742,6 +1821,166 @@ mod tests {
             format!("f{:05}.log", GLOB_MAX_RESULTS - 1)
         );
         assert_eq!(lines[GLOB_MAX_RESULTS], "… 5 more files");
+    }
+
+    /// A grep over a small tree: a source file, a note, and the hits a call
+    /// returns as lines.
+    fn grep_fixture() -> GrepTool {
+        let root = temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/a.rs"),
+            "fn alpha() {}\nlet x = 1;\nfn beta_two() {}\n// Needle in code\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.md"), "a needle in prose\n").unwrap();
+        GrepTool {
+            root,
+            policy: SensitivePolicy::default(),
+        }
+    }
+
+    async fn grep_lines(grep: &GrepTool, args: Value) -> Vec<String> {
+        let result = grep.invoke(args.clone()).await;
+        assert!(!result.is_error, "{args}: {}", result.output);
+        result.output.lines().map(str::to_owned).collect()
+    }
+
+    #[tokio::test]
+    async fn grep_matches_a_regex() {
+        let grep = grep_fixture();
+        assert_eq!(
+            grep_lines(&grep, serde_json::json!({"pattern": r"^fn \w+\("})).await,
+            ["src/a.rs:1:fn alpha() {}", "src/a.rs:3:fn beta_two() {}"]
+        );
+        // A plain word is a regex that matches itself.
+        assert_eq!(
+            grep_lines(&grep, serde_json::json!({"pattern": "alpha"})).await,
+            ["src/a.rs:1:fn alpha() {}"]
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_can_ignore_case() {
+        let grep = grep_fixture();
+        assert_eq!(
+            grep_lines(&grep, serde_json::json!({"pattern": "needle"})).await,
+            ["notes.md:1:a needle in prose"],
+            "case matters by default"
+        );
+        assert_eq!(
+            grep_lines(
+                &grep,
+                serde_json::json!({"pattern": "needle", "ignore_case": true})
+            )
+            .await,
+            [
+                "notes.md:1:a needle in prose",
+                "src/a.rs:4:// Needle in code"
+            ]
+        );
+    }
+
+    /// `glob` narrows the files searched with the matcher the glob tool uses,
+    /// over the same workspace-relative path.
+    #[tokio::test]
+    async fn grep_filters_files_by_glob() {
+        let grep = grep_fixture();
+        let args =
+            |glob: &str| serde_json::json!({"pattern": "eedle", "ignore_case": true, "glob": glob});
+        assert_eq!(
+            grep_lines(&grep, args("*.rs")).await,
+            ["src/a.rs:4:// Needle in code"]
+        );
+        assert_eq!(
+            grep_lines(&grep, args("src/**")).await,
+            ["src/a.rs:4:// Needle in code"]
+        );
+        assert_eq!(
+            grep_lines(&grep, args("notes")).await,
+            ["notes.md:1:a needle in prose"],
+            "text with no wildcard is a substring, as in glob"
+        );
+        let bad = grep.invoke(args("*.{rs")).await;
+        assert!(bad.is_error, "{}", bad.output);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_regex_is_an_error_that_names_the_problem() {
+        let grep = grep_fixture();
+        let result = grep
+            .invoke(serde_json::json!({"pattern": "fn alpha("}))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("unclosed group"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// The hit list stops at the cap and says how many more there were. The
+    /// walk is in name order, so which hits survive the cap does not depend on
+    /// the order the file system lists a directory in.
+    #[tokio::test]
+    async fn grep_hits_are_capped_in_path_order() {
+        let root = temp_root();
+        fs::write(root.join("b.txt"), "hit\n".repeat(3)).unwrap();
+        fs::write(root.join("a.txt"), "hit\n".repeat(GREP_MAX_MATCHES)).unwrap();
+        let grep = GrepTool {
+            root,
+            policy: SensitivePolicy::default(),
+        };
+        let lines = grep_lines(&grep, serde_json::json!({"pattern": "hit"})).await;
+        assert_eq!(lines.len(), GREP_MAX_MATCHES + 1);
+        assert_eq!(lines[0], "a.txt:1:hit");
+        assert_eq!(
+            lines[GREP_MAX_MATCHES - 1],
+            format!("a.txt:{GREP_MAX_MATCHES}:hit")
+        );
+        assert_eq!(lines[GREP_MAX_MATCHES], "… 3 more matches");
+    }
+
+    /// A regex, a case-blind match or a glob naming the file outright still
+    /// never reaches a credential file; a file that is not UTF-8 is skipped.
+    #[tokio::test]
+    async fn grep_options_still_skip_credential_and_binary_files() {
+        let root = temp_root();
+        fs::write(root.join(".env"), "API_KEY=sk-test-0000000000000000\n").unwrap();
+        fs::write(root.join("blob.bin"), b"\xff\xfeAPI_KEY\n").unwrap();
+        let grep = GrepTool {
+            root,
+            policy: SensitivePolicy::default(),
+        };
+        for args in [
+            serde_json::json!({"pattern": "api_key=sk-.*", "ignore_case": true}),
+            serde_json::json!({"pattern": "API_KEY", "glob": ".env"}),
+            serde_json::json!({"pattern": "API_KEY", "glob": "*"}),
+        ] {
+            let result = grep.invoke(args.clone()).await;
+            assert!(
+                !result.output.contains("sk-test"),
+                "{args}: {}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("blob.bin"),
+                "{args}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
+    fn grep_describes_its_options() {
+        let grep = grep_fixture();
+        assert_eq!(
+            grep.describe(&serde_json::json!({
+                "pattern": "fn \\w+", "path": "crates", "glob": "*.rs", "ignore_case": true
+            }))
+            .as_deref(),
+            Some("grep fn \\w+ crates -g *.rs -i")
+        );
     }
 
     #[tokio::test]
