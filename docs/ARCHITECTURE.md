@@ -210,7 +210,10 @@ Under `agent_dir`:
 Settings layer bottom-up: defaults ← `<agent_dir>/config.yml` ←
 `<project>/.titi/config.yml` (read-only through this API) ←
 `$TITI_CONFIG_FILES` and explicit overlays ← runtime overrides. A project can
-override settings, but state stays in `agent_dir`.
+override settings, but state stays in `agent_dir`. A cloned repo is untrusted
+input, so three things are read from the user's layers only (`get_user`):
+`privacy.allow`, `privacy.maskIps`, and the provider catalog (`providers`,
+`models`), whose entries name the URL a key is sent to.
 
 **Why it matters:** `git status` after a session shows nothing new, keys
 cannot end up in a commit, profiles are isolated from each other, and a

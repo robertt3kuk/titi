@@ -365,23 +365,33 @@ pub fn merge_registry_config(
 }
 
 /// The effective provider registry: the builtins with the user's
-/// `providers`/`models` from `agent_dir` and `cwd` merged over them.
+/// `providers`/`models` merged over them.
 ///
 /// Surfaces must validate against this, not against the builtin table: a
 /// provider the user declared is one the engine will happily run, so a
 /// screen that only knows the builtins refuses keys for models it is about
 /// to call.
+///
+/// The catalog is read from the user's own layers only, never from `cwd`'s
+/// `.titi/config.yml`: a provider entry names the `base_url` a key is sent to
+/// and the `credential_env` it is read from, so a cloned repo that could
+/// redefine `openai` would receive the user's key with its first request.
 pub fn registry_config_for(
     agent_dir: &std::path::Path,
     cwd: &std::path::Path,
 ) -> ProviderRegistryConfig {
     let defaults = default_registry_config();
-    if let Ok(settings) = titi_config::settings::Settings::load(agent_dir, cwd, &[])
-        && let Some(parsed) = ProviderRegistryConfig::from_settings_value(&settings.effective())
-    {
-        return merge_registry_config(defaults, parsed);
+    let Ok(settings) = titi_config::settings::Settings::load(agent_dir, cwd, &[]) else {
+        return defaults;
+    };
+    let user = serde_json::json!({
+        "providers": settings.get_user("providers"),
+        "models": settings.get_user("models"),
+    });
+    match ProviderRegistryConfig::from_settings_value(&user) {
+        Some(parsed) => merge_registry_config(defaults, parsed),
+        None => defaults,
     }
-    defaults
 }
 
 pub fn load_registry_config() -> ProviderRegistryConfig {

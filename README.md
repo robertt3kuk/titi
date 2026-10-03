@@ -27,7 +27,7 @@ titi --set-key opencode-go "$KEY"
 titi --list-keys
 ```
 
-Without a key the turn fails in the open: the provider requires a credential. Settings stack from lowest to highest: built-in defaults, `~/.titi/agent`, `<project>/.titi/config.yml`, then environment variables.
+Without a key the turn fails in the open: the provider requires a credential. Settings stack from lowest to highest: built-in defaults, `~/.titi/agent`, `<project>/.titi/config.yml`, then environment variables. The project file cannot declare `providers` or `models`, and cannot loosen `privacy.allow` or `privacy.maskIps`: a provider entry names where your key is sent, so only your own layers decide it.
 
 Built in:
 
@@ -223,7 +223,7 @@ titi --set-key opencode-go "$KEY"
 titi --list-keys
 ```
 
-Без ключа ход падает открыто: провайдер требует credential. Настройки складываются снизу вверх: встроенные значения, `~/.titi/agent`, `<проект>/.titi/config.yml`, затем переменные окружения.
+Без ключа ход падает открыто: провайдер требует credential. Настройки складываются снизу вверх: встроенные значения, `~/.titi/agent`, `<проект>/.titi/config.yml`, затем переменные окружения. Проектный файл не может объявить `providers` или `models` и не может ослабить `privacy.allow` или `privacy.maskIps`: запись провайдера называет, куда уйдёт ваш ключ, поэтому решают только ваши собственные слои.
 
 Встроены:
 
