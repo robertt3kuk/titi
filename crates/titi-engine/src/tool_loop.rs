@@ -314,6 +314,17 @@ async fn invoke_one(
             detail: None,
         };
     };
+    let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+    // A call the tool would refuse anyway is answered before anyone is asked
+    // to approve it.
+    if let Some(refusal) = handler.refusal(&args) {
+        return Executed {
+            call_id: call.call_id,
+            output: refusal.into(),
+            is_error: true,
+            detail: None,
+        };
+    }
     let tier = tools.approval_tier(&call.name);
     if !approval_mode.auto_approves(tier) {
         let _ = events
@@ -338,7 +349,6 @@ async fn invoke_one(
             };
         }
     }
-    let args = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
     let ToolResult {
         output,
         is_error,

@@ -962,11 +962,15 @@ impl ToolHandler for BashTool {
         Some(format!("bash {}", describe_line(&command, DESCRIBE_MAX)))
     }
 
+    fn refusal(&self, args: &Value) -> Option<String> {
+        crate::intercept::refusal(&arg_str(args, "command")?)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let Some(command) = arg_str(&args, "command") else {
             return err("missing command");
         };
-        if let Some(refusal) = crate::intercept::refusal(&command) {
+        if let Some(refusal) = self.refusal(&args) {
             return err(refusal);
         }
         let timeout = args

@@ -984,3 +984,48 @@ async fn a_cancel_stops_the_shell_command_the_turn_waits_on() {
     }
     assert_eq!(output, Some(("fine\n".to_owned(), false)));
 }
+
+/// A call its tool refuses on its arguments alone — a foreground dev server
+/// for `bash` — is answered at once. Asking the user to approve a command
+/// that was never going to run only to refuse it afterwards wastes their
+/// attention.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_the_tool_refuses_is_not_put_to_the_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("bash", r#"{"command": "npm run dev"}"#)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Write;
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(titi_tools::BashTool::new(dir.path())));
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "serve".into(),
+        })
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        collect_until_terminal(&mut engine),
+    )
+    .await
+    .expect("the turn waited on an approval for a refused call");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::ToolApprovalNeeded { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolFinished { output, is_error: true, .. } if output.starts_with("refused:")
+        )),
+        "{events:?}"
+    );
+}

@@ -127,6 +127,16 @@ pub trait ToolHandler: Send + Sync + 'static {
         let _ = args;
         None
     }
+
+    /// Why this call would be refused without running, decided from its
+    /// arguments alone. The engine asks before it puts the call to the user,
+    /// so nobody approves a call that was never going to run. `None`, the
+    /// default, sends every call on to approval and [`ToolHandler::invoke`],
+    /// which must still refuse the same calls when called directly.
+    fn refusal(&self, args: &serde_json::Value) -> Option<String> {
+        let _ = args;
+        None
+    }
 }
 
 #[derive(Clone, Default)]
