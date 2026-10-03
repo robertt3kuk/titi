@@ -1685,6 +1685,8 @@ async fn run_turn(
         .as_deref(),
     );
 
+    // Per turn, not per model: rounds a fallback leaves behind were paid for.
+    let mut meter = TurnMeter::new(&spent);
     for model in models {
         if aborted.load(Ordering::SeqCst) {
             return None;
@@ -1796,7 +1798,7 @@ async fn run_turn(
                     events.clone(),
                     Arc::clone(&aborted),
                     &tools,
-                    &spent,
+                    &mut meter,
                 )
                 .await
                 {
@@ -1884,6 +1886,33 @@ async fn run_turn(
     None
 }
 
+/// What one turn has spent, round by round. A tool round re-sends the whole
+/// conversation and is paid for like any other request, so the turn's usage
+/// is the sum of its rounds; each round also goes on the session's meter,
+/// which the budget reads.
+struct TurnMeter<'a> {
+    session: &'a Arc<AtomicU64>,
+    prompt: u64,
+    completion: u64,
+}
+
+impl<'a> TurnMeter<'a> {
+    fn new(session: &'a Arc<AtomicU64>) -> Self {
+        Self {
+            session,
+            prompt: 0,
+            completion: 0,
+        }
+    }
+
+    fn charge(&mut self, prompt: u64, completion: u64) {
+        self.prompt = self.prompt.saturating_add(prompt);
+        self.completion = self.completion.saturating_add(completion);
+        self.session
+            .fetch_add(prompt.saturating_add(completion), Ordering::SeqCst);
+    }
+}
+
 /// The turn's messages without the system prompt it was given: the next turn
 /// rebuilds that itself. A digest compaction put in its place is not the
 /// system prompt and stays, so folded messages do not come back.
@@ -1907,8 +1936,8 @@ async fn stream_attempt(
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
-    // Session meter this request's estimated tokens are added to.
-    spent: &Arc<AtomicU64>,
+    // The turn's meter, which adds this request to the session's as well.
+    meter: &mut TurnMeter<'_>,
 ) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
     // Every request the turn makes goes through here, including each transient
     // retry, so this is the one place that can be the last look at the flag
@@ -1957,15 +1986,16 @@ async fn stream_attempt(
                 // meter is bumped here rather than once per turn. These are
                 // the project's own estimates: no provider on the wire
                 // reports usage back through this transport.
-                let prompt_tokens = crate::compaction::estimate_request(messages);
-                let completion_tokens = titi_core::compaction::estimate_tokens(&answer);
-                spent.fetch_add(prompt_tokens + completion_tokens, Ordering::SeqCst);
+                meter.charge(
+                    crate::compaction::estimate_request(messages),
+                    titi_core::compaction::estimate_tokens(&answer),
+                );
                 if calls.is_empty() {
                     let _ = events
                         .send(EngineEvent::TurnUsage {
                             turn_id,
-                            prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
-                            completion_tokens: u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                            prompt_tokens: u32::try_from(meter.prompt).unwrap_or(u32::MAX),
+                            completion_tokens: u32::try_from(meter.completion).unwrap_or(u32::MAX),
                         })
                         .await;
                     let _ = events

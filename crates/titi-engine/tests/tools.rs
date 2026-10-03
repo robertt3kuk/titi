@@ -143,6 +143,59 @@ async fn auto_approves_read_tool_and_continues() {
     )));
 }
 
+/// A tool round re-sends the whole conversation and is paid for like any
+/// other request, so a turn's usage is the sum of its rounds. Each round's
+/// `ContextUsage` is the estimate of the request that round sent; reporting
+/// only the last round undercounted every turn that called a tool.
+#[tokio::test]
+async fn turn_usage_counts_every_round_of_the_turn() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("echo", r#"{"text":"pong"}"#)),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "done".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+    let mut engine = EngineRuntime::start_with_tools(
+        EngineConfig::new("primary"),
+        resolver(transport),
+        echo_registry(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let rounds: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::ContextUsage { tokens, .. } => Some(*tokens),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rounds.len(), 2, "{events:?}");
+    let usage: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::TurnUsage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => Some((*prompt_tokens, *completion_tokens)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 1, "one report per turn: {events:?}");
+    assert_eq!(u64::from(usage[0].0), rounds.iter().sum::<u64>());
+    assert!(usage[0].1 > 0, "{usage:?}");
+}
+
 /// Tool output goes to a remote provider; a key or a server address in it
 /// must be masked before the model or the transcript sees it.
 #[tokio::test]
