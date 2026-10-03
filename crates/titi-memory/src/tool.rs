@@ -44,10 +44,11 @@ impl MemoryTool {
             .index
             .lock()
             .map_err(|_| "memory index lock poisoned".to_owned())?;
-        if guard.is_none() {
-            *guard = Some(MemoryIndex::open(&self.agent_dir).map_err(|e| e.to_string())?);
-        }
-        f(guard.as_ref().unwrap()).map_err(|e| e.to_string())
+        let index = match &mut *guard {
+            Some(index) => index,
+            slot => slot.insert(MemoryIndex::open(&self.agent_dir).map_err(|e| e.to_string())?),
+        };
+        f(index).map_err(|e| e.to_string())
     }
 }
 
