@@ -1546,6 +1546,18 @@ impl Chat {
         }
     }
 
+    /// Puts the stored conversation of this chat's session on the screen —
+    /// the same window the engine replays to the model at startup. A session
+    /// with nothing stored, or one that cannot be read, leaves the screen as
+    /// it is, so a fresh start still opens on the welcome.
+    pub fn show_stored_history(&mut self) {
+        if let Ok(messages) = crate::app::session_history(&self.agent_dir, &self.session_id)
+            && !messages.is_empty()
+        {
+            self.show_history(&messages);
+        }
+    }
+
     fn show_history(&mut self, messages: &[titi_providers::ChatMessage]) {
         self.lines.clear();
         self.assistant_at = None;
@@ -3176,6 +3188,8 @@ pub fn run(
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
     chat.session_label = stored_session_title(&chat.agent_dir, &session_id);
+    // The engine resumed this session's history; the screen shows the same.
+    chat.show_stored_history();
     chat.catalog = catalog;
     chat.skills = discovered_skills(&chat.agent_dir);
     let detect = titi_tui::image::PlaceholderDetect::from_env();
@@ -11109,6 +11123,52 @@ mod tests {
         }
         assert!(chat.lines.iter().any(|line| line.text == "keep"));
         assert!(!chat.lines.iter().any(|line| line.text == "drop"));
+    }
+
+    /// A resumed session is replayed into the engine, so the model answers
+    /// with that conversation in mind; the screen shows the same conversation
+    /// rather than a welcome that reads as a fresh start.
+    #[test]
+    fn a_resumed_session_shows_its_conversation() {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("session");
+        store
+            .append(&id, Role::User, "remember the word banana")
+            .expect("user");
+        store
+            .append(&id, Role::Assistant, "noted: banana")
+            .expect("assistant");
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        chat.show_stored_history();
+
+        let shown: Vec<(LineKind, &str)> = chat
+            .lines
+            .iter()
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (LineKind::User, "remember the word banana"),
+                (LineKind::Assistant, "noted: banana"),
+            ]
+        );
+        let frame = frame_rows(&mut chat, 80, 20).join("\n");
+        assert!(!frame.contains("say what you want done"), "{frame}");
+
+        // A session with nothing in it keeps the welcome.
+        let fresh = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("fresh");
+        let mut chat = Chat::new("openai/gpt-4.1", &fresh, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.show_stored_history();
+        assert!(chat.lines.is_empty(), "{:?}", chat.lines);
     }
 
     #[test]
