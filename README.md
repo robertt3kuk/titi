@@ -71,7 +71,7 @@ titi --mode plan
 | `y` / `n` | Approves or refuses a write or a shell command |
 | `/model` | Switches to the next model in the list. `/model <id>` picks one by id or by its short name |
 | `/switch` | Fuzzy search over the same list: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` resolves a model role from the settings |
-| `/usage` | Tokens for this turn and for the session, prompt and completion apart |
+| `/usage` | Tokens for this turn and for the session, prompt and completion apart — as the provider counted them, estimated only when it reports none |
 | `/budget` | Caps what the session may spend: `/budget 200k`, `/budget 1.5m`, `/budget off`. The cap is in tokens; a cap in money is refused, because nothing here knows a price |
 | `/settings` | Every resolved setting with the layer it came from |
 | `/keys` · `/whoami` | Which providers have a key: env, stored, or none. The key itself is never shown |
@@ -113,13 +113,19 @@ Tool approval: `--approval always-ask|write|yolo`. The default is `write` — re
 
 ### The tools
 
-`read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `memory`, `settings`.
+`read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `todo`, `memory`, `settings`.
+
+`read` takes an optional `offset` (the first line, 1-based) and `limit` (how many lines); a range that leaves lines out starts with `[lines A-B of N]`, so a large file is read in pieces.
+
+`glob` matches real glob patterns: `*` and `?` stay in one directory, `**/` crosses any number, `[a-z]` and `{rs,toml}` work, and a pattern without `/` names a file in any directory. `grep` takes a regular expression, with `ignore_case` and a `glob` file filter, and `path` may name one file. Both skip `target`, `.git` and `node_modules`, list in path order, and cap the answer (1,000 paths, 500 matching lines) with a count of the rest.
 
 `edit` replaces text that occurs exactly once — an ambiguous `old_string` is refused with its count — or every occurrence with `replace_all`; a CRLF file is matched from the LF text a model writes and keeps its own line endings and byte-order mark.
 
 `hashline_edit` pins the lines it replaces by the six-hex anchor of the text that was read. A line that changed since the read is refused as a stale read instead of being overwritten from a picture of the file that is no longer true.
 
-`bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. A pty run is bounded on three axes: `timeout_secs` (1 to 3600, 300 by default), a 64 KiB cap on captured output, and an interrupt the surface can raise. Zero means "no deadline" nowhere in titi. Every tool result, whatever the tool, is capped at 40,000 characters before the model sees it: past that it keeps the head and the tail around a note saying how much was left out.
+`bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. Either way a run is bounded: by `timeout_secs` (1 to 3600, 300 by default), by Ctrl+C, which stops the command a cancelled turn was waiting on, and by a cap on what it keeps (64 KiB on a pty; the first and last 64 KiB of each stream on a pipe, since a log puts its error last). A stop takes the command's whole process group with it, and a failure starts with its `exit N`. Zero means "no deadline" nowhere in titi. A dev server, a watcher or `tail -f` in the foreground is refused before it runs, with the backgrounded form to use instead (`cmd > log 2>&1 &`) and `timeout 30 cmd` to check only that it starts. Every tool result, whatever the tool, is capped at 40,000 characters before the model sees it: past that it keeps the head and the tail around a note saying how much was left out.
+
+`todo` is the agent's checklist for multi-step work: `write` sets the whole list, `update` sets one item's status by its number, `view` shows it. At most one item is in progress, a list holds up to 50 items of up to 200 characters, and the list lasts as long as the process.
 
 `settings` lets the agent read and write configuration. Approval (`approval_mode`, `tools.approval*`), `privacy`, the provider catalog (`providers`, `models`) — their roots, everything under them, and any parent such as `tools` — and any credential-looking leaf (`key`, `apiKey`, `api_key`, `token`, `secret`, `password`) are refused, to read as well as to write: loosening approval, redirecting a key, or reading out a credential is a human decision.
 
@@ -179,7 +185,7 @@ cargo run -p titi-genome --example map -- . 40
 
 ### What is already here
 
-The engine, streaming, model switching and a fallback chain across providers, tools jailed to the current directory, approval for dangerous calls, hashline edits that refuse a stale read, `bash` on a real pty with a timeout, agent / plan / duck modes, sessions that restore, fork, export, and rewind, compaction of a long context, a coder-and-reviewer goal loop with an exit code CI can read, background loops and a token budget, a toolless advisor, a local hub, subagents that can only read unless asked otherwise, Genome over twelve languages with tree-sitter for Rust, TypeScript, and Python, memory, SOUL, skills that are discovered and expanded by name, prompt caching on Anthropic, and local photos in Kitty and Ghostty.
+The engine, streaming, model switching and a fallback chain across providers, tools jailed to the current directory, approval for dangerous calls, hashline edits that refuse a stale read, `bash` with a deadline that Ctrl+C can cut short, on a real pty when asked, agent / plan / duck modes, sessions that restore, fork, export, and rewind, compaction of a long context, a coder-and-reviewer goal loop with an exit code CI can read, background loops and a token budget, a toolless advisor, a local hub, subagents that can only read unless asked otherwise, Genome over twelve languages with tree-sitter for Rust, TypeScript, and Python, memory, SOUL, skills that are discovered and expanded by name, prompt caching on Anthropic, and local photos in Kitty and Ghostty.
 
 ### What is not
 
@@ -269,7 +275,7 @@ titi --mode plan
 | `y` / `n` | Разрешить или отказать записи и shell |
 | `/model` | Следующая модель в списке. `/model <id>` выбирает по id или по короткому имени |
 | `/switch` | Нечёткий поиск по тому же списку: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` разворачивает роль модели из настроек |
-| `/usage` | Токены за ход и за сессию, prompt и completion отдельно |
+| `/usage` | Токены за ход и за сессию, prompt и completion отдельно — как их посчитал провайдер; оценка, только если он не сообщает |
 | `/budget` | Ограничивает трату сессии: `/budget 200k`, `/budget 1.5m`, `/budget off`. Лимит в токенах; лимит в деньгах отклоняется — прайса здесь никто не знает |
 | `/settings` | Все разрешённые настройки и слой, из которого пришла каждая |
 | `/keys` · `/whoami` | У кого есть ключ: env, сохранён или нет. Сам ключ не показывается |
@@ -311,13 +317,19 @@ titi --mode plan
 
 ### Инструменты
 
-`read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `memory`, `settings`.
+`read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `todo`, `memory`, `settings`.
+
+`read` принимает необязательные `offset` (первая строка, с единицы) и `limit` (сколько строк); диапазон, в который попал не весь файл, начинается с `[lines A-B of N]`, так что большой файл читается частями.
+
+`glob` понимает настоящие glob-шаблоны: `*` и `?` не выходят за каталог, `**/` проходит любое их число, работают `[a-z]` и `{rs,toml}`, а шаблон без `/` ищет имя файла в любом каталоге. `grep` принимает регулярное выражение, `ignore_case` и фильтр файлов `glob`, а `path` может указывать на один файл. Оба пропускают `target`, `.git` и `node_modules`, выдают пути по порядку и обрезают ответ (1000 путей, 500 совпавших строк), называя число остальных.
 
 `edit` заменяет текст, который встречается ровно один раз — неоднозначный `old_string` отвергается с числом совпадений, — или все вхождения при `replace_all`; файл с CRLF находится по LF-тексту, который пишет модель, и сохраняет свои концы строк и BOM.
 
 `hashline_edit` закрепляет заменяемые строки шестизначным hex-якорем того текста, который был прочитан. Строка, изменившаяся после чтения, отклоняется как устаревшее чтение, а не переписывается по снимку файла, который уже неправда.
 
-`bash` по умолчанию работает через пайп. `pty: true` запускает команду под настоящим терминалом: она видит tty и ведёт себя так, как в вашей собственной оболочке — цвет, прогресс, пейджер. Запуск на pty ограничен по трём осям: `timeout_secs` (от 1 до 3600, по умолчанию 300), 64 KiB захваченного вывода и прерывание, которое может поднять поверхность. Ноль нигде в titi не означает «без дедлайна». Результат любого инструмента обрезается до 40 000 символов, прежде чем его увидит модель: сверх этого остаются начало и конец, а между ними — пометка, сколько выпало.
+`bash` по умолчанию работает через пайп. `pty: true` запускает команду под настоящим терминалом: она видит tty и ведёт себя так, как в вашей собственной оболочке — цвет, прогресс, пейджер. В обоих случаях запуск ограничен: `timeout_secs` (от 1 до 3600, по умолчанию 300), Ctrl+C, который останавливает команду, на которой стоял отменённый ход, и объёмом того, что сохраняется (64 KiB на pty; первые и последние 64 KiB каждого потока на пайпе — ошибка в логе обычно в конце). Остановка забирает всю группу процессов команды, а неудача начинается с `exit N`. Ноль нигде в titi не означает «без дедлайна». Dev-сервер, вотчер или `tail -f` на переднем плане отклоняются до запуска, с подсказкой, как запустить в фоне (`cmd > log 2>&1 &`), и `timeout 30 cmd`, чтобы только проверить, что он стартует. Результат любого инструмента обрезается до 40 000 символов, прежде чем его увидит модель: сверх этого остаются начало и конец, а между ними — пометка, сколько выпало.
+
+`todo` — чеклист агента для многошаговой работы: `write` задаёт весь список, `update` меняет статус одного пункта по номеру, `view` показывает его. В работе не больше одного пункта, в списке до 50 пунктов по 200 символов, и живёт он столько же, сколько процесс.
 
 `settings` даёт агенту читать и писать конфигурацию. Подтверждение (`approval_mode`, `tools.approval*`), `privacy`, каталог провайдеров (`providers`, `models`) — их корни, всё под ними и любой родитель вроде `tools` — и любой лист, похожий на credential (`key`, `apiKey`, `api_key`, `token`, `secret`, `password`), запрещены и на чтение, и на запись: ослабить подтверждение, перенаправить ключ или достать credential — решение человека.
 
@@ -377,7 +389,7 @@ cargo run -p titi-genome --example map -- . 40
 
 ### Что уже есть
 
-Движок, стриминг, смена модели и цепочка фолбэков между провайдерами, инструменты в пределах текущего каталога, подтверждение опасных вызовов, hashline-правки, которые отказывают на устаревшем чтении, `bash` на настоящем pty с таймаутом, режимы agent / plan / duck, сессии с восстановлением, форком, выгрузкой и откатом, компакция длинного контекста, цикл «кодер и ревьюер» с кодом выхода для CI, фоновые циклы и бюджет в токенах, советчик без инструментов, локальный хаб, субагенты (по умолчанию только чтение), Genome по двенадцати языкам с tree-sitter для Rust, TypeScript и Python, память, SOUL, скиллы, которые находятся и разворачиваются по имени, кэш промпта у Anthropic и локальные фото в Kitty и Ghostty.
+Движок, стриминг, смена модели и цепочка фолбэков между провайдерами, инструменты в пределах текущего каталога, подтверждение опасных вызовов, hashline-правки, которые отказывают на устаревшем чтении, `bash` с дедлайном, который прерывает Ctrl+C, и на настоящем pty по запросу, режимы agent / plan / duck, сессии с восстановлением, форком, выгрузкой и откатом, компакция длинного контекста, цикл «кодер и ревьюер» с кодом выхода для CI, фоновые циклы и бюджет в токенах, советчик без инструментов, локальный хаб, субагенты (по умолчанию только чтение), Genome по двенадцати языкам с tree-sitter для Rust, TypeScript и Python, память, SOUL, скиллы, которые находятся и разворачиваются по имени, кэш промпта у Anthropic и локальные фото в Kitty и Ghostty.
 
 ### Чего ещё нет
 
