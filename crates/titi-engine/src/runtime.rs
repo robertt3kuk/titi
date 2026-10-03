@@ -9,8 +9,8 @@ use futures::StreamExt;
 use smol_str::SmolStr;
 use titi_genome::Genome;
 use titi_providers::{
-    ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, Transport, TransportError,
-    WireRequest,
+    ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, TokenUsage, Transport,
+    TransportError, WireRequest,
 };
 use titi_tools::{ApprovalMode, ApprovalTier, ToolRegistry};
 use tokio::sync::mpsc;
@@ -2035,6 +2035,7 @@ async fn stream_attempt(
     let mut visible_content = false;
     let mut collector = ToolCallCollector::default();
     let mut answer = String::new();
+    let mut reported: Option<TokenUsage> = None;
 
     while let Some(event) = stream.next().await {
         if aborted.load(Ordering::SeqCst) {
@@ -2054,16 +2055,20 @@ async fn stream_attempt(
                     .send(EngineEvent::ThinkingDelta { turn_id, text })
                     .await;
             }
+            StreamEvent::Usage(usage) => reported = Some(usage),
             StreamEvent::Done { reason } => {
                 let calls = collector.take();
                 // Every round is paid for, tool rounds included, so the
-                // meter is bumped here rather than once per turn. These are
-                // the project's own estimates: no provider on the wire
-                // reports usage back through this transport.
-                meter.charge(
-                    crate::compaction::estimate_request(messages),
-                    titi_core::compaction::estimate_tokens(&answer),
-                );
+                // meter is bumped here rather than once per turn. The
+                // provider's own count wins; a provider that reports none
+                // (or a malformed one) is charged the project's estimate.
+                match reported {
+                    Some(usage) => meter.charge(usage.prompt_tokens, usage.completion_tokens),
+                    None => meter.charge(
+                        crate::compaction::estimate_request(messages),
+                        titi_core::compaction::estimate_tokens(&answer),
+                    ),
+                }
                 if calls.is_empty() {
                     let _ = events
                         .send(EngineEvent::TurnUsage {
