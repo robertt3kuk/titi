@@ -838,6 +838,55 @@ async fn exhausting_every_model_names_the_last_failure() {
     assert!(message.contains("overloaded"), "{message}");
 }
 
+/// A rate limit is not answered with an immediate second request: each
+/// transient retry waits longer than the last, so the retries are spent over
+/// seconds instead of milliseconds against the server that asked for less.
+#[tokio::test(start_paused = true)]
+async fn transient_retries_back_off() {
+    let limited = || {
+        MockBody::Err(TransportError::Retryable {
+            status: Some(429),
+            message: "slow down".into(),
+        })
+    };
+    let primary = Arc::new(MockTransport::new(vec![
+        limited(),
+        limited(),
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "ok".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.max_transient_retries = 2;
+    config.retry_backoff = std::time::Duration::from_secs(1);
+    let mut engine = EngineRuntime::start(config, resolver(vec![("primary", primary.clone())]));
+
+    let started = tokio::time::Instant::now();
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    assert!(
+        matches!(events.last(), Some(EngineEvent::TurnFinished { .. })),
+        "{events:?}"
+    );
+    assert_eq!(primary.call_count(), 3);
+    // One second before the second attempt, two before the third.
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 /// A standalone switch is not part of a turn, so it answers with a
 /// `ModelSwitched` that names no turn — the field is `None`, not a fabricated
 /// id. A switch to the model that is already active answers too, so a surface

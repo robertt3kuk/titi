@@ -347,6 +347,9 @@ pub struct EngineConfig {
     pub primary_model: SmolStr,
     pub fallback_models: Vec<SmolStr>,
     pub max_transient_retries: u32,
+    /// Wait before the first transient retry; each later one doubles it, up
+    /// to [`MAX_RETRY_BACKOFF`]. A 429 answered at once is a retry spent.
+    pub retry_backoff: std::time::Duration,
     pub command_capacity: usize,
     pub event_capacity: usize,
     pub max_tool_rounds: u32,
@@ -411,6 +414,7 @@ impl EngineConfig {
             primary_model: primary.clone(),
             fallback_models: Vec::new(),
             max_transient_retries: 2,
+            retry_backoff: std::time::Duration::from_millis(500),
             command_capacity: 64,
             event_capacity: 256,
             max_tool_rounds: 8,
@@ -1791,7 +1795,14 @@ async fn run_turn(
                 .await;
             let mut last_error = None;
             let mut completed = false;
-            for _attempt in 0..=config.max_transient_retries {
+            for attempt in 0..=config.max_transient_retries {
+                // A stall already waited out its own timeout; a rate limit or
+                // an outage is asked again only after a pause.
+                if matches!(last_error, Some(TransportError::Retryable { .. }))
+                    && !back_off(retry_delay(config.retry_backoff, attempt), &aborted).await
+                {
+                    return None;
+                }
                 match stream_attempt(
                     turn_id,
                     &messages,
@@ -1891,6 +1902,33 @@ async fn run_turn(
         })
         .await;
     None
+}
+
+/// Longest pause before one transient retry.
+pub const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The pause before attempt `attempt` (1 is the first retry): `base`, then
+/// doubled each time, capped.
+fn retry_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    base.saturating_mul(1 << doublings).min(MAX_RETRY_BACKOFF)
+}
+
+/// Sleeps for `delay` in short slices so a cancel is not kept waiting for
+/// the whole pause. Returns `false` when the turn was cancelled meanwhile.
+async fn back_off(delay: std::time::Duration, aborted: &AtomicBool) -> bool {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if aborted.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        tokio::time::sleep((deadline - now).min(SLICE)).await;
+    }
 }
 
 /// What one turn has spent, round by round. A tool round re-sends the whole
