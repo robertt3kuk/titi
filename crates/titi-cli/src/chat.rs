@@ -5595,9 +5595,11 @@ fn welcome_with_tail(
 ///
 /// The lockup and the chords are not on the list. On a short pane the brand
 /// with its build, and the keys that start something, are what a first screen
-/// is for; a blank row is not a fact, so it goes before the model does.
+/// is for; a blank row is not a fact, so it goes before the model does, and a
+/// tip is not a fact about this session at all, so it goes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WelcomePart {
+    Tip,
     Sessions,
     Dir,
     Tagline,
@@ -5688,6 +5690,50 @@ fn welcome_hint(width: usize) -> String {
     hint
 }
 
+/// The narrowest pane that shows a tip.
+const WELCOME_TIP_COLUMNS: usize = 50;
+
+/// What the first screen can point at, each one true of this build — a chord
+/// the live mapper yields or a command [`COMMANDS`] runs — and short enough to
+/// fit whole at [`WELCOME_TIP_COLUMNS`].
+const WELCOME_TIPS: [&str; 20] = [
+    "enter during a turn steers it",
+    "ctrl-c stops a turn, and twice quits",
+    "alt+m picks a model, and typing filters",
+    "ctrl-x switches to another session",
+    "/checkpoint records a rewind point",
+    "/rewind cuts back to a rewind point",
+    "/recap says what this session did",
+    "/plan reads the repo and changes nothing",
+    "/done leaves plan or duck mode",
+    "/duck talks it through, repo-blind",
+    "/theme opens the palette picker",
+    "/usage shows the tokens spent",
+    "/keys shows which providers have a key",
+    "/login signs in or stores a key",
+    "/model <id> switches the model",
+    "/compact folds the history now",
+    "/goal codes and reviews until it passes",
+    "/fork copies this session into a new one",
+    "/export saves this session as markdown",
+    "/help lists every command",
+];
+
+/// The tip a session's welcome offers. It is picked by the session's id, so
+/// every frame of one session offers the same tip and a new session may offer
+/// another.
+fn welcome_tip(session_id: &str) -> Option<&'static str> {
+    // FNV-1a: the same id picks the same tip on every run and every build,
+    // which the standard library's hasher does not promise.
+    let hash = session_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let at = usize::try_from(hash % WELCOME_TIPS.len() as u64).ok()?;
+    WELCOME_TIPS.get(at).copied()
+}
+
 /// The git state as the masthead states it: the branch, then one mark per kind
 /// of change, in the ink.
 fn welcome_git(git: &WelcomeGit, grays: &WelcomeGrays) -> Vec<Span<'static>> {
@@ -5702,9 +5748,10 @@ fn welcome_git(git: &WelcomeGit, grays: &WelcomeGrays) -> Vec<Span<'static>> {
 
 /// The welcome's rows at one degradation level, each centred in `width`
 /// cells: the lockup, or the brand in one line when `lockup` is false; the
-/// tagline; the facts as one left-aligned block; and the chords.
+/// tagline; the facts as one left-aligned block; the chords; and the tip.
 fn welcome_rows(
     facts: &WelcomeFacts,
+    tip: Option<&str>,
     level: u8,
     lockup: bool,
     width: usize,
@@ -5738,6 +5785,21 @@ fn welcome_rows(
         vec![Line::from(Span::styled(welcome_hint(width), grays.faded()))],
         width,
     ));
+    if let Some(tip) = tip
+        && WelcomePart::Tip.shown(level)
+        && width >= WELCOME_TIP_COLUMNS
+    {
+        let line = format!("Tip: {tip}");
+        if titi_tui::width::visible_width(&line) + 2 <= width {
+            sections.push(centre_block(
+                vec![Line::from(Span::styled(
+                    line,
+                    grays.faded().add_modifier(Modifier::ITALIC),
+                ))],
+                width,
+            ));
+        }
+    }
     let spaced = WelcomePart::Spacing.shown(level);
     let mut rows = Vec::new();
     for section in sections {
@@ -5750,8 +5812,8 @@ fn welcome_rows(
 }
 
 /// The first screen, set the way omp opens: the TITI mark beside the `titi`
-/// wordmark with the build under it, the tagline, the facts, and the chords,
-/// centred in the pane with no box around them, in black and white.
+/// wordmark with the build under it, the tagline, the facts, the chords and a
+/// tip, centred in the pane with no box around them, in black and white.
 ///
 /// This is an empty state, not a panel: it is drawn only while the transcript
 /// has no line, it never asks for more room than the pane has, and on a short
@@ -5759,6 +5821,7 @@ fn welcome_rows(
 /// composer's rows be squeezed by a paragraph that cannot fit.
 fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph<'static> {
     let facts = welcome_facts(chat);
+    let tip = welcome_tip(&chat.session_id);
     let grays = WelcomeGrays::of(theme);
     let (width, height) = (usize::from(width), usize::from(height));
     // A column clear on each side of the mark; a pane narrower than that states
@@ -5766,13 +5829,13 @@ fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph
     let lockup = width >= welcome_lockup_width(&facts) + 2;
     let mut rows = Vec::new();
     for level in 0..=WELCOME_BARE {
-        rows = welcome_rows(&facts, level, lockup, width, &grays);
+        rows = welcome_rows(&facts, tip, level, lockup, width, &grays);
         if rows.len() <= height {
             break;
         }
     }
     if rows.len() > height {
-        rows = welcome_rows(&facts, WELCOME_BARE, false, width, &grays);
+        rows = welcome_rows(&facts, tip, WELCOME_BARE, false, width, &grays);
     }
     let pad = height.saturating_sub(rows.len()) / 2;
     let mut lines = vec![Line::from(""); pad];
@@ -8805,10 +8868,11 @@ mod tests {
         assert!(states_fact(&frame, "dir"), "and the directory: {frame}");
     }
 
-    /// A short pane gives the welcome down in one order — the recent sessions,
-    /// then the directory, then the tagline, then the blank rows, then the
-    /// model — and the lockup with the chords outlasts all of them. When even
-    /// those two do not fit, the brand and its build fold into one line.
+    /// A short pane gives the welcome down in one order — the tip, the recent
+    /// sessions, then the directory, then the tagline, then the blank rows,
+    /// then the model — and the lockup with the chords outlasts all of them.
+    /// When even those two do not fit, the brand and its build fold into one
+    /// line.
     #[test]
     fn a_short_pane_gives_the_welcome_down_in_order() {
         let (_dir, mut chat) = welcome_chat();
@@ -8822,19 +8886,23 @@ mod tests {
 
         // The pane is the screen less the masthead and the composer's four
         // rows; each height below is the first that drops one more thing.
-        let roomy = welcome_at(&mut chat, 80, 19);
+        let roomy = welcome_at(&mut chat, 80, 21);
+        assert!(roomy.contains("Tip: "), "a roomy pane has a tip: {roomy}");
+
+        let no_tip = welcome_at(&mut chat, 80, 19);
+        assert!(!no_tip.contains("Tip: "), "the tip goes first: {no_tip}");
         for label in ["recent", "dir", "model"] {
             assert!(
-                states_fact(&roomy, label),
-                "a roomy pane has {label}: {roomy}"
+                states_fact(&no_tip, label),
+                "the facts are all there: {label} missing from {no_tip}"
             );
         }
-        assert!(roomy.contains("say what you want done"), "{roomy}");
+        assert!(no_tip.contains("say what you want done"), "{no_tip}");
 
         let no_sessions = welcome_at(&mut chat, 80, 17);
         assert!(
             !states_fact(&no_sessions, "recent"),
-            "the list goes first: {no_sessions}"
+            "then the list: {no_sessions}"
         );
         assert!(
             states_fact(&no_sessions, "dir"),
@@ -8899,6 +8967,66 @@ mod tests {
                 "{chord} is whole or absent: {narrow}"
             );
         }
+    }
+
+    /// The welcome offers one tip, and a true one: every command a tip names
+    /// is one this build runs, and every tip fits whole on the narrowest pane
+    /// that shows one. The tip is picked from the session, so a redraw keeps it
+    /// instead of flickering to another, and a pane too narrow for it shows
+    /// none rather than a sentence cut short.
+    #[test]
+    fn the_welcome_offers_one_true_tip_and_keeps_it() {
+        for tip in WELCOME_TIPS {
+            for word in tip.split_whitespace().filter(|word| word.starts_with('/')) {
+                assert!(
+                    COMMANDS
+                        .iter()
+                        .any(|command| format!("/{}", command.name) == word),
+                    "{tip}: {word} is a command"
+                );
+            }
+            assert!(
+                titi_tui::width::visible_width(&format!("Tip: {tip}")) + 2 <= WELCOME_TIP_COLUMNS,
+                "{tip} fits whole at {WELCOME_TIP_COLUMNS} columns"
+            );
+        }
+
+        let (_dir, mut chat) = welcome_chat();
+        let tip_of = |frame: &str| {
+            frame
+                .lines()
+                .find_map(|row| row.trim().strip_prefix("Tip: ").map(str::to_owned))
+        };
+        let first = welcome_at(&mut chat, 80, 24);
+        let tip = tip_of(&first).unwrap_or_else(|| panic!("a tip is offered: {first}"));
+        assert!(
+            WELCOME_TIPS.contains(&tip.as_str()),
+            "{tip:?} is one of the listed tips"
+        );
+        assert_eq!(
+            tip_of(&welcome_at(&mut chat, 80, 24)),
+            Some(tip.clone()),
+            "and the next frame offers the same one"
+        );
+        let rows = frame_rows(&mut chat, 80, 24);
+        let (x, y) = cell_of(&rows, "Tip: ").unwrap_or_else(|| panic!("{rows:#?}"));
+        assert!(
+            frame_buffer(&mut chat, 80, 24)[(x, y)]
+                .modifier
+                .contains(Modifier::ITALIC),
+            "the tip is set in italic"
+        );
+
+        let narrow = WELCOME_TIP_COLUMNS as u16;
+        assert!(welcome_at(&mut chat, narrow, 24).contains("Tip: "));
+        let narrower = welcome_at(&mut chat, narrow - 1, 24);
+        assert!(!narrower.contains("Tip:"), "{narrower}");
+
+        // Another session may offer another tip: the pick follows the session.
+        let picked: HashSet<&str> = (0..64)
+            .filter_map(|n| welcome_tip(&format!("session-{n}")))
+            .collect();
+        assert!(picked.len() > 1, "{picked:?}");
     }
 
     /// The picker above the composer is a box: the title sits inset in the top
