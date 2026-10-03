@@ -194,10 +194,11 @@ async fn a_subagent_cannot_write_by_default() {
     );
     let requests = transport.requests();
     assert!(
-        requests[1]
-            .messages
-            .iter()
-            .any(|message| { message.content.contains("unknown tool write") }),
+        requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("write is withheld here; only read tools are offered")
+        }),
         "the refusal is reported back to the model: {:?}",
         requests[1]
             .messages

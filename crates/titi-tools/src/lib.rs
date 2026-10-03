@@ -49,6 +49,18 @@ pub enum ApprovalTier {
     Exec,
 }
 
+impl ApprovalTier {
+    /// The tier as a word in a sentence: `read`, `network`, `write`, `exec`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalTier::Read => "read",
+            ApprovalTier::Network => "network",
+            ApprovalTier::Write => "write",
+            ApprovalTier::Exec => "exec",
+        }
+    }
+}
+
 /// When the engine auto-approves versus waiting for `ApproveTool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -116,6 +128,12 @@ pub trait ToolHandler: Send + Sync + 'static {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<SmolStr, Arc<dyn ToolHandler>>,
+    /// Names [`ToolRegistry::retain_tiers`] took out. A call to one of them
+    /// is refused as out of reach, not as a tool that does not exist.
+    withheld: std::collections::BTreeSet<SmolStr>,
+    /// The tiers the last [`ToolRegistry::retain_tiers`] kept, to say what is
+    /// on offer instead.
+    offered: Vec<ApprovalTier>,
 }
 
 impl ToolRegistry {
@@ -125,6 +143,7 @@ impl ToolRegistry {
 
     pub fn register(&mut self, handler: Arc<dyn ToolHandler>) {
         let name = handler.definition().spec.name;
+        self.withheld.remove(&name);
         self.tools.insert(name, handler);
     }
 
@@ -156,8 +175,33 @@ impl ToolRegistry {
     /// registry it cannot escalate out of: with nothing exec-tier registered,
     /// no call can ever wait for an approval no one will give.
     pub fn retain_tiers(&mut self, tiers: &[ApprovalTier]) {
-        self.tools
-            .retain(|_, handler| tiers.contains(&handler.definition().approval));
+        self.offered = tiers.to_vec();
+        let withheld = &mut self.withheld;
+        self.tools.retain(|name, handler| {
+            let keep = tiers.contains(&handler.definition().approval);
+            if !keep {
+                withheld.insert(name.clone());
+            }
+            keep
+        });
+    }
+
+    /// Why a call to `name` cannot run, when the tool exists but
+    /// [`ToolRegistry::retain_tiers`] withheld it: `write is withheld here;
+    /// only read tools are offered`. `None` for a name never registered.
+    pub fn withheld_reason(&self, name: &str) -> Option<String> {
+        if !self.withheld.contains(name) {
+            return None;
+        }
+        let offered: Vec<&str> = self.offered.iter().map(|tier| tier.as_str()).collect();
+        Some(if offered.is_empty() {
+            format!("{name} is withheld here; no tools are offered")
+        } else {
+            format!(
+                "{name} is withheld here; only {} tools are offered",
+                offered.join(" and ")
+            )
+        })
     }
 
     /// Names of the registered tools, sorted.

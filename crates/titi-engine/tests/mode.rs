@@ -68,6 +68,55 @@ async fn finished(engine: &mut titi_engine::Engine) {
     .await;
 }
 
+/// A call to a tool the mode withholds says so: "unknown tool" told the
+/// model, and the person reading the transcript, that the tool does not
+/// exist, when it is only out of reach until the mode changes.
+#[tokio::test]
+async fn a_tool_the_mode_withholds_is_refused_as_withheld_not_unknown() {
+    let call = MockBody::Events(vec![
+        StreamEvent::ToolcallStart {
+            id: titi_providers::BlockId::new("tool"),
+            call: titi_providers::ToolCallRef {
+                call_id: "call-1".into(),
+                name: "shell_probe".into(),
+            },
+        },
+        StreamEvent::ToolcallDelta {
+            id: titi_providers::BlockId::new("tool"),
+            json: "{}".into(),
+        },
+        StreamEvent::ToolcallEnd {
+            id: titi_providers::BlockId::new("tool"),
+        },
+        StreamEvent::Done {
+            reason: StopReason::ToolUse,
+        },
+    ]);
+    let transport = Arc::new(MockTransport::new(vec![call, done()]));
+    let mut config = EngineConfig::new("primary");
+    config.mode = SessionMode::Plan;
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), mixed_registry());
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "run the probe".into(),
+        })
+        .await
+        .unwrap();
+    let output = wait_for(&mut engine, |event| match event {
+        EngineEvent::ToolFinished {
+            output, is_error, ..
+        } => Some((output.to_string(), *is_error)),
+        _ => None,
+    })
+    .await;
+    assert!(output.1);
+    assert_eq!(
+        output.0,
+        "shell_probe is withheld here; only read tools are offered"
+    );
+}
+
 /// Plan mode is enforced by what the request carries, not by asking the
 /// model nicely: nothing above read tier is offered at all.
 #[tokio::test]

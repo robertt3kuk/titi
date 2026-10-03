@@ -279,9 +279,12 @@ async fn invoke_one(
     events: &mpsc::Sender<EngineEvent>,
 ) -> Executed {
     let Some(handler) = tools.get(&call.name) else {
+        let output = tools
+            .withheld_reason(&call.name)
+            .unwrap_or_else(|| format!("unknown tool {}", call.name));
         return Executed {
             call_id: call.call_id,
-            output: format!("unknown tool {}", call.name).into(),
+            output: output.into(),
             is_error: true,
             detail: None,
         };
