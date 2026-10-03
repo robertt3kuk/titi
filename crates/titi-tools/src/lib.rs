@@ -22,6 +22,7 @@ use titi_providers::ToolSpec;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod settings;
+pub mod todo;
 
 pub use cache::{READ_CACHE_CAPACITY, ReadCache};
 pub use fs::{
@@ -32,6 +33,7 @@ pub use git::{DiagnoseTool, GIT_TIMEOUT, GitCommitTool, GitError, GitTool, git_t
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
+pub use todo::TodoTool;
 pub use web::{
     FETCH_BYTE_CAP, FETCH_TIMEOUT, FetchTool, SearchProvider, WebError, WebSearchTool, web_tools,
 };
