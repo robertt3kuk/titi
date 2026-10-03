@@ -323,6 +323,18 @@ pub struct TranscriptLine {
 struct PendingApproval {
     call_id: String,
     name: String,
+    /// The tool's own one-line description of the call (`bash rm -rf
+    /// build`), taken from the `ToolStarted` the engine sent before it
+    /// asked. An approval that named only the tool asked for a blind yes.
+    detail: Option<String>,
+}
+
+impl PendingApproval {
+    /// What the person is asked to allow: the description when the tool gave
+    /// one, else the tool's name.
+    fn subject(&self) -> &str {
+        self.detail.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// What the running turn is doing, for the status row above the composer.
@@ -788,7 +800,11 @@ impl Chat {
                 };
                 self.assistant_at = None;
                 self.shown_from = self.reply.len();
-                self.push(LineKind::Tool, format!("tool {name}"));
+                // The chip keeps what the call did (`bash cargo test`), not
+                // only which tool it was: once the row moves on, the
+                // transcript is the only place that says what ran.
+                let shown = detail.as_deref().unwrap_or(name.as_str());
+                self.push(LineKind::Tool, format!("tool {shown}"));
                 // The call goes to the session file now, not at the end of
                 // the turn: the result below it has to follow its own call,
                 // or a restore replays an orphan.
@@ -802,9 +818,18 @@ impl Chat {
                 }
             }
             EngineEvent::ToolApprovalNeeded { call_id, name, .. } => {
+                let detail = match &self.phase {
+                    WorkPhase::Tool {
+                        call_id: running,
+                        detail,
+                        ..
+                    } if running.as_str() == call_id.as_str() => detail.clone(),
+                    _ => None,
+                };
                 self.approval = Some(PendingApproval {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
+                    detail,
                 });
                 // The phase is left as it stands. The engine emits
                 // `ToolStarted` before it asks (crates/titi-engine/src/
@@ -5053,12 +5078,16 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
     // The masthead's `needs you` is the session state; this row says what the
     // person is being asked about, and the composer below says what to press.
     if let Some(pending) = &chat.approval {
+        let (head, argument) = match pending.subject().split_once(' ') {
+            Some((head, rest)) => (head, Some(rest.to_owned())),
+            None => (pending.subject(), None),
+        };
         return Some(
             Paragraph::new(work_line(
                 "⚠",
                 &WorkFact {
-                    wording: format!("needs you · {}", pending.name),
-                    argument: None,
+                    wording: format!("needs you · {head}"),
+                    argument,
                     compact: "needs you".to_owned(),
                     seconds: None,
                 },
@@ -6360,11 +6389,13 @@ fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
         .style(surface(theme));
     let inner = (width as usize).saturating_sub(6).max(4);
     let line = if let Some(pending) = &chat.approval {
+        const KEYS: &str = "   y allow    n refuse";
+        let room = inner.saturating_sub(titi_tui::width::visible_width(KEYS));
+        // A cut command says so: an approval must not read as the whole
+        // command when it is only its head.
+        let subject = ellipsis_label(pending.subject(), room.max(1));
         Line::from(Span::styled(
-            titi_tui::width::truncate_to_width(
-                &format!("{}   y allow    n refuse", pending.name),
-                inner,
-            ),
+            titi_tui::width::truncate_to_width(&format!("{subject}{KEYS}"), inner),
             fg(theme, ThemeColor::Warning).add_modifier(Modifier::BOLD),
         ))
     } else if let Some(provider) = &chat.login_for {
@@ -6993,6 +7024,7 @@ mod tests {
         chat.approval = Some(PendingApproval {
             call_id: "call-1".into(),
             name: "bash".into(),
+            detail: None,
         });
 
         chat.on_event(EngineEvent::Failed {
@@ -7020,6 +7052,7 @@ mod tests {
         chat.approval = Some(PendingApproval {
             call_id: "call-1".into(),
             name: "bash".into(),
+            detail: None,
         });
 
         chat.on_event(EngineEvent::Failed {
@@ -8898,6 +8931,65 @@ mod tests {
             .position(|line| *line == (LineKind::Assistant, "It printed hi."))
             .expect("the second round's own line");
         assert!(first < tool && tool < second, "{shown:?}");
+    }
+
+    /// An approval names what it approves: the command or the path the tool
+    /// described, on the chip, in the status row and on the composer line —
+    /// not only the tool's name.
+    #[test]
+    fn an_approval_shows_what_the_call_will_do() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            detail: Some("bash rm -rf build".into()),
+        });
+        chat.on_event(EngineEvent::ToolApprovalNeeded {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            name: "bash".into(),
+        });
+        let frame = frame_rows(&mut chat, 80, 20).join("\n");
+        assert!(frame.contains("▸ bash rm -rf build"), "{frame}");
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("needs you · bash rm -rf build"), "{row:?}");
+        let rows = frame_rows(&mut chat, 80, 20);
+        let prompt = &rows[17];
+        assert!(prompt.contains("bash rm -rf build"), "{prompt:?}");
+        assert!(prompt.contains("y allow"), "{prompt:?}");
+    }
+
+    /// A long command is cut, never the keys that answer it.
+    #[test]
+    fn a_long_approval_keeps_its_keys_on_a_narrow_screen() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        let long = format!("bash {}", "x".repeat(200));
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            detail: Some(long.into()),
+        });
+        chat.on_event(EngineEvent::ToolApprovalNeeded {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            name: "bash".into(),
+        });
+        let rows = frame_rows(&mut chat, 60, 20);
+        let prompt = &rows[17];
+        assert!(prompt.contains("y allow"), "{prompt:?}");
+        assert!(prompt.contains("n refuse"), "{prompt:?}");
+        assert!(prompt.contains("bash xx"), "{prompt:?}");
+        assert!(prompt.contains("…"), "{prompt:?}");
     }
 
     /// A tool borrows the row and gives it back when its own call finishes.
