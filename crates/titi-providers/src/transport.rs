@@ -157,16 +157,28 @@ impl TransportError {
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransportError::Retryable { status, message } => {
-                write!(
-                    f,
-                    "retryable transport error (status {status:?}): {message}"
-                )
-            }
-            TransportError::Fatal { status, message } => {
-                write!(f, "fatal transport error (status {status:?}): {message}")
-            }
-            TransportError::Stalled { phase } => write!(f, "stream stalled at {phase:?} phase"),
+            TransportError::Retryable {
+                status: Some(status),
+                message,
+            } => write!(f, "temporarily unavailable (HTTP {status}): {message}"),
+            TransportError::Retryable {
+                status: None,
+                message,
+            } => write!(f, "temporarily unavailable: {message}"),
+            TransportError::Fatal {
+                status: Some(status),
+                message,
+            } => write!(f, "rejected (HTTP {status}): {message}"),
+            TransportError::Fatal {
+                status: None,
+                message,
+            } => write!(f, "rejected: {message}"),
+            TransportError::Stalled {
+                phase: StallPhase::FirstEvent,
+            } => f.write_str("no reply before the first-event timeout"),
+            TransportError::Stalled {
+                phase: StallPhase::Idle,
+            } => f.write_str("the reply stalled mid-stream"),
         }
     }
 }
@@ -269,6 +281,60 @@ mod tests {
             serde_json::to_value(ApiKind::GeminiGenerateContent).unwrap(),
             serde_json::json!("gemini-generate-content")
         );
+    }
+
+    /// The message reaches the person as written: the status as `HTTP 401`,
+    /// never as a debug-printed `Some(401)`, and a stall in words rather than
+    /// a variant name.
+    #[test]
+    fn errors_read_as_sentences_not_debug_output() {
+        let cases = [
+            (
+                TransportError::Fatal {
+                    status: Some(401),
+                    message: "invalid api key".into(),
+                },
+                "rejected (HTTP 401): invalid api key",
+            ),
+            (
+                TransportError::Fatal {
+                    status: None,
+                    message: "bad frame".into(),
+                },
+                "rejected: bad frame",
+            ),
+            (
+                TransportError::Retryable {
+                    status: Some(429),
+                    message: "slow down".into(),
+                },
+                "temporarily unavailable (HTTP 429): slow down",
+            ),
+            (
+                TransportError::Retryable {
+                    status: None,
+                    message: "connection refused".into(),
+                },
+                "temporarily unavailable: connection refused",
+            ),
+            (
+                TransportError::Stalled {
+                    phase: StallPhase::FirstEvent,
+                },
+                "no reply before the first-event timeout",
+            ),
+            (
+                TransportError::Stalled {
+                    phase: StallPhase::Idle,
+                },
+                "the reply stalled mid-stream",
+            ),
+        ];
+        for (error, expected) in cases {
+            let shown = error.to_string();
+            assert_eq!(shown, expected);
+            assert!(!shown.contains("Some("), "{shown}");
+        }
     }
 
     #[test]
