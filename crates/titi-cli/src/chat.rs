@@ -1071,7 +1071,9 @@ impl Chat {
         }
     }
 
-    /// Insert pasted text into the composer. Newlines become spaces.
+    /// Insert pasted text into the composer. A paste is usually code or a
+    /// log, so its line breaks and tabs are kept — a `\r\n` or lone `\r`
+    /// becomes `\n` — and every other control character is dropped.
     pub fn paste(&mut self, text: &str) {
         if self.approval.is_some() {
             return;
@@ -1080,13 +1082,18 @@ impl Chat {
         // A pasted body is composer input, not a picker keystroke.
         self.login_picker = None;
         self.model_picker = None;
-        for ch in text.chars() {
-            if ch == '\n' || ch == '\r' {
-                if !self.input.ends_with(' ') {
-                    self.input.push(' ');
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.input.push('\n');
                 }
-            } else if !ch.is_control() {
-                self.input.push(ch);
+                '\n' | '\t' => self.input.push(ch),
+                ch if ch.is_control() => {}
+                ch => self.input.push(ch),
             }
         }
     }
@@ -6467,7 +6474,10 @@ fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
         let room = inner.saturating_sub(4).max(1);
         Line::from(vec![
             Span::styled("› ", fg(theme, ThemeColor::Accent)),
-            Span::styled(fit_tail(&chat.input, room), fg(theme, ThemeColor::Text)),
+            Span::styled(
+                fit_tail(&composer_view(&chat.input), room),
+                fg(theme, ThemeColor::Text),
+            ),
             Span::styled("▍", fg(theme, ThemeColor::Accent)),
         ])
     };
@@ -6510,6 +6520,9 @@ fn composer_caption(chat: &Chat) -> String {
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
+    // A cell holding a tab is drawn as nothing, so pasted indentation is
+    // spelled out before the text is measured.
+    let text = text.replace('\t', "    ");
     for paragraph in text.split('\n') {
         if paragraph.is_empty() {
             rows.push(String::new());
@@ -6549,6 +6562,13 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
         rows.push(String::new());
     }
     rows
+}
+
+/// The composer's one row: a pasted line break is shown as `↵` and a tab as
+/// four spaces, so a multi-line paste reads as what it is without the box
+/// growing. The input itself keeps both.
+fn composer_view(input: &str) -> String {
+    input.replace('\n', "↵").replace('\t', "    ")
 }
 
 fn fit_tail(text: &str, width: usize) -> String {
@@ -11169,6 +11189,40 @@ mod tests {
         chat.agent_dir = dir.path().to_path_buf();
         chat.show_stored_history();
         assert!(chat.lines.is_empty(), "{:?}", chat.lines);
+    }
+
+    /// A paste is usually code or a log, and its line breaks are part of it:
+    /// they reach the model as written, whatever the terminal's line ending,
+    /// and a tab stays a tab.
+    #[test]
+    fn a_pasted_block_keeps_its_lines() {
+        let mut chat = chat();
+        chat.paste("fn main() {\r\n\tprintln!(\"hi\");\r}\n");
+        assert_eq!(chat.input, "fn main() {\n\tprintln!(\"hi\");\n}\n");
+
+        // One row in the composer, each break shown, nothing cut mid-word.
+        let rows = frame_rows(&mut chat, 80, 20);
+        assert!(
+            rows[17].contains("fn main() {↵    println!(\"hi\");↵}"),
+            "{:?}",
+            rows[17]
+        );
+
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt {
+                text: "fn main() {\n\tprintln!(\"hi\");\n}".into()
+            }))
+        );
+        // The transcript shows it as the lines it is.
+        let frame = frame_rows(&mut chat, 80, 20);
+        let first = frame
+            .iter()
+            .position(|row| row.contains("fn main() {"))
+            .expect("the first line");
+        assert!(frame[first + 1].contains("│     println!"), "{frame:?}");
+        assert!(!frame[first].contains("println!"), "{frame:?}");
     }
 
     #[test]
