@@ -7,6 +7,9 @@ phase of a turn — streaming, reasoning, each tool, each failure — through
 the real binary and the real HTTP stack:
 
   "sleepy shell"  a bash call that runs for 3 s (the live tool phase)
+  "forever"       a bash call that never exits (Ctrl+C must stop it)
+  "dev server"    a bash call on `npm run dev` (refused before it runs)
+  "make todo"     a todo write: three items, the second in progress
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
   "big output"    a bash call that prints 20,000 lines (the output cap)
@@ -82,6 +85,17 @@ def script(last: dict) -> list[tuple[dict, float]]:
         return words(f"tool said: {first}", 0) + [(chunk({}, "stop"), 0)]
     if "sleepy shell" in content:
         return [(c, 0) for c in call("call_sleepy", "bash", {"command": "sleep 3; echo slept"})]
+    if "forever" in content:
+        return [(c, 0) for c in call("call_forever", "bash", {"command": "echo started; sleep 600"})]
+    if "dev server" in content:
+        return [(c, 0) for c in call("call_dev", "bash", {"command": "npm run dev"})]
+    if "make todo" in content:
+        items = [
+            {"content": "Read the failing test", "status": "completed"},
+            {"content": "Fix the parser", "status": "in_progress"},
+            {"content": "Run the suite", "status": "pending"},
+        ]
+        return [(c, 0) for c in call("call_todo", "todo", {"op": "write", "items": items})]
     if "slow" in content:
         return [(chunk({"content": f"tick{i} "}), 0.15) for i in range(60)] + [(chunk({}, "stop"), 0)]
     if "run bash" in content:
