@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -9,6 +8,7 @@ use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
 use crate::hashline::HashlineEditTool;
+use crate::pipe;
 use crate::pty::{self, Interrupt, Options as PtyOptions};
 use crate::sensitive::SensitivePolicy;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
@@ -919,9 +919,8 @@ struct Hits {
 
 pub struct BashTool {
     pub root: PathBuf,
-    /// Raised to stop the command a `pty` run is waiting on. Held by the
-    /// surface that owns the cancel key; the pipe path below cannot be
-    /// interrupted, which is half of why `pty` exists.
+    /// Raised to stop the command a run is waiting on, on either path. Held
+    /// by whoever owns the cancel key.
     pub interrupt: Interrupt,
 }
 
@@ -938,14 +937,17 @@ impl ToolHandler for BashTool {
                         "command": { "type": "string" },
                         "pty": {
                             "type": "boolean",
-                            "description": "Run under a terminal, so the command sees a tty \
-                                            and can be timed out and interrupted. Default false: \
-                                            without it output comes back unwrapped and uncoloured."
+                            "description": "Run under a terminal, so the command sees a tty. \
+                                            Default false: without it output comes back \
+                                            unwrapped and uncoloured."
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Deadline for a pty run, 1..3600, default 300. \
-                                            Past it the command is killed and the call is an error."
+                            "description": "Deadline in seconds, 1..3600, default 300. Past it \
+                                            the command and everything it started are killed \
+                                            and the call is an error. Start a server or a \
+                                            watcher in the background (`cmd &`) instead of \
+                                            waiting on it."
                         }
                     },
                     "required": ["command"]
@@ -964,23 +966,24 @@ impl ToolHandler for BashTool {
         let Some(command) = arg_str(&args, "command") else {
             return err("missing command");
         };
+        let timeout = args
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .map_or_else(
+                || pty::clamp_timeout(pty::DEFAULT_TIMEOUT_SECS),
+                pty::clamp_timeout,
+            );
         if arg_bool(&args, "pty").unwrap_or(false) {
-            return self.run_on_pty(&command, &args);
+            return self.run_on_pty(&command, timeout);
         }
-        match Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&self.root)
-            .output()
-        {
-            Ok(output) => {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                if output.status.success() {
-                    ok(text)
-                } else {
-                    err(text)
-                }
+        match pipe::run(&command, &self.root, timeout, &self.interrupt) {
+            Ok(run) if run.success => ok(run.output),
+            Ok(run) => {
+                let status = run.exit_code.map_or_else(
+                    || "killed by a signal".to_owned(),
+                    |code| format!("exit {code}"),
+                );
+                err(format!("{status}\n{}", run.output))
             }
             Err(error) => err(error.to_string()),
         }
@@ -998,15 +1001,9 @@ impl BashTool {
     /// The pty path: bounded by a deadline, by [`pty::OUTPUT_CAP`], and by
     /// [`Interrupt`]. Every one of those ends the call with `is_error`, output
     /// included, so the model sees how far the command got.
-    fn run_on_pty(&self, command: &str, args: &Value) -> ToolResult {
+    fn run_on_pty(&self, command: &str, timeout: std::time::Duration) -> ToolResult {
         let options = PtyOptions {
-            timeout: args
-                .get("timeout_secs")
-                .and_then(Value::as_u64)
-                .map_or_else(
-                    || pty::clamp_timeout(pty::DEFAULT_TIMEOUT_SECS),
-                    pty::clamp_timeout,
-                ),
+            timeout,
             ..PtyOptions::default()
         };
         match pty::run(command, &self.root, &options, &self.interrupt) {
@@ -2271,6 +2268,60 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("timed out"), "{}", result.output);
         assert!(result.output.contains("working"), "{}", result.output);
+    }
+
+    /// The default path has the pty path's deadline: a command that never
+    /// exits ends the call instead of the turn.
+    #[tokio::test]
+    async fn a_piped_command_past_its_deadline_is_an_error_that_keeps_the_output() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        let started = std::time::Instant::now();
+        let result = tool
+            .invoke(serde_json::json!({
+                "command": "echo working; sleep 30", "timeout_secs": 1
+            }))
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(result.is_error);
+        assert!(result.output.contains("timed out"), "{}", result.output);
+        assert!(result.output.contains("working"), "{}", result.output);
+    }
+
+    /// A failure says how the command exited, so an empty output still
+    /// tells the model something.
+    #[tokio::test]
+    async fn a_failed_piped_command_names_its_exit_code() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        let result = tool
+            .invoke(serde_json::json!({"command": "echo nope >&2; exit 3"}))
+            .await;
+        assert!(result.is_error);
+        assert_eq!(result.output, "exit 3\nnope\n");
+        let result = tool.invoke(serde_json::json!({"command": "false"})).await;
+        assert_eq!(result.output, "exit 1\n");
+    }
+
+    #[tokio::test]
+    async fn the_shared_interrupt_stops_a_running_piped_command() {
+        let root = temp_root();
+        let interrupt = Interrupt::new();
+        let tool = BashTool {
+            root,
+            interrupt: interrupt.clone(),
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            interrupt.raise();
+        });
+        let started = std::time::Instant::now();
+        let result = tool
+            .invoke(serde_json::json!({"command": "sleep 30"}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("interrupted"), "{}", result.output);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]
