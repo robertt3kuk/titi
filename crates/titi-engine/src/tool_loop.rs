@@ -220,7 +220,7 @@ pub(crate) async fn execute_tools(
         // event alone: the model never reads a presentation detail, so it can
         // never spend the context or answer for the tool.
         let result = Executed {
-            output: mask(&result.output, mask_ips).into(),
+            output: cap_output(&mask(&result.output, mask_ips)).into(),
             detail: result
                 .detail
                 .as_deref()
@@ -250,6 +250,31 @@ pub(crate) async fn execute_tools(
         });
     }
     messages
+}
+
+/// Most characters of one tool result that go anywhere: to the model, the
+/// transcript, the session file. A `cat` of a large file or a chatty build
+/// would otherwise fill the context window in one call, past what compaction
+/// can fold, since the newest round is the one that cannot be folded.
+pub const MAX_TOOL_OUTPUT: usize = 40_000;
+
+/// An output past [`MAX_TOOL_OUTPUT`], cut to its head and its tail — where a
+/// listing starts and where a log ends with its error — around a note that
+/// says how much was left out and how to see it.
+fn cap_output(output: &str) -> String {
+    let total = output.chars().count();
+    if total <= MAX_TOOL_OUTPUT {
+        return output.to_owned();
+    }
+    let tail = MAX_TOOL_OUTPUT / 4;
+    let head = MAX_TOOL_OUTPUT - tail;
+    let omitted = total - head - tail;
+    let start: String = output.chars().take(head).collect();
+    let end: String = output.chars().skip(total - tail).collect();
+    format!(
+        "{start}\n… [{omitted} characters left out: the output was longer than \
+         {MAX_TOOL_OUTPUT}; narrow it, e.g. with grep, head or a line range] …\n{end}"
+    )
 }
 
 fn mask(output: &str, mask_ips: bool) -> String {

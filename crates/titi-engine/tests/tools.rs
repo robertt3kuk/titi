@@ -196,6 +196,60 @@ async fn turn_usage_counts_every_round_of_the_turn() {
     assert!(usage[0].1 > 0, "{usage:?}");
 }
 
+/// One tool call must not fill the context window: an output past the cap
+/// keeps its head and its tail around a note that says how much was left
+/// out, and the model, the transcript and the session all get that version.
+#[tokio::test]
+async fn an_oversized_tool_output_is_cut_to_its_head_and_tail() {
+    let huge: String = (0..20_000).map(|n| format!("{n}\n")).collect();
+    let args = serde_json::json!({ "text": huge }).to_string();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("echo", &args)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let captured = Arc::clone(&transport);
+    let mut engine = EngineRuntime::start_with_tools(
+        EngineConfig::new("primary"),
+        resolver(transport),
+        echo_registry(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished { output, .. } => Some(output.to_string()),
+            _ => None,
+        })
+        .expect("the tool finished");
+    assert!(
+        output.chars().count() <= titi_engine::MAX_TOOL_OUTPUT + 200,
+        "{}",
+        output.len()
+    );
+    assert!(output.starts_with("0\n1\n2\n"), "{}", &output[..40]);
+    assert!(
+        output.ends_with("19998\n19999\n"),
+        "{}",
+        &output[output.len() - 40..]
+    );
+    assert!(output.contains("characters left out"), "no note");
+
+    let requests = captured.requests();
+    let sent = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("the tool result goes back");
+    assert_eq!(sent.content.as_str(), output);
+}
+
 /// Tool output goes to a remote provider; a key or a server address in it
 /// must be masked before the model or the transcript sees it.
 #[tokio::test]

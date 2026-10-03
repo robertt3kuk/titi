@@ -50,7 +50,9 @@ pub use review::{AgentReviewer, REVIEWER_BRIEF, Review, ReviewRequest, Reviewer,
 pub use runtime::{Engine, EngineConfig, EngineError, EngineRuntime, TransportResolver};
 pub use steering::{STEERING_CAPACITY, Steering};
 pub use tool_agent::{DEFAULT_AGENT_ROUNDS, ToolAgentRunner};
-pub use tool_loop::{TOUCHED_CAPACITY, TOUCHING_TOOLS, TouchedSet, TouchedSink, TrajectorySink};
+pub use tool_loop::{
+    MAX_TOOL_OUTPUT, TOUCHED_CAPACITY, TOUCHING_TOOLS, TouchedSet, TouchedSink, TrajectorySink,
+};
 
 /// Crate version, mirrors the workspace release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
