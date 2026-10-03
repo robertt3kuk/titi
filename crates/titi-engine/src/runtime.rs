@@ -1687,6 +1687,9 @@ async fn run_turn(
 
     // Per turn, not per model: rounds a fallback leaves behind were paid for.
     let mut meter = TurnMeter::new(&spent);
+    // What the last model to give up said, for the failure that ends the
+    // turn when every model has: "unavailable" alone does not say why.
+    let mut last_failure: Option<String> = None;
     for model in models {
         if aborted.load(Ordering::SeqCst) {
             return None;
@@ -1869,7 +1872,8 @@ async fn run_turn(
                 }
                 return Some(visible_history(messages, system.as_ref()));
             }
-            if last_error.is_some() {
+            if let Some(error) = last_error {
+                last_failure = Some(format!("{model}: {error}"));
                 previous_model = Some(model.clone());
                 break;
             }
@@ -1880,7 +1884,10 @@ async fn run_turn(
         .send(EngineEvent::Failed {
             turn_id: Some(turn_id),
             reason: ErrorReason::Connection,
-            message: "all configured models are unavailable".into(),
+            message: match last_failure {
+                Some(last) => format!("all configured models are unavailable; last, {last}").into(),
+                None => "all configured models are unavailable".into(),
+            },
         })
         .await;
     None

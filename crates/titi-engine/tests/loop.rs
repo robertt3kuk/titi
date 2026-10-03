@@ -791,6 +791,53 @@ async fn falls_back_after_transient_budget() {
     assert!(events.iter().any(|event| matches!(event, EngineEvent::ModelSwitched { from, to, .. } if from == "primary" && to == "backup")));
 }
 
+/// When every model gives up, the failure still says why: the last model
+/// tried and what its provider answered, not only that none were available.
+#[tokio::test]
+async fn exhausting_every_model_names_the_last_failure() {
+    let limited = || {
+        MockBody::Err(TransportError::Retryable {
+            status: Some(429),
+            message: "rate limit reached for requests".into(),
+        })
+    };
+    let primary = Arc::new(MockTransport::new(vec![limited(), limited()]));
+    let backup = Arc::new(MockTransport::new(vec![
+        MockBody::Err(TransportError::Retryable {
+            status: Some(503),
+            message: "overloaded".into(),
+        }),
+        MockBody::Err(TransportError::Retryable {
+            status: Some(503),
+            message: "overloaded".into(),
+        }),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.fallback_models = vec!["backup".into()];
+    config.max_transient_retries = 1;
+    let mut engine = EngineRuntime::start(
+        config,
+        resolver(vec![("primary", primary), ("backup", backup)]),
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let Some(EngineEvent::Failed { message, .. }) = events.last() else {
+        panic!("the turn must fail: {events:?}");
+    };
+    assert!(
+        message.contains("all configured models are unavailable"),
+        "{message}"
+    );
+    assert!(message.contains("backup"), "{message}");
+    assert!(message.contains("HTTP 503"), "{message}");
+    assert!(message.contains("overloaded"), "{message}");
+}
+
 /// A standalone switch is not part of a turn, so it answers with a
 /// `ModelSwitched` that names no turn — the field is `None`, not a fabricated
 /// id. A switch to the model that is already active answers too, so a surface
