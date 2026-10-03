@@ -635,14 +635,59 @@ struct PumpState {
     /// Events decoded from frames already read, drained before polling more
     /// bytes (a single SSE frame can decode to several events).
     queued: std::collections::VecDeque<StreamEvent>,
+    /// No more bytes are read.
     done: bool,
+    /// The body ended or said `[DONE]`: the stream finished by agreement.
+    eof: bool,
+    /// The terminal event went out; nothing follows it.
+    ended: bool,
+    /// A `Done` decoded before any usage report, kept back while the count
+    /// may still come: Chat Completions sends it in a chunk of its own after
+    /// the one that carries `finish_reason`.
+    held: Option<StreamEvent>,
+    usage_seen: bool,
+    /// How long a held `Done` waits for the rest of the stream.
+    grace: std::time::Duration,
 }
 
 impl PumpState {
+    /// Whether a decoded event goes out now.
+    fn admit(&mut self, event: StreamEvent) -> Option<StreamEvent> {
+        if self.ended {
+            return None;
+        }
+        match &event {
+            StreamEvent::Usage(_) => {
+                self.usage_seen = true;
+                if self.held.is_some() {
+                    self.done = true;
+                }
+                Some(event)
+            }
+            // Past the finish only the count is still wanted.
+            _ if self.held.is_some() => None,
+            StreamEvent::Done { .. } if !self.usage_seen => {
+                self.held = Some(event);
+                None
+            }
+            _ if event.is_terminal() => {
+                self.done = true;
+                self.ended = true;
+                Some(event)
+            }
+            _ => Some(event),
+        }
+    }
+
     fn decode_frame(&mut self, frame: SseFrame) {
         let SseFrame::Data { event, data } = frame else {
             return;
         };
+        if data.trim() == "[DONE]" {
+            self.done = true;
+            self.eof = true;
+            return;
+        }
         let payload: Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(_) => {
@@ -668,10 +713,14 @@ impl PumpState {
 }
 
 /// Pump raw body bytes into normalized events.
+///
+/// A `Done` that comes before any usage report waits up to `grace` for the
+/// count to follow, then goes out with or without it.
 pub fn sse_event_stream(
     body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
     api: ApiKind,
     policy: StreamDecodePolicy,
+    grace: std::time::Duration,
 ) -> impl Stream<Item = StreamEvent> + Send {
     let family = match api {
         ApiKind::AnthropicMessages => FamilyDecoder::Anthropic(Default::default()),
@@ -687,6 +736,11 @@ pub fn sse_event_stream(
             family,
             queued: std::collections::VecDeque::new(),
             done: false,
+            eof: false,
+            ended: false,
+            held: None,
+            usage_seen: false,
+            grace,
         },
         pump_step,
     )
@@ -694,47 +748,62 @@ pub fn sse_event_stream(
 
 async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
     loop {
-        if let Some(ev) = state.queued.pop_front() {
-            if ev.is_terminal() {
-                state.done = true;
+        if let Some(event) = state.queued.pop_front() {
+            if let Some(event) = state.admit(event) {
+                return Some((event, state));
             }
-            return Some((ev, state));
+            continue;
         }
         if state.done {
-            return None;
+            // A body that ends without a terminal event reads as a natural
+            // stop.
+            let last = state.held.take().or_else(|| {
+                (state.eof && !state.ended).then_some(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                })
+            })?;
+            state.ended = true;
+            return Some((last, state));
         }
-        match state.body.next().await {
+        let next = if state.held.is_some() {
+            match tokio::time::timeout(state.grace, state.body.next()).await {
+                Ok(next) => next,
+                // The server keeps the response open after the finish; the
+                // answer is complete without the count.
+                Err(_) => {
+                    state.done = true;
+                    continue;
+                }
+            }
+        } else {
+            state.body.next().await
+        };
+        match next {
             Some(Ok(chunk)) => {
                 for frame in state.decoder.feed(&chunk) {
+                    if state.eof {
+                        break;
+                    }
                     state.decode_frame(frame);
                 }
             }
             Some(Err(e)) => {
                 state.done = true;
-                return Some((
-                    StreamEvent::Error {
+                // Lost while only the count was awaited, the connection takes
+                // nothing from an answer that already finished.
+                if state.held.is_none() {
+                    state.queued.push_back(StreamEvent::Error {
                         reason: ErrorReason::Connection,
                         message: e.into(),
-                    },
-                    state,
-                ));
+                    });
+                }
             }
             None => {
                 state.done = true;
+                state.eof = true;
                 if let Some(frame) = state.decoder.finish() {
                     state.decode_frame(frame);
                 }
-                // Fall through: next loop iteration drains decoded events or
-                // emits the default Done.
-                if let Some(ev) = state.queued.pop_front() {
-                    return Some((ev, state));
-                }
-                return Some((
-                    StreamEvent::Done {
-                        reason: StopReason::Stop,
-                    },
-                    state,
-                ));
             }
         }
     }
@@ -894,6 +963,7 @@ impl Transport for FamilyTransport {
             resp.body,
             self.api,
             StreamDecodePolicy::default(),
+            self.watchdog().post_finish_grace,
         )))
     }
 }
@@ -1728,5 +1798,216 @@ mod tests {
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
         assert!(body.get("store").is_none());
         assert_eq!(body["max_output_tokens"], 128);
+    }
+
+    fn frame(payload: Value) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    fn says(text: &str) -> String {
+        let delta = serde_json::json!({"content": text});
+        frame(serde_json::json!({"choices": [{"index": 0, "delta": delta}], "usage": null}))
+    }
+
+    fn finish() -> String {
+        let choice = serde_json::json!({"index": 0, "delta": {}, "finish_reason": "stop"});
+        frame(serde_json::json!({"choices": [choice], "usage": null}))
+    }
+
+    fn usage_chunk() -> String {
+        let usage = serde_json::json!({"prompt_tokens": 321, "completion_tokens": 7});
+        frame(serde_json::json!({"choices": [], "usage": usage}))
+    }
+
+    const REPORTED: crate::stream::TokenUsage = crate::stream::TokenUsage {
+        prompt_tokens: 321,
+        completion_tokens: 7,
+        cached_tokens: 0,
+    };
+
+    /// What follows the scripted chunks of a [`TailFetch`] body.
+    #[derive(Clone, Copy)]
+    enum Tail {
+        /// The server keeps the response open and says nothing more.
+        Hang,
+        /// The connection breaks.
+        Fail,
+    }
+
+    /// A completions body that does not end the way [`MockFetch`]'s does.
+    struct TailFetch {
+        chunks: Vec<String>,
+        tail: Tail,
+    }
+
+    impl HttpFetch for TailFetch {
+        fn fetch<'a>(
+            &'a self,
+            _req: HttpRequest,
+        ) -> futures::future::BoxFuture<'a, Result<crate::http::HttpResponse, TransportError>>
+        {
+            let head = futures::stream::iter(
+                self.chunks
+                    .clone()
+                    .into_iter()
+                    .map(|chunk| Ok(chunk.into_bytes())),
+            );
+            let body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>> =
+                match self.tail {
+                    Tail::Hang => Box::pin(head.chain(futures::stream::pending())),
+                    Tail::Fail => Box::pin(head.chain(futures::stream::once(async {
+                        Err("connection reset".to_owned())
+                    }))),
+                };
+            Box::pin(async move {
+                Ok(crate::http::HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                })
+            })
+        }
+    }
+
+    async fn completions_events(fetch: Arc<dyn HttpFetch>) -> Vec<StreamEvent> {
+        let transport = FamilyTransport::new(ApiKind::OpenAiCompletions, "http://x/v1", fetch);
+        let stream = match transport
+            .stream(req(), RequestCtx::with_key("sk-test"))
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => panic!("the stream did not open: {error}"),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(60), stream.collect())
+            .await
+            .expect("the stream must end on its own")
+    }
+
+    fn assert_ends_once(events: &[StreamEvent]) {
+        let terminals = events.iter().filter(|e| e.is_terminal()).count();
+        assert_eq!(terminals, 1, "{events:?}");
+        assert!(
+            events.last().is_some_and(StreamEvent::is_terminal),
+            "{events:?}"
+        );
+    }
+
+    /// `stream_options.include_usage` sends the count after the chunk that
+    /// carries `finish_reason`; stopping at the finish lost it every time.
+    #[tokio::test]
+    async fn a_usage_chunk_after_the_finish_lands_before_done() {
+        let fetch = Arc::new(MockFetch::sse(vec![
+            says("hi"),
+            finish(),
+            usage_chunk(),
+            "data: [DONE]\n\n".into(),
+        ]));
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert_eq!(
+            &events[events.len() - 2..],
+            &[
+                StreamEvent::Usage(REPORTED),
+                StreamEvent::Done {
+                    reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    /// `[DONE]` is how an OpenAI-compatible server says the stream is over;
+    /// some send it without any `finish_reason`. It is not a JSON payload to
+    /// be refused.
+    #[tokio::test]
+    async fn the_done_sentinel_ends_the_stream_instead_of_failing_it() {
+        let fetch = Arc::new(MockFetch::sse(vec![says("hi"), "data: [DONE]\n\n".into()]));
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::Stop
+            })
+        );
+    }
+
+    /// A server that keeps the response open after the finish must not keep
+    /// the turn: the finished answer goes out once the grace window closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_holds_the_stream_open_after_the_finish_is_let_go() {
+        let started = tokio::time::Instant::now();
+        let fetch = Arc::new(TailFetch {
+            chunks: vec![says("hi"), finish()],
+            tail: Tail::Hang,
+        });
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::Stop
+            })
+        );
+        let grace = WatchdogConfig::default().post_finish_grace;
+        assert!(started.elapsed() >= grace, "{:?}", started.elapsed());
+        assert!(started.elapsed() < grace * 2, "{:?}", started.elapsed());
+    }
+
+    /// Once the count is in, nothing more is awaited, even from a server
+    /// that never closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_reported_count_releases_the_finish_at_once() {
+        let started = tokio::time::Instant::now();
+        let fetch = Arc::new(TailFetch {
+            chunks: vec![says("hi"), finish(), usage_chunk()],
+            tail: Tail::Hang,
+        });
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert_eq!(events[events.len() - 2], StreamEvent::Usage(REPORTED));
+        assert!(
+            started.elapsed() < WatchdogConfig::default().post_finish_grace,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The answer was complete when the connection broke while its count
+    /// was awaited; the turn must not fail over a missing count.
+    #[tokio::test]
+    async fn a_connection_lost_after_the_finish_does_not_undo_the_answer() {
+        let fetch = Arc::new(TailFetch {
+            chunks: vec![says("hi"), finish()],
+            tail: Tail::Fail,
+        });
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Done {
+                reason: StopReason::Stop
+            })
+        );
+    }
+
+    /// A connection lost mid-answer is still a connection error.
+    #[tokio::test]
+    async fn a_connection_lost_before_the_finish_is_still_an_error() {
+        let fetch = Arc::new(TailFetch {
+            chunks: vec![says("hi")],
+            tail: Tail::Fail,
+        });
+        let events = completions_events(fetch).await;
+        assert_ends_once(&events);
+        assert!(
+            matches!(
+                events.last(),
+                Some(StreamEvent::Error {
+                    reason: ErrorReason::Connection,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
     }
 }
