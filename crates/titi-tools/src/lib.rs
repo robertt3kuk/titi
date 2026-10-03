@@ -6,6 +6,7 @@ pub mod cache;
 pub mod fs;
 pub mod git;
 pub mod hashline;
+pub mod intercept;
 pub mod pipe;
 pub mod pty;
 pub mod sensitive;

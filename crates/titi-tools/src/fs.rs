@@ -966,6 +966,9 @@ impl ToolHandler for BashTool {
         let Some(command) = arg_str(&args, "command") else {
             return err("missing command");
         };
+        if let Some(refusal) = crate::intercept::refusal(&command) {
+            return err(refusal);
+        }
         let timeout = args
             .get("timeout_secs")
             .and_then(Value::as_u64)
@@ -2290,6 +2293,30 @@ mod tests {
 
     /// A failure says how the command exited, so an empty output still
     /// tells the model something.
+    /// A dev server in the foreground would hold the call to its deadline;
+    /// it is refused before it starts, on either path.
+    #[tokio::test]
+    async fn a_foreground_server_is_refused_before_it_runs() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        for pty in [false, true] {
+            let started = std::time::Instant::now();
+            let result = tool
+                .invoke(serde_json::json!({
+                    "command": "touch ran && npm run dev", "pty": pty
+                }))
+                .await;
+            assert!(result.is_error);
+            assert!(result.output.starts_with("refused:"), "{}", result.output);
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert!(!root.join("ran").exists(), "a refused command ran");
+        }
+        let result = tool
+            .invoke(serde_json::json!({"command": "echo 'npm run dev' > notes.txt"}))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+    }
+
     #[tokio::test]
     async fn a_failed_piped_command_names_its_exit_code() {
         let root = temp_root();
