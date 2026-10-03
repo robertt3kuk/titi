@@ -2466,6 +2466,7 @@ impl Chat {
                 (Some(row), true) => format!("env + {}", crate::secrets::describe_key(row, now)),
                 (Some(row), false) => crate::secrets::describe_key(row, now),
                 (None, true) => "env".to_owned(),
+                (None, false) if !provider.credential_required => "no key needed".to_owned(),
                 (None, false) => "no key".to_owned(),
             };
             listed.push(id.clone());
@@ -2589,6 +2590,8 @@ impl Chat {
                     "env".to_owned()
                 } else if let Some(row) = &credential.stored {
                     crate::secrets::describe_key(row, now)
+                } else if !provider.credential_required {
+                    "no key needed".to_owned()
                 } else {
                     "no key".to_owned()
                 };
@@ -10999,6 +11002,39 @@ mod tests {
                 chat.lines
             );
         }
+    }
+
+    /// A local server that takes no credential is ready as it is: `/keys`
+    /// and `/diagnose` must not list it as missing something.
+    #[test]
+    fn a_provider_without_a_credential_is_not_missing_a_key() {
+        let dir = agent_dir_with_extra_provider();
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+        type_text(&mut chat, "/keys");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "ollama  no key needed"),
+            "{:?}",
+            chat.lines
+        );
+        // A provider that does need one and has none still says so (the
+        // test environment sets no ZAI_API_KEY).
+        assert!(
+            chat.lines.iter().any(|line| line.text == "zai  no key"),
+            "{:?}",
+            chat.lines
+        );
+
+        type_text(&mut chat, "/diagnose");
+        chat.on_key(Key::Enter, Instant::now());
+        let summary = chat.lines.last().expect("a transcript line");
+        assert!(
+            summary.text.contains("ollama (no key needed)"),
+            "{summary:?}"
+        );
     }
 
     #[test]
