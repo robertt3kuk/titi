@@ -511,6 +511,10 @@ pub struct Chat {
     /// again between two deltas reads these rows instead of re-parsing the
     /// whole answer ([`Chat::assistant_rows`]).
     reply_render: Option<ReplyRender>,
+    /// When the welcome's intro started. Only `run` starts it, as the first
+    /// frame reaches a terminal; a chat that never starts it — every test's —
+    /// draws the resting frame.
+    intro: Option<Instant>,
 }
 
 impl Chat {
@@ -571,7 +575,14 @@ impl Chat {
             last_transcript_height: 0,
             theme,
             reply_render: None,
+            intro: None,
         }
+    }
+
+    /// Plays the welcome's intro from `now`: the shine crosses the mark over
+    /// the next [`WELCOME_INTRO`], and the frame settles after it.
+    fn start_intro(&mut self, now: Instant) {
+        self.intro = Some(now);
     }
 
     fn take_kitty_flush(&mut self) -> String {
@@ -3211,6 +3222,7 @@ pub fn run(
     }
     let mut reported = AgentState::Idle;
     let mut screen = Screen::open()?;
+    chat.start_intro(Instant::now());
     let result = loop {
         let state = chat.agent_state();
         if state != reported
@@ -5334,6 +5346,13 @@ const WELCOME_WORDMARK: [&str; 2] = ["▄█▄ ▀ ▄█▄ ▀", " █▄ █
 /// Columns between the mark and the wordmark.
 const WELCOME_GAP: usize = 4;
 
+/// How long the intro's shine takes to cross the mark. The run loop draws a
+/// frame at least every 50 ms, which is the intro's frame rate.
+const WELCOME_INTRO: Duration = Duration::from_millis(1500);
+
+/// Half the width of the shine band, along the mark's diagonal (0 to 1).
+const WELCOME_SHINE: f64 = 0.2;
+
 /// What the first screen states, every fact read from the source the surface
 /// that owns it reads: the catalog plus the credential reader behind `/keys`,
 /// the status-bar snapshot behind the masthead, and the session list behind
@@ -5411,6 +5430,9 @@ struct WelcomeGrays {
     /// The ink most of the way back to the page: labels, the build, the
     /// chords, the mark's far corner.
     faded: f64,
+    /// The far end of the page's lightness, past the ink, where the intro's
+    /// shine lifts a cell to.
+    peak: f64,
 }
 
 impl WelcomeGrays {
@@ -5423,10 +5445,11 @@ impl WelcomeGrays {
                     / 255.0
             })
             .unwrap_or(if theme.is_light() { 1.0 } else { 0.0 });
-        let bright = if page < 0.5 { 0.96 } else { 0.08 };
+        let (bright, peak) = if page < 0.5 { (0.96, 1.0) } else { (0.08, 0.0) };
         Self {
             bright,
             faded: bright + (page - bright) * 0.6,
+            peak,
         }
     }
 
@@ -5454,10 +5477,30 @@ fn welcome_mark_width() -> usize {
         .unwrap_or(0)
 }
 
+/// Where the intro's shine is along the mark's diagonal `elapsed` into the
+/// intro, or `None` once it has crossed.
+///
+/// It eases out — quick off the lit corner, slowing into the far one — and
+/// travels from a band's width before the mark to a band's width past it, so
+/// its first and last frames light nothing and the intro meets the resting
+/// frame without a jump.
+fn welcome_shine(elapsed: Duration) -> Option<f64> {
+    let progress = elapsed.as_secs_f64() / WELCOME_INTRO.as_secs_f64();
+    if progress >= 1.0 {
+        return None;
+    }
+    // A quadratic, not omp's cubic: a cubic spends the last two fifths of the
+    // intro creeping past the far corner, which on a mark this small reads as
+    // a shine that is over before the intro is.
+    let eased = 1.0 - (1.0 - progress).powi(2);
+    Some(-WELCOME_SHINE + (1.0 + 2.0 * WELCOME_SHINE) * eased)
+}
+
 /// The mark, shaded along its diagonal from the ink in the top-left corner to
 /// the faded gray in the bottom-right: each cell at the mean of how far across
-/// and how far down it is, the way omp shades its own mark.
-fn welcome_mark(grays: &WelcomeGrays) -> Vec<Vec<Span<'static>>> {
+/// and how far down it is, the way omp shades its own mark. While the intro
+/// plays, the cells within a band of `shine` are lifted toward the peak.
+fn welcome_mark(grays: &WelcomeGrays, shine: Option<f64>) -> Vec<Vec<Span<'static>>> {
     let across = welcome_mark_width().saturating_sub(1).max(1) as f64;
     let down = WELCOME_MARK.len().saturating_sub(1).max(1) as f64;
     WELCOME_MARK
@@ -5471,7 +5514,11 @@ fn welcome_mark(grays: &WelcomeGrays) -> Vec<Vec<Span<'static>>> {
                         return Span::raw(" ");
                     }
                     let along = (x as f64 / across + y as f64 / down) / 2.0;
-                    let level = grays.bright + (grays.faded - grays.bright) * along;
+                    let rest = grays.bright + (grays.faded - grays.bright) * along;
+                    let lift = shine.map_or(0.0, |at| {
+                        (1.0 - (along - at).abs() / WELCOME_SHINE).max(0.0)
+                    });
+                    let level = rest + (grays.peak - rest) * lift;
                     Span::styled(glyph.to_string(), Style::default().fg(gray(level)))
                 })
                 .collect()
@@ -5498,14 +5545,18 @@ fn welcome_lockup_width(facts: &WelcomeFacts) -> usize {
 
 /// The mark with the wordmark beside it from its second row and the build
 /// under the wordmark, the way omp sets its own lockup.
-fn welcome_lockup(facts: &WelcomeFacts, grays: &WelcomeGrays) -> Vec<Line<'static>> {
+fn welcome_lockup(
+    facts: &WelcomeFacts,
+    grays: &WelcomeGrays,
+    shine: Option<f64>,
+) -> Vec<Line<'static>> {
     let word = grays.bright().add_modifier(Modifier::BOLD);
     let beside: Vec<Span<'static>> = WELCOME_WORDMARK
         .iter()
         .map(|row| Span::styled(*row, word))
         .chain([Span::styled(welcome_build(facts), grays.faded())])
         .collect();
-    welcome_mark(grays)
+    welcome_mark(grays, shine)
         .into_iter()
         .enumerate()
         .map(|(y, mut spans)| {
@@ -5746,21 +5797,29 @@ fn welcome_git(git: &WelcomeGit, grays: &WelcomeGrays) -> Vec<Span<'static>> {
     spans
 }
 
+/// What the welcome opens with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WelcomeHead {
+    /// The mark beside the wordmark, with the intro's shine where it is.
+    Lockup { shine: Option<f64> },
+    /// The brand in one line, for a pane with no room for the mark.
+    Brand,
+}
+
 /// The welcome's rows at one degradation level, each centred in `width`
-/// cells: the lockup, or the brand in one line when `lockup` is false; the
-/// tagline; the facts as one left-aligned block; the chords; and the tip.
+/// cells: the head; the tagline; the facts as one left-aligned block; the
+/// chords; and the tip.
 fn welcome_rows(
     facts: &WelcomeFacts,
     tip: Option<&str>,
     level: u8,
-    lockup: bool,
+    head: WelcomeHead,
     width: usize,
     grays: &WelcomeGrays,
 ) -> Vec<Line<'static>> {
-    let head = if lockup {
-        welcome_lockup(facts, grays)
-    } else {
-        vec![welcome_brand(facts, grays)]
+    let head = match head {
+        WelcomeHead::Lockup { shine } => welcome_lockup(facts, grays, shine),
+        WelcomeHead::Brand => vec![welcome_brand(facts, grays)],
     };
     let mut sections = vec![centre_block(head, width)];
     if WelcomePart::Tagline.shown(level) {
@@ -5826,16 +5885,22 @@ fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph
     let (width, height) = (usize::from(width), usize::from(height));
     // A column clear on each side of the mark; a pane narrower than that states
     // the brand in one line rather than cut the mark down the middle.
-    let lockup = width >= welcome_lockup_width(&facts) + 2;
+    let head = if width >= welcome_lockup_width(&facts) + 2 {
+        WelcomeHead::Lockup {
+            shine: chat.intro.and_then(|start| welcome_shine(start.elapsed())),
+        }
+    } else {
+        WelcomeHead::Brand
+    };
     let mut rows = Vec::new();
     for level in 0..=WELCOME_BARE {
-        rows = welcome_rows(&facts, tip, level, lockup, width, &grays);
+        rows = welcome_rows(&facts, tip, level, head, width, &grays);
         if rows.len() <= height {
             break;
         }
     }
     if rows.len() > height {
-        rows = welcome_rows(&facts, tip, WELCOME_BARE, false, width, &grays);
+        rows = welcome_rows(&facts, tip, WELCOME_BARE, WelcomeHead::Brand, width, &grays);
     }
     let pad = height.saturating_sub(rows.len()) / 2;
     let mut lines = vec![Line::from(""); pad];
@@ -9027,6 +9092,95 @@ mod tests {
             .filter_map(|n| welcome_tip(&format!("session-{n}")))
             .collect();
         assert!(picked.len() > 1, "{picked:?}");
+    }
+
+    /// The welcome holds still until the live screen starts its intro: two
+    /// frames of a chat that never started one are the same cells, and an
+    /// intro that has run its course leaves exactly that resting frame.
+    #[test]
+    fn the_welcome_rests_unless_the_screen_starts_its_intro() {
+        let (_dir, mut chat) = welcome_chat();
+        let rest = frame_buffer(&mut chat, 80, 24);
+        assert_eq!(
+            frame_buffer(&mut chat, 80, 24),
+            rest,
+            "a chat that never started the intro draws one frame"
+        );
+        let long_ago = Instant::now()
+            .checked_sub(WELCOME_INTRO * 2)
+            .expect("the clock has run longer than two intros");
+        chat.start_intro(long_ago);
+        assert_eq!(
+            frame_buffer(&mut chat, 80, 24),
+            rest,
+            "and a finished intro settles on it"
+        );
+    }
+
+    /// The intro sweeps a shine across the mark, from the lit corner to the
+    /// far one, quick at first and slowing into the end, and is gone by the
+    /// time it has run: the band starts and ends off the mark, so its first
+    /// and last frames are the resting one. Every cell it lights stays a gray,
+    /// pushed toward the page's far end — whiter on a dark page, blacker on a
+    /// light one.
+    #[test]
+    fn the_intro_sweeps_a_shine_across_the_mark() {
+        assert!(
+            (Duration::from_millis(1200)..=Duration::from_millis(1500)).contains(&WELCOME_INTRO),
+            "{WELCOME_INTRO:?}"
+        );
+        let at = |millis: u64| welcome_shine(Duration::from_millis(millis));
+        assert_eq!(welcome_shine(WELCOME_INTRO), None, "it is over in time");
+        assert_eq!(welcome_shine(WELCOME_INTRO * 3), None, "and stays over");
+        let steps: Vec<f64> = (0..WELCOME_INTRO.as_millis() as u64)
+            .step_by(50)
+            .map(|millis| at(millis).expect("still sweeping"))
+            .collect();
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "it moves one way: {steps:?}"
+        );
+        let half = WELCOME_INTRO.as_millis() as u64 / 2;
+        let (start, middle, end) = (
+            steps[0],
+            at(half).unwrap_or_default(),
+            steps[steps.len() - 1],
+        );
+        assert!(
+            middle - start > end - middle,
+            "and eases out: {start} → {middle} → {end}"
+        );
+
+        for name in ["titanium", "alabaster"] {
+            let grays = WelcomeGrays::of(&test_theme_named(name));
+            let levels = |shine: Option<f64>| -> Vec<u8> {
+                welcome_mark(&grays, shine)
+                    .into_iter()
+                    .flatten()
+                    .filter(|span| span.content.trim() != "")
+                    .map(|span| {
+                        let color = span.style.fg.unwrap_or(Color::Reset);
+                        gray_level(color)
+                            .unwrap_or_else(|| panic!("{name}: {color:?} is not a gray"))
+                    })
+                    .collect()
+            };
+            let rest = levels(None);
+            assert_eq!(
+                levels(at(0)),
+                rest,
+                "{name}: the first frame is the resting one"
+            );
+            let lit = levels(at(250));
+            assert_ne!(lit, rest, "{name}: the shine shows mid-sweep");
+            let dark = grays.bright > 0.5;
+            for (lit, rest) in lit.iter().zip(&rest) {
+                assert!(
+                    if dark { lit >= rest } else { lit <= rest },
+                    "{name}: the shine moves a cell toward the page's far end ({rest} → {lit})"
+                );
+            }
+        }
     }
 
     /// The picker above the composer is a box: the title sits inset in the top
