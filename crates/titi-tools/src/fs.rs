@@ -238,16 +238,77 @@ pub struct ReadFileTool {
     pub policy: SensitivePolicy,
 }
 
+/// A positive line number or count, from an integer or a string of digits;
+/// absent or `null` is `None`.
+fn line_arg(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let value = match args.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let number = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+        .and_then(|number| usize::try_from(number).ok());
+    match number {
+        Some(number) if number >= 1 => Ok(Some(number)),
+        _ => Err(format!(
+            "{key} must be a whole number of at least 1, not {value}"
+        )),
+    }
+}
+
+/// Lines `offset..offset + limit` (1-based) of `content`, as the file holds
+/// them. A window that leaves any line out starts with `[lines A-B of N]`.
+fn line_window(
+    path: &str,
+    content: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total = lines.len();
+    // Line 1 of an empty file is where it starts, not past its end.
+    if offset > total.max(1) {
+        return Err(format!(
+            "{path}:{offset} is past the end of the file ({total} lines)"
+        ));
+    }
+    let first = offset - 1;
+    let end = limit.map_or(total, |limit| first.saturating_add(limit).min(total));
+    let body = lines[first..end].concat();
+    if first == 0 && end == total {
+        return Ok(body);
+    }
+    Ok(format!("[lines {offset}-{end} of {total}]\n{body}"))
+}
+
 #[async_trait]
 impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             spec: ToolSpec {
                 name: "read".into(),
-                description: "Read a UTF-8 file from the workspace".into(),
+                description: "Read a UTF-8 file from the workspace: the whole file, or a line \
+                              range with offset and limit. A range that leaves lines out starts \
+                              with a `[lines A-B of N]` line; long results are cut, so read a \
+                              large file in ranges."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "path": { "type": "string" } },
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "First line to read, 1-based. Default 1."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "How many lines to read from offset. \
+                                            Default: to the end of the file."
+                        }
+                    },
                     "required": ["path"]
                 }),
             },
@@ -257,16 +318,41 @@ impl ToolHandler for ReadFileTool {
 
     fn describe(&self, args: &Value) -> Option<String> {
         let path = arg_str(args, "path")?;
-        Some(format!("read {}", describe_line(&path, DESCRIBE_MAX)))
+        let offset = line_arg(args, "offset").ok().flatten();
+        let limit = line_arg(args, "limit").ok().flatten();
+        let window = match (offset, limit) {
+            (None, None) => String::new(),
+            (offset, Some(limit)) => {
+                let first = offset.unwrap_or(1);
+                format!(":{first}-{}", first.saturating_add(limit - 1))
+            }
+            (Some(offset), None) => format!(":{offset}-"),
+        };
+        Some(format!(
+            "read {}{window}",
+            describe_line(&path, DESCRIBE_MAX)
+        ))
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let Some(path) = arg_str(&args, "path") else {
             return err("missing path");
         };
-        match readable_path(&self.root, &path, &self.policy).and_then(|path| self.cache.read(&path))
+        let (offset, limit) = match (line_arg(&args, "offset"), line_arg(&args, "limit")) {
+            (Ok(offset), Ok(limit)) => (offset, limit),
+            (Err(error), _) | (_, Err(error)) => return err(error),
+        };
+        let content = match readable_path(&self.root, &path, &self.policy)
+            .and_then(|path| self.cache.read(&path))
         {
-            Ok(content) => ok(content),
+            Ok(content) => content,
+            Err(error) => return err(error),
+        };
+        if offset.is_none() && limit.is_none() {
+            return ok(content);
+        }
+        match line_window(&path, &content, offset.unwrap_or(1), limit) {
+            Ok(window) => ok(window),
             Err(error) => err(error),
         }
     }
@@ -1427,6 +1513,147 @@ mod tests {
 
     fn cache_hits(tool: &ReadFileTool) -> u64 {
         tool.cache.stats().0
+    }
+
+    /// A ten-line file, `line 1` … `line 10`, and a reader over its root.
+    fn ten_line_reader() -> (PathBuf, ReadFileTool) {
+        let root = temp_root();
+        let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        fs::write(root.join("ten.txt"), body).unwrap();
+        let read = ReadFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+        (root, read)
+    }
+
+    /// A range is those lines and nothing else, under one header that says
+    /// where they sit — the model asked for a window because the file is too
+    /// long to take whole, so it must know how long.
+    #[tokio::test]
+    async fn a_range_read_returns_those_lines_under_a_header() {
+        let (_root, read) = ten_line_reader();
+        let result = read
+            .invoke(serde_json::json!({"path": "ten.txt", "offset": 3, "limit": 2}))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "[lines 3-4 of 10]\nline 3\nline 4\n");
+
+        let tail = read
+            .invoke(serde_json::json!({"path": "ten.txt", "offset": 9}))
+            .await;
+        assert_eq!(tail.output, "[lines 9-10 of 10]\nline 9\nline 10\n");
+
+        let head = read
+            .invoke(serde_json::json!({"path": "ten.txt", "limit": 2}))
+            .await;
+        assert_eq!(head.output, "[lines 1-2 of 10]\nline 1\nline 2\n");
+
+        // A limit that runs past the end stops at the last line.
+        let past = read
+            .invoke(serde_json::json!({"path": "ten.txt", "offset": 8, "limit": 100}))
+            .await;
+        assert_eq!(past.output, "[lines 8-10 of 10]\nline 8\nline 9\nline 10\n");
+    }
+
+    /// A range that covers the whole file is the whole file, with no header:
+    /// nothing was left out, so there is nothing to locate.
+    #[tokio::test]
+    async fn a_range_over_the_whole_file_has_no_header() {
+        let (root, read) = ten_line_reader();
+        let whole = fs::read_to_string(root.join("ten.txt")).unwrap();
+        let ranged = read
+            .invoke(serde_json::json!({"path": "ten.txt", "offset": 1, "limit": 50}))
+            .await;
+        assert_eq!(ranged.output, whole);
+        let plain = read.invoke(serde_json::json!({"path": "ten.txt"})).await;
+        assert!(!plain.is_error, "{}", plain.output);
+        assert_eq!(
+            plain.output, whole,
+            "no range reads the file as it always did"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_names_the_line_count() {
+        let (_root, read) = ten_line_reader();
+        let result = read
+            .invoke(serde_json::json!({"path": "ten.txt", "offset": 11}))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("ten.txt"), "{}", result.output);
+        assert!(result.output.contains("10 lines"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_range_is_an_error() {
+        let (_root, read) = ten_line_reader();
+        for args in [
+            serde_json::json!({"path": "ten.txt", "offset": 0}),
+            serde_json::json!({"path": "ten.txt", "limit": 0}),
+            serde_json::json!({"path": "ten.txt", "offset": -3}),
+            serde_json::json!({"path": "ten.txt", "offset": "soon"}),
+        ] {
+            let result = read.invoke(args.clone()).await;
+            assert!(result.is_error, "{args}: {}", result.output);
+            assert!(!result.output.contains("line 1"), "{}", result.output);
+        }
+    }
+
+    /// The last line of a file with no final newline is still a line, and a
+    /// range reads it as the file holds it.
+    #[tokio::test]
+    async fn a_range_reads_an_unterminated_last_line() {
+        let root = temp_root();
+        fs::write(root.join("short.txt"), "a\nb\nc").unwrap();
+        let read = ReadFileTool {
+            root,
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+        let result = read
+            .invoke(serde_json::json!({"path": "short.txt", "offset": 3}))
+            .await;
+        assert_eq!(result.output, "[lines 3-3 of 3]\nc");
+    }
+
+    /// A range is cut from the cached body, so reading a second window of the
+    /// same file does not go back to disk; and a credential file is refused
+    /// whatever window is asked for.
+    #[tokio::test]
+    async fn a_range_read_uses_the_cache_and_the_credential_policy() {
+        let (root, read) = ten_line_reader();
+        read.invoke(serde_json::json!({"path": "ten.txt", "offset": 1, "limit": 2}))
+            .await;
+        read.invoke(serde_json::json!({"path": "ten.txt", "offset": 5, "limit": 2}))
+            .await;
+        assert_eq!(read.cache.stats(), (1, 1));
+
+        fs::write(root.join(".env"), "API_KEY=sk-test-0000000000000000\n").unwrap();
+        let secret = read
+            .invoke(serde_json::json!({"path": ".env", "offset": 1, "limit": 1}))
+            .await;
+        assert!(secret.is_error, "{}", secret.output);
+        assert!(!secret.output.contains("sk-test"), "{}", secret.output);
+    }
+
+    #[test]
+    fn a_range_read_describes_its_window() {
+        let (_root, read) = ten_line_reader();
+        let described = |args: Value| read.describe(&args);
+        assert_eq!(
+            described(serde_json::json!({"path": "a.rs", "offset": 120, "limit": 61})).as_deref(),
+            Some("read a.rs:120-180")
+        );
+        assert_eq!(
+            described(serde_json::json!({"path": "a.rs", "offset": 120})).as_deref(),
+            Some("read a.rs:120-")
+        );
+        assert_eq!(
+            described(serde_json::json!({"path": "a.rs", "limit": 40})).as_deref(),
+            Some("read a.rs:1-40")
+        );
     }
 
     #[test]
