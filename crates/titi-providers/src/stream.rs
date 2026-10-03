@@ -59,6 +59,33 @@ pub enum ErrorReason {
     Aborted,
 }
 
+/// Token counts the provider itself reported for one request.
+///
+/// `prompt_tokens` is everything the request was billed as input, prompt-cache
+/// reads and writes included, so it stands where an estimate of the whole
+/// request would; `cached_tokens` is the part of it read from the cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl TokenUsage {
+    /// A report, or `None` when it measured nothing: some compatible servers
+    /// fill the field with zeros, and a request always has input.
+    pub(crate) fn reported(prompt: u64, completion: u64, cached: u64) -> Option<Self> {
+        if prompt == 0 && completion == 0 {
+            return None;
+        }
+        Some(Self {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached.min(prompt),
+        })
+    }
+}
+
 /// Normalized stream event, identical for every endpoint family.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamEvent {
@@ -94,6 +121,10 @@ pub enum StreamEvent {
     ToolcallEnd {
         id: BlockId,
     },
+    /// The provider's own count for the request, ahead of the terminal event.
+    /// Counts are cumulative, so a later report in the stream replaces an
+    /// earlier one; a provider that reports nothing sends none.
+    Usage(TokenUsage),
     Done {
         reason: StopReason,
     },

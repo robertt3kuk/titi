@@ -35,7 +35,7 @@ pub use mock::{MockBody, MockFetch, MockFetchResponse, MockTransport};
 pub use partial_json::{PartialJson, STREAMING_JSON_PARSE_MIN_GROWTH, relaxed_parse};
 pub use sse::{MarkerStripper, SseDecoder, SseFrame};
 pub use stop::{StopMapping, map_stop_reason, promote_stop_for_tools};
-pub use stream::{BlockId, ErrorReason, StopReason, StreamEvent, ToolCallRef};
+pub use stream::{BlockId, ErrorReason, StopReason, StreamEvent, TokenUsage, ToolCallRef};
 pub use transport::{
     ApiKind, ChatMessage, EventStream, RequestCtx, Role, ToolSpec, Transport, TransportError,
     WatchdogConfig, WireRequest,

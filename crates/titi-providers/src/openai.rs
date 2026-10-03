@@ -7,7 +7,7 @@ use smol_str::SmolStr;
 use crate::compat::StreamDecodePolicy;
 use crate::sse::MarkerStripper;
 use crate::stop::map_stop_reason;
-use crate::stream::{BlockId, StreamEvent, ToolCallRef};
+use crate::stream::{BlockId, StreamEvent, TokenUsage, ToolCallRef};
 use crate::transport::ApiKind;
 
 /// Mutable decode state for one OpenAI-family stream.
@@ -83,10 +83,64 @@ pub fn decode_completions_chunk(
     state: &mut OpenAiStreamState,
     policy: &StreamDecodePolicy,
 ) -> Vec<StreamEvent> {
+    let mut events = completions_chunk_events(payload, state, policy);
+    if let Some(usage) = completions_usage(payload) {
+        let at = events
+            .iter()
+            .position(StreamEvent::is_terminal)
+            .unwrap_or(events.len());
+        events.insert(at, StreamEvent::Usage(usage));
+    }
+    events
+}
+
+/// The count on a Chat Completions chunk: the top-level `usage` of the
+/// trailing chunk `stream_options.include_usage` asks for (or of the finish
+/// chunk, on gateways that put it there), else a `usage` on the choice, where
+/// a few compatible servers put it instead.
+fn completions_usage(payload: &Value) -> Option<TokenUsage> {
+    let usage = payload
+        .get("usage")
+        .filter(|usage| usage.is_object())
+        .or_else(|| {
+            payload
+                .pointer("/choices/0/usage")
+                .filter(|usage| usage.is_object())
+        })?;
+    let prompt = usage.get("prompt_tokens")?.as_u64()?;
+    let completion = usage.get("completion_tokens")?.as_u64()?;
+    // DeepSeek reports its cache hits at the top level instead.
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    TokenUsage::reported(prompt, completion, cached)
+}
+
+/// The count on a Responses terminal event (`response.usage`), where input
+/// already includes the cached part.
+fn responses_usage(payload: &Value) -> Option<TokenUsage> {
+    let usage = payload.pointer("/response/usage")?;
+    let prompt = usage.get("input_tokens")?.as_u64()?;
+    let completion = usage.get("output_tokens")?.as_u64()?;
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    TokenUsage::reported(prompt, completion, cached)
+}
+
+fn completions_chunk_events(
+    payload: &Value,
+    state: &mut OpenAiStreamState,
+    policy: &StreamDecodePolicy,
+) -> Vec<StreamEvent> {
     let mut events: Vec<StreamEvent> = Vec::new();
 
+    // A chunk without choices is the usage-only trailer; its count is read
+    // by the caller.
     let Some(choices) = payload.get("choices").and_then(Value::as_array) else {
-        // Usage-only trailing chunk (stream_options.include_usage): skip.
         return events;
     };
     let Some(choice) = choices.first() else {
@@ -510,6 +564,7 @@ pub fn decode_responses_event(
                 "response.incomplete" => "incomplete",
                 _ => "failed",
             };
+            events.extend(responses_usage(payload).map(StreamEvent::Usage));
             events.extend(close_all(state, wire));
         }
         _ => {}
@@ -520,7 +575,7 @@ pub fn decode_responses_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::StopReason;
+    use crate::stream::{StopReason, TokenUsage};
     use serde_json::json;
 
     fn state() -> OpenAiStreamState {
@@ -1118,5 +1173,191 @@ mod tests {
                 reason: StopReason::ToolUse
             })
         );
+    }
+
+    fn usage(prompt: u64, completion: u64, cached: u64) -> StreamEvent {
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached,
+        })
+    }
+
+    fn usages(events: &[StreamEvent]) -> Vec<&StreamEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Usage(_)))
+            .collect()
+    }
+
+    /// `stream_options.include_usage` puts the count in a chunk of its own
+    /// after the finish, with an empty `choices`; every chunk before it says
+    /// `"usage": null`.
+    #[test]
+    fn completions_trailing_usage_chunk_is_reported() {
+        let mut s = state();
+        let policy = StreamDecodePolicy::default();
+        let ev = decode_completions_chunk(
+            &json!({"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,
+                    "delta":{"content":"hi"},"finish_reason":null}],"usage":null}),
+            &mut s,
+            &policy,
+        );
+        assert!(usages(&ev).is_empty(), "{ev:?}");
+        let ev = decode_completions_chunk(
+            &json!({"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,
+                    "delta":{},"finish_reason":"stop"}],"usage":null}),
+            &mut s,
+            &policy,
+        );
+        assert!(usages(&ev).is_empty(), "{ev:?}");
+        let ev = decode_completions_chunk(
+            &json!({"id":"c1","object":"chat.completion.chunk","choices":[],
+                    "usage":{"prompt_tokens":1200,"completion_tokens":34,"total_tokens":1234,
+                             "prompt_tokens_details":{"cached_tokens":1024,"audio_tokens":0},
+                             "completion_tokens_details":{"reasoning_tokens":0}}}),
+            &mut s,
+            &policy,
+        );
+        assert_eq!(ev, vec![usage(1200, 34, 1024)]);
+    }
+
+    /// OpenRouter-style: the count rides on the finish chunk itself, and it
+    /// must land before the terminal event that ends the stream.
+    #[test]
+    fn completions_usage_on_the_finish_chunk_precedes_done() {
+        let mut s = state();
+        let policy = StreamDecodePolicy::default();
+        let _ = decode_completions_chunk(
+            &json!({"choices":[{"delta":{"content":"hi"}}]}),
+            &mut s,
+            &policy,
+        );
+        let ev = decode_completions_chunk(
+            &json!({"choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":40,"completion_tokens":2,"total_tokens":42}}),
+            &mut s,
+            &policy,
+        );
+        assert_eq!(
+            &ev[ev.len() - 2..],
+            &[
+                usage(40, 2, 0),
+                StreamEvent::Done {
+                    reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    /// DeepSeek counts cache hits at the top level, not in the details.
+    #[test]
+    fn completions_cache_hits_without_details_still_count() {
+        let mut s = state();
+        let ev = decode_completions_chunk(
+            &json!({"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":10,
+                    "prompt_cache_hit_tokens":512,"prompt_cache_miss_tokens":388}}),
+            &mut s,
+            &StreamDecodePolicy::default(),
+        );
+        assert_eq!(ev, vec![usage(900, 10, 512)]);
+    }
+
+    /// A count that is not two numbers is no count: the stream goes on and
+    /// still ends normally.
+    #[test]
+    fn completions_malformed_usage_is_absent() {
+        let policy = StreamDecodePolicy::default();
+        for bad in [
+            json!(null),
+            json!("lots"),
+            json!({"prompt_tokens":"12","completion_tokens":3}),
+            json!({"prompt_tokens":12}),
+            json!({"prompt_tokens":-1,"completion_tokens":3}),
+            json!({"prompt_tokens":1.5,"completion_tokens":3}),
+            json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+        ] {
+            let mut s = state();
+            let ev = decode_completions_chunk(
+                &json!({"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}],"usage":bad}),
+                &mut s,
+                &policy,
+            );
+            assert!(usages(&ev).is_empty(), "{bad}: {ev:?}");
+            assert_eq!(
+                ev.last(),
+                Some(&StreamEvent::Done {
+                    reason: StopReason::Stop
+                }),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_completed_reports_usage_before_done() {
+        let events = drive_responses(&[
+            ("response.created", json!({"type":"response.created"})),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","delta":"hi"}),
+            ),
+            (
+                "response.completed",
+                json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+                       "usage":{"input_tokens":2000,"input_tokens_details":{"cached_tokens":1500},
+                                "output_tokens":120,"output_tokens_details":{"reasoning_tokens":64},
+                                "total_tokens":2120}}}),
+            ),
+        ]);
+        assert_eq!(usages(&events), vec![&usage(2000, 120, 1500)]);
+        let at = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Usage(_)))
+            .expect("usage");
+        assert_eq!(
+            &events[at + 1..],
+            &[
+                StreamEvent::TextEnd { id: text_id() },
+                StreamEvent::Done {
+                    reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    /// A reply cut at the output cap is still a request that was paid for.
+    #[test]
+    fn responses_incomplete_reports_usage_too() {
+        let events = drive_responses(&[(
+            "response.incomplete",
+            json!({"type":"response.incomplete","response":{"status":"incomplete",
+                   "usage":{"input_tokens":10,"output_tokens":4096}}}),
+        )]);
+        assert_eq!(usages(&events), vec![&usage(10, 4096, 0)]);
+        assert!(events.last().is_some_and(StreamEvent::is_terminal));
+    }
+
+    #[test]
+    fn responses_missing_or_malformed_usage_is_absent() {
+        for response in [
+            json!({"status":"completed"}),
+            json!({"status":"completed","usage":null}),
+            json!({"status":"completed","usage":{"input_tokens":"many","output_tokens":3}}),
+            json!({"status":"completed","usage":{"output_tokens":3}}),
+            json!("completed"),
+        ] {
+            let events = drive_responses(&[(
+                "response.completed",
+                json!({"type":"response.completed","response":response}),
+            )]);
+            assert!(usages(&events).is_empty(), "{response}: {events:?}");
+            assert_eq!(
+                events.last(),
+                Some(&StreamEvent::Done {
+                    reason: StopReason::Stop
+                })
+            );
+        }
     }
 }

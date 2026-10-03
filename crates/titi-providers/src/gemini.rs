@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 
 use crate::compat::StreamDecodePolicy;
 use crate::stop::map_stop_reason;
-use crate::stream::{BlockId, ErrorReason, StreamEvent, ToolCallRef};
+use crate::stream::{BlockId, ErrorReason, StreamEvent, TokenUsage, ToolCallRef};
 use crate::transport::ApiKind;
 
 /// Mutable decode state for one Gemini stream.
@@ -34,6 +34,39 @@ fn tool_id(i: usize) -> BlockId {
 
 /// Decode one Gemini SSE chunk (one `candidates[0].content.parts` payload).
 pub fn decode_chunk(
+    payload: &Value,
+    state: &mut GeminiStreamState,
+    policy: &StreamDecodePolicy,
+) -> Vec<StreamEvent> {
+    let mut events = chunk_events(payload, state, policy);
+    if let Some(usage) = chunk_usage(payload) {
+        let at = events
+            .iter()
+            .position(StreamEvent::is_terminal)
+            .unwrap_or(events.len());
+        events.insert(at, StreamEvent::Usage(usage));
+    }
+    events
+}
+
+/// The cumulative `usageMetadata` a chunk carries. `promptTokenCount`
+/// includes the cached part; thinking is billed as output beside the
+/// candidates, and a zero count is left out of the JSON altogether.
+fn chunk_usage(payload: &Value) -> Option<TokenUsage> {
+    let metadata = payload.get("usageMetadata")?;
+    let count = |key: &str| metadata.get(key).and_then(Value::as_u64);
+    let prompt = count("promptTokenCount")?;
+    let completion = count("candidatesTokenCount")
+        .unwrap_or(0)
+        .saturating_add(count("thoughtsTokenCount").unwrap_or(0));
+    TokenUsage::reported(
+        prompt,
+        completion,
+        count("cachedContentTokenCount").unwrap_or(0),
+    )
+}
+
+fn chunk_events(
     payload: &Value,
     state: &mut GeminiStreamState,
     policy: &StreamDecodePolicy,
@@ -154,7 +187,7 @@ fn close(state: &mut GeminiStreamState, wire: &str) -> Vec<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::StopReason;
+    use crate::stream::{StopReason, TokenUsage};
     use serde_json::json;
 
     #[test]
@@ -263,6 +296,108 @@ mod tests {
             StreamEvent::Error { .. }
         ));
         let _ = policy;
+    }
+
+    fn usages(events: &[StreamEvent]) -> Vec<TokenUsage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `usageMetadata` is cumulative and rides on the chunks; the one on the
+    /// closing chunk lands before `Done`. Thinking is billed as output, and
+    /// `promptTokenCount` already includes the cached part.
+    #[test]
+    fn usage_metadata_is_reported_before_done() {
+        let mut s = GeminiStreamState::default();
+        let policy = StreamDecodePolicy::default();
+        let ev = decode_chunk(
+            &json!({"candidates":[{"content":{"parts":[{"text":"Hel"}],"role":"model"},"index":0}],
+                    "usageMetadata":{"promptTokenCount":950,"totalTokenCount":950},
+                    "modelVersion":"gemini-test"}),
+            &mut s,
+            &policy,
+        );
+        assert_eq!(
+            usages(&ev),
+            vec![TokenUsage {
+                prompt_tokens: 950,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            }]
+        );
+        let ev = decode_chunk(
+            &json!({"candidates":[{"content":{"parts":[{"text":"lo"}],"role":"model"},
+                                   "finishReason":"STOP","index":0}],
+                    "usageMetadata":{"promptTokenCount":950,"candidatesTokenCount":80,
+                                     "thoughtsTokenCount":40,"cachedContentTokenCount":600,
+                                     "totalTokenCount":1070}}),
+            &mut s,
+            &policy,
+        );
+        assert_eq!(
+            &ev[ev.len() - 2..],
+            &[
+                StreamEvent::Usage(TokenUsage {
+                    prompt_tokens: 950,
+                    completion_tokens: 120,
+                    cached_tokens: 600,
+                }),
+                StreamEvent::Done {
+                    reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    /// A count that arrives in a chunk without candidates still counts.
+    #[test]
+    fn usage_only_chunk_is_reported() {
+        let mut s = GeminiStreamState::default();
+        let ev = decode_chunk(
+            &json!({"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}),
+            &mut s,
+            &StreamDecodePolicy::default(),
+        );
+        assert_eq!(
+            ev,
+            vec![StreamEvent::Usage(TokenUsage {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                cached_tokens: 0,
+            })]
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_usage_metadata_is_absent() {
+        for metadata in [
+            Value::Null,
+            json!({}),
+            json!({"promptTokenCount":"950","candidatesTokenCount":3}),
+            json!({"candidatesTokenCount":3}),
+            json!({"promptTokenCount":-1,"candidatesTokenCount":3}),
+            json!([1, 2]),
+        ] {
+            let mut s = GeminiStreamState::default();
+            let mut chunk =
+                json!({"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]});
+            if !metadata.is_null() {
+                chunk["usageMetadata"] = metadata.clone();
+            }
+            let ev = decode_chunk(&chunk, &mut s, &StreamDecodePolicy::default());
+            assert!(usages(&ev).is_empty(), "{metadata}: {ev:?}");
+            assert_eq!(
+                ev.last(),
+                Some(&StreamEvent::Done {
+                    reason: StopReason::Stop
+                })
+            );
+        }
     }
 
     #[test]

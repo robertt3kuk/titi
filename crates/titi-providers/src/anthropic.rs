@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::partial_json::PartialJson;
 use crate::stop::map_stop_reason;
-use crate::stream::{BlockId, ErrorReason, StreamEvent, ToolCallRef};
+use crate::stream::{BlockId, ErrorReason, StreamEvent, TokenUsage, ToolCallRef};
 use crate::transport::ApiKind;
 
 /// Mutable decode state for one Anthropic stream.
@@ -14,6 +14,43 @@ pub struct AnthropicStreamState {
     started: bool,
     /// index → open block kind
     open: Vec<BlockKind>,
+    /// The message's count so far: `message_start` brings the input, the
+    /// closing `message_delta` the final output (and, on newer API versions,
+    /// the input again).
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl AnthropicStreamState {
+    /// Take in the counts a `usage` object carries; a missing or `null`
+    /// field keeps what an earlier event said.
+    fn absorb_usage(&mut self, usage: &Value) {
+        let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+        if let Some(n) = count("input_tokens") {
+            self.input_tokens = Some(n);
+        }
+        if let Some(n) = count("output_tokens") {
+            self.output_tokens = Some(n);
+        }
+        if let Some(n) = count("cache_read_input_tokens") {
+            self.cache_read_tokens = n;
+        }
+        if let Some(n) = count("cache_creation_input_tokens") {
+            self.cache_write_tokens = n;
+        }
+    }
+
+    /// `input_tokens` leaves out what the cache served and what it stored,
+    /// and both were billed as input of this request.
+    fn usage(&self) -> Option<TokenUsage> {
+        let prompt = self
+            .input_tokens?
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
+        TokenUsage::reported(prompt, self.output_tokens?, self.cache_read_tokens)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +91,9 @@ pub fn decode_event(
             if !state.started {
                 state.started = true;
                 events.push(StreamEvent::Start);
+            }
+            if let Some(usage) = payload.pointer("/message/usage") {
+                state.absorb_usage(usage);
             }
         }
         "content_block_start" => {
@@ -159,6 +199,10 @@ pub fn decode_event(
             }
         }
         "message_delta" => {
+            if let Some(usage) = payload.get("usage") {
+                state.absorb_usage(usage);
+            }
+            events.extend(state.usage().map(StreamEvent::Usage));
             if let Some(reason) = payload
                 .pointer("/delta/stop_reason")
                 .and_then(Value::as_str)
@@ -204,7 +248,7 @@ pub fn finalize_tool_args(buffer: PartialJson) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream::StopReason;
+    use crate::stream::{StopReason, TokenUsage};
     use serde_json::json;
 
     #[test]
@@ -423,5 +467,111 @@ mod tests {
         let mut s = AnthropicStreamState::default();
         assert!(decode_event("ping", &json!({"type":"ping"}), &mut s).is_empty());
         assert!(decode_event("x", &json!({"type":"whatever"}), &mut s).is_empty());
+    }
+
+    fn start_with(usage: Value) -> Value {
+        json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant",
+               "model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,
+               "usage":usage}})
+    }
+
+    fn usages(events: &[StreamEvent]) -> Vec<TokenUsage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Input arrives with `message_start`, the final output count with the
+    /// `message_delta` that ends the message; cache reads and writes are
+    /// input that was billed too.
+    #[test]
+    fn usage_joins_message_start_and_the_closing_delta() {
+        let mut s = AnthropicStreamState::default();
+        let ev = decode_event(
+            "message_start",
+            &start_with(json!({"input_tokens":12,"cache_creation_input_tokens":300,
+                               "cache_read_input_tokens":2000,"output_tokens":1})),
+            &mut s,
+        );
+        assert_eq!(ev, vec![StreamEvent::Start]);
+        let ev = decode_event(
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},
+                    "usage":{"output_tokens":87}}),
+            &mut s,
+        );
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::Usage(TokenUsage {
+                    prompt_tokens: 2312,
+                    completion_tokens: 87,
+                    cached_tokens: 2000,
+                }),
+                StreamEvent::Done {
+                    reason: StopReason::Stop
+                }
+            ]
+        );
+    }
+
+    /// Newer API versions repeat the input counts on `message_delta`; the
+    /// later figure wins, a `null` keeps the earlier one.
+    #[test]
+    fn a_closing_delta_with_input_counts_overrides_the_start() {
+        let mut s = AnthropicStreamState::default();
+        let _ = decode_event(
+            "message_start",
+            &start_with(json!({"input_tokens":5,"cache_read_input_tokens":null,"output_tokens":1})),
+            &mut s,
+        );
+        let ev = decode_event(
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},
+                    "usage":{"input_tokens":50,"cache_read_input_tokens":20,
+                             "cache_creation_input_tokens":null,"output_tokens":9}}),
+            &mut s,
+        );
+        assert_eq!(
+            usages(&ev),
+            vec![TokenUsage {
+                prompt_tokens: 70,
+                completion_tokens: 9,
+                cached_tokens: 20,
+            }]
+        );
+        assert!(matches!(ev.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// No input count anywhere, or one that is not a number: no report, and
+    /// the stream still ends.
+    #[test]
+    fn missing_or_malformed_usage_is_absent() {
+        for start in [
+            json!({"type":"message_start"}),
+            start_with(json!(null)),
+            start_with(json!({"input_tokens":"12","output_tokens":1})),
+            start_with(json!({"input_tokens":-3,"output_tokens":1})),
+        ] {
+            let mut s = AnthropicStreamState::default();
+            let _ = decode_event("message_start", &start, &mut s);
+            let ev = decode_event(
+                "message_delta",
+                &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                        "usage":{"output_tokens":"lots"}}),
+                &mut s,
+            );
+            assert!(usages(&ev).is_empty(), "{start}: {ev:?}");
+            assert_eq!(
+                ev.last(),
+                Some(&StreamEvent::Done {
+                    reason: StopReason::Stop
+                })
+            );
+        }
     }
 }
