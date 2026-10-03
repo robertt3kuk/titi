@@ -133,9 +133,13 @@ pub struct TerminalUi {
     /// on a thread keeps the callback server observable while the user is
     /// still deciding whether to paste anything at all.
     lines: Arc<Mutex<VecDeque<String>>>,
+    /// The device grant takes no pasted code — the user types the provider's
+    /// code on its page instead — so its notice must not ask for one.
+    device: bool,
 }
 
 impl TerminalUi {
+    /// The browser flow: a callback, or a code pasted on stdin.
     pub fn new() -> Self {
         let lines: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
         let sink = Arc::clone(&lines);
@@ -159,7 +163,19 @@ impl TerminalUi {
                 }
             }
         });
-        Self { lines }
+        Self {
+            lines,
+            device: false,
+        }
+    }
+
+    /// The device grant. Nothing reads a pasted code there, so no thread
+    /// holds stdin either.
+    pub fn device() -> Self {
+        Self {
+            lines: Arc::new(Mutex::new(VecDeque::new())),
+            device: true,
+        }
     }
 }
 
@@ -171,7 +187,11 @@ impl Default for TerminalUi {
 
 impl OAuthUi for TerminalUi {
     fn on_auth(&self, url: &str, instructions: &str) {
-        eprint!("{}", auth_notice(url, instructions));
+        if self.device {
+            eprint!("{}", device_auth_notice(url, instructions));
+        } else {
+            eprint!("{}", auth_notice(url, instructions));
+        }
         open_browser(url);
     }
 
@@ -191,6 +211,16 @@ fn auth_notice(url: &str, instructions: &str) -> String {
     format!(
         "{instructions}\n\nOpen this URL in your browser:\n{}\n\n\
          Paste the authorization code (or the full redirect URL):\n",
+        titi_tui::caps::osc8_link(url, url)
+    )
+}
+
+/// What `titi --login --device` prints: the page to open on any device and
+/// the code to type there. `instructions` is the provider's `Enter code: …`,
+/// and nothing is pasted back, so there is no prompt for it.
+fn device_auth_notice(url: &str, instructions: &str) -> String {
+    format!(
+        "Open this URL in a browser on any device:\n{}\n\n{instructions}\n",
         titi_tui::caps::osc8_link(url, url)
     )
 }
@@ -235,7 +265,7 @@ pub fn run_login_device(provider_id: &str, agent_dir: &Path) -> Result<(), Strin
     let runtime = runtime()?;
     let fetch = ReqwestFetch::new().map_err(|error| error.to_string())?;
     let tokens = runtime.block_on(async {
-        let ui = TerminalUi::new();
+        let ui = TerminalUi::device();
         oauth::login_device(provider, &fetch, &ui)
             .await
             .map_err(|error| error.to_string())
@@ -350,5 +380,32 @@ mod tests {
             plain.contains(&format!("Open this URL in your browser:\n{url}")),
             "{plain:?}"
         );
+    }
+
+    /// The device grant is typed into the provider's page, not pasted here:
+    /// its notice names the code and the page and asks for nothing back.
+    #[test]
+    fn the_device_notice_shows_the_code_and_asks_for_no_paste() {
+        let url = "https://auth.openai.com/codex/device";
+        let printed = device_auth_notice(url, "Enter code: ABCD-1234");
+        let open = format!("\x1b]8;;{url}\x1b\\");
+        assert_eq!(printed.matches(&open).count(), 1, "{printed:?}");
+        assert_eq!(printed.matches(titi_tui::caps::OSC8_CLOSE).count(), 1);
+        assert!(
+            printed.contains(&format!("on any device:\n{open}{url}")),
+            "{printed:?}"
+        );
+        assert!(printed.contains("Enter code: ABCD-1234"), "{printed:?}");
+        assert!(!printed.contains("Paste"), "{printed:?}");
+        assert!(!printed.contains("in your browser"), "{printed:?}");
+    }
+
+    /// The device UI never takes a line from stdin: no pasted code can reach
+    /// a flow that has no use for one.
+    #[test]
+    fn the_device_ui_reads_no_code() {
+        let ui = TerminalUi::device();
+        assert!(ui.device);
+        assert_eq!(ui.manual_code(), None);
     }
 }
