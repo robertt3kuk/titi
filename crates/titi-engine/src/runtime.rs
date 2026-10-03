@@ -766,6 +766,12 @@ impl EngineRuntime {
                             for text in queued.drain(..) {
                                 let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
                             }
+                            // Steering the cancelled turn never read goes back
+                            // the same way, or it would ride along with the
+                            // next prompt the user sends.
+                            for text in self.steering.drain() {
+                                let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                            }
                         }
                         EngineCommand::SwitchModel { model } => {
                             // Answer, even when the model does not change: a
@@ -971,6 +977,15 @@ impl EngineRuntime {
                         // inside it: this returns before the namer has talked
                         // to anything.
                         self.name_session(primary_model.clone());
+                        // A steer typed while the final answer streamed found
+                        // no step boundary left in the turn. It was addressed
+                        // to this conversation, so it runs next, ahead of the
+                        // prompts queued behind the turn.
+                        let unread = self.steering.drain();
+                        if !unread.is_empty() {
+                            let joined = unread.iter().map(SmolStr::as_str).collect::<Vec<_>>().join("\n\n");
+                            queued.push_front(joined.into());
+                        }
                         let spent = self.spent.load(Ordering::SeqCst);
                         let _ = self.events.send(EngineEvent::BudgetUpdated { spent, limit: self.budget }).await;
                         if self.over_budget().await {

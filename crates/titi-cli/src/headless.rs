@@ -10,7 +10,8 @@
 //! Not every command answers, and those that do not must not be waited on:
 //!
 //! * `Steer` is queued for the running turn's next step boundary and emits
-//!   nothing of its own;
+//!   nothing of its own — one that arrives after the turn's last boundary
+//!   runs as the next turn, and a `Cancel` hands it back as `PromptReturned`;
 //! * `RestoreHistory` replaces the replayed history and emits nothing;
 //! * `Cancel` emits `Cancelled` only while a turn is active — with no turn
 //!   it is silent;
