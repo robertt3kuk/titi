@@ -119,7 +119,7 @@ Tool approval: `--approval always-ask|write|yolo`. The default is `write` — re
 
 `bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. A pty run is bounded on three axes: `timeout_secs` (1 to 3600, 300 by default), a 64 KiB cap on captured output, and an interrupt the surface can raise. Zero means "no deadline" nowhere in titi.
 
-`settings` lets the agent read and write configuration. `approval_mode`, everything under `privacy.`, and any key ending in `.key` are refused: loosening approval or reading out a credential is a human decision.
+`settings` lets the agent read and write configuration. Approval (`approval_mode`, `tools.approval*`), `privacy`, the provider catalog (`providers`, `models`) — their roots, everything under them, and any parent such as `tools` — and any credential-looking leaf (`key`, `apiKey`, `api_key`, `token`, `secret`, `password`) are refused, to read as well as to write: loosening approval, redirecting a key, or reading out a credential is a human decision.
 
 ### How it fits
 
@@ -315,7 +315,7 @@ titi --mode plan
 
 `bash` по умолчанию работает через пайп. `pty: true` запускает команду под настоящим терминалом: она видит tty и ведёт себя так, как в вашей собственной оболочке — цвет, прогресс, пейджер. Запуск на pty ограничен по трём осям: `timeout_secs` (от 1 до 3600, по умолчанию 300), 64 KiB захваченного вывода и прерывание, которое может поднять поверхность. Ноль нигде в titi не означает «без дедлайна».
 
-`settings` даёт агенту читать и писать конфигурацию. `approval_mode`, всё под `privacy.` и любой ключ, кончающийся на `.key`, запрещены: ослабить подтверждение или достать credential — решение человека.
+`settings` даёт агенту читать и писать конфигурацию. Подтверждение (`approval_mode`, `tools.approval*`), `privacy`, каталог провайдеров (`providers`, `models`) — их корни, всё под ними и любой родитель вроде `tools` — и любой лист, похожий на credential (`key`, `apiKey`, `api_key`, `token`, `secret`, `password`), запрещены и на чтение, и на запись: ослабить подтверждение, перенаправить ключ или достать credential — решение человека.
 
 ### Как устроено
 

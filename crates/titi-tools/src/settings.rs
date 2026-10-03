@@ -25,7 +25,7 @@ impl ToolHandler for SettingsTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "settings".into(),
-                description: "Read or write configuration settings. Pass a key to read its current value. Pass key and value to write. Scope can be 'global' or 'project' (defaults to the layer where it is already set, or 'project' if new). NEVER change 'approval_mode', 'privacy.*' (including 'maskIps'), or provider keys.".into(),
+                description: "Read or write configuration settings. Pass a key to read its current value. Pass key and value to write. Scope can be 'global' or 'project' (defaults to the layer where it is already set, or 'project' if new). Approval, 'privacy', 'providers', 'models' and credentials (keys, tokens, secrets, passwords) are refused.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -52,7 +52,15 @@ impl ToolHandler for SettingsTool {
             }
         };
 
-        if key == "approval_mode" || key.starts_with("privacy.") || key.ends_with(".key") {
+        let segments: Vec<&str> = key.split('.').collect();
+        if segments.iter().any(|segment| segment.is_empty()) {
+            return ToolResult {
+                output: format!("'{key}' is not a dotted settings key").into(),
+                is_error: true,
+                detail: None,
+            };
+        }
+        if is_protected(&segments) || is_credential(&segments) {
             return ToolResult {
                 output: "changing this setting via tool is blocked for security reasons".into(),
                 is_error: true,
@@ -60,38 +68,40 @@ impl ToolHandler for SettingsTool {
             };
         }
 
-        let has_value = args.get("value").is_some();
-        if !has_value {
-            match self.backend.resolve_source(key) {
-                Ok(Some((source, val))) => {
-                    return ToolResult {
-                        output: format!("value: {}\nsource: {}", val, source).into(),
-                        is_error: false,
-                        detail: None,
-                    };
-                }
-                Ok(None) => {
-                    return ToolResult {
-                        output: "not set".into(),
-                        is_error: false,
-                        detail: None,
-                    };
-                }
-                Err(e) => {
-                    return ToolResult {
-                        output: format!("failed to read settings: {}", e).into(),
-                        is_error: true,
-                        detail: None,
-                    };
-                }
-            }
-        }
+        let Some(value) = args.get("value").cloned() else {
+            return match self.backend.resolve_source(key) {
+                Ok(Some((source, val))) => ToolResult {
+                    output: format!("value: {}\nsource: {}", val, source).into(),
+                    is_error: false,
+                    detail: None,
+                },
+                Ok(None) => ToolResult {
+                    output: "not set".into(),
+                    is_error: false,
+                    detail: None,
+                },
+                Err(e) => ToolResult {
+                    output: format!("failed to read settings: {}", e).into(),
+                    is_error: true,
+                    detail: None,
+                },
+            };
+        };
 
-        let value = args.get("value").unwrap().clone();
         let mut scope = args
             .get("scope")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        if let Some(scope) = scope.as_deref()
+            && scope != "global"
+            && scope != "project"
+        {
+            return ToolResult {
+                output: format!("scope must be 'global' or 'project', not '{scope}'").into(),
+                is_error: true,
+                detail: None,
+            };
+        }
 
         if scope.is_none() {
             if let Ok(Some((source, _))) = self.backend.resolve_source(key) {
@@ -130,9 +140,52 @@ impl ToolHandler for SettingsTool {
     }
 }
 
+/// Subtrees that decide what the agent may do or where a key is sent:
+/// privacy, the provider catalog, and approval. Loosening any of them is a
+/// human decision, never the model's.
+const PROTECTED: &[&[&str]] = &[
+    &["privacy"],
+    &["providers"],
+    &["models"],
+    &["approval_mode"],
+    &["tools", "approval"],
+    &["tools", "approvalMode"],
+];
+
+/// A key is protected when it lies inside a protected subtree or contains
+/// one: writing `tools` replaces `tools.approval` as surely as writing
+/// `tools.approval.bash` changes it. Settings keys are case-sensitive, but a
+/// guard that a capital letter defeats is no guard.
+fn is_protected(segments: &[&str]) -> bool {
+    PROTECTED.iter().any(|path| {
+        path.iter()
+            .zip(segments)
+            .all(|(protected, segment)| protected.eq_ignore_ascii_case(segment))
+    })
+}
+
+/// A leaf that names a credential, under any of the spellings a config gives
+/// it (`key`, `apiKey`, `api_key`, `token`, `secret`, `password`). Reading
+/// one hands the model a secret, so reads are refused as well as writes.
+fn is_credential(segments: &[&str]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    let leaf: String = leaf
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    leaf == "key"
+        || ["apikey", "token", "secret", "password"]
+            .iter()
+            .any(|suffix| leaf.ends_with(suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     struct DummyBackend;
     impl SettingsBackend for DummyBackend {
@@ -142,6 +195,144 @@ mod tests {
         fn set(&self, _key: &str, _value: Value, _scope: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    /// Remembers every read and write, so a test can tell a refused call
+    /// from one that reached the config.
+    #[derive(Default)]
+    struct Recording {
+        reads: Mutex<Vec<String>>,
+        writes: Mutex<Vec<(String, Value, String)>>,
+    }
+    impl SettingsBackend for Recording {
+        fn resolve_source(&self, key: &str) -> Result<Option<(String, Value)>, String> {
+            self.reads.lock().unwrap().push(key.to_owned());
+            Ok(None)
+        }
+        fn set(&self, key: &str, value: Value, scope: &str) -> Result<(), String> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.to_owned(), value, scope.to_owned()));
+            Ok(())
+        }
+    }
+
+    async fn call(backend: &Arc<Recording>, args: Value) -> ToolResult {
+        let tool = SettingsTool::new(Arc::clone(backend) as Arc<dyn SettingsBackend>);
+        tool.invoke(args).await
+    }
+
+    /// A write to a protected subtree is refused whatever the spelling: the
+    /// subtree's root replaces every key under it, a parent of `tools.approval`
+    /// replaces approval, and nothing about a key's case changes what it is.
+    #[tokio::test]
+    async fn a_protected_subtree_is_refused_from_its_root_and_its_parent() {
+        let backend = Arc::new(Recording::default());
+        for (key, value) in [
+            (
+                "privacy",
+                serde_json::json!({ "maskIps": false, "allow": [".env"] }),
+            ),
+            ("privacy.allow", serde_json::json!([".env"])),
+            ("Privacy.maskIps", serde_json::json!(false)),
+            (
+                "providers",
+                serde_json::json!([{ "id": "openai", "base_url": "https://example.invalid" }]),
+            ),
+            (
+                "providers.0.base_url",
+                serde_json::json!("https://example.invalid"),
+            ),
+            ("models", serde_json::json!([])),
+            (
+                "tools",
+                serde_json::json!({ "approval": { "bash": "allow" } }),
+            ),
+            ("tools.approval.bash", serde_json::json!("allow")),
+            ("tools.approvalMode", serde_json::json!("yolo")),
+            ("approval_mode", serde_json::json!("yolo")),
+        ] {
+            let res = call(&backend, serde_json::json!({ "key": key, "value": value })).await;
+            assert!(res.is_error, "{key} was accepted");
+        }
+        assert!(backend.writes.lock().unwrap().is_empty());
+    }
+
+    /// Reading a credential is as refused as writing one, under any of the
+    /// names a config gives it.
+    #[tokio::test]
+    async fn a_credential_is_neither_read_nor_written() {
+        let backend = Arc::new(Recording::default());
+        for key in [
+            "anthropic.key",
+            "openrouter.apiKey",
+            "custom.api_key",
+            "github.token",
+            "smtp.password",
+            "hook.secret",
+        ] {
+            let read = call(&backend, serde_json::json!({ "key": key })).await;
+            assert!(read.is_error, "{key} was read");
+            let write = call(
+                &backend,
+                serde_json::json!({ "key": key, "value": "sk-test" }),
+            )
+            .await;
+            assert!(write.is_error, "{key} was written");
+        }
+        assert!(backend.reads.lock().unwrap().is_empty());
+        assert!(backend.writes.lock().unwrap().is_empty());
+    }
+
+    /// A key with an empty segment names no setting, and a scope outside the
+    /// two the schema offers is not quietly read as `project`.
+    #[tokio::test]
+    async fn a_malformed_key_or_scope_is_refused() {
+        let backend = Arc::new(Recording::default());
+        for key in ["", ".", "display.", ".display", "display..theme"] {
+            let res = call(&backend, serde_json::json!({ "key": key, "value": 1 })).await;
+            assert!(res.is_error, "{key:?} was accepted");
+        }
+        let res = call(
+            &backend,
+            serde_json::json!({ "key": "display.theme", "value": "dark", "scope": "system" }),
+        )
+        .await;
+        assert!(res.is_error);
+        assert!(backend.writes.lock().unwrap().is_empty());
+    }
+
+    /// The guard is narrow: an ordinary key reads and writes, `null` is a
+    /// value and not a read, and a key that only shares a prefix with a
+    /// protected one is not protected.
+    #[tokio::test]
+    async fn ordinary_settings_still_read_and_write() {
+        let backend = Arc::new(Recording::default());
+        let read = call(&backend, serde_json::json!({ "key": "display.theme" })).await;
+        assert!(!read.is_error, "{:?}", read.output);
+        assert_eq!(read.output.as_str(), "not set");
+
+        for (key, value) in [
+            ("display.theme", serde_json::json!("dark")),
+            ("compaction.thresholdPercent", serde_json::json!(70)),
+            ("privacyNotes", serde_json::json!("ok")),
+            ("toolsets.default", serde_json::json!("small")),
+            ("keyboard.layout", serde_json::json!("dvorak")),
+            ("display.badge", Value::Null),
+        ] {
+            let res = call(
+                &backend,
+                serde_json::json!({ "key": key, "value": value, "scope": "global" }),
+            )
+            .await;
+            assert!(!res.is_error, "{key}: {:?}", res.output);
+        }
+        let writes = backend.writes.lock().unwrap();
+        assert_eq!(writes.len(), 6);
+        assert_eq!(writes[0].0, "display.theme");
+        assert_eq!(writes[0].2, "global");
+        assert_eq!(writes[5].1, Value::Null);
     }
 
     #[tokio::test]
