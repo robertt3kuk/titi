@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::Value;
 use titi_providers::ToolSpec;
 
@@ -558,6 +559,9 @@ fn apply_edit(
     ))
 }
 
+/// Paths a glob answer lists before it says how many more there were.
+const GLOB_MAX_RESULTS: usize = 1_000;
+
 pub struct GlobTool {
     pub root: PathBuf,
 }
@@ -568,10 +572,25 @@ impl ToolHandler for GlobTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "glob".into(),
-                description: "List workspace files whose names contain a substring".into(),
+                description: format!(
+                    "List workspace files matching a glob, sorted, at most \
+                     {GLOB_MAX_RESULTS}. `*` and `?` stay inside one directory, `**/` \
+                     spans any number of directories (none included), `[abc]` is one \
+                     of those characters and `{{rs,toml}}` one of those alternatives. \
+                     Without a `/` the pattern matches the file name in any directory \
+                     (`*.rs`); with one it matches the path from the workspace root \
+                     (`src/**/*.rs`). Text with no wildcard matches any path containing it."
+                )
+                .into(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "pattern": { "type": "string" } },
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "A glob such as `**/*.rs`, `*.{md,toml}` or \
+                                            `crates/*/Cargo.toml`, or plain text."
+                        }
+                    },
                     "required": ["pattern"]
                 }),
             },
@@ -586,11 +605,179 @@ impl ToolHandler for GlobTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let pattern = arg_str(&args, "pattern").unwrap_or_default();
+        let filter = match PathFilter::new(&pattern) {
+            Ok(filter) => filter,
+            Err(error) => return err(error),
+        };
         let mut matches = Vec::new();
-        walk(&self.root, &self.root, &pattern, &mut matches);
+        walk(&self.root, &self.root, &filter, &mut matches);
         matches.sort();
+        let more = matches.len().saturating_sub(GLOB_MAX_RESULTS);
+        matches.truncate(GLOB_MAX_RESULTS);
+        if more > 0 {
+            matches.push(format!("… {more} more files"));
+        }
         ok(matches.join("\n"))
     }
+}
+
+/// Which workspace-relative paths a glob pattern selects.
+enum PathFilter {
+    All,
+    /// Text with no wildcard: any path containing it, the match `glob` made
+    /// before it understood globs, so a caller of that era still finds its
+    /// files.
+    Substring(String),
+    Glob(Regex),
+}
+
+impl PathFilter {
+    fn new(pattern: &str) -> Result<Self, String> {
+        if pattern.is_empty() {
+            Ok(Self::All)
+        } else if !pattern.contains(['*', '?', '[', '{']) {
+            Ok(Self::Substring(pattern.to_owned()))
+        } else {
+            glob_regex(pattern)
+                .map(Self::Glob)
+                .map_err(|reason| format!("invalid glob {pattern}: {reason}"))
+        }
+    }
+
+    /// `path` is `/`-separated and relative to the workspace root.
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Substring(text) => path.contains(text.as_str()),
+            Self::Glob(regex) => regex.is_match(path),
+        }
+    }
+}
+
+/// A glob as a regex anchored over a whole `/`-separated relative path. A
+/// glob without `/` may be preceded by any directories, so it names a file
+/// anywhere, as `rg -g` does.
+fn glob_regex(glob: &str) -> Result<Regex, String> {
+    let glob = glob.trim_start_matches("./").trim_start_matches('/');
+    let body = glob_to_regex(glob)?;
+    let anchored = if glob.contains('/') {
+        format!("^{body}$")
+    } else {
+        format!("^(?:.*/)?{body}$")
+    };
+    // The full error quotes the translated regex, which the caller never
+    // wrote; its last line says what is wrong.
+    Regex::new(&anchored).map_err(|error| {
+        let error = error.to_string();
+        let reason = error.lines().last().unwrap_or_default();
+        reason.trim_start_matches("error: ").to_owned()
+    })
+}
+
+fn glob_to_regex(glob: &str) -> Result<String, String> {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut out = String::new();
+    let mut open_braces = 0usize;
+    let mut i = 0;
+    while let Some(&ch) = chars.get(i) {
+        i += 1;
+        match ch {
+            '*' => {
+                let mut stars = 1;
+                while chars.get(i) == Some(&'*') {
+                    stars += 1;
+                    i += 1;
+                }
+                let starts_component = i == stars || chars.get(i - stars - 1) == Some(&'/');
+                match chars.get(i) {
+                    Some('/') if stars > 1 && starts_component => {
+                        out.push_str("(?:.*/)?");
+                        i += 1;
+                    }
+                    None if stars > 1 && starts_component => out.push_str(".*"),
+                    _ => out.push_str("[^/]*"),
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '[' => {
+                let (class, used) = glob_class(&chars[i..])?;
+                out.push_str(&class);
+                i += used;
+            }
+            '{' => {
+                open_braces += 1;
+                out.push_str("(?:");
+            }
+            '}' if open_braces > 0 => {
+                open_braces -= 1;
+                out.push(')');
+            }
+            ',' if open_braces > 0 => out.push('|'),
+            '}' => return Err("`}` closes no `{`".into()),
+            '\\' => {
+                let Some(&next) = chars.get(i) else {
+                    return Err("a trailing `\\` escapes nothing".into());
+                };
+                out.push_str(&regex::escape(next.encode_utf8(&mut [0; 4])));
+                i += 1;
+            }
+            other => out.push_str(&regex::escape(other.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    if open_braces > 0 {
+        return Err("`{` is never closed".into());
+    }
+    Ok(out)
+}
+
+/// The class that `rest` (what follows a `[`) opens, as regex, and how many
+/// characters it used, its `]` included. `[!...]` and `[^...]` negate, a `]`
+/// first is a member, and no negated class matches `/`, which separates
+/// directories.
+fn glob_class(rest: &[char]) -> Result<(String, usize), String> {
+    let negated = matches!(rest.first(), Some('!' | '^'));
+    let mut i = usize::from(negated);
+    let mut members: Vec<(char, bool)> = Vec::new();
+    loop {
+        let Some(&ch) = rest.get(i) else {
+            return Err("`[` is never closed".into());
+        };
+        i += 1;
+        match ch {
+            ']' if !members.is_empty() => break,
+            '\\' => {
+                let Some(&next) = rest.get(i) else {
+                    return Err("`[` is never closed".into());
+                };
+                members.push((next, true));
+                i += 1;
+            }
+            other => members.push((other, false)),
+        }
+    }
+    let mut class = String::from(if negated { "[^/" } else { "[" });
+    let last = members.len() - 1;
+    for (index, &(ch, escaped)) in members.iter().enumerate() {
+        // A `-` between two members is a range; first, last or escaped, it is
+        // the character itself.
+        if ch == '-' && !escaped && index > 0 && index < last {
+            class.push('-');
+        } else {
+            class.push_str(&regex::escape(ch.encode_utf8(&mut [0; 4])));
+        }
+    }
+    class.push(']');
+    Ok((class, i))
+}
+
+/// `relative` with `/` between its components on every platform, the form a
+/// glob is written in.
+fn slash_path(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub struct GrepTool {
@@ -742,7 +929,7 @@ impl BashTool {
     }
 }
 
-fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
+fn walk(root: &Path, dir: &Path, filter: &PathFilter, out: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -762,13 +949,12 @@ fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>) {
             {
                 continue;
             }
-            walk(root, &path, pattern, out);
+            walk(root, &path, filter, out);
             continue;
         }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let rendered = relative.display().to_string();
-        if pattern.is_empty() || rendered.contains(pattern) {
-            out.push(rendered);
+        let relative = slash_path(path.strip_prefix(root).unwrap_or(&path));
+        if filter.matches(&relative) {
+            out.push(relative);
         }
     }
 }
@@ -1451,6 +1637,111 @@ mod tests {
         assert!(listed.output.contains("hello.txt"));
         let hits = grep.invoke(serde_json::json!({"pattern": "world"})).await;
         assert!(hits.output.contains("hello.txt:1:hello world"));
+    }
+
+    /// A small tree for glob patterns: sources at three depths, two manifests
+    /// in different directories, and names that differ by one character.
+    fn glob_fixture() -> GlobTool {
+        let root = temp_root();
+        for (path, body) in [
+            ("top.rs", ""),
+            ("src/main.rs", ""),
+            ("src/lib.rs", ""),
+            ("src/deep/mod.rs", ""),
+            ("Cargo.toml", ""),
+            ("crates/a/Cargo.toml", ""),
+            ("notes.md", ""),
+            ("a1.txt", ""),
+            ("b1.txt", ""),
+            ("a22.txt", ""),
+            ("target/debug/build.rs", ""),
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        GlobTool { root }
+    }
+
+    async fn glob_lines(glob: &GlobTool, pattern: &str) -> Vec<String> {
+        let result = glob.invoke(serde_json::json!({ "pattern": pattern })).await;
+        assert!(!result.is_error, "{pattern}: {}", result.output);
+        result.output.lines().map(str::to_owned).collect()
+    }
+
+    #[tokio::test]
+    async fn glob_matches_real_glob_patterns() {
+        let glob = glob_fixture();
+        // `**/` crosses any number of directories, none included; `target`
+        // stays skipped.
+        assert_eq!(
+            glob_lines(&glob, "**/*.rs").await,
+            ["src/deep/mod.rs", "src/lib.rs", "src/main.rs", "top.rs"]
+        );
+        // A single `*` stays inside one directory.
+        assert_eq!(
+            glob_lines(&glob, "src/*.rs").await,
+            ["src/lib.rs", "src/main.rs"]
+        );
+        assert_eq!(glob_lines(&glob, "src/**").await.len(), 3);
+        // Without a `/` the pattern is a file name, in any directory.
+        assert_eq!(
+            glob_lines(&glob, "*.toml").await,
+            ["Cargo.toml", "crates/a/Cargo.toml"]
+        );
+        assert_eq!(
+            glob_lines(&glob, "*.{md,toml}").await,
+            ["Cargo.toml", "crates/a/Cargo.toml", "notes.md"]
+        );
+        assert_eq!(glob_lines(&glob, "a?.txt").await, ["a1.txt"]);
+        assert_eq!(glob_lines(&glob, "[ab]1.txt").await, ["a1.txt", "b1.txt"]);
+        assert_eq!(
+            glob_lines(&glob, "[!a]*.txt").await,
+            ["b1.txt", "hello.txt"]
+        );
+        assert_eq!(glob_lines(&glob, "./src/*.rs").await.len(), 2);
+    }
+
+    /// A pattern with no wildcard keeps the substring match every earlier
+    /// caller relied on.
+    #[tokio::test]
+    async fn a_glob_with_no_wildcard_is_still_a_substring() {
+        let glob = glob_fixture();
+        assert_eq!(glob_lines(&glob, "main").await, ["src/main.rs"]);
+        assert_eq!(
+            glob_lines(&glob, "src/").await,
+            ["src/deep/mod.rs", "src/lib.rs", "src/main.rs"]
+        );
+        assert_eq!(glob_lines(&glob, "").await.len(), 11, "empty lists all");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_glob_is_an_error() {
+        let glob = glob_fixture();
+        for pattern in ["src/[ab", "*.{rs,toml", "*.rs}", "[z-a]*", "*\\"] {
+            let result = glob.invoke(serde_json::json!({ "pattern": pattern })).await;
+            assert!(result.is_error, "{pattern}: {}", result.output);
+            assert!(result.output.contains(pattern), "{}", result.output);
+        }
+    }
+
+    /// A listing stops at the cap and says how many paths it left out, so a
+    /// broad pattern cannot flood the context.
+    #[tokio::test]
+    async fn a_glob_listing_is_capped() {
+        let root = temp_root();
+        for n in 0..GLOB_MAX_RESULTS + 5 {
+            fs::write(root.join(format!("f{n:05}.log")), "").unwrap();
+        }
+        let glob = GlobTool { root };
+        let lines = glob_lines(&glob, "*.log").await;
+        assert_eq!(lines.len(), GLOB_MAX_RESULTS + 1);
+        assert_eq!(lines[0], "f00000.log", "the listing is sorted");
+        assert_eq!(
+            lines[GLOB_MAX_RESULTS - 1],
+            format!("f{:05}.log", GLOB_MAX_RESULTS - 1)
+        );
+        assert_eq!(lines[GLOB_MAX_RESULTS], "… 5 more files");
     }
 
     #[tokio::test]
