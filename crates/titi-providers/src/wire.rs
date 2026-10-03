@@ -463,6 +463,8 @@ pub fn build_http_request(
                 "model": req.model.as_str(),
                 "messages": openai_messages_wire(req),
                 "stream": true,
+                // Without it a stream carries no usage at all.
+                "stream_options": {"include_usage": true},
                 "tools": openai_tools_wire(req),
                 "max_tokens": req.max_tokens,
                 "temperature": req.temperature,
@@ -1043,6 +1045,26 @@ mod tests {
             .find(|(k, _)| k == "authorization")
             .expect("auth");
         assert_eq!(auth.1, "Bearer sk");
+    }
+
+    /// Chat Completions reports usage in a stream only when asked; the
+    /// other families report it unasked, and the Responses API refuses a
+    /// `stream_options` key it does not know.
+    #[test]
+    fn only_chat_completions_ask_for_usage_in_the_stream() {
+        let r = req();
+        let chat = body_of(ApiKind::OpenAiCompletions, &r);
+        assert_eq!(
+            chat["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+        for api in [
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+            ApiKind::GeminiGenerateContent,
+        ] {
+            assert!(body_of(api, &r).get("stream_options").is_none(), "{api}");
+        }
     }
 
     #[test]
