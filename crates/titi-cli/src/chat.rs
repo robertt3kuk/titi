@@ -6628,13 +6628,20 @@ fn tool_chip(text: &str) -> (&'static str, ThemeColor, String, ThemeColor) {
 /// what the tool wanted drawn — so nothing a tool reported is dropped.
 fn diff_rows(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let Some(diff) = titi_tui::diff::render_diff(text, theme, diff_width(width) as u16) else {
+        // Not a diff — the todo checklist today. Its own rows are the point,
+        // so they are kept, each cut to the preview width, and a long list
+        // is capped like a long diff.
+        let lines: Vec<&str> = text.lines().collect();
+        let shown = lines.len().min(DIFF_MAX_ROWS);
+        let mut kept: Vec<String> = lines[..shown]
+            .iter()
+            .map(|line| one_line(line, TOOL_PREVIEW))
+            .collect();
+        if lines.len() > shown {
+            kept.push(format!("… {} more lines", lines.len() - shown));
+        }
         return chip(
-            (
-                "✓",
-                ThemeColor::Success,
-                one_line(text, TOOL_PREVIEW),
-                ThemeColor::Muted,
-            ),
+            ("✓", ThemeColor::Success, kept.join("\n"), ThemeColor::Muted),
             theme,
             width,
         );
@@ -10466,6 +10473,42 @@ mod tests {
         }
     }
 
+    /// A detail that is not a diff — the todo checklist — keeps its rows: a
+    /// list flattened onto one line reads as a sentence, not a checklist.
+    #[test]
+    fn a_checklist_detail_keeps_one_row_per_item() {
+        let mut chat = chat();
+        chat.push(LineKind::Tool, "todo 1/3 · Fix the parser".to_owned());
+        chat.push(
+            LineKind::Diff,
+            "[x] 1. Read the failing test\n[>] 2. Fix the parser\n[ ] 3. Run the suite".to_owned(),
+        );
+        let rows = frame_rows(&mut chat, 80, 12);
+        for item in [
+            "✓ [x] 1. Read the failing test",
+            "[>] 2. Fix the parser",
+            "[ ] 3. Run the suite",
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(item))
+                .unwrap_or_else(|| panic!("no row for {item:?}: {rows:#?}"));
+            assert_eq!(
+                row.trim(),
+                item,
+                "an item shares its row with another: {rows:#?}"
+            );
+        }
+        // The rows after the first hang under its text, not under the mark.
+        let column = |item: &str| {
+            rows.iter().find_map(|row| {
+                row.find(item)
+                    .map(|byte| titi_tui::width::visible_width(&row[..byte]))
+            })
+        };
+        assert_eq!(column("[x] 1."), column("[>] 2."), "{rows:#?}");
+    }
+
     /// Air lands where the writer changes, and nowhere else: not between a
     /// turn's own text and its tool chips, not between a chip and the diff under
     /// it, not between a note and the answer it belongs to.
@@ -13021,7 +13064,8 @@ mod tests {
     }
 
     /// A diff line the renderer cannot read as a diff falls back to the plain
-    /// chip: the result is still on screen, and nothing is invented.
+    /// chip: the result is still on screen, line by line, and nothing is
+    /// invented.
     #[test]
     fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
         let theme = test_theme();
@@ -13031,9 +13075,9 @@ mod tests {
         };
         let rows = message_rows(&line, 80, &theme).0;
         assert_eq!(
-            row_texts(&rows)[0],
-            "   ✓ not a diff at all second line",
-            "the summary is flattened into the chip"
+            row_texts(&rows)[..2],
+            ["   ✓ not a diff at all", "     second line"],
+            "each line of the detail keeps its row under the chip"
         );
     }
 
