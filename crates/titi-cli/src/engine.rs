@@ -6,7 +6,7 @@ use titi_engine::{
     ModelDescriptor, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig, TrajectorySink,
 };
 use titi_providers::ApiKind;
-use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_policy};
+use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_interrupt};
 
 pub fn default_registry_config() -> ProviderRegistryConfig {
     let mut config = ProviderRegistryConfig {
@@ -621,7 +621,14 @@ pub fn start_engine_with(
     // One cache for the main turn and every subagent it spawns.
     let read_cache = titi_tools::ReadCache::default();
     engine_config.read_cache = read_cache.clone();
-    for tool in workspace_tools_with_policy(&workspace, read_cache, sensitive) {
+    // Built with the engine's interrupt, so a cancel stops the command a
+    // `bash` call is waiting on instead of waiting for it to finish.
+    for tool in workspace_tools_with_interrupt(
+        &workspace,
+        read_cache,
+        sensitive,
+        engine_config.interrupt.clone(),
+    ) {
         tools.register(Arc::from(tool));
     }
     tools.register(std::sync::Arc::new(

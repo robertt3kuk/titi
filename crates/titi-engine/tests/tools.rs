@@ -912,3 +912,75 @@ async fn a_tool_call_description_reaches_the_event_and_not_the_model() {
         );
     }
 }
+
+/// The abort flag is read between steps, and a `bash` call blocks inside one,
+/// so a cancel used to wait for the command to finish — forever, for a dev
+/// server. The cancel now stops the command, and the next turn's commands
+/// run as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_stops_the_shell_command_the_turn_waits_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events(
+            "bash",
+            r#"{"command": "trap 'touch stopped; exit 1' TERM; sleep 30 & wait"}"#,
+        )),
+        MockBody::Events(tool_call_events("bash", r#"{"command": "echo fine"}"#)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = ApprovalMode::Yolo;
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(titi_tools::BashTool {
+        root: dir.path().to_path_buf(),
+        interrupt: config.interrupt.clone(),
+    }));
+    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "serve".into(),
+        })
+        .await
+        .unwrap();
+    while let Some(event) = engine.recv().await {
+        if matches!(event, EngineEvent::ToolStarted { .. }) {
+            break;
+        }
+    }
+    // Give the shell time to set its trap before the cancel lands.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    engine.send(EngineCommand::Cancel).await.unwrap();
+
+    let stopped = dir.path().join("stopped");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !stopped.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stopped.exists(), "the command never saw the cancel");
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "again".into(),
+        })
+        .await
+        .unwrap();
+    let mut output = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.recv()).await
+    {
+        match event {
+            EngineEvent::ToolFinished {
+                output: text,
+                is_error,
+                ..
+            } if output.is_none() && !text.contains("interrupted") => {
+                output = Some((text.to_string(), is_error));
+            }
+            EngineEvent::TurnFinished { .. } if output.is_some() => break,
+            _ => {}
+        }
+    }
+    assert_eq!(output, Some(("fine\n".to_owned(), false)));
+}

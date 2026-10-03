@@ -405,6 +405,10 @@ pub struct EngineConfig {
     /// Mode the session starts in (`--mode plan|duck`). `SetMode` changes it
     /// afterwards.
     pub mode: crate::protocol::SessionMode,
+    /// Stops the command a `bash` call is waiting on. The surface builds its
+    /// workspace tools with a clone, as the runtime does a subagent's; a
+    /// cancel raises it and the next turn lowers it as it starts.
+    pub interrupt: titi_tools::Interrupt,
 }
 
 impl EngineConfig {
@@ -441,6 +445,7 @@ impl EngineConfig {
             )),
             judgment_provider: None,
             mode: crate::protocol::SessionMode::Agent,
+            interrupt: titi_tools::Interrupt::new(),
         }
     }
 }
@@ -637,10 +642,11 @@ impl EngineRuntime {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
             let mut tools = ToolRegistry::new();
-            for tool in titi_tools::workspace_tools_with_policy(
+            for tool in titi_tools::workspace_tools_with_interrupt(
                 &root,
                 config.read_cache.clone(),
                 config.sensitive.clone(),
+                config.interrupt.clone(),
             ) {
                 tools.register(Arc::from(tool));
             }
@@ -756,6 +762,10 @@ impl EngineRuntime {
                         EngineCommand::Cancel => {
                             if let Some((turn_id, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
+                                // The abort flag is only read between steps; a
+                                // shell command the turn is waiting on has to be
+                                // stopped, or the cancel waits for it to finish.
+                                self.config.interrupt.raise();
                                 let _ = self.events.send(EngineEvent::Cancelled { turn_id }).await;
                             }
                             // Cancel is a stop, and taking `active` already stops
@@ -900,6 +910,7 @@ impl EngineRuntime {
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
+                                self.config.interrupt.raise();
                             }
                             // The timers hold a command sender, so leaving
                             // them alive keeps the channel open forever.
@@ -1346,6 +1357,9 @@ impl EngineRuntime {
     ) -> (TurnId, Arc<AtomicBool>) {
         let epoch = self.history_epoch;
         let turn_id = TurnId(self.next_turn.fetch_add(1, Ordering::SeqCst));
+        // A cancel is spent once a new turn starts. The command it was raised
+        // for still sees it: the interrupt counts raises, not just the flag.
+        self.config.interrupt.clear();
         let aborted = Arc::new(AtomicBool::new(false));
         let task_abort = Arc::clone(&aborted);
         let mut config = self.config.clone();
