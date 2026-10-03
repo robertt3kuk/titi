@@ -431,6 +431,10 @@ pub struct Chat {
     /// Bytes of `reply` already written to the session file. A tool call
     /// splits the turn's text into segments, and each is recorded once.
     recorded_reply: usize,
+    /// Where the reply line on screen starts in `reply`. A tool call closes
+    /// the line, so the next round's text opens one under the call and its
+    /// result instead of being appended above them.
+    shown_from: usize,
     thinking: String,
     assistant_at: Option<usize>,
     thinking_at: Option<usize>,
@@ -519,6 +523,7 @@ impl Chat {
             context_percent: None,
             reply: String::new(),
             recorded_reply: 0,
+            shown_from: 0,
             thinking: String::new(),
             assistant_at: None,
             thinking_at: None,
@@ -749,6 +754,7 @@ impl Chat {
                 self.model = model.to_string();
                 self.reply.clear();
                 self.recorded_reply = 0;
+                self.shown_from = 0;
                 self.assistant_at = None;
                 self.drop_thinking();
                 Applied::none()
@@ -780,6 +786,8 @@ impl Chat {
                     detail: detail.as_ref().map(ToString::to_string),
                     since: Instant::now(),
                 };
+                self.assistant_at = None;
+                self.shown_from = self.reply.len();
                 self.push(LineKind::Tool, format!("tool {name}"));
                 // The call goes to the session file now, not at the end of
                 // the turn: the result below it has to follow its own call,
@@ -1518,6 +1526,7 @@ impl Chat {
         self.assistant_at = None;
         self.thinking_at = None;
         self.reply.clear();
+        self.shown_from = 0;
         self.thinking.clear();
         for message in messages {
             let kind = match message.role {
@@ -2953,6 +2962,7 @@ impl Chat {
         let reply = self.unrecorded_reply();
         self.reply.clear();
         self.recorded_reply = 0;
+        self.shown_from = 0;
         self.turn_active = false;
         self.turn_started = None;
         // No phase outlives its turn: the next one starts in `Waiting`, and
@@ -2973,7 +2983,11 @@ impl Chat {
     }
 
     fn show_reply(&mut self) {
-        let text = self.reply.clone();
+        let text = self
+            .reply
+            .get(self.shown_from..)
+            .unwrap_or_default()
+            .to_owned();
         if let Some(at) = self.assistant_at
             && let Some(line) = self.lines.get_mut(at)
         {
@@ -8833,6 +8847,57 @@ mod tests {
         let row = above_composer(&mut chat, 80, 20);
         assert!(row.contains("streaming"), "{row:?}");
         assert!(!row.contains("thinking"), "{row:?}");
+    }
+
+    /// A tool call closes the reply line: the text of the round after it is
+    /// a new line under the call and its result, not an addition to the text
+    /// the model wrote before it asked for the tool.
+    #[test]
+    fn the_round_after_a_tool_starts_a_new_reply_line() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "Running it.".into(),
+        });
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            detail: Some("bash echo hi".into()),
+        });
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: "call-1".into(),
+            output: "hi".into(),
+            is_error: false,
+            detail: None,
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "It printed hi.".into(),
+        });
+        let shown: Vec<(LineKind, &str)> = chat
+            .lines
+            .iter()
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect();
+        let first = shown
+            .iter()
+            .position(|line| *line == (LineKind::Assistant, "Running it."))
+            .expect("the first round's line");
+        let tool = shown
+            .iter()
+            .position(|(kind, _)| *kind == LineKind::Tool)
+            .expect("the tool chip");
+        let second = shown
+            .iter()
+            .position(|line| *line == (LineKind::Assistant, "It printed hi."))
+            .expect("the second round's own line");
+        assert!(first < tool && tool < second, "{shown:?}");
     }
 
     /// A tool borrows the row and gives it back when its own call finishes.
