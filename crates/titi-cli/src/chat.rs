@@ -19,7 +19,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
@@ -4705,13 +4705,15 @@ fn roster(chat: &Chat, theme: &Theme) -> Paragraph<'static> {
 //   text               the body of a message and of the composer
 //   muted              the right half of the masthead, a finished tool's
 //                      detail, an unselected picker row
-//   dim                the ready state, a composer caption, a note, the empty
-//                      state's hint
+//   dim                the ready state, a composer caption, a note
 //   border             the composer's frame while idle
 //   statusLineBg       the screen behind everything
 //   customMessageBg    the composer's own surface, the one raised surface the
 //                      theme has to spare; `userMessageBg` belongs to the
 //                      user's block
+//
+// The welcome is the one exception: it is black and white on every palette,
+// in grays measured off `statusLineBg` (`WelcomeGrays`).
 
 /// One theme colour token as a ratatui style. The theme resolves a token to
 /// CSS hex, so this is the only place a token becomes a terminal colour.
@@ -5307,11 +5309,30 @@ fn cut_keeping_seconds(fact: &WorkFact, room: usize) -> String {
     )
 }
 
-/// The width the welcome box asks the pane for before the pane has its say.
-const WELCOME_WIDTH: u16 = 64;
-
-/// Recent sessions the welcome box names before it stops.
+/// Recent sessions the welcome names before it stops.
 const WELCOME_SESSIONS: usize = 3;
+
+/// The widest the facts block grows: on a wide pane it stays a block a glance
+/// takes in, not a row stretched to the far edge.
+const WELCOME_MEASURE: usize = 60;
+
+/// The TITI mark: two block-grid T's, ti·ti, in the grid omp draws its own
+/// mark in. The first T's leg fades at the foot, so the pair reads as two
+/// letters of one word rather than two equal pillars.
+const WELCOME_MARK: [&str; 5] = [
+    "██████ ██████",
+    "  ██     ██  ",
+    "  ██     ██  ",
+    "  ██     ██  ",
+    "  ▒▒     ██  ",
+];
+
+/// `titi` in half blocks: each `t` an ascender over a crossbar with a foot,
+/// each `i` a dot over a stem. Set beside the mark from its second row.
+const WELCOME_WORDMARK: [&str; 2] = ["▄█▄ ▀ ▄█▄ ▀", " █▄ █  █▄ █"];
+
+/// Columns between the mark and the wordmark.
+const WELCOME_GAP: usize = 4;
 
 /// What the first screen states, every fact read from the source the surface
 /// that owns it reads: the catalog plus the credential reader behind `/keys`,
@@ -5329,7 +5350,7 @@ struct WelcomeFacts {
     sessions: Vec<(String, bool)>,
 }
 
-/// The git fact of the welcome box, in the same shape the masthead states it.
+/// The git fact of the welcome, in the same shape the masthead states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WelcomeGit {
     branch: String,
@@ -5340,10 +5361,10 @@ struct WelcomeGit {
 
 /// The facts the first screen can state right now.
 ///
-/// A fact that is not available is `None` or empty, and the box omits it rather
-/// than printing a placeholder: the credential of a provider that holds none,
-/// the git state of a directory that is not a checkout, the session list of an
-/// agent directory that has no sessions yet.
+/// A fact that is not available is `None` or empty, and the welcome omits it
+/// rather than printing a placeholder: the credential of a provider that holds
+/// none, the git state of a directory that is not a checkout, the session list
+/// of an agent directory that has no sessions yet.
 fn welcome_facts(chat: &Chat) -> WelcomeFacts {
     let snapshot = masthead_snapshot(chat);
     // The credential chip is the one the model picker wears (`oauth` for a
@@ -5377,41 +5398,167 @@ fn welcome_facts(chat: &Chat) -> WelcomeFacts {
     }
 }
 
-/// One row of the welcome box: the borders, the content, and the fill out to the
-/// right border, so every row is exactly `inner + 2` cells wide.
-fn welcome_row(spans: Vec<Span<'static>>, inner: usize, theme: &Theme) -> Line<'static> {
-    let used: usize = spans
+/// The welcome's grays, measured off the page they are drawn on.
+///
+/// The first screen is black and white on every palette. A theme's accent is
+/// a hue picked for chrome, and a brand drawn in it changes character from one
+/// theme to the next; ink does not — it is the far end of the page's own
+/// lightness, whatever the page is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WelcomeGrays {
+    /// The ink: values, the wordmark, the mark's lit corner.
+    bright: f64,
+    /// The ink most of the way back to the page: labels, the build, the
+    /// chords, the mark's far corner.
+    faded: f64,
+}
+
+impl WelcomeGrays {
+    fn of(theme: &Theme) -> Self {
+        // BT.601 luma of the page. A page with no hex to measure is taken at
+        // the theme's own word for whether it is light.
+        let page = titi_tui::theme::color::hex_to_rgb(&theme.get_bg_hex(ThemeBg::StatusLineBg))
+            .map(|rgb| {
+                (0.299 * f64::from(rgb.r) + 0.587 * f64::from(rgb.g) + 0.114 * f64::from(rgb.b))
+                    / 255.0
+            })
+            .unwrap_or(if theme.is_light() { 1.0 } else { 0.0 });
+        let bright = if page < 0.5 { 0.96 } else { 0.08 };
+        Self {
+            bright,
+            faded: bright + (page - bright) * 0.6,
+        }
+    }
+
+    fn bright(&self) -> Style {
+        Style::default().fg(gray(self.bright))
+    }
+
+    fn faded(&self) -> Style {
+        Style::default().fg(gray(self.faded))
+    }
+}
+
+/// A level between black (0) and white (1) as a terminal colour.
+fn gray(level: f64) -> Color {
+    let value = (level.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::Rgb(value, value, value)
+}
+
+/// Cells the mark takes across.
+fn welcome_mark_width() -> usize {
+    WELCOME_MARK
         .iter()
-        .map(|span| titi_tui::width::visible_width(&span.content))
-        .sum();
-    let mut row = vec![Span::styled("│ ", fg(theme, ThemeColor::Border))];
-    row.extend(spans);
-    let fill = inner.saturating_sub(2 + used);
-    row.push(Span::styled(
-        format!("{} ", " ".repeat(fill)),
-        Style::default(),
-    ));
-    row.push(Span::styled("│", fg(theme, ThemeColor::Border)));
-    Line::from(row)
+        .map(|row| titi_tui::width::visible_width(row))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The mark, shaded along its diagonal from the ink in the top-left corner to
+/// the faded gray in the bottom-right: each cell at the mean of how far across
+/// and how far down it is, the way omp shades its own mark.
+fn welcome_mark(grays: &WelcomeGrays) -> Vec<Vec<Span<'static>>> {
+    let across = welcome_mark_width().saturating_sub(1).max(1) as f64;
+    let down = WELCOME_MARK.len().saturating_sub(1).max(1) as f64;
+    WELCOME_MARK
+        .iter()
+        .enumerate()
+        .map(|(y, row)| {
+            row.chars()
+                .enumerate()
+                .map(|(x, glyph)| {
+                    if glyph == ' ' {
+                        return Span::raw(" ");
+                    }
+                    let along = (x as f64 / across + y as f64 / down) / 2.0;
+                    let level = grays.bright + (grays.faded - grays.bright) * along;
+                    Span::styled(glyph.to_string(), Style::default().fg(gray(level)))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The build as the lockup states it.
+fn welcome_build(facts: &WelcomeFacts) -> String {
+    format!("v{}", facts.version)
+}
+
+/// Cells the lockup takes across: the mark, the gap, and the wider of the
+/// wordmark and the build.
+fn welcome_lockup_width(facts: &WelcomeFacts) -> usize {
+    let beside = WELCOME_WORDMARK
+        .iter()
+        .map(|row| titi_tui::width::visible_width(row))
+        .chain([titi_tui::width::visible_width(&welcome_build(facts))])
+        .max()
+        .unwrap_or(0);
+    welcome_mark_width() + WELCOME_GAP + beside
+}
+
+/// The mark with the wordmark beside it from its second row and the build
+/// under the wordmark, the way omp sets its own lockup.
+fn welcome_lockup(facts: &WelcomeFacts, grays: &WelcomeGrays) -> Vec<Line<'static>> {
+    let word = grays.bright().add_modifier(Modifier::BOLD);
+    let beside: Vec<Span<'static>> = WELCOME_WORDMARK
+        .iter()
+        .map(|row| Span::styled(*row, word))
+        .chain([Span::styled(welcome_build(facts), grays.faded())])
+        .collect();
+    welcome_mark(grays)
+        .into_iter()
+        .enumerate()
+        .map(|(y, mut spans)| {
+            if let Some(span) = y.checked_sub(1).and_then(|at| beside.get(at)) {
+                spans.push(Span::raw(" ".repeat(WELCOME_GAP)));
+                spans.push(span.clone());
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The lockup in one line, for a pane too small for the mark: the name in the
+/// wordmark's weight with the build beside it.
+fn welcome_brand(facts: &WelcomeFacts, grays: &WelcomeGrays) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("titi", grays.bright().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", welcome_build(facts)), grays.faded()),
+    ])
+}
+
+/// `lines` as one block whose widest line is centred in `width` cells. Every
+/// line moves by the same indent, so a left-aligned block stays aligned.
+fn centre_block(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let indent = " ".repeat(width.saturating_sub(widest) / 2);
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw(indent.clone())];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Cells a fact's label takes.
 const WELCOME_LABEL: usize = 9;
 
-/// A labelled fact: the label in the dim token, the value in the body text.
+/// A labelled fact: the label in the faded gray, the value in the ink.
 ///
 /// A value too long for the row keeps its tail behind an ellipsis — the leaf of
 /// a path and the last segment of a model id are what a reader needs — rather
 /// than being cut at whatever cell the row happens to end on.
-fn welcome_fact(label: &str, value: &str, room: usize, theme: &Theme) -> Vec<Span<'static>> {
+fn welcome_fact(label: &str, value: &str, room: usize, grays: &WelcomeGrays) -> Vec<Span<'static>> {
     vec![
         Span::styled(
             titi_tui::width::truncate_to_width(&format!("{label:<WELCOME_LABEL$}"), WELCOME_LABEL),
-            fg(theme, ThemeColor::Dim),
+            grays.faded(),
         ),
         Span::styled(
             fit_tail(value, room.saturating_sub(WELCOME_LABEL)),
-            fg(theme, ThemeColor::Text),
+            grays.bright(),
         ),
     ]
 }
@@ -5428,7 +5575,7 @@ fn welcome_width(spans: &[Span<'static>]) -> usize {
 ///
 /// The tail is stated whole or not at all: a branch or a credential word cut in
 /// half says something that is not true — a detached HEAD's short sha would read
-/// as whatever cells happened to fit — and a welcome box that cannot fit the git
+/// as whatever cells happened to fit — and a welcome that cannot fit the git
 /// state is better off without it, exactly as the masthead is.
 fn welcome_with_tail(
     mut spans: Vec<Span<'static>>,
@@ -5443,151 +5590,194 @@ fn welcome_with_tail(
     spans
 }
 
-/// The welcome box's body at one degradation level.
+/// What a short pane gives up, least load-bearing first: level `n` of the
+/// welcome has given up the first `n` of these.
 ///
-/// Level 0 is everything. Each level gives one thing up — the recent sessions,
-/// then the working directory, then the blank rows between the facts, then the
-/// tagline, then the model — because on a short pane the brand with the version
-/// beside it in the title, and the chords at the foot, are what a first screen
-/// is for; a blank row is not a fact, so it goes before the last two do.
-fn welcome_body(
+/// The lockup and the chords are not on the list. On a short pane the brand
+/// with its build, and the keys that start something, are what a first screen
+/// is for; a blank row is not a fact, so it goes before the model does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WelcomePart {
+    Sessions,
+    Dir,
+    Tagline,
+    Spacing,
+    Model,
+}
+
+impl WelcomePart {
+    fn shown(self, level: u8) -> bool {
+        self as u8 >= level
+    }
+}
+
+/// The level that has given every [`WelcomePart`] up.
+const WELCOME_BARE: u8 = WelcomePart::Model as u8 + 1;
+
+/// The facts block at one degradation level, every row at most `room` cells:
+/// the model and its credential, the directory and its git state, and the
+/// recent sessions, each label over the same column.
+fn welcome_fact_rows(
     facts: &WelcomeFacts,
     level: u8,
-    inner: usize,
-    theme: &Theme,
+    room: usize,
+    grays: &WelcomeGrays,
 ) -> Vec<Line<'static>> {
-    let room = inner.saturating_sub(3);
-    let mut body: Vec<Line<'static>> = Vec::new();
-    if level < 4 {
-        body.push(welcome_row(
-            vec![Span::styled(
-                "say what you want done",
-                fg(theme, ThemeColor::Muted),
-            )],
-            inner,
-            theme,
-        ));
-        if level < 3 {
-            body.push(welcome_row(Vec::new(), inner, theme));
-        }
+    let mut rows = Vec::new();
+    if WelcomePart::Model.shown(level) && !facts.model.is_empty() {
+        let spans = welcome_fact("model", &facts.model, room, grays);
+        let credential = facts
+            .credential
+            .as_ref()
+            .map(|credential| vec![Span::styled(format!("  ·  {credential}"), grays.faded())]);
+        rows.push(Line::from(welcome_with_tail(spans, credential, room)));
     }
-    if level < 5 && !facts.model.is_empty() {
-        let spans = welcome_fact("model", &facts.model, room, theme);
-        let credential = facts.credential.as_ref().map(|credential| {
-            vec![Span::styled(
-                format!("  ·  {credential}"),
-                fg(theme, ThemeColor::Dim),
-            )]
-        });
-        body.push(welcome_row(
-            welcome_with_tail(spans, credential, room),
-            inner,
-            theme,
-        ));
-    }
-    if level < 2 && !facts.path.is_empty() {
-        let spans = welcome_fact("dir", &facts.path, room, theme);
+    if WelcomePart::Dir.shown(level) && !facts.path.is_empty() {
+        let spans = welcome_fact("dir", &facts.path, room, grays);
         let git = facts.git.as_ref().map(|git| {
-            let mut tail = vec![Span::styled("  ·  ", fg(theme, ThemeColor::Dim))];
-            tail.extend(welcome_git(git, theme));
+            let mut tail = vec![Span::styled("  ·  ", grays.faded())];
+            tail.extend(welcome_git(git, grays));
             tail
         });
-        body.push(welcome_row(
-            welcome_with_tail(spans, git, room),
-            inner,
-            theme,
-        ));
+        rows.push(Line::from(welcome_with_tail(spans, git, room)));
     }
-    if level == 0 && !facts.sessions.is_empty() {
+    if WelcomePart::Sessions.shown(level) {
         for (at, (name, current)) in facts.sessions.iter().enumerate() {
             // The first row carries the label; the rest align under it, so a
             // list of sessions reads as one fact rather than several.
             let label = if at == 0 { "recent" } else { "" };
-            let mut spans = welcome_fact(label, name, room, theme);
             // The same mark in the same words as the switcher's row: one namer,
-            // so a session is never named two ways on one screen.
-            if *current {
-                spans.push(Span::styled("  ✓ current", fg(theme, ThemeColor::Success)));
+            // so a session is never named two ways on one screen. Its room is
+            // taken off the name, which keeps an ellipsis, not off the mark.
+            let mark = if *current { "  ✓ current" } else { "" };
+            let mut spans = welcome_fact(
+                label,
+                name,
+                room.saturating_sub(titi_tui::width::visible_width(mark)),
+                grays,
+            );
+            if !mark.is_empty() {
+                spans.push(Span::styled(mark, grays.faded()));
             }
-            body.push(welcome_row(spans, inner, theme));
+            rows.push(Line::from(spans));
         }
     }
-    if level < 3 {
-        body.push(welcome_row(Vec::new(), inner, theme));
-    }
-    body.push(welcome_row(
-        vec![Span::styled(welcome_hint(), fg(theme, ThemeColor::Dim))],
-        inner,
-        theme,
-    ));
-    body
+    rows
 }
 
 /// The chords the live screen answers to, and no others: the model picker's
 /// chord is the one the crate's table binds and the live mapper yields, not the
 /// `/model` command or a chord that reaches nothing.
-fn welcome_hint() -> &'static str {
-    "enter  send      alt+m  models      ctrl-c  quit"
+const WELCOME_CHORDS: [&str; 3] = ["enter  send", "alt+m  models", "ctrl-c  quit"];
+
+/// As many of [`WELCOME_CHORDS`] as fit in `width` cells, each one whole: a
+/// chord cut after its key would name an action it does not take.
+fn welcome_hint(width: usize) -> String {
+    let mut hint = String::new();
+    for chord in WELCOME_CHORDS {
+        let next = if hint.is_empty() {
+            chord.to_owned()
+        } else {
+            format!("{hint}      {chord}")
+        };
+        if titi_tui::width::visible_width(&next) > width {
+            break;
+        }
+        hint = next;
+    }
+    hint
 }
 
 /// The git state as the masthead states it: the branch, then one mark per kind
-/// of change, in the crate's status-line tokens.
-fn welcome_git(git: &WelcomeGit, theme: &Theme) -> Vec<Span<'static>> {
-    let dirty = git.unstaged > 0 || git.staged > 0 || git.untracked > 0;
-    let token = if dirty {
-        ThemeColor::StatusLineGitDirty
-    } else {
-        ThemeColor::StatusLineGitClean
-    };
-    let mut spans = vec![Span::styled(git.branch.clone(), fg(theme, token))];
-    for (count, mark, token) in [
-        (git.unstaged, "*", ThemeColor::StatusLineDirty),
-        (git.staged, "+", ThemeColor::StatusLineStaged),
-        (git.untracked, "?", ThemeColor::StatusLineUntracked),
-    ] {
+/// of change, in the ink.
+fn welcome_git(git: &WelcomeGit, grays: &WelcomeGrays) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(git.branch.clone(), grays.bright())];
+    for (count, mark) in [(git.unstaged, "*"), (git.staged, "+"), (git.untracked, "?")] {
         if count > 0 {
-            spans.push(Span::styled(format!(" {mark}{count}"), fg(theme, token)));
+            spans.push(Span::styled(format!(" {mark}{count}"), grays.bright()));
         }
     }
     spans
 }
 
-/// The first screen: what titi is and how to start, in the panel crate's chrome
-/// — the same box the pickers wear — centred in the pane.
+/// The welcome's rows at one degradation level, each centred in `width`
+/// cells: the lockup, or the brand in one line when `lockup` is false; the
+/// tagline; the facts as one left-aligned block; and the chords.
+fn welcome_rows(
+    facts: &WelcomeFacts,
+    level: u8,
+    lockup: bool,
+    width: usize,
+    grays: &WelcomeGrays,
+) -> Vec<Line<'static>> {
+    let head = if lockup {
+        welcome_lockup(facts, grays)
+    } else {
+        vec![welcome_brand(facts, grays)]
+    };
+    let mut sections = vec![centre_block(head, width)];
+    if WelcomePart::Tagline.shown(level) {
+        sections.push(centre_block(
+            vec![Line::from(Span::styled(
+                "say what you want done",
+                grays.bright(),
+            ))],
+            width,
+        ));
+    }
+    let block = welcome_fact_rows(
+        facts,
+        level,
+        width.saturating_sub(2).min(WELCOME_MEASURE),
+        grays,
+    );
+    if !block.is_empty() {
+        sections.push(centre_block(block, width));
+    }
+    sections.push(centre_block(
+        vec![Line::from(Span::styled(welcome_hint(width), grays.faded()))],
+        width,
+    ));
+    let spaced = WelcomePart::Spacing.shown(level);
+    let mut rows = Vec::new();
+    for section in sections {
+        if spaced && !rows.is_empty() {
+            rows.push(Line::from(""));
+        }
+        rows.extend(section);
+    }
+    rows
+}
+
+/// The first screen, set the way omp opens: the TITI mark beside the `titi`
+/// wordmark with the build under it, the tagline, the facts, and the chords,
+/// centred in the pane with no box around them, in black and white.
 ///
 /// This is an empty state, not a panel: it is drawn only while the transcript
 /// has no line, it never asks for more room than the pane has, and on a short
-/// pane it gives facts up through [`welcome_body`]'s levels rather than let the
+/// pane it gives things up through [`WelcomePart`]'s order rather than let the
 /// composer's rows be squeezed by a paragraph that cannot fit.
 fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph<'static> {
-    let box_width = (width as usize).min(WELCOME_WIDTH as usize).max(16);
-    let inner = box_width.saturating_sub(2).max(8);
     let facts = welcome_facts(chat);
-    let room = (height as usize).saturating_sub(2);
-    let mut body = welcome_body(&facts, 0, inner, theme);
-    for level in 1..=5 {
-        if body.len() <= room {
+    let grays = WelcomeGrays::of(theme);
+    let (width, height) = (usize::from(width), usize::from(height));
+    // A column clear on each side of the mark; a pane narrower than that states
+    // the brand in one line rather than cut the mark down the middle.
+    let lockup = width >= welcome_lockup_width(&facts) + 2;
+    let mut rows = Vec::new();
+    for level in 0..=WELCOME_BARE {
+        rows = welcome_rows(&facts, level, lockup, width, &grays);
+        if rows.len() <= height {
             break;
         }
-        body = welcome_body(&facts, level, inner, theme);
     }
-    let mut rows = vec![Line::from(Span::styled(
-        titi_tui::panels::box_top_title(inner, &format!("titi {}", facts.version)),
-        fg(theme, ThemeColor::Border),
-    ))];
-    rows.extend(body);
-    rows.push(Line::from(Span::styled(
-        titi_tui::panels::box_bot(inner),
-        fg(theme, ThemeColor::Border),
-    )));
-    // Centred in the pane, and never taller than it: a pane with no room for the
-    // box at all shows nothing rather than a paragraph cut in half.
-    let pad = (height as usize).saturating_sub(rows.len()) / 2;
+    if rows.len() > height {
+        rows = welcome_rows(&facts, WELCOME_BARE, false, width, &grays);
+    }
+    let pad = height.saturating_sub(rows.len()) / 2;
     let mut lines = vec![Line::from(""); pad];
     lines.extend(rows);
-    Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .style(page(theme))
+    Paragraph::new(lines).style(page(theme))
 }
 
 struct Photo {
@@ -8129,12 +8319,28 @@ mod tests {
     }
 
     /// A chat on a temp agent directory with one model and a key stored for it:
-    /// the facts the welcome box reads are the test's own, not this machine's.
+    /// the facts the welcome reads are the test's own, not this machine's.
     fn welcome_chat() -> (tempfile::TempDir, Chat) {
         let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
         chat.catalog = crate::engine::ModelCatalog::fixed(vec!["openai/gpt-4.1".to_owned()]);
         crate::secrets::store_key(&chat.agent_dir, "openai", "sk-test").expect("store a key");
         (dir, chat)
+    }
+
+    /// Two stored sessions with a message each, so the welcome has a list of
+    /// recent ones to offer.
+    fn with_two_sessions(chat: &Chat) {
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
+        for title in ["one", "two"] {
+            let id = store
+                .create(titi_core::session::SessionMeta {
+                    title: Some(title.to_owned()),
+                    bot_id: None,
+                    source: Some("cli".to_owned()),
+                })
+                .expect("create");
+            store.append(&id, Role::User, title).expect("append");
+        }
     }
 
     /// A frame as one string at `width` x `height`, for a test that is about
@@ -8143,8 +8349,40 @@ mod tests {
         frame_rows(chat, width, height).join("\n")
     }
 
-    /// What the box states for the directory: the path the snapshot gives, or
-    /// its leaf behind the ellipsis a row shortens a long value to.
+    /// The rows between the masthead and the composer: where the welcome is
+    /// drawn on an idle screen with no panel open.
+    fn welcome_area(rows: &[String]) -> &[String] {
+        rows.get(1..rows.len().saturating_sub(4))
+            .unwrap_or_default()
+    }
+
+    /// The welcome's rows of a frame at `width` x `height`, as one string.
+    fn welcome_at(chat: &mut Chat, width: u16, height: u16) -> String {
+        welcome_area(&frame_rows(chat, width, height)).join("\n")
+    }
+
+    /// Whether a fact row carrying `label` is on screen: a label opens its
+    /// row, so the masthead's model id or the composer's `/model` does not
+    /// count as the welcome's model row.
+    fn states_fact(welcome: &str, label: &str) -> bool {
+        welcome
+            .lines()
+            .any(|row| row.trim_start().starts_with(&format!("{label} ")))
+    }
+
+    /// Whether there is a blank row between the welcome's first and last rows.
+    fn spaced(welcome: &str) -> bool {
+        let rows: Vec<&str> = welcome.lines().collect();
+        let first = rows.iter().position(|row| !row.trim().is_empty());
+        let last = rows.iter().rposition(|row| !row.trim().is_empty());
+        match (first, last) {
+            (Some(first), Some(last)) => rows[first..=last].iter().any(|row| row.trim().is_empty()),
+            _ => false,
+        }
+    }
+
+    /// What the welcome states for the directory: the path the snapshot gives,
+    /// or its leaf behind the ellipsis a row shortens a long value to.
     fn states_path(frame: &str, path: &str) -> bool {
         frame.contains(path)
             || (frame.contains('…')
@@ -8158,7 +8396,7 @@ mod tests {
         frame.contains(branch) || !frame.contains(&branch.chars().take(4).collect::<String>())
     }
 
-    /// The text of the box's row carrying `label`.
+    /// The text of the fact row carrying `label`.
     fn row_with_label(body: &[Line<'static>], label: &str) -> String {
         body.iter()
             .map(|line| {
@@ -8171,20 +8409,48 @@ mod tests {
             .unwrap_or_else(|| panic!("no {label} row in {body:?}"))
     }
 
+    /// The cells the welcome draws something on, as symbol and foreground.
+    fn welcome_cells(chat: &mut Chat, width: u16, height: u16) -> Vec<(String, Color)> {
+        let buffer = frame_buffer(chat, width, height);
+        (1..height.saturating_sub(4))
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| (buffer[(x, y)].symbol().to_owned(), buffer[(x, y)].fg))
+            .filter(|(symbol, _)| !symbol.trim().is_empty())
+            .collect()
+    }
+
+    /// A colour's gray level, or `None` when its channels differ: a colour
+    /// with a hue in it is not black and white.
+    fn gray_level(color: Color) -> Option<u8> {
+        match color {
+            Color::Rgb(r, g, b) if r == g && g == b => Some(r),
+            _ => None,
+        }
+    }
+
+    /// BT.601 luma of a colour, 0 to 255.
+    fn luma(color: Color) -> f64 {
+        match color {
+            Color::Rgb(r, g, b) => {
+                0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
+            }
+            other => panic!("not an RGB colour: {other:?}"),
+        }
+    }
+
     /// The first screen states the build, the model behind the next turn, what
     /// stands behind that model, and the directory — each read from the source
-    /// that owns it — inside the panel crate's chrome.
+    /// that owns it — under the TITI mark, the whole lockup centred in the pane
+    /// with no box around it.
     #[test]
-    fn the_welcome_box_names_the_build_the_model_and_the_directory() {
+    fn the_welcome_names_the_build_the_model_and_the_directory() {
         let (_dir, mut chat) = welcome_chat();
         let snapshot = masthead_snapshot(&chat);
+        let build = format!("v{}", titi_tui::VERSION);
         for width in [60u16, 80, 120] {
             let rows = frame_rows(&mut chat, width, 20);
-            let frame = rows.join("\n");
-            assert!(
-                frame.contains(&format!("titi {}", titi_tui::VERSION)),
-                "{width}: the build is named: {frame}"
-            );
+            let area = welcome_area(&rows);
+            let frame = area.join("\n");
             assert!(
                 frame.contains("say what you want done"),
                 "{width}: and what to do: {frame}"
@@ -8213,21 +8479,37 @@ mod tests {
                     "{width}: the chords that work are advertised: {expected} missing from {frame}"
                 );
             }
-            // The box is a box, centred in the pane, and no row runs past it.
-            let top = rows
+            // The lockup: the mark with the build beside it, centred as one
+            // block, and nothing drawn around it.
+            let top = area
                 .iter()
-                .find(|row| row.contains("╭─ titi"))
-                .unwrap_or_else(|| panic!("{width}: no titled rule: {frame}"));
-            let left = top.chars().count() - top.trim_start().chars().count();
-            assert_eq!(
-                left,
-                (width as usize - titi_tui::width::visible_width(top.trim())) / 2,
-                "{width}: the box is centred: {top:?}"
-            );
+                .position(|row| row.contains("██████ ██████"))
+                .unwrap_or_else(|| panic!("{width}: no mark: {frame}"));
+            let lockup = &area[top..top + 5];
             assert!(
-                rows.iter().any(|row| row.contains("╰")),
-                "{width}: and it closes: {frame}"
+                lockup.iter().any(|row| row.contains(&build)),
+                "{width}: the build is named beside the mark: {frame}"
             );
+            let margin = |row: &String, trimmed: &str| {
+                titi_tui::width::visible_width(row) - titi_tui::width::visible_width(trimmed)
+            };
+            let left = lockup
+                .iter()
+                .map(|row| margin(row, row.trim_start()))
+                .min()
+                .unwrap_or_default();
+            let right = lockup
+                .iter()
+                .map(|row| margin(row, row.trim_end()))
+                .min()
+                .unwrap_or_default();
+            assert!(
+                left.abs_diff(right) <= 1,
+                "{width}: the lockup is centred ({left} | {right}): {lockup:#?}"
+            );
+            for corner in ['╭', '╰', '│'] {
+                assert!(!frame.contains(corner), "{width}: no box is drawn: {frame}");
+            }
             for row in &rows {
                 assert_eq!(
                     titi_tui::width::visible_width(row),
@@ -8238,34 +8520,112 @@ mod tests {
         }
     }
 
-    /// A session is named on the welcome box the way the switcher names it.
+    /// The welcome is black and white on every palette: every cell it draws
+    /// is a gray, and the mark stands off the page the way ink does — lighter
+    /// than a dark page, darker than a light one — rather than in whatever hue
+    /// a theme's accent or its git colours happen to be.
     #[test]
-    fn the_welcome_box_names_a_session_as_the_switcher_does() {
-        let (_dir, mut chat) = welcome_chat();
-        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
-        let named = store
-            .create(titi_core::session::SessionMeta {
-                title: Some("named".to_owned()),
-                bot_id: None,
-                source: Some("cli".to_owned()),
-            })
-            .expect("create");
-        chat.session_id = named.clone();
-        let frame = frame_at(&mut chat, 80, 20);
+    fn the_welcome_is_black_and_white_on_every_palette() {
+        let (mut dark, mut light) = (0, 0);
+        for name in titi_tui::theme::builtin::list_builtin_themes() {
+            let (_dir, mut chat) = welcome_chat();
+            chat.theme = test_theme_named(name);
+            let page = luma(bg(&chat.theme, ThemeBg::StatusLineBg));
+            let cells = welcome_cells(&mut chat, 80, 24);
+            for (symbol, color) in &cells {
+                assert!(
+                    gray_level(*color).is_some(),
+                    "{name}: {symbol:?} is drawn in {color:?}, which is not a gray"
+                );
+            }
+            let mark: Vec<f64> = cells
+                .iter()
+                .filter(|(symbol, _)| symbol == "█")
+                .filter_map(|(_, color)| gray_level(*color).map(f64::from))
+                .collect();
+            assert!(!mark.is_empty(), "{name}: the mark is drawn");
+            if page < 127.5 {
+                let brightest = mark.iter().copied().fold(0.0, f64::max);
+                assert!(
+                    brightest > page,
+                    "{name}: the mark ({brightest}) is lighter than a dark page ({page})"
+                );
+                dark += 1;
+            } else {
+                let darkest = mark.iter().copied().fold(255.0, f64::min);
+                assert!(
+                    darkest < page,
+                    "{name}: the mark ({darkest}) is darker than a light page ({page})"
+                );
+                light += 1;
+            }
+        }
         assert!(
-            frame.contains(&session_row_text(&named, true)),
-            "the box marks the session on screen the way the switcher does: {frame}"
+            dark > 0 && light > 0,
+            "the presets hold dark pages ({dark}) and light ones ({light})"
         );
+        for (name, page_is_dark) in [("titanium", true), ("alabaster", false)] {
+            let page = luma(bg(&test_theme_named(name), ThemeBg::StatusLineBg));
+            assert_eq!(page < 127.5, page_is_dark, "{name}: {page}");
+        }
+    }
+
+    /// The facts are one block: left-aligned under one another, and the block
+    /// centred in the pane as a whole, so the values read down one column
+    /// instead of each row drifting to its own centre.
+    #[test]
+    fn the_welcome_facts_are_one_left_aligned_block() {
+        let (_dir, mut chat) = welcome_chat();
+        with_two_sessions(&chat);
+        for width in [60u16, 80, 120] {
+            let rows = frame_rows(&mut chat, width, 24);
+            let area = welcome_area(&rows);
+            let model = area
+                .iter()
+                .position(|row| row.trim_start().starts_with("model "))
+                .unwrap_or_else(|| panic!("{width}: no model row: {area:#?}"));
+            // The model, the directory, and the two sessions.
+            let block = &area[model..model + 4];
+            let indent = |row: &String| {
+                titi_tui::width::visible_width(row)
+                    - titi_tui::width::visible_width(row.trim_start())
+            };
+            let left = indent(&block[0]);
+            assert!(
+                block[..3].iter().all(|row| indent(row) == left),
+                "{width}: every label starts in one column: {block:#?}"
+            );
+            assert_eq!(
+                indent(&block[3]),
+                left + WELCOME_LABEL,
+                "{width}: and a second session sits under the first: {block:#?}"
+            );
+            assert!(
+                block[1].trim_start().starts_with("dir ")
+                    && block[2].trim_start().starts_with("recent "),
+                "{width}: {block:#?}"
+            );
+            let widest = block
+                .iter()
+                .map(|row| titi_tui::width::visible_width(row.trim_end()) - left)
+                .max()
+                .unwrap_or_default();
+            let right = width as usize - left - widest;
+            assert!(
+                left.abs_diff(right) <= 1,
+                "{width}: the block is centred ({left} | {right}): {block:#?}"
+            );
+        }
     }
 
     /// A fact's tail is stated whole or dropped whole. A detached HEAD's short
     /// sha, cut where the row happens to end, reads as whatever cells fitted —
-    /// so the box gives the git state up rather than print half of it, the way
+    /// so the welcome gives the git state up rather than print half of it, the way
     /// the masthead gives it up when the pane is narrow. A value too long for
     /// its row keeps its informative end behind an ellipsis, never a bare cut.
     #[test]
-    fn the_welcome_box_states_a_fact_whole_or_not_at_all() {
-        let theme = test_theme();
+    fn the_welcome_states_a_fact_whole_or_not_at_all() {
+        let grays = WelcomeGrays::of(&test_theme());
         let facts = WelcomeFacts {
             version: "0.0.0",
             model: "opencode-go/glm-5.3-flash".to_owned(),
@@ -8279,10 +8639,9 @@ mod tests {
             }),
             sessions: Vec::new(),
         };
-        let inner = 62;
-        let room = inner - 3;
+        let room = 59;
 
-        let wide = welcome_body(&facts, 0, inner, &theme);
+        let wide = welcome_fact_rows(&facts, 0, room, &grays);
         let row = row_with_label(&wide, "dir");
         assert!(
             row.contains("/tmp/titi") && row.contains("636c207") && row.contains("*2"),
@@ -8299,7 +8658,7 @@ mod tests {
             path: format!("/{}", "deep/".repeat(12)),
             ..facts.clone()
         };
-        let row = row_with_label(&welcome_body(&long_path, 0, inner, &theme), "dir");
+        let row = row_with_label(&welcome_fact_rows(&long_path, 0, room, &grays), "dir");
         assert!(
             !row.contains("636c207"),
             "the branch is gone, not cut: {row}"
@@ -8316,7 +8675,7 @@ mod tests {
             model: "x".repeat(room),
             ..facts.clone()
         };
-        let row = row_with_label(&welcome_body(&long_model, 0, inner, &theme), "model");
+        let row = row_with_label(&welcome_fact_rows(&long_model, 0, room, &grays), "model");
         assert!(
             !row.contains("key"),
             "the credential word is not cut either: {row}"
@@ -8332,7 +8691,7 @@ mod tests {
             path: "p".repeat(35),
             ..facts.clone()
         };
-        let row = row_with_label(&welcome_body(&fits, 0, inner, &theme), "dir");
+        let row = row_with_label(&welcome_fact_rows(&fits, 0, room, &grays), "dir");
         assert!(
             row.contains("636c207") && row.contains("*2"),
             "a tail that fits to the cell is stated: {row}"
@@ -8341,13 +8700,45 @@ mod tests {
             path: "p".repeat(36),
             ..facts.clone()
         };
-        let row = row_with_label(&welcome_body(&over, 0, inner, &theme), "dir");
+        let row = row_with_label(&welcome_fact_rows(&over, 0, room, &grays), "dir");
         assert!(!row.contains("636c207"), "and one cell over is not: {row}");
+
+        // The session on screen keeps its mark whole; its name gives the room up.
+        let long_session = WelcomeFacts {
+            sessions: vec![("s".repeat(room), true)],
+            ..facts.clone()
+        };
+        let row = row_with_label(&welcome_fact_rows(&long_session, 0, room, &grays), "recent");
+        assert!(
+            row.ends_with("✓ current") && row.contains('…'),
+            "the mark is whole and the name is shortened: {row}"
+        );
+        assert_eq!(titi_tui::width::visible_width(&row), room, "{row}");
+    }
+
+    /// A session is named on the welcome the way the switcher names it.
+    #[test]
+    fn the_welcome_names_a_session_as_the_switcher_does() {
+        let (_dir, mut chat) = welcome_chat();
+        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
+        let named = store
+            .create(titi_core::session::SessionMeta {
+                title: Some("named".to_owned()),
+                bot_id: None,
+                source: Some("cli".to_owned()),
+            })
+            .expect("create");
+        chat.session_id = named.clone();
+        let frame = welcome_at(&mut chat, 80, 20);
+        assert!(
+            frame.contains(&session_row_text(&named, true)),
+            "the welcome marks the session on screen the way the switcher does: {frame}"
+        );
     }
 
     /// The credential word is the model picker's, not a second vocabulary.
     #[test]
-    fn the_welcome_box_states_a_subscription_as_oauth() {
+    fn the_welcome_states_a_subscription_as_oauth() {
         let (_dir, mut chat) = welcome_chat();
         crate::secrets::remove_key(&chat.agent_dir, "openai").expect("remove the key");
         crate::secrets::store_oauth(
@@ -8364,7 +8755,7 @@ mod tests {
             },
         )
         .expect("store a sign-in");
-        let frame = frame_at(&mut chat, 80, 20);
+        let frame = welcome_at(&mut chat, 80, 20);
         assert!(
             frame.contains("·  oauth"),
             "a subscription reads as oauth: {frame}"
@@ -8372,31 +8763,32 @@ mod tests {
         assert!(!frame.contains("·  key"), "and not as a key: {frame}");
     }
 
-    /// The welcome box is an empty state: one transcript line takes the screen,
+    /// The welcome is an empty state: one transcript line takes the screen,
     /// and emptying the transcript brings it back — a rewind to nothing, or a
     /// switch to a session with no history.
     #[test]
-    fn the_welcome_box_yields_the_screen_to_a_line() {
+    fn the_welcome_yields_the_screen_to_a_line() {
         let (_dir, mut chat) = welcome_chat();
         assert!(frame_at(&mut chat, 80, 20).contains("say what you want done"));
 
         chat.push(LineKind::User, "hello".to_owned());
         let frame = frame_at(&mut chat, 80, 20);
         assert!(
-            !frame.contains("say what you want done"),
+            !frame.contains("say what you want done") && !frame.contains("██████"),
             "one line is enough to take the screen: {frame}"
         );
         assert!(frame.contains("hello"), "{frame}");
 
         chat.show_history(&[]);
+        let frame = frame_at(&mut chat, 80, 20);
         assert!(
-            frame_at(&mut chat, 80, 20).contains("say what you want done"),
-            "and an empty transcript brings it back"
+            frame.contains("say what you want done") && frame.contains("██████ ██████"),
+            "and an empty transcript brings it back: {frame}"
         );
     }
 
     /// A session with no history yet — a fresh agent directory — has no list to
-    /// offer, so the box states the facts it does have and no empty heading.
+    /// offer, so the welcome states the facts it does have and no empty heading.
     #[test]
     fn a_session_with_no_history_shows_no_list() {
         let (_dir, mut chat) = welcome_chat();
@@ -8404,94 +8796,109 @@ mod tests {
             chat.session_choices().is_empty(),
             "a fresh directory has no sessions to list"
         );
-        let frame = frame_at(&mut chat, 80, 20);
-        assert!(!frame.contains("recent"), "no list is offered: {frame}");
-        assert!(frame.contains(&chat.model), "but the model is: {frame}");
-        assert!(frame.contains("dir"), "and the directory: {frame}");
+        let frame = welcome_at(&mut chat, 80, 20);
+        assert!(
+            !states_fact(&frame, "recent"),
+            "no list is offered: {frame}"
+        );
+        assert!(states_fact(&frame, "model"), "but the model is: {frame}");
+        assert!(states_fact(&frame, "dir"), "and the directory: {frame}");
     }
 
-    /// A short pane gives the box down in one order — the session list, then
-    /// the directory, then the blank rows, then the tagline, then the model. The
-    /// brand with the build beside it, and the chords, outlast all of them.
+    /// A short pane gives the welcome down in one order — the recent sessions,
+    /// then the directory, then the tagline, then the blank rows, then the
+    /// model — and the lockup with the chords outlasts all of them. When even
+    /// those two do not fit, the brand and its build fold into one line.
     #[test]
-    fn a_short_pane_gives_the_welcome_box_down_in_order() {
+    fn a_short_pane_gives_the_welcome_down_in_order() {
         let (_dir, mut chat) = welcome_chat();
-        let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
-        for title in ["one", "two"] {
-            let id = store
-                .create(titi_core::session::SessionMeta {
-                    title: Some(title.to_owned()),
-                    bot_id: None,
-                    source: Some("cli".to_owned()),
-                })
-                .expect("create");
-            store.append(&id, Role::User, title).expect("append");
-        }
+        with_two_sessions(&chat);
+        let build = format!("v{}", titi_tui::VERSION);
+        let chords = |frame: &str| {
+            frame.contains("enter  send")
+                && frame.contains("alt+m  models")
+                && frame.contains("ctrl-c  quit")
+        };
 
-        let roomy = frame_at(&mut chat, 80, 20);
-        for expected in ["recent", "dir", "say what you want done", "model"] {
+        // The pane is the screen less the masthead and the composer's four
+        // rows; each height below is the first that drops one more thing.
+        let roomy = welcome_at(&mut chat, 80, 19);
+        for label in ["recent", "dir", "model"] {
             assert!(
-                roomy.contains(expected),
-                "a roomy pane has {expected}: {roomy}"
+                states_fact(&roomy, label),
+                "a roomy pane has {label}: {roomy}"
             );
         }
+        assert!(roomy.contains("say what you want done"), "{roomy}");
 
-        // One fact at a time, from the least to the most load-bearing.
-        let no_sessions = frame_at(&mut chat, 80, 14);
+        let no_sessions = welcome_at(&mut chat, 80, 17);
         assert!(
-            !no_sessions.contains("recent"),
+            !states_fact(&no_sessions, "recent"),
             "the list goes first: {no_sessions}"
         );
         assert!(
-            no_sessions.contains("dir"),
+            states_fact(&no_sessions, "dir"),
             "the directory is still there: {no_sessions}"
         );
 
-        let no_directory = frame_at(&mut chat, 80, 12);
+        let no_directory = welcome_at(&mut chat, 80, 16);
         assert!(
-            !no_directory.contains("dir"),
+            !states_fact(&no_directory, "dir"),
             "then the directory: {no_directory}"
         );
         assert!(
             no_directory.contains("say what you want done"),
             "the tagline is still there: {no_directory}"
         );
+
+        let no_tagline = welcome_at(&mut chat, 80, 14);
         assert!(
-            no_directory.contains("model") && no_directory.contains("alt+m  models"),
-            "and so are the model and the chords: {no_directory}"
+            !no_tagline.contains("say what you want done"),
+            "then the tagline: {no_tagline}"
+        );
+        assert!(
+            states_fact(&no_tagline, "model") && spaced(&no_tagline),
+            "the model and the blank rows around it are still there: {no_tagline}"
         );
 
-        // Then the blank rows go, which buys the tagline its place back: three
-        // facts and no spacing is what a five-row pane can hold.
-        let tight = frame_at(&mut chat, 80, 10);
+        let tight = welcome_at(&mut chat, 80, 12);
+        assert!(!spaced(&tight), "then the blank rows: {tight}");
         assert!(
-            !tight.contains("recent") && !tight.contains("dir"),
-            "{tight}"
-        );
-        assert!(
-            tight.contains("say what you want done")
-                && tight.contains("model")
-                && tight.contains("alt+m  models"),
-            "the tagline, the model and the chords stay: {tight}"
+            states_fact(&tight, "model") && chords(&tight),
+            "which keeps the model with the chords: {tight}"
         );
 
-        // And on a pane with room for the hints alone, the brand stays with them.
-        let bare = frame_at(&mut chat, 80, 8);
+        let bare = welcome_at(&mut chat, 80, 11);
+        assert!(!states_fact(&bare, "model"), "then the model: {bare}");
         assert!(
-            !bare.contains("say what you want done") && !bare.contains("model    "),
-            "even the tagline and the model's row go: {bare}"
+            bare.contains("██████ ██████") && bare.contains(&build) && chords(&bare),
+            "the lockup with the build, and the chords, outlast it: {bare}"
+        );
+
+        let brand = welcome_at(&mut chat, 80, 10);
+        assert!(
+            !brand.contains("██████"),
+            "a pane with no room for the mark: {brand}"
         );
         assert!(
-            bare.contains(&format!("titi {}", titi_tui::VERSION)),
-            "the brand and the build are never given up: {bare}"
+            brand.contains(&format!("titi {build}")) && chords(&brand),
+            "states the brand and its build in one line, over the chords: {brand}"
         );
+
+        // So does a pane too narrow for the mark, however tall it is.
+        let narrow = welcome_at(&mut chat, 26, 24);
         assert!(
-            bare.contains("enter  send")
-                && bare.contains("alt+m  models")
-                && bare.contains("ctrl-c  quit"),
-            "and neither are the chords: {bare}"
+            !narrow.contains("██████") && narrow.contains(&format!("titi {build}")),
+            "{narrow}"
         );
-        assert!(bare.contains("╰"), "the box still closes: {bare}");
+        // Its chords are the ones that fit, each one whole.
+        assert!(narrow.contains("enter  send"), "{narrow}");
+        for (key, chord) in [("alt+m", "alt+m  models"), ("ctrl-c", "ctrl-c  quit")] {
+            assert!(
+                !narrow.contains(key) || narrow.contains(chord),
+                "{chord} is whole or absent: {narrow}"
+            );
+        }
     }
 
     /// The picker above the composer is a box: the title sits inset in the top
