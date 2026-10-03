@@ -348,13 +348,20 @@ impl ToolHandler for EditFileTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "edit".into(),
-                description: "Replace one occurrence of old_string with new_string".into(),
+                description: "Replace old_string with new_string in a file. old_string must \
+                              match exactly and occur once — include surrounding lines to make it \
+                              unique — or pass replace_all to change every occurrence."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
                         "old_string": { "type": "string" },
-                        "new_string": { "type": "string" }
+                        "new_string": { "type": "string" },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace every occurrence instead of exactly one."
+                        }
                     },
                     "required": ["path", "old_string", "new_string"]
                 }),
@@ -378,22 +385,91 @@ impl ToolHandler for EditFileTool {
         let Some(new) = arg_str(&args, "new_string") else {
             return err("missing new_string");
         };
+        let replace_all = arg_bool(&args, "replace_all").unwrap_or(false);
         match readable_path(&self.root, &path, &self.policy).and_then(|resolved| {
             let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
-            if !content.contains(&old) {
-                return Err("old_string not found".into());
-            }
-            let updated = content.replacen(&old, &new, 1);
+            let (updated, replaced) = apply_edit(&content, &old, &new, replace_all)?;
             fs::write(&resolved, &updated).map_err(|error| error.to_string())?;
-            Ok(unified_diff(&path, &content, &updated))
+            Ok((unified_diff(&path, &content, &updated), replaced))
         }) {
-            Ok(diff) => match diff {
-                Some(diff) => ok_with_detail("edited", diff),
-                None => ok("edited"),
-            },
+            Ok((diff, replaced)) => {
+                let answer = if replaced > 1 {
+                    format!("edited ({replaced} replacements)")
+                } else {
+                    "edited".to_owned()
+                };
+                match diff {
+                    Some(diff) => ok_with_detail(answer, diff),
+                    None => ok(answer),
+                }
+            }
             Err(error) => err(error),
         }
     }
+}
+
+/// Applies one `edit` call to a file's text and says how many places changed.
+///
+/// A model writes `\n`; a file that uses `\r\n` throughout is matched in LF
+/// and written back in CRLF, and a byte-order mark is kept. A file that mixes
+/// the two is matched as it is, so lines the edit did not touch keep their
+/// endings. `old_string` must be non-empty, differ from `new_string`, and —
+/// unless `replace_all` — occur exactly once: replacing the first of several
+/// was a guess that could land in the wrong function.
+fn apply_edit(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize), String> {
+    if old.is_empty() {
+        return Err("old_string is empty; use write to create or replace a whole file".into());
+    }
+    if old == new {
+        return Err("old_string and new_string are identical; nothing would change".into());
+    }
+    let (bom, body) = match content.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", content),
+    };
+    let crlf = body.contains("\r\n") && !body.replace("\r\n", "").contains('\n');
+    let (text, old, new) = if crlf {
+        (
+            body.replace("\r\n", "\n"),
+            old.replace("\r\n", "\n"),
+            new.replace("\r\n", "\n"),
+        )
+    } else {
+        (body.to_owned(), old.to_owned(), new.to_owned())
+    };
+    let count = text.matches(old.as_str()).count();
+    if count == 0 {
+        return Err(
+            "old_string not found; read the file again and copy the text exactly, \
+                    whitespace included"
+                .into(),
+        );
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_string occurs {count} times; include surrounding lines to make it unique, \
+             or pass replace_all: true"
+        ));
+    }
+    let replaced = if replace_all {
+        text.replace(old.as_str(), &new)
+    } else {
+        text.replacen(old.as_str(), &new, 1)
+    };
+    let replaced = if crlf {
+        replaced.replace('\n', "\r\n")
+    } else {
+        replaced
+    };
+    Ok((
+        format!("{bom}{replaced}"),
+        if replace_all { count } else { 1 },
+    ))
 }
 
 pub struct GlobTool {
@@ -1000,6 +1076,106 @@ mod tests {
             .describe(&serde_json::json!({"command": "echo one\necho two"}))
             .expect("a command is a call");
         assert_eq!(newline, "bash echo one echo two", "a newline is flattened");
+    }
+
+    fn edit_tool(root: &Path) -> EditFileTool {
+        EditFileTool {
+            root: root.to_path_buf(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        }
+    }
+
+    /// An `old_string` that occurs more than once names no place: replacing
+    /// the first was a guess that could land in the wrong function. It is
+    /// refused with the count, unless the call asks for every occurrence.
+    #[tokio::test]
+    async fn an_ambiguous_edit_is_refused_unless_it_replaces_all() {
+        let root = temp_root();
+        fs::write(root.join("dup.rs"), "let x = 1;\nlet y = 2;\nlet x = 1;\n").unwrap();
+        let edit = edit_tool(&root);
+        let result = edit
+            .invoke(serde_json::json!({
+                "path": "dup.rs", "old_string": "let x = 1;", "new_string": "let x = 9;"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("2 times"), "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.join("dup.rs")).unwrap(),
+            "let x = 1;\nlet y = 2;\nlet x = 1;\n",
+            "a refused edit changes nothing"
+        );
+
+        let result = edit
+            .invoke(serde_json::json!({
+                "path": "dup.rs", "old_string": "let x = 1;", "new_string": "let x = 9;",
+                "replace_all": true
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "edited (2 replacements)");
+        assert_eq!(
+            fs::read_to_string(root.join("dup.rs")).unwrap(),
+            "let x = 9;\nlet y = 2;\nlet x = 9;\n"
+        );
+    }
+
+    /// A CRLF file is matched by the LF text a model writes, and keeps its
+    /// own line endings — and its byte-order mark — after the edit.
+    #[tokio::test]
+    async fn a_crlf_file_is_edited_from_lf_text_and_stays_crlf() {
+        let root = temp_root();
+        fs::write(root.join("win.txt"), "\u{feff}one\r\ntwo\r\nthree\r\n").unwrap();
+        let result = edit_tool(&root)
+            .invoke(serde_json::json!({
+                "path": "win.txt", "old_string": "one\ntwo", "new_string": "one\n2\nand a half"
+            }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(root.join("win.txt")).unwrap(),
+            "\u{feff}one\r\n2\r\nand a half\r\nthree\r\n"
+        );
+    }
+
+    /// An empty `old_string` is found everywhere and once meant "prepend",
+    /// and an edit that changes nothing is a model that lost track: both are
+    /// refused without touching the file.
+    #[tokio::test]
+    async fn an_empty_or_unchanged_edit_is_refused() {
+        let root = temp_root();
+        let edit = edit_tool(&root);
+        for (old, new) in [("", "prefix "), ("hello", "hello")] {
+            let result = edit
+                .invoke(serde_json::json!({
+                    "path": "hello.txt", "old_string": old, "new_string": new
+                }))
+                .await;
+            assert!(result.is_error, "{old:?} -> {new:?} was accepted");
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world"
+        );
+    }
+
+    /// A miss says what to do next instead of only that it missed.
+    #[tokio::test]
+    async fn a_missed_edit_says_how_to_recover() {
+        let root = temp_root();
+        let result = edit_tool(&root)
+            .invoke(serde_json::json!({
+                "path": "hello.txt", "old_string": "goodbye", "new_string": "x"
+            }))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.output.starts_with("old_string not found"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("read"), "{}", result.output);
     }
 
     /// An edit's answer stays the one line it always was, and the change it

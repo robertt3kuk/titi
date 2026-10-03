@@ -115,6 +115,8 @@ Tool approval: `--approval always-ask|write|yolo`. The default is `write` — re
 
 `read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `memory`, `settings`.
 
+`edit` replaces text that occurs exactly once — an ambiguous `old_string` is refused with its count — or every occurrence with `replace_all`; a CRLF file is matched from the LF text a model writes and keeps its own line endings and byte-order mark.
+
 `hashline_edit` pins the lines it replaces by the six-hex anchor of the text that was read. A line that changed since the read is refused as a stale read instead of being overwritten from a picture of the file that is no longer true.
 
 `bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. A pty run is bounded on three axes: `timeout_secs` (1 to 3600, 300 by default), a 64 KiB cap on captured output, and an interrupt the surface can raise. Zero means "no deadline" nowhere in titi. Every tool result, whatever the tool, is capped at 40,000 characters before the model sees it: past that it keeps the head and the tail around a note saying how much was left out.
@@ -310,6 +312,8 @@ titi --mode plan
 ### Инструменты
 
 `read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `memory`, `settings`.
+
+`edit` заменяет текст, который встречается ровно один раз — неоднозначный `old_string` отвергается с числом совпадений, — или все вхождения при `replace_all`; файл с CRLF находится по LF-тексту, который пишет модель, и сохраняет свои концы строк и BOM.
 
 `hashline_edit` закрепляет заменяемые строки шестизначным hex-якорем того текста, который был прочитан. Строка, изменившаяся после чтения, отклоняется как устаревшее чтение, а не переписывается по снимку файла, который уже неправда.
 
