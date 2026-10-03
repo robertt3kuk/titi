@@ -3063,6 +3063,19 @@ impl Chat {
         self.scroll_offset = 0;
     }
 
+    /// How many leading transcript lines can no longer change: everything
+    /// above the reply or the reasoning still streaming, which grow in place.
+    /// A surface that writes each line once — the cast replay — waits for a
+    /// line to settle before writing it.
+    pub fn settled_len(&self) -> usize {
+        [self.assistant_at, self.thinking_at]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(self.lines.len())
+            .min(self.lines.len())
+    }
+
     /// The transcript as it stands. A cast replay renders these lines; the
     /// live screen draws them.
     pub fn transcript(&self) -> &[TranscriptLine] {

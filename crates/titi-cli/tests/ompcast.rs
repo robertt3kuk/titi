@@ -163,6 +163,53 @@ fn replaying_renders_the_transcript_of_the_recorded_session() {
     assert!(input_at < reply_at, "{text}");
 }
 
+/// A reply arrives in many deltas and the screen grows one line in place.
+/// The replay prints each line once, so it must wait for the line to stop
+/// growing: printing on first sight wrote the first delta and nothing more.
+#[test]
+fn a_reply_streamed_in_pieces_replays_whole_and_once() {
+    let records: Vec<CastRecord> = [
+        EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        },
+        EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "Hello ".into(),
+        },
+        EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "from ".into(),
+        },
+        EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "the cast".into(),
+        },
+        EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(at, event)| CastRecord {
+        t: at as u64,
+        body: CastBody::Event(event),
+    })
+    .collect();
+
+    let mut out = Vec::new();
+    play(&records, Pace::Fast, &mut out).expect("the records play");
+    let text = String::from_utf8(out).unwrap();
+
+    let replies: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("titi"))
+        .collect();
+    assert_eq!(replies.len(), 1, "{text}");
+    assert!(replies[0].ends_with("Hello from the cast"), "{text}");
+}
+
 #[test]
 fn the_replay_flag_plays_a_cast_without_starting_the_engine() {
     let dir = tempfile::tempdir().unwrap();

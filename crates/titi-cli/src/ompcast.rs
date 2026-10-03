@@ -235,12 +235,21 @@ pub fn play<W: Write>(records: &[CastRecord], pace: Pace, out: &mut W) -> Result
             }
             CastBody::Input(text) => chat.push_user(text),
         }
+        // A streaming reply grows its line in place, so a line is written
+        // only once nothing can change it any more.
+        let settled = chat.settled_len();
         let transcript = chat.transcript();
-        for line in &transcript[shown.min(transcript.len())..] {
+        for line in &transcript[shown.min(settled)..settled] {
             writeln!(out, "{:<6} {}", line.kind.as_str(), line.text).map_err(CastError::Io)?;
         }
-        shown = transcript.len();
+        shown = shown.max(settled);
         out.flush().map_err(CastError::Io)?;
     }
+    // A cast cut off mid-reply still shows what had arrived.
+    let transcript = chat.transcript();
+    for line in &transcript[shown.min(transcript.len())..] {
+        writeln!(out, "{:<6} {}", line.kind.as_str(), line.text).map_err(CastError::Io)?;
+    }
+    out.flush().map_err(CastError::Io)?;
     Ok(())
 }
