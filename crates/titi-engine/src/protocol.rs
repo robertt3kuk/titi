@@ -341,8 +341,9 @@ pub enum EngineEvent {
     },
     /// What this session has spent, and against what cap.
     ///
-    /// `spent` is the engine's own estimate (~4 characters per token) of
-    /// everything sent and received, not a count a provider reported.
+    /// `spent` sums every request's input and output as the provider counted
+    /// them; a request whose provider reported nothing is charged the
+    /// engine's own estimate (~4 characters per token) instead.
     BudgetUpdated {
         spent: u64,
         limit: Option<u64>,

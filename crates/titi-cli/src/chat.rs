@@ -2913,14 +2913,11 @@ impl Chat {
     fn show_budget(&mut self) {
         let text = match self.budget {
             Some(limit) => format!(
-                "budget: {} of {limit} tokens spent ({}%), estimated",
+                "budget: {} of {limit} tokens spent ({}%)",
                 self.spent_tokens,
                 share(self.spent_tokens, limit)
             ),
-            None => format!(
-                "budget: no cap · {} tokens spent (estimated)",
-                self.spent_tokens
-            ),
+            None => format!("budget: no cap · {} tokens spent", self.spent_tokens),
         };
         self.push(LineKind::Note, text);
     }
@@ -11120,6 +11117,16 @@ mod tests {
             chat.lines
                 .iter()
                 .any(|line| line.text.contains("1200 of 4000 tokens spent (30%)")),
+            "{:?}",
+            chat.lines.last()
+        );
+        // The spend is the provider's count wherever it reports one; calling
+        // all of it an estimate undersells the number.
+        assert!(
+            !chat
+                .lines
+                .last()
+                .is_some_and(|line| line.text.contains("estimated")),
             "{:?}",
             chat.lines.last()
         );
