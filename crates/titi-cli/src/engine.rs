@@ -627,6 +627,7 @@ pub fn start_engine_with(
     tools.register(std::sync::Arc::new(
         titi_memory::tool::MemoryTool::with_providers(agent_dir.clone(), provider_ids),
     ));
+    tools.register(Arc::new(titi_tools::TodoTool::new()));
     struct CliSettingsBackend {
         agent_dir: std::path::PathBuf,
         workspace: std::path::PathBuf,
