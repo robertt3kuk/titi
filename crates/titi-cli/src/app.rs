@@ -927,8 +927,15 @@ impl App {
                 }
                 self.push_transcript(Section::Subagents, format!("{agent_id} · {summary}"));
             }
-            EngineEvent::ModelSwitched { from, to, .. } => {
-                self.push_transcript(Section::Activity, format!("model fallback: {from} → {to}"));
+            EngineEvent::ModelSwitched { turn_id, from, to } => {
+                // Only a switch inside a turn is the engine falling back; one
+                // that names no turn is the user's own choice.
+                let line = if turn_id.is_some() {
+                    format!("model fallback: {from} → {to}")
+                } else {
+                    format!("model: {from} → {to}")
+                };
+                self.push_transcript(Section::Activity, line);
                 self.set_alert(format!("model: {to}"));
             }
             EngineEvent::ContextUsage { tokens, window, .. } => {

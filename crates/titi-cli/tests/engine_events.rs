@@ -91,6 +91,37 @@ fn engine_events_render_stream_thinking_tools_and_agents() {
     );
 }
 
+/// A switch the user asked for names no turn and is not a fallback; only a
+/// switch inside a turn is the engine giving up on the chosen model.
+#[test]
+fn only_a_switch_inside_a_turn_reads_as_a_fallback() {
+    let mut app = app();
+    assert!(app.details("activity expanded"));
+
+    app.ingest_engine_event(EngineEvent::ModelSwitched {
+        turn_id: None,
+        from: "openai/gpt-4.1".into(),
+        to: "anthropic/claude-opus-5".into(),
+    });
+    let rendered = app.render().join("\n");
+    assert!(
+        rendered.contains("model: openai/gpt-4.1 → anthropic/claude-opus-5"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("fallback"), "{rendered}");
+
+    app.ingest_engine_event(EngineEvent::ModelSwitched {
+        turn_id: Some(TurnId(3)),
+        from: "anthropic/claude-opus-5".into(),
+        to: "openai/gpt-4.1".into(),
+    });
+    let rendered = app.render().join("\n");
+    assert!(
+        rendered.contains("model fallback: anthropic/claude-opus-5 → openai/gpt-4.1"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn agents_slash_opens_live_hub() {
     let mut app = app();

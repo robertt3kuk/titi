@@ -859,9 +859,17 @@ impl Chat {
                 self.context_percent = Some(u8::try_from(percent.min(100)).unwrap_or(100));
                 Applied::none()
             }
-            EngineEvent::ModelSwitched { to, .. } => {
+            EngineEvent::ModelSwitched { turn_id, from, to } => {
                 self.model = to.to_string();
-                self.push(LineKind::Note, format!("model {to}"));
+                // A switch inside a turn is the engine giving up on the model
+                // the user chose; naming only the new one would pass it off
+                // as their own switch.
+                let line = if turn_id.is_some() {
+                    format!("model {to} · fallback from {from}")
+                } else {
+                    format!("model {to}")
+                };
+                self.push(LineKind::Note, line);
                 Applied::none()
             }
             EngineEvent::Compacted { folded, .. } => {
@@ -7443,6 +7451,23 @@ mod tests {
             confirmations_after_switch(&mut chat, "anthropic/claude-opus-5"),
             ["model anthropic/claude-opus-5"]
         );
+    }
+
+    /// A fallback inside a turn says which model gave up, so it cannot be
+    /// read as the user's own switch; the masthead follows it either way.
+    #[test]
+    fn a_fallback_names_the_model_it_left() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.on_event(EngineEvent::ModelSwitched {
+            turn_id: Some(TurnId(7)),
+            from: "openai/gpt-4.1".into(),
+            to: "anthropic/claude-opus-5".into(),
+        });
+        assert_eq!(
+            confirmations(&chat),
+            ["model anthropic/claude-opus-5 · fallback from openai/gpt-4.1"]
+        );
+        assert_eq!(chat.model, "anthropic/claude-opus-5");
     }
 
     /// An argument is not a picker: the resolution tests above must not have
