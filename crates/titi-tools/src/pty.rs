@@ -14,7 +14,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,10 @@ const CTRL_C: u8 = 0x03;
 #[derive(Clone, Debug, Default)]
 pub struct Interrupt {
     raised: Arc<AtomicBool>,
+    /// Counts every raise. A command keeps the count it started under, so a
+    /// raise still reaches it when the flag is lowered again before it next
+    /// looks — the engine lowers it as soon as the next turn starts.
+    raises: Arc<AtomicU64>,
 }
 
 impl Interrupt {
@@ -61,11 +65,22 @@ impl Interrupt {
 
     /// Interrupts the command currently running, if any. Idempotent.
     pub fn raise(&self) {
+        self.raises.fetch_add(1, Ordering::SeqCst);
         self.raised.store(true, Ordering::SeqCst);
     }
 
     pub fn is_raised(&self) -> bool {
         self.raised.load(Ordering::SeqCst)
+    }
+
+    /// Where the count of raises stands, for [`Interrupt::raised_since`].
+    pub fn mark(&self) -> u64 {
+        self.raises.load(Ordering::SeqCst)
+    }
+
+    /// Whether the flag is up, or was raised at any point after `mark`.
+    pub fn raised_since(&self, mark: u64) -> bool {
+        self.is_raised() || self.mark() != mark
     }
 
     /// Lowers the flag so the next command is not killed on sight. The owner
@@ -186,6 +201,7 @@ pub fn run(
     options: &Options,
     interrupt: &Interrupt,
 ) -> Result<Run, PtyError> {
+    let mark = interrupt.mark();
     // A cancel that landed while this call was queued still means stop: the
     // command must not start at all.
     if interrupt.is_raised() {
@@ -274,7 +290,7 @@ pub fn run(
             }
             Ok(None) => {}
         }
-        if interrupt.is_raised() {
+        if interrupt.raised_since(mark) {
             stop(child.as_mut(), writer.as_mut());
             await_drain(&drained);
             return Err(PtyError::Interrupted {
@@ -434,6 +450,30 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    /// The engine raises the interrupt on a cancel and lowers it when the
+    /// next turn starts, which can happen before this run looks again.
+    #[test]
+    fn a_raise_reaches_the_command_even_if_lowered_at_once() {
+        let interrupt = Interrupt::new();
+        let armed = interrupt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            armed.raise();
+            armed.clear();
+        });
+        let started = Instant::now();
+        let error = run(
+            "sleep 30",
+            Path::new("."),
+            &fast(Duration::from_secs(30)),
+            &interrupt,
+        )
+        .expect_err("a raise lowered at once must still stop the command");
+        assert!(matches!(error, PtyError::Interrupted { .. }), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!interrupt.is_raised());
     }
 
     #[test]
