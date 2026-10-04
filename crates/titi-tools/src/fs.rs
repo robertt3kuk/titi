@@ -901,10 +901,14 @@ impl ToolHandler for GrepTool {
         // named by its absolute path.
         let root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
         let path = arg_str(&args, "path");
-        let start = path
-            .as_deref()
-            .and_then(|path| jail_path(&self.root, path).ok())
-            .unwrap_or_else(|| root.clone());
+        let start = match path.as_deref() {
+            None => root.clone(),
+            Some(path) => match jail_path(&self.root, path) {
+                Ok(start) if start.exists() => start,
+                Ok(_) => return err(format!("{path} does not exist")),
+                Err(error) => return err(error),
+            },
+        };
         let query = GrepQuery {
             regex,
             files,
@@ -2000,6 +2004,20 @@ mod tests {
         let result = grep.invoke(args.clone()).await;
         assert!(!result.is_error, "{args}: {}", result.output);
         result.output.lines().map(str::to_owned).collect()
+    }
+
+    /// A path the search cannot use is an error, not a quiet search of the
+    /// whole workspace that answers a question nobody asked.
+    #[tokio::test]
+    async fn grep_refuses_a_path_outside_or_missing() {
+        let grep = grep_fixture();
+        for (path, says) in [("..", "outside the workspace"), ("nope/", "does not exist")] {
+            let result = grep
+                .invoke(serde_json::json!({ "pattern": "needle", "path": path }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(result.output.contains(says), "{path}: {}", result.output);
+        }
     }
 
     #[tokio::test]
