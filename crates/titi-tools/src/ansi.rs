@@ -10,6 +10,11 @@
 //! the same reason; this is the part of it that needs no knowledge of the
 //! command that produced the output.
 
+/// The rightmost column the cursor can be moved to. A terminal stops the
+/// cursor at the edge of its screen; without an edge, `ESC[999999999G` and
+/// one character would make a line of a billion spaces.
+const MAX_COLUMN: usize = 4_096;
+
 /// `raw` with escape sequences removed and each line's carriage returns,
 /// backspaces and line erases applied, as a terminal would show it. Other
 /// control characters are dropped; text, tabs and newlines pass untouched.
@@ -101,7 +106,13 @@ impl Screen {
                 self.line[..end].fill(' ');
             }
             ('K', "2") => self.line.clear(),
-            ('G', column) => self.cursor = column.parse::<usize>().unwrap_or(1).saturating_sub(1),
+            ('G', column) => {
+                self.cursor = column
+                    .parse::<usize>()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(MAX_COLUMN);
+            }
             _ => {}
         }
     }
@@ -153,6 +164,15 @@ mod tests {
             ),
             "link ok\n"
         );
+    }
+
+    /// A terminal keeps the cursor on its screen; a column far past any
+    /// screen must not become a line of a billion spaces.
+    #[test]
+    fn a_cursor_move_far_off_screen_stays_bounded() {
+        let text = plain("a\u{1b}[999999999Gb\n");
+        assert!(text.len() <= MAX_COLUMN + 8, "{} bytes", text.len());
+        assert!(text.starts_with('a') && text.ends_with("b\n"));
     }
 
     #[test]
