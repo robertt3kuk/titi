@@ -455,6 +455,9 @@ pub struct Chat {
     session_completion_tokens: u32,
     last_prompt_tokens: u32,
     last_completion_tokens: u32,
+    /// The part of the prompt counts above the provider read from its cache.
+    session_cached_tokens: u32,
+    last_cached_tokens: u32,
     quit_armed: Option<Instant>,
     hint: String,
     /// Provider waiting for a key or an OAuth code. The composer masks
@@ -548,6 +551,8 @@ impl Chat {
             session_completion_tokens: 0,
             last_prompt_tokens: 0,
             last_completion_tokens: 0,
+            session_cached_tokens: 0,
+            last_cached_tokens: 0,
             quit_armed: None,
             hint: String::new(),
             login_for: None,
@@ -979,12 +984,15 @@ impl Chat {
             EngineEvent::TurnUsage {
                 prompt_tokens,
                 completion_tokens,
+                cached_tokens,
                 ..
             } => {
                 self.last_prompt_tokens = prompt_tokens;
                 self.last_completion_tokens = completion_tokens;
+                self.last_cached_tokens = cached_tokens;
                 self.session_prompt_tokens += prompt_tokens;
                 self.session_completion_tokens += completion_tokens;
+                self.session_cached_tokens += cached_tokens;
                 Applied::none()
             }
             EngineEvent::MemoryResult { output } => {
@@ -1298,11 +1306,21 @@ impl Chat {
         Applied::none()
     }
     fn usage(&mut self) -> Applied {
+        // Cached input bills cheaper; it is named only when there was some.
+        let cached = |tokens: u32| {
+            if tokens > 0 {
+                format!(" ({tokens} cached)")
+            } else {
+                String::new()
+            }
+        };
         let text = format!(
-            "Turn: {} prompt + {} completion. Session: {} / {}.",
+            "Turn: {} prompt{} + {} completion. Session: {}{} / {}.",
             self.last_prompt_tokens,
+            cached(self.last_cached_tokens),
             self.last_completion_tokens,
             self.session_prompt_tokens,
+            cached(self.session_cached_tokens),
             self.session_completion_tokens
         );
         self.push(LineKind::Note, text);
@@ -12047,6 +12065,34 @@ mod tests {
         assert!(!chat.turn_active);
     }
 
+    /// Cached input is cheaper input; /usage says how much of the prompt
+    /// the provider served from its cache, and says nothing when none was.
+    #[test]
+    fn usage_names_the_cached_share_of_the_prompt() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 50,
+            cached_tokens: 800,
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(2),
+            prompt_tokens: 1_200,
+            completion_tokens: 40,
+            cached_tokens: 1_000,
+        });
+        type_text(&mut chat, "/usage");
+        chat.on_key(Key::Enter, Instant::now());
+        let note = chat.lines.last().map(|line| line.text.clone());
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "Turn: 1200 prompt (1000 cached) + 40 completion. Session: 2200 (1800 cached) / 90."
+            )
+        );
+    }
+
     #[test]
     fn usage_command_prints_tokens() {
         let mut chat = chat();
@@ -12054,6 +12100,7 @@ mod tests {
             turn_id: TurnId(1),
             prompt_tokens: 100,
             completion_tokens: 50,
+            cached_tokens: 0,
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());

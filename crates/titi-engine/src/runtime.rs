@@ -1982,6 +1982,7 @@ struct TurnMeter<'a> {
     session: &'a Arc<AtomicU64>,
     prompt: u64,
     completion: u64,
+    cached: u64,
     /// The turn's usage went out. It goes out once, however the turn ends.
     reported: bool,
 }
@@ -1992,6 +1993,7 @@ impl<'a> TurnMeter<'a> {
             session,
             prompt: 0,
             completion: 0,
+            cached: 0,
             reported: false,
         }
     }
@@ -2003,6 +2005,7 @@ impl<'a> TurnMeter<'a> {
             turn_id,
             prompt_tokens: u32::try_from(self.prompt).unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(self.completion).unwrap_or(u32::MAX),
+            cached_tokens: u32::try_from(self.cached).unwrap_or(u32::MAX),
         }
     }
 
@@ -2015,8 +2018,9 @@ impl<'a> TurnMeter<'a> {
         }
     }
 
-    fn charge(&mut self, prompt: u64, completion: u64) {
+    fn charge(&mut self, prompt: u64, completion: u64, cached: u64) {
         self.prompt = self.prompt.saturating_add(prompt);
+        self.cached = self.cached.saturating_add(cached);
         self.completion = self.completion.saturating_add(completion);
         self.session
             .fetch_add(prompt.saturating_add(completion), Ordering::SeqCst);
@@ -2099,10 +2103,15 @@ async fn stream_attempt(
                 // provider's own count wins; a provider that reports none
                 // (or a malformed one) is charged the project's estimate.
                 match reported {
-                    Some(usage) => meter.charge(usage.prompt_tokens, usage.completion_tokens),
+                    Some(usage) => meter.charge(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.cached_tokens,
+                    ),
                     None => meter.charge(
                         crate::compaction::estimate_request(messages),
                         titi_core::compaction::estimate_tokens(&answer),
+                        0,
                     ),
                 }
                 if calls.is_empty() {

@@ -362,3 +362,41 @@ async fn a_cancelled_turn_still_reports_the_rounds_it_paid_for() {
     .expect("a cancelled turn never reported its spend");
     assert_eq!(usage, (100, 10));
 }
+
+/// The share of the input the provider read from its prompt cache reaches
+/// the turn's usage, summed over the rounds like the rest.
+#[tokio::test]
+async fn the_cached_share_of_each_round_is_reported() {
+    let cached = |prompt, cached| {
+        StreamEvent::Usage(TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: 5,
+            cached_tokens: cached,
+        })
+    };
+    let mut first = echo_call();
+    first.push(cached(1_000, 0));
+    first.push(done(StopReason::ToolUse));
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(first),
+        MockBody::Events(vec![
+            text("done"),
+            cached(1_200, 900),
+            done(StopReason::Stop),
+        ]),
+    ]));
+    let mut engine = EngineRuntime::start_with_tools(
+        EngineConfig::new("primary"),
+        resolver(vec![("primary", transport)]),
+        echo_registry(),
+    );
+    let events = run_turn(&mut engine).await;
+    let reported: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::TurnUsage { cached_tokens, .. } => Some(*cached_tokens),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, [900], "{events:?}");
+}

@@ -256,6 +256,10 @@ pub enum EngineEvent {
         turn_id: TurnId,
         prompt_tokens: u32,
         completion_tokens: u32,
+        /// The part of `prompt_tokens` the provider served from its prompt
+        /// cache. Zero when it reported none, or reported nothing at all.
+        #[serde(default)]
+        cached_tokens: u32,
     },
     TurnFinished {
         turn_id: TurnId,
