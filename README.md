@@ -115,7 +115,7 @@ Tool approval: `--approval always-ask|write|yolo`. The default is `write` — re
 
 `read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `todo`, `memory`, `settings`.
 
-`read` takes an optional `offset` (the first line, 1-based) and `limit` (how many lines); a range that leaves lines out starts with `[lines A-B of N]`, so a large file is read in pieces.
+`read` takes an optional `offset` (the first line, 1-based) and `limit` (how many lines); a range that leaves lines out starts with `[lines A-B of N]`, so a large file is read in pieces. One read answers at most 30,000 characters, and 2,000 lines without a `limit`; a longer file comes back as its first part under `[lines 1-N of M; read on from offset N+1]` instead of being cut in the middle. Reading a directory lists it; a binary file is named as one.
 
 `glob` matches real glob patterns: `*` and `?` stay in one directory, `**/` crosses any number, `[a-z]` and `{rs,toml}` work, and a pattern without `/` names a file in any directory. `grep` takes a regular expression, with `ignore_case` and a `glob` file filter, and `path` may name one file (a path outside the workspace or one that does not exist is an error); a hit on a very long line shows the 300 characters around the match. Both skip `target`, `.git` and `node_modules`, list in path order, and cap the answer (1,000 paths, 500 matching lines) with a count of the rest.
 
@@ -319,7 +319,7 @@ titi --mode plan
 
 `read`, `write`, `edit`, `hashline_edit`, `glob`, `grep`, `bash`, `todo`, `memory`, `settings`.
 
-`read` принимает необязательные `offset` (первая строка, с единицы) и `limit` (сколько строк); диапазон, в который попал не весь файл, начинается с `[lines A-B of N]`, так что большой файл читается частями.
+`read` принимает необязательные `offset` (первая строка, с единицы) и `limit` (сколько строк); диапазон, в который попал не весь файл, начинается с `[lines A-B of N]`, так что большой файл читается частями. Один `read` отдаёт не больше 30 000 символов и 2000 строк без `limit`; файл длиннее приходит первой частью с `[lines 1-N of M; read on from offset N+1]`, а не с вырезанной серединой. `read` каталога показывает его содержимое, бинарный файл называется бинарным.
 
 `glob` понимает настоящие glob-шаблоны: `*` и `?` не выходят за каталог, `**/` проходит любое их число, работают `[a-z]` и `{rs,toml}`, а шаблон без `/` ищет имя файла в любом каталоге. `grep` принимает регулярное выражение, `ignore_case` и фильтр файлов `glob`, а `path` может указывать на один файл (путь вне workspace или несуществующий — ошибка); совпадение в очень длинной строке показывается 300 символами вокруг него. Оба пропускают `target`, `.git` и `node_modules`, выдают пути по порядку и обрезают ответ (1000 путей, 500 совпавших строк), называя число остальных.
 
