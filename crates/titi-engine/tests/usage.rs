@@ -278,3 +278,87 @@ async fn reported_rounds_on_both_sides_of_a_fallback_are_summed() {
     assert_eq!(turn_usage(&events), vec![(2200, 15)], "{events:?}");
     assert_eq!(spent(&events), 2215);
 }
+
+/// Rounds a turn paid for stay paid for when it ends without finishing: a
+/// turn stopped by the tool-round cap reports what its rounds cost before
+/// the failure that ends it.
+#[tokio::test]
+async fn a_turn_that_fails_still_reports_the_rounds_it_paid_for() {
+    let round = |prompt, completion| {
+        let mut events = echo_call();
+        events.push(reported(prompt, completion));
+        events.push(done(StopReason::ToolUse));
+        MockBody::Events(events)
+    };
+    let transport = Arc::new(MockTransport::new(vec![round(100, 10), round(200, 20)]));
+    let mut config = EngineConfig::new("primary");
+    config.max_tool_rounds = 1;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(vec![("primary", transport)]),
+        echo_registry(),
+    );
+    let events = run_turn(&mut engine).await;
+    assert!(
+        matches!(events.last(), Some(EngineEvent::Failed { message, .. }) if message.contains("cap")),
+        "{events:?}"
+    );
+    assert_eq!(turn_usage(&events), [(300, 30)], "{events:?}");
+}
+
+/// A cancelled turn reports the rounds it finished, so the session's total
+/// is what was actually spent.
+#[tokio::test]
+async fn a_cancelled_turn_still_reports_the_rounds_it_paid_for() {
+    let mut events = vec![
+        StreamEvent::ToolcallStart {
+            id: BlockId::new("tool"),
+            call: ToolCallRef {
+                call_id: "call-1".into(),
+                name: "shell_probe".into(),
+            },
+        },
+        StreamEvent::ToolcallDelta {
+            id: BlockId::new("tool"),
+            json: "{}".into(),
+        },
+        StreamEvent::ToolcallEnd {
+            id: BlockId::new("tool"),
+        },
+    ];
+    events.push(reported(100, 10));
+    events.push(done(StopReason::ToolUse));
+    let transport = Arc::new(MockTransport::new(vec![MockBody::Events(events)]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(titi_tools::ShellProbeTool));
+    // The exec-tier call waits on an approval nobody gives, so the turn is
+    // parked mid-way when the cancel lands.
+    let mut config = EngineConfig::new("primary");
+    config.approval_mode = titi_tools::ApprovalMode::Write;
+    let mut engine =
+        EngineRuntime::start_with_tools(config, resolver(vec![("primary", transport)]), tools);
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .expect("the engine takes the prompt");
+    let mut seen = Vec::new();
+    let usage = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = engine.recv().await {
+            if matches!(event, EngineEvent::ToolApprovalNeeded { .. }) {
+                engine
+                    .send(EngineCommand::Cancel)
+                    .await
+                    .expect("the engine takes the cancel");
+            }
+            let usage = turn_usage(std::slice::from_ref(&event));
+            seen.push(event);
+            if let Some(usage) = usage.first() {
+                return *usage;
+            }
+        }
+        panic!("the engine stopped: {seen:?}");
+    })
+    .await
+    .expect("a cancelled turn never reported its spend");
+    assert_eq!(usage, (100, 10));
+}

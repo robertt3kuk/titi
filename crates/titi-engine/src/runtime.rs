@@ -1720,217 +1720,231 @@ async fn run_turn(
 
     // Per turn, not per model: rounds a fallback leaves behind were paid for.
     let mut meter = TurnMeter::new(&spent);
-    // What the last model to give up said, for the failure that ends the
-    // turn when every model has: "unavailable" alone does not say why.
-    let mut last_failure: Option<String> = None;
-    for model in models {
-        if aborted.load(Ordering::SeqCst) {
-            return None;
-        }
-        if let Some(previous) = previous_model.take() {
-            let _ = events
-                .send(EngineEvent::ModelSwitched {
-                    turn_id: Some(turn_id),
-                    from: previous,
-                    to: model.clone(),
-                })
-                .await;
-        }
-        let resolved = match resolver.resolve(&model) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = events
-                    .send(EngineEvent::Failed {
-                        turn_id: Some(turn_id),
-                        reason: ErrorReason::Rejected,
-                        message: error.to_string().into(),
-                    })
-                    .await;
-                return None;
-            }
-        };
-        let credential = resolved.credential;
-        let wire_model = resolved.wire_model;
-        let transport = resolved.transport;
-        let _ = events
-            .send(EngineEvent::TurnStarted {
-                turn_id,
-                model: model.clone(),
-            })
-            .await;
-
-        if let Some(recorder) = trajectory.lock().await.as_mut() {
-            let _ = recorder.record(titi_core::trajectory::EventKind::UserMessage {
-                text: prompt.to_string(),
-            });
-        }
-        let mut messages = Vec::new();
-        if let Some(system) = &system {
-            messages.push(ChatMessage {
-                role: Role::System,
-                content: system.clone(),
-                tool_calls: Vec::new(),
-            });
-        }
-        // A resumed session replays its history before the new prompt.
-        messages.extend(config.restored_messages.iter().cloned());
-        messages.push(ChatMessage {
-            role: Role::User,
-            content: contextual_prompt.clone(),
-            tool_calls: Vec::new(),
-        });
-        let mut tool_rounds = 0;
-        loop {
-            // `execute_tools` returns as soon as the abort lands, and the loop
-            // used to walk straight back into another stream. Nothing below
-            // this point is worth doing for a turn nobody will read.
+    let history = async {
+        // What the last model to give up said, for the failure that ends the
+        // turn when every model has: "unavailable" alone does not say why.
+        let mut last_failure: Option<String> = None;
+        for model in models {
             if aborted.load(Ordering::SeqCst) {
                 return None;
             }
-            // Anything typed mid-flight lands before the next attempt.
-            for text in steering.drain() {
-                messages.push(ChatMessage {
-                    role: Role::User,
-                    content: text,
-                    tool_calls: Vec::new(),
-                });
-            }
-            // A turn accumulates tool results without bound; fold the oldest
-            // away before the provider refuses the request.
-            if let Some(folded) =
-                crate::compaction::compact(&mut messages, &config.compaction, config.context_window)
-            {
-                if let Some(recorder) = trajectory.lock().await.as_mut() {
-                    let _ = recorder.record(titi_core::trajectory::EventKind::Compaction {
-                        folded: folded.folded as u64,
-                        strategy: folded.strategy.to_string(),
-                    });
-                }
+            if let Some(previous) = previous_model.take() {
                 let _ = events
-                    .send(EngineEvent::Compacted {
-                        turn_id,
-                        folded: folded.folded as u32,
-                        tokens_before: folded.tokens_before,
-                        strategy: folded.strategy.clone(),
+                    .send(EngineEvent::ModelSwitched {
+                        turn_id: Some(turn_id),
+                        from: previous,
+                        to: model.clone(),
                     })
                     .await;
             }
-            let _ = events
-                .send(EngineEvent::ContextUsage {
-                    turn_id,
-                    tokens: crate::compaction::estimate_request(&messages),
-                    window: config.context_window,
-                })
-                .await;
-            let mut last_error = None;
-            let mut completed = false;
-            for attempt in 0..=config.max_transient_retries {
-                // A stall already waited out its own timeout; a rate limit or
-                // an outage is asked again only after a pause.
-                if matches!(last_error, Some(TransportError::Retryable { .. }))
-                    && !back_off(retry_delay(config.retry_backoff, attempt), &aborted).await
-                {
+            let resolved = match resolver.resolve(&model) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    meter.settle(&events, turn_id).await;
+                    let _ = events
+                        .send(EngineEvent::Failed {
+                            turn_id: Some(turn_id),
+                            reason: ErrorReason::Rejected,
+                            message: error.to_string().into(),
+                        })
+                        .await;
                     return None;
                 }
-                match stream_attempt(
+            };
+            let credential = resolved.credential;
+            let wire_model = resolved.wire_model;
+            let transport = resolved.transport;
+            let _ = events
+                .send(EngineEvent::TurnStarted {
                     turn_id,
-                    &messages,
-                    &wire_model,
-                    Arc::clone(&transport),
-                    credential.clone(),
-                    events.clone(),
-                    Arc::clone(&aborted),
-                    &tools,
-                    &mut meter,
-                )
-                .await
-                {
-                    Ok((text, calls)) if calls.is_empty() => {
-                        if !text.is_empty() {
-                            messages.push(ChatMessage {
-                                role: Role::Assistant,
-                                content: text,
-                                tool_calls: Vec::new(),
-                            });
-                        }
-                        completed = true;
-                        break;
-                    }
-                    Ok((text, calls)) => {
-                        if tool_rounds >= config.max_tool_rounds {
-                            let _ = events
-                                .send(EngineEvent::Failed {
-                                    turn_id: Some(turn_id),
-                                    reason: ErrorReason::Rejected,
-                                    message: "tool round cap reached".into(),
-                                })
-                                .await;
-                            return None;
-                        }
-                        tool_rounds += 1;
-                        let extra = execute_tools(
-                            turn_id,
-                            calls,
-                            text,
-                            &tools,
-                            config.approval_mode,
-                            &waiters,
-                            &events,
-                            &aborted,
-                            &trajectory,
-                            &touched,
-                            &claims,
-                            &MAIN_AGENT,
-                            config.mask_ips,
-                        )
-                        .await;
-                        messages.extend(extra);
-                        last_error = None;
-                        break;
-                    }
-                    Err((error, visible_content)) => {
-                        if aborted.load(Ordering::SeqCst) {
-                            return None;
-                        }
-                        if visible_content || !error.is_retryable() {
-                            emit_transport_failure(&events, turn_id, error).await;
-                            return None;
-                        }
-                        last_error = Some(error);
-                    }
-                }
+                    model: model.clone(),
+                })
+                .await;
+
+            if let Some(recorder) = trajectory.lock().await.as_mut() {
+                let _ = recorder.record(titi_core::trajectory::EventKind::UserMessage {
+                    text: prompt.to_string(),
+                });
             }
-            if completed {
-                if let Some(recorder) = trajectory.lock().await.as_mut() {
-                    let _ = recorder.record(titi_core::trajectory::EventKind::TurnEnd);
-                }
-                // A cancelled turn contributes nothing. Its assistant output is
-                // partial and its last tool calls may have no results, and a
-                // tool call without its result is a request no provider accepts.
+            let mut messages = Vec::new();
+            if let Some(system) = &system {
+                messages.push(ChatMessage {
+                    role: Role::System,
+                    content: system.clone(),
+                    tool_calls: Vec::new(),
+                });
+            }
+            // A resumed session replays its history before the new prompt.
+            messages.extend(config.restored_messages.iter().cloned());
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: contextual_prompt.clone(),
+                tool_calls: Vec::new(),
+            });
+            let mut tool_rounds = 0;
+            loop {
+                // `execute_tools` returns as soon as the abort lands, and the loop
+                // used to walk straight back into another stream. Nothing below
+                // this point is worth doing for a turn nobody will read.
                 if aborted.load(Ordering::SeqCst) {
                     return None;
                 }
-                return Some(visible_history(messages, system.as_ref()));
-            }
-            if let Some(error) = last_error {
-                last_failure = Some(format!("{model}: {error}"));
-                previous_model = Some(model.clone());
-                break;
+                // Anything typed mid-flight lands before the next attempt.
+                for text in steering.drain() {
+                    messages.push(ChatMessage {
+                        role: Role::User,
+                        content: text,
+                        tool_calls: Vec::new(),
+                    });
+                }
+                // A turn accumulates tool results without bound; fold the oldest
+                // away before the provider refuses the request.
+                if let Some(folded) = crate::compaction::compact(
+                    &mut messages,
+                    &config.compaction,
+                    config.context_window,
+                ) {
+                    if let Some(recorder) = trajectory.lock().await.as_mut() {
+                        let _ = recorder.record(titi_core::trajectory::EventKind::Compaction {
+                            folded: folded.folded as u64,
+                            strategy: folded.strategy.to_string(),
+                        });
+                    }
+                    let _ = events
+                        .send(EngineEvent::Compacted {
+                            turn_id,
+                            folded: folded.folded as u32,
+                            tokens_before: folded.tokens_before,
+                            strategy: folded.strategy.clone(),
+                        })
+                        .await;
+                }
+                let _ = events
+                    .send(EngineEvent::ContextUsage {
+                        turn_id,
+                        tokens: crate::compaction::estimate_request(&messages),
+                        window: config.context_window,
+                    })
+                    .await;
+                let mut last_error = None;
+                let mut completed = false;
+                for attempt in 0..=config.max_transient_retries {
+                    // A stall already waited out its own timeout; a rate limit or
+                    // an outage is asked again only after a pause.
+                    if matches!(last_error, Some(TransportError::Retryable { .. }))
+                        && !back_off(retry_delay(config.retry_backoff, attempt), &aborted).await
+                    {
+                        return None;
+                    }
+                    match stream_attempt(
+                        turn_id,
+                        &messages,
+                        &wire_model,
+                        Arc::clone(&transport),
+                        credential.clone(),
+                        events.clone(),
+                        Arc::clone(&aborted),
+                        &tools,
+                        &mut meter,
+                    )
+                    .await
+                    {
+                        Ok((text, calls)) if calls.is_empty() => {
+                            if !text.is_empty() {
+                                messages.push(ChatMessage {
+                                    role: Role::Assistant,
+                                    content: text,
+                                    tool_calls: Vec::new(),
+                                });
+                            }
+                            completed = true;
+                            break;
+                        }
+                        Ok((text, calls)) => {
+                            if tool_rounds >= config.max_tool_rounds {
+                                meter.settle(&events, turn_id).await;
+                                let _ = events
+                                    .send(EngineEvent::Failed {
+                                        turn_id: Some(turn_id),
+                                        reason: ErrorReason::Rejected,
+                                        message: "tool round cap reached".into(),
+                                    })
+                                    .await;
+                                return None;
+                            }
+                            tool_rounds += 1;
+                            let extra = execute_tools(
+                                turn_id,
+                                calls,
+                                text,
+                                &tools,
+                                config.approval_mode,
+                                &waiters,
+                                &events,
+                                &aborted,
+                                &trajectory,
+                                &touched,
+                                &claims,
+                                &MAIN_AGENT,
+                                config.mask_ips,
+                            )
+                            .await;
+                            messages.extend(extra);
+                            last_error = None;
+                            break;
+                        }
+                        Err((error, visible_content)) => {
+                            if aborted.load(Ordering::SeqCst) {
+                                return None;
+                            }
+                            if visible_content || !error.is_retryable() {
+                                meter.settle(&events, turn_id).await;
+                                emit_transport_failure(&events, turn_id, error).await;
+                                return None;
+                            }
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                if completed {
+                    if let Some(recorder) = trajectory.lock().await.as_mut() {
+                        let _ = recorder.record(titi_core::trajectory::EventKind::TurnEnd);
+                    }
+                    // A cancelled turn contributes nothing. Its assistant output is
+                    // partial and its last tool calls may have no results, and a
+                    // tool call without its result is a request no provider accepts.
+                    if aborted.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    return Some(visible_history(messages, system.as_ref()));
+                }
+                if let Some(error) = last_error {
+                    last_failure = Some(format!("{model}: {error}"));
+                    previous_model = Some(model.clone());
+                    break;
+                }
             }
         }
-    }
 
-    let _ = events
-        .send(EngineEvent::Failed {
-            turn_id: Some(turn_id),
-            reason: ErrorReason::Connection,
-            message: match last_failure {
-                Some(last) => format!("all configured models are unavailable; last, {last}").into(),
-                None => "all configured models are unavailable".into(),
-            },
-        })
-        .await;
-    None
+        meter.settle(&events, turn_id).await;
+        let _ = events
+            .send(EngineEvent::Failed {
+                turn_id: Some(turn_id),
+                reason: ErrorReason::Connection,
+                message: match last_failure {
+                    Some(last) => {
+                        format!("all configured models are unavailable; last, {last}").into()
+                    }
+                    None => "all configured models are unavailable".into(),
+                },
+            })
+            .await;
+        None
+    }
+    .await;
+    // A cancelled turn ends here without a word of its own.
+    meter.settle(&events, turn_id).await;
+    history
 }
 
 /// Longest pause before one transient retry.
@@ -1968,6 +1982,8 @@ struct TurnMeter<'a> {
     session: &'a Arc<AtomicU64>,
     prompt: u64,
     completion: u64,
+    /// The turn's usage went out. It goes out once, however the turn ends.
+    reported: bool,
 }
 
 impl<'a> TurnMeter<'a> {
@@ -1976,6 +1992,26 @@ impl<'a> TurnMeter<'a> {
             session,
             prompt: 0,
             completion: 0,
+            reported: false,
+        }
+    }
+
+    /// The turn's usage, which counts as reported from here on.
+    fn usage(&mut self, turn_id: TurnId) -> EngineEvent {
+        self.reported = true;
+        EngineEvent::TurnUsage {
+            turn_id,
+            prompt_tokens: u32::try_from(self.prompt).unwrap_or(u32::MAX),
+            completion_tokens: u32::try_from(self.completion).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Reports what the turn spent if nothing has yet. A turn that fails or
+    /// is cancelled paid for every round it finished, and a session total
+    /// that skips them undercounts.
+    async fn settle(&mut self, events: &mpsc::Sender<EngineEvent>, turn_id: TurnId) {
+        if !self.reported && (self.prompt > 0 || self.completion > 0) {
+            let _ = events.send(self.usage(turn_id)).await;
         }
     }
 
@@ -2070,13 +2106,7 @@ async fn stream_attempt(
                     ),
                 }
                 if calls.is_empty() {
-                    let _ = events
-                        .send(EngineEvent::TurnUsage {
-                            turn_id,
-                            prompt_tokens: u32::try_from(meter.prompt).unwrap_or(u32::MAX),
-                            completion_tokens: u32::try_from(meter.completion).unwrap_or(u32::MAX),
-                        })
-                        .await;
+                    let _ = events.send(meter.usage(turn_id)).await;
                     let _ = events
                         .send(EngineEvent::TurnFinished { turn_id, reason })
                         .await;
