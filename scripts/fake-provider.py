@@ -17,6 +17,8 @@ the real binary and the real HTTP stack:
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
+  "read long"     a read call on long.txt, no range (make it with `seq 1 5000`)
+  "read dir"      a read call on the workspace root (a directory)
   "write file"    a write call creating smoke.txt
   "think"         reasoning deltas, then markdown
   "wide text"     CJK and emoji
@@ -118,6 +120,10 @@ def script(last: dict) -> list[tuple[dict, float]]:
     if "edit readme" in content:
         args = {"path": "README.md", "old_string": "# smoke ws", "new_string": "# smoke workspace"}
         return [(c, 0) for c in call("call_edit", "edit", args)]
+    if "read long" in content:
+        return [(c, 0) for c in call("call_long", "read", {"path": "long.txt"})]
+    if "read dir" in content:
+        return [(c, 0) for c in call("call_dir", "read", {"path": "."})]
     if "read readme" in content:
         return [(c, 0) for c in call("call_read", "read", {"path": "README.md"})]
     if "write file" in content:
