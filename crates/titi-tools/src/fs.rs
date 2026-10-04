@@ -258,8 +258,19 @@ fn line_arg(args: &Value, key: &str) -> Result<Option<usize>, String> {
     }
 }
 
+/// Lines a read answers with when the call sets no `limit`.
+pub const READ_MAX_LINES: usize = 2_000;
+
+/// Characters one read answers with, whatever the range. It sits under the
+/// engine's cap on a tool result, so a long file comes back as a clean first
+/// part that says where to read on, not as a head and a tail with the middle
+/// cut out and no line number to find it by.
+pub const READ_MAX_CHARS: usize = 30_000;
+
 /// Lines `offset..offset + limit` (1-based) of `content`, as the file holds
-/// them. A window that leaves any line out starts with `[lines A-B of N]`.
+/// them, as far as [`READ_MAX_LINES`] (without a limit) and
+/// [`READ_MAX_CHARS`] reach. A window that leaves any line out starts with
+/// `[lines A-B of N]`, and one those limits cut short says where to read on.
 fn line_window(
     path: &str,
     content: &str,
@@ -275,10 +286,32 @@ fn line_window(
         ));
     }
     let first = offset - 1;
-    let end = limit.map_or(total, |limit| first.saturating_add(limit).min(total));
+    let asked = limit.map_or(total, |limit| first.saturating_add(limit).min(total));
+    let most = if limit.is_some() {
+        usize::MAX
+    } else {
+        READ_MAX_LINES
+    };
+    let mut end = first;
+    let mut chars = 0;
+    while end < asked && end - first < most {
+        let width = lines[end].chars().count();
+        // At least one line, however long: a read never answers nothing.
+        if end > first && chars + width > READ_MAX_CHARS {
+            break;
+        }
+        chars += width;
+        end += 1;
+    }
     let body = lines[first..end].concat();
     if first == 0 && end == total {
         return Ok(body);
+    }
+    if end < asked {
+        return Ok(format!(
+            "[lines {offset}-{end} of {total}; read on from offset {}]\n{body}",
+            end + 1
+        ));
     }
     Ok(format!("[lines {offset}-{end} of {total}]\n{body}"))
 }
@@ -289,11 +322,15 @@ impl ToolHandler for ReadFileTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "read".into(),
-                description: "Read a UTF-8 file from the workspace: the whole file, or a line \
-                              range with offset and limit. A range that leaves lines out starts \
-                              with a `[lines A-B of N]` line; long results are cut, so read a \
-                              large file in ranges."
-                    .into(),
+                description: format!(
+                    "Read a UTF-8 file from the workspace: the whole file, or a line range \
+                     with offset and limit. A range that \
+                     leaves lines out starts with a `[lines A-B of N]` line. One read \
+                     answers at most {READ_MAX_CHARS} characters, and {READ_MAX_LINES} \
+                     lines without a limit; past that the header says which offset to \
+                     read on from."
+                )
+                .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -343,15 +380,14 @@ impl ToolHandler for ReadFileTool {
             (Ok(offset), Ok(limit)) => (offset, limit),
             (Err(error), _) | (_, Err(error)) => return err(error),
         };
-        let content = match readable_path(&self.root, &path, &self.policy)
-            .and_then(|path| self.cache.read(&path))
-        {
+        let resolved = match readable_path(&self.root, &path, &self.policy) {
+            Ok(resolved) => resolved,
+            Err(error) => return err(error),
+        };
+        let content = match self.cache.read(&resolved) {
             Ok(content) => content,
             Err(error) => return err(error),
         };
-        if offset.is_none() && limit.is_none() {
-            return ok(content);
-        }
         match line_window(&path, &content, offset.unwrap_or(1), limit) {
             Ok(window) => ok(window),
             Err(error) => err(error),
@@ -2303,6 +2339,73 @@ mod tests {
             policy: SensitivePolicy::default(),
         };
         (root, read)
+    }
+
+    fn reader(files: &[(&str, Vec<u8>)]) -> ReadFileTool {
+        let root = temp_root();
+        for (path, body) in files {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        ReadFileTool {
+            root,
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        }
+    }
+
+    /// A long file read whole would be cut by the engine to its head and
+    /// tail, the middle lost without a line number to find it by. Read with
+    /// no range, it comes back as its first part under a header that says
+    /// where to read on, by lines or by characters, whichever runs out first.
+    #[tokio::test]
+    async fn a_long_file_read_whole_comes_back_as_its_first_part() {
+        let lines: String = (1..=3_000).map(|n| format!("line {n}\n")).collect();
+        let wide: String = (1..=100)
+            .map(|n| format!("{n:04}{}\n", "w".repeat(996)))
+            .collect();
+        let read = reader(&[
+            ("long.txt", lines.into_bytes()),
+            ("wide.txt", wide.into_bytes()),
+            ("short.txt", b"one\ntwo\n".to_vec()),
+        ]);
+        let result = read.invoke(serde_json::json!({"path": "long.txt"})).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result
+                .output
+                .starts_with("[lines 1-2000 of 3000; read on from offset 2001]\nline 1\n"),
+            "{}",
+            &result.output[..80]
+        );
+        assert!(result.output.ends_with("line 2000\n"));
+
+        let result = read.invoke(serde_json::json!({"path": "wide.txt"})).await;
+        assert!(
+            result
+                .output
+                .starts_with("[lines 1-29 of 100; read on from offset 30]\n0001"),
+            "{}",
+            &result.output[..80]
+        );
+        assert!(result.output.chars().count() <= READ_MAX_CHARS + 80);
+
+        // An explicit range is cut by characters too, and says so.
+        let result = read
+            .invoke(serde_json::json!({"path": "wide.txt", "offset": 50, "limit": 40}))
+            .await;
+        assert!(
+            result
+                .output
+                .starts_with("[lines 50-78 of 100; read on from offset 79]\n0050"),
+            "{}",
+            &result.output[..80]
+        );
+
+        // A file inside both limits is the file, no header.
+        let result = read.invoke(serde_json::json!({"path": "short.txt"})).await;
+        assert_eq!(result.output, "one\ntwo\n");
     }
 
     /// A range is those lines and nothing else, under one header that says
