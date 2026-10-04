@@ -114,7 +114,16 @@ impl ReadCache {
         }
 
         let body: SmolStr = fs::read_to_string(path)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| match error.kind() {
+                // The decoder's own words ("stream did not contain valid
+                // UTF-8") do not say what the file is or what to do instead.
+                std::io::ErrorKind::InvalidData => format!(
+                    "not UTF-8 text ({} bytes): a binary file or another encoding; \
+                     only text can be read",
+                    fs::metadata(path).map_or(0, |meta| meta.len())
+                ),
+                _ => error.to_string(),
+            })?
             .into();
         let mut inner = self.lock();
         inner.tick += 1;

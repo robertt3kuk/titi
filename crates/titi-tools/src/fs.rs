@@ -316,6 +316,33 @@ fn line_window(
     Ok(format!("[lines {offset}-{end} of {total}]\n{body}"))
 }
 
+/// A directory as a read shows it: its entries by name, a directory marked
+/// with `/`, capped like a glob answer.
+fn listing(dir: &Path) -> Result<String, String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        return Ok("empty directory".into());
+    }
+    names.sort();
+    let more = names.len().saturating_sub(GLOB_MAX_RESULTS);
+    names.truncate(GLOB_MAX_RESULTS);
+    if more > 0 {
+        names.push(format!("… {more} more entries"));
+    }
+    Ok(names.join("\n") + "\n")
+}
+
 #[async_trait]
 impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
@@ -324,7 +351,7 @@ impl ToolHandler for ReadFileTool {
                 name: "read".into(),
                 description: format!(
                     "Read a UTF-8 file from the workspace: the whole file, or a line range \
-                     with offset and limit. A range that \
+                     with offset and limit; a directory lists its entries. A range that \
                      leaves lines out starts with a `[lines A-B of N]` line. One read \
                      answers at most {READ_MAX_CHARS} characters, and {READ_MAX_LINES} \
                      lines without a limit; past that the header says which offset to \
@@ -384,6 +411,12 @@ impl ToolHandler for ReadFileTool {
             Ok(resolved) => resolved,
             Err(error) => return err(error),
         };
+        if resolved.is_dir() {
+            return match listing(&resolved) {
+                Ok(listing) => ok(listing),
+                Err(error) => err(error),
+            };
+        }
         let content = match self.cache.read(&resolved) {
             Ok(content) => content,
             Err(error) => return err(error),
@@ -2406,6 +2439,33 @@ mod tests {
         // A file inside both limits is the file, no header.
         let result = read.invoke(serde_json::json!({"path": "short.txt"})).await;
         assert_eq!(result.output, "one\ntwo\n");
+    }
+
+    /// Reading a directory lists it, the way a model that asks for one
+    /// means; a binary file says what it is instead of quoting a decoder.
+    #[tokio::test]
+    async fn read_lists_a_directory_and_names_a_binary_file() {
+        let read = reader(&[
+            ("pkg/b.rs", b"b".to_vec()),
+            ("pkg/a.rs", b"a".to_vec()),
+            ("pkg/sub/c.rs", b"c".to_vec()),
+            (
+                "logo.png",
+                vec![0x89, b'P', b'N', b'G', 0xff, 0xfe, 0x00, 0x01],
+            ),
+        ]);
+        let result = read.invoke(serde_json::json!({"path": "pkg"})).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "a.rs\nb.rs\nsub/\n");
+
+        let result = read.invoke(serde_json::json!({"path": "logo.png"})).await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("not UTF-8 text"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("8 bytes"), "{}", result.output);
     }
 
     /// A range is those lines and nothing else, under one header that says
