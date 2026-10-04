@@ -980,19 +980,17 @@ impl ToolHandler for BashTool {
                 || pty::clamp_timeout(pty::DEFAULT_TIMEOUT_SECS),
                 pty::clamp_timeout,
             );
-        if arg_bool(&args, "pty").unwrap_or(false) {
-            return self.run_on_pty(&command, timeout);
-        }
-        match pipe::run(&command, &self.root, timeout, &self.interrupt) {
-            Ok(run) if run.success => ok(run.output),
-            Ok(run) => {
-                let status = run.exit_code.map_or_else(
-                    || "killed by a signal".to_owned(),
-                    |code| format!("exit {code}"),
-                );
-                err(format!("{status}\n{}", run.output))
-            }
-            Err(error) => err(error.to_string()),
+        let result = if arg_bool(&args, "pty").unwrap_or(false) {
+            self.run_on_pty(&command, timeout)
+        } else {
+            self.run_on_pipe(&command, timeout)
+        };
+        // What the terminal would show, not the escapes and redraws that
+        // drew it: the model pays for every byte, and a screen previewing a
+        // stray escape gets scrambled.
+        ToolResult {
+            output: crate::ansi::plain(&result.output).into(),
+            ..result
         }
     }
 }
@@ -1002,6 +1000,23 @@ impl BashTool {
         Self {
             root: root.into(),
             interrupt: Interrupt::new(),
+        }
+    }
+
+    /// The default path, bounded as [`pipe::run`] describes. A failure says
+    /// how the command exited, so an empty output still tells the model
+    /// something.
+    fn run_on_pipe(&self, command: &str, timeout: std::time::Duration) -> ToolResult {
+        match pipe::run(command, &self.root, timeout, &self.interrupt) {
+            Ok(run) if run.success => ok(run.output),
+            Ok(run) => {
+                let status = run.exit_code.map_or_else(
+                    || "killed by a signal".to_owned(),
+                    |code| format!("exit {code}"),
+                );
+                err(format!("{status}\n{}", run.output))
+            }
+            Err(error) => err(error.to_string()),
         }
     }
 
@@ -2319,6 +2334,22 @@ mod tests {
             .invoke(serde_json::json!({"command": "echo 'npm run dev' > notes.txt"}))
             .await;
         assert!(!result.is_error, "{}", result.output);
+    }
+
+    /// Colour and progress redraws reach neither the model nor the screen,
+    /// on either path: only the text a terminal would leave standing.
+    #[tokio::test]
+    async fn bash_output_is_the_text_a_terminal_would_show() {
+        let root = temp_root();
+        let tool = BashTool::new(&root);
+        let command = r"printf 'fetch 10%%\rfetch 99%%\r\033[Kfetched \033[32mok\033[0m\n'";
+        for pty in [false, true] {
+            let result = tool
+                .invoke(serde_json::json!({ "command": command, "pty": pty }))
+                .await;
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(result.output, "fetched ok\n", "pty: {pty}");
+        }
     }
 
     #[tokio::test]
