@@ -1144,11 +1144,42 @@ fn grep_file(root: &Path, path: &Path, query: &GrepQuery, hits: &mut Hits) {
             continue;
         }
         if hits.lines.len() < GREP_MAX_MATCHES {
-            hits.lines.push(format!("{shown}:{}:{line}", index + 1));
+            hits.lines.push(format!(
+                "{shown}:{}:{}",
+                index + 1,
+                excerpt(line, &query.regex)
+            ));
         } else {
             hits.more += 1;
         }
     }
+}
+
+/// Characters of one hit line a grep answer shows.
+const GREP_LINE_CHARS: usize = 300;
+
+/// `line` as a hit shows it: whole when it is short, otherwise the stretch
+/// around its first match with `…` where it was cut. One line of a minified
+/// bundle can be a megabyte, and the match is the part worth reading.
+fn excerpt(line: &str, regex: &Regex) -> String {
+    let total = line.chars().count();
+    if total <= GREP_LINE_CHARS {
+        return line.to_owned();
+    }
+    let at = regex
+        .find(line)
+        .map_or(0, |found| line[..found.start()].chars().count());
+    let first = at.saturating_sub(GREP_LINE_CHARS / 3);
+    let last = (first + GREP_LINE_CHARS).min(total);
+    let mut shown = String::with_capacity(GREP_LINE_CHARS + 8);
+    if first > 0 {
+        shown.push('…');
+    }
+    shown.extend(line.chars().skip(first).take(last - first));
+    if last < total {
+        shown.push('…');
+    }
+    shown
 }
 
 pub fn workspace_tools(root: impl Into<PathBuf>) -> Vec<Box<dyn ToolHandler>> {
@@ -2018,6 +2049,26 @@ mod tests {
             assert!(result.is_error, "{path}: {}", result.output);
             assert!(result.output.contains(says), "{path}: {}", result.output);
         }
+    }
+
+    /// One line of a minified bundle can be a megabyte. A hit on a long line
+    /// shows the stretch around the match, marked as cut, not the whole line.
+    #[tokio::test]
+    async fn a_hit_on_a_long_line_shows_the_stretch_around_the_match() {
+        let grep = grep_fixture();
+        let line = format!("{}needle{}", "x".repeat(5_000), "y".repeat(5_000));
+        fs::write(grep.root.join("bundle.js"), format!("{line}\n")).unwrap();
+        let hits = grep_lines(
+            &grep,
+            serde_json::json!({ "pattern": "needle", "glob": "*.js" }),
+        )
+        .await;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let hit = &hits[0];
+        assert!(hit.starts_with("bundle.js:1:…"), "{hit}");
+        assert!(hit.contains("xneedley"), "{hit}");
+        assert!(hit.ends_with('…'), "{hit}");
+        assert!(hit.chars().count() < 400, "{} chars", hit.chars().count());
     }
 
     #[tokio::test]
