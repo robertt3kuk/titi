@@ -475,13 +475,17 @@ impl ToolHandler for EditFileTool {
         let replace_all = arg_bool(&args, "replace_all").unwrap_or(false);
         match readable_path(&self.root, &path, &self.policy).and_then(|resolved| {
             let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
-            let (updated, replaced) = apply_edit(&content, &old, &new, replace_all)?;
-            fs::write(&resolved, &updated).map_err(|error| error.to_string())?;
-            Ok((unified_diff(&path, &content, &updated), replaced))
+            let edit = apply_edit(&content, &old, &new, replace_all)?;
+            fs::write(&resolved, &edit.text).map_err(|error| error.to_string())?;
+            Ok((unified_diff(&path, &content, &edit.text), edit))
         }) {
-            Ok((diff, replaced)) => {
-                let answer = if replaced > 1 {
-                    format!("edited ({replaced} replacements)")
+            Ok((diff, edit)) => {
+                let answer = if edit.loose {
+                    "edited: old_string matched once whitespace was set aside, and the \
+                     new lines took the file's indentation"
+                        .to_owned()
+                } else if edit.replaced > 1 {
+                    format!("edited ({} replacements)", edit.replaced)
                 } else {
                     "edited".to_owned()
                 };
@@ -503,12 +507,7 @@ impl ToolHandler for EditFileTool {
 /// endings. `old_string` must be non-empty, differ from `new_string`, and —
 /// unless `replace_all` — occur exactly once: replacing the first of several
 /// was a guess that could land in the wrong function.
-fn apply_edit(
-    content: &str,
-    old: &str,
-    new: &str,
-    replace_all: bool,
-) -> Result<(String, usize), String> {
+fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<Edit, String> {
     if old.is_empty() {
         return Err("old_string is empty; use write to create or replace a whole file".into());
     }
@@ -529,13 +528,35 @@ fn apply_edit(
     } else {
         (body.to_owned(), old.to_owned(), new.to_owned())
     };
+    let restore = |text: String| {
+        let text = if crlf {
+            text.replace('\n', "\r\n")
+        } else {
+            text
+        };
+        format!("{bom}{text}")
+    };
     let count = text.matches(old.as_str()).count();
     if count == 0 {
-        return Err(
-            "old_string not found; read the file again and copy the text exactly, \
-                    whitespace included"
-                .into(),
-        );
+        // Exact text first, always; whitespace is only set aside when the
+        // exact text is nowhere.
+        return match crate::loose::replace(&text, &old, &new) {
+            crate::loose::Loose::Replaced(text) => Ok(Edit {
+                text: restore(text),
+                replaced: 1,
+                loose: true,
+            }),
+            crate::loose::Loose::Ambiguous(places) => Err(format!(
+                "old_string is not in the file as written, and once whitespace is set \
+                 aside it matches {places} places; read the file again and copy the \
+                 text exactly, with enough lines to name one place"
+            )),
+            crate::loose::Loose::Nowhere => Err(
+                "old_string not found; read the file again and copy the text exactly, \
+                 whitespace included"
+                    .into(),
+            ),
+        };
     }
     if count > 1 && !replace_all {
         return Err(format!(
@@ -548,15 +569,20 @@ fn apply_edit(
     } else {
         text.replacen(old.as_str(), &new, 1)
     };
-    let replaced = if crlf {
-        replaced.replace('\n', "\r\n")
-    } else {
-        replaced
-    };
-    Ok((
-        format!("{bom}{replaced}"),
-        if replace_all { count } else { 1 },
-    ))
+    Ok(Edit {
+        text: restore(replaced),
+        replaced: if replace_all { count } else { 1 },
+        loose: false,
+    })
+}
+
+/// A file's text after one `edit` call.
+struct Edit {
+    text: String,
+    /// How many places changed.
+    replaced: usize,
+    /// The place was found with whitespace set aside, not as written.
+    loose: bool,
 }
 
 /// Paths a glob answer lists before it says how many more there were.
@@ -1550,6 +1576,95 @@ mod tests {
             fs::read_to_string(root.join("hello.txt")).unwrap(),
             "hello world"
         );
+    }
+
+    async fn loose_edit(file: &str, old: &str, new: &str) -> (ToolResult, String) {
+        let root = temp_root();
+        fs::write(root.join("loose.rs"), file).unwrap();
+        let result = edit_tool(&root)
+            .invoke(serde_json::json!({
+                "path": "loose.rs", "old_string": old, "new_string": new
+            }))
+            .await;
+        (result, fs::read_to_string(root.join("loose.rs")).unwrap())
+    }
+
+    /// Models drop trailing spaces and get indentation wrong all the time.
+    /// When the text matches nowhere exactly but its lines match exactly one
+    /// place once whitespace is set aside, that place is edited, the new
+    /// lines take the file's indentation, and the answer says it was loose.
+    #[tokio::test]
+    async fn an_edit_off_only_in_whitespace_lands_in_the_one_place_it_fits() {
+        // Trailing whitespace in the file.
+        let (result, after) = loose_edit(
+            "fn a() {   \n    x\n}\n",
+            "fn a() {\n    x\n}",
+            "fn a() {\n    y\n}",
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("whitespace"), "{}", result.output);
+        assert_eq!(after, "fn a() {\n    y\n}\n");
+
+        // The model lost the block's indentation; the new lines get it back,
+        // nesting included.
+        let (result, after) = loose_edit(
+            "impl A {\n    fn f() {\n        1\n    }\n}\n",
+            "fn f() {\n    1\n}\n",
+            "fn f() {\n    if ok {\n        2\n    }\n}\n",
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            after,
+            "impl A {\n    fn f() {\n        if ok {\n            2\n        }\n    }\n}\n"
+        );
+
+        // Spaces in the call, tabs in the file.
+        let (result, after) = loose_edit(
+            "\tif x {\n\t\ty()\n\t}\n",
+            "    if x {\n        y()\n    }",
+            "    if x {\n        z()\n    }",
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(after, "\tif x {\n\t\tz()\n\t}\n");
+
+        // Typographic quotes and dashes in the call, ASCII in the file.
+        let (result, after) = loose_edit(
+            "say(\"it's - fine\");\n",
+            "say(\u{201c}it\u{2019}s \u{2013} fine\u{201d});",
+            "say(\"done\");",
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(after, "say(\"done\");\n");
+    }
+
+    /// Loose matching never guesses: two places that both fit once
+    /// whitespace is ignored are refused with the count, and text that fits
+    /// nowhere is still a miss. An exact match is used as it always was.
+    #[tokio::test]
+    async fn a_loose_edit_that_fits_twice_or_nowhere_is_refused() {
+        let file = "if a {\n    go()\n}\nif a {\n  go()\n}\n";
+        let (result, after) = loose_edit(file, "if a {\ngo()\n}", "if b {\ngo()\n}").await;
+        assert!(result.is_error);
+        assert!(result.output.contains("2 places"), "{}", result.output);
+        assert_eq!(after, file, "a refused edit changes nothing");
+
+        let (result, after) = loose_edit(file, "if c {\ngo()\n}", "x").await;
+        assert!(
+            result.output.starts_with("old_string not found"),
+            "{}",
+            result.output
+        );
+        assert_eq!(after, file);
+
+        // Only one of the two blocks is an exact match: it wins, untouched by
+        // the loose rules, and the answer is the plain one.
+        let (result, after) = loose_edit(file, "if a {\n  go()\n}", "if a {\n  stop()\n}").await;
+        assert_eq!(result.output, "edited");
+        assert_eq!(after, "if a {\n    go()\n}\nif a {\n  stop()\n}\n");
     }
 
     /// A miss says what to do next instead of only that it missed.

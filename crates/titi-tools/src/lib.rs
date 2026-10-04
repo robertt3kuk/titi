@@ -8,6 +8,7 @@ pub mod fs;
 pub mod git;
 pub mod hashline;
 pub mod intercept;
+mod loose;
 pub mod pipe;
 pub mod pty;
 pub mod sensitive;
