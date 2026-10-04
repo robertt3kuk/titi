@@ -10,6 +10,8 @@ the real binary and the real HTTP stack:
   "forever"       a bash call that never exits (Ctrl+C must stop it)
   "dev server"    a bash call on `npm run dev` (refused before it runs)
   "make todo"     a todo write: three items, the second in progress
+  "color shell"   a pty bash call printing colour and a `\r` progress bar
+  "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
   "big output"    a bash call that prints 20,000 lines (the output cap)
@@ -21,6 +23,9 @@ the real binary and the real HTTP stack:
   "fail401" / "fail429" / "fail500"   that HTTP status with an error body
   a tool result   "tool said: <first line of the result>"
   anything else   "Hello from the fake server. You said: <text>"
+
+Every answer ends with a usage chunk: 100 prompt tokens, 60 of them cached,
+and 10 completion tokens.
 
 Every request body is appended to `requests.jsonl` in the working
 directory, so a run can check what the model was actually sent.
@@ -89,6 +94,12 @@ def script(last: dict) -> list[tuple[dict, float]]:
         return [(c, 0) for c in call("call_forever", "bash", {"command": "echo started; sleep 600"})]
     if "dev server" in content:
         return [(c, 0) for c in call("call_dev", "bash", {"command": "npm run dev"})]
+    if "color shell" in content:
+        command = r"printf 'fetch 10%%\rfetch 99%%\r\033[Kfetched \033[32mok\033[0m\n'"
+        return [(c, 0) for c in call("call_color", "bash", {"command": command, "pty": True})]
+    if "loose edit" in content:
+        args = {"path": "README.md", "old_string": "#   smoke ws  ", "new_string": "# smoke loose"}
+        return [(c, 0) for c in call("call_loose", "edit", args)]
     if "make todo" in content:
         items = [
             {"content": "Read the failing test", "status": "completed"},
@@ -166,7 +177,8 @@ class Handler(BaseHTTPRequestHandler):
                 if pause:
                     time.sleep(pause)
             usage = {"id": "u", "object": "chat.completion.chunk", "model": "fake", "choices": [],
-                     "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}}
+                     "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                               "prompt_tokens_details": {"cached_tokens": 60}}}
             self.write_chunk(b"data: " + json.dumps(usage).encode() + b"\n\n")
             self.write_chunk(b"data: [DONE]\n\n")
             self.wfile.write(b"0\r\n\r\n")
