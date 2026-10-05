@@ -93,12 +93,19 @@ impl Language {
 pub struct ParsedFile {
     /// Symbols this file defines and publishes.
     pub exports: Vec<String>,
+    /// One site per export, source order. Names match [`Self::exports`].
+    pub export_sites: Vec<crate::ExportSite>,
     /// Files this one depends on.
     pub imports: Vec<String>,
+    /// Import specifiers that did not resolve to a known file. Not edges.
+    pub unresolved_imports: Vec<String>,
     /// Distinct identifiers this file mentions, minus its own exports and
     /// keywords. Resolved against the repo's exports to become the
     /// symbol-level half of the graph.
     pub refs: Vec<String>,
+    /// Tree-sitter `ERROR` nodes, or 1 if a grammar language refused to parse.
+    /// Languages without a grammar stay 0.
+    pub syntax_errors: u32,
 }
 
 pub fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -112,24 +119,81 @@ pub fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
         Language::Kotlin => parse_kotlin(path, source, files),
         Language::Php => parse_php(path, source, files),
         Language::Ruby => parse_ruby(path, source, files),
-        Language::Swift => finish(source, swift_exports(source), Vec::new()),
+        Language::Swift => finish(source, swift_exports(source), Vec::new(), Vec::new(), 0),
         Language::C | Language::Cpp => parse_c_family(path, source, files),
         Language::Other => ParsedFile::default(),
     }
 }
 
 /// Sorts, dedups and attaches the identifier set every parser ends up needing.
-fn finish(source: &str, mut exports: Vec<String>, mut imports: Vec<String>) -> ParsedFile {
+///
+/// Export *names* stay sorted, which is what the ranker keys off. Sites keep
+/// source order so a definition query can point at the declaration.
+fn finish(
+    source: &str,
+    mut sites: Vec<crate::ExportSite>,
+    mut imports: Vec<String>,
+    mut unresolved: Vec<String>,
+    syntax_errors: u32,
+) -> ParsedFile {
+    let mut seen = HashSet::new();
+    sites.retain(|site| seen.insert(site.name.clone()));
+    let mut exports: Vec<String> = sites.iter().map(|site| site.name.clone()).collect();
     exports.sort();
     exports.dedup();
     imports.sort();
     imports.dedup();
+    unresolved.sort();
+    unresolved.dedup();
     let refs = collect_refs(source, &exports);
     ParsedFile {
         exports,
+        export_sites: sites,
         imports,
+        unresolved_imports: unresolved,
         refs,
+        syntax_errors,
     }
+}
+
+fn note_resolved(
+    resolved: Option<String>,
+    spec: &str,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    if spec.is_empty() {
+        return;
+    }
+    match resolved {
+        Some(path) => imports.push(path),
+        None => unresolved.push(spec.to_owned()),
+    }
+}
+
+fn export_sites_from(re: &Regex, source: &str) -> Vec<crate::ExportSite> {
+    re.captures_iter(source)
+        .filter_map(|cap| {
+            let matched = cap.get(1).or_else(|| cap.get(2))?;
+            let (line, character) = line_character(source, matched.start());
+            Some(crate::ExportSite {
+                name: matched.as_str().to_owned(),
+                line,
+                character,
+            })
+        })
+        .collect()
+}
+
+fn line_character(source: &str, byte: usize) -> (u32, u32) {
+    let byte = byte.min(source.len());
+    let head = source.get(..byte).unwrap_or("");
+    let line = head.bytes().filter(|unit| *unit == b'\n').count() as u32 + 1;
+    let character = head
+        .rfind('\n')
+        .map(|index| byte - index - 1)
+        .unwrap_or(byte) as u32;
+    (line, character)
 }
 
 /// Keywords and primitive type names across the supported languages. Filtering
@@ -343,6 +407,23 @@ fn is_std_qualifier(name: &str) -> bool {
     STD_QUALIFIERS.contains(&name) || UBIQUITOUS.contains(&name)
 }
 
+/// Whether a mention at `name_start` is a use under the same rules as
+/// [`collect_refs`]. A method call and a std-qualified path are not: name-only
+/// resolution cannot tell `path.join` from the file that exports `join`.
+pub(crate) fn is_resolvable_mention(source: &str, name_start: usize) -> bool {
+    if preceded_by_dot(source, name_start) {
+        return false;
+    }
+    if let Some(qualifier) = qualifier_before(source, name_start) {
+        return !is_std_qualifier(qualifier);
+    }
+    true
+}
+
+pub(crate) fn is_noise_name(name: &str) -> bool {
+    KEYWORDS.contains(&name) || UBIQUITOUS.contains(&name)
+}
+
 /// Distinct *usage sites* the file mentions: bare calls (`name(`), path-qualified
 /// names whose qualifier is not std (`hub::join`), and capitalized type or
 /// constructor names.
@@ -471,22 +552,22 @@ fn parse_path_imports(
     });
     let exports_re = Regex::new(exports_pattern).expect("caller-supplied export pattern");
 
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
-
+    let sites = export_sites_from(&exports_re, source);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in import_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         // The trailing segment is the type; the rest is the package path.
         let candidate = spec.replace('.', "/");
-        if let Some(resolved) = resolve_suffix(&candidate, exts, files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_suffix(&candidate, exts, files),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
     let _ = path;
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
 fn parse_go(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -505,11 +586,7 @@ fn parse_go(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
             .expect("go exports")
     });
 
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
-
+    let sites = export_sites_from(exports_re, source);
     let mut specs: Vec<String> = Vec::new();
     for cap in block_re.captures_iter(source) {
         let body = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -524,18 +601,17 @@ fn parse_go(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     }
 
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for spec in specs {
         // Go import paths are module-qualified; the package directory is the
         // trailing segment, so a suffix match is the honest resolution.
         let last = spec.rsplit('/').next().unwrap_or(&spec);
-        if let Some(resolved) = resolve_suffix(&format!("{last}/{last}"), &["go"], files)
-            .or_else(|| resolve_suffix(last, &["go"], files))
-        {
-            imports.push(resolved);
-        }
+        let resolved = resolve_suffix(&format!("{last}/{last}"), &["go"], files)
+            .or_else(|| resolve_suffix(last, &["go"], files));
+        note_resolved(resolved, &spec, &mut imports, &mut unresolved);
     }
     let _ = path;
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
 fn parse_kotlin(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -550,19 +626,20 @@ fn parse_kotlin(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile
         )
         .expect("kotlin exports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
+    let sites = export_sites_from(exports_re, source);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in import_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(resolved) = resolve_suffix(&spec.replace('.', "/"), &["kt", "kts"], files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_suffix(&spec.replace('.', "/"), &["kt", "kts"], files),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
     let _ = path;
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
 fn parse_php(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -574,19 +651,20 @@ fn parse_php(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
         Regex::new(r"(?m)^\s*(?:final\s+|abstract\s+)*(?:class|interface|trait|function)\s+([A-Za-z_][A-Za-z0-9_]*)")
             .expect("php exports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
+    let sites = export_sites_from(exports_re, source);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in import_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(resolved) = resolve_suffix(&spec.replace('\\', "/"), &["php"], files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_suffix(&spec.replace('\\', "/"), &["php"], files),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
     let _ = path;
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
 fn parse_ruby(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -599,20 +677,21 @@ fn parse_ruby(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
         Regex::new(r"(?m)^\s*(?:def|class|module)\s+([A-Za-z_][A-Za-z0-9_]*)")
             .expect("ruby exports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect();
+    let sites = export_sites_from(exports_re, source);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in import_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let stem = spec.strip_suffix(".rb").unwrap_or(spec);
-        if let Some(resolved) = resolve_suffix(stem, &["rb"], files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_suffix(stem, &["rb"], files),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
     let _ = path;
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
 fn parse_c_family(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -626,16 +705,10 @@ fn parse_c_family(path: &str, source: &str, files: &HashSet<String>) -> ParsedFi
         )
         .expect("c exports")
     });
-    let exports: Vec<String> = exports_re
-        .captures_iter(source)
-        .filter_map(|cap| {
-            cap.get(1)
-                .or_else(|| cap.get(2))
-                .map(|m| m.as_str().to_owned())
-        })
-        .collect();
+    let sites = export_sites_from(exports_re, source);
     let from_dir = parent(path).unwrap_or("");
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in include_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let joined = if from_dir.is_empty() {
@@ -643,14 +716,17 @@ fn parse_c_family(path: &str, source: &str, files: &HashSet<String>) -> ParsedFi
         } else {
             format!("{from_dir}/{spec}")
         };
-        if let Some(resolved) = normalize_join("", &joined).filter(|p| files.contains(p)) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            normalize_join("", &joined).filter(|candidate| files.contains(candidate)),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
-    finish(source, exports, imports)
+    finish(source, sites, imports, unresolved, 0)
 }
 
-fn swift_exports(source: &str) -> Vec<String> {
+fn swift_exports(source: &str) -> Vec<crate::ExportSite> {
     static EXPORTS: OnceLock<Regex> = OnceLock::new();
     let exports_re = EXPORTS.get_or_init(|| {
         Regex::new(
@@ -658,10 +734,7 @@ fn swift_exports(source: &str) -> Vec<String> {
         )
         .expect("swift exports")
     });
-    exports_re
-        .captures_iter(source)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_owned()))
-        .collect()
+    export_sites_from(exports_re, source)
 }
 
 /// Resolves a module/package path to a known file by trying the path itself
@@ -708,22 +781,33 @@ fn parse_rust(path: &str, source: &str, files: &std::collections::HashSet<String
     });
     let (uses_re, mods_re) = (&*USES, &*MODS);
 
-    let exports = symbols::exports(path, source).unwrap_or_default();
-
+    let extracted = symbols::extract(path, source);
+    let syntax_errors = grammar_errors(path, &extracted);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in uses_re.captures_iter(source) {
         let raw = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        if let Some(resolved) = resolve_rust_use(path, raw, files) {
-            imports.push(resolved);
+        // `std` and external crates are not workspace lookups. Only a
+        // crate/super/self path can fail to resolve to a known file.
+        if raw.starts_with("crate::") || raw.starts_with("super::") || raw.starts_with("self::") {
+            note_resolved(
+                resolve_rust_use(path, raw, files),
+                raw,
+                &mut imports,
+                &mut unresolved,
+            );
         }
     }
     for cap in mods_re.captures_iter(source) {
         let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(resolved) = resolve_child_module(path, name, files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_child_module(path, name, files),
+            name,
+            &mut imports,
+            &mut unresolved,
+        );
     }
-    finish(source, exports, imports)
+    finish(source, extracted.sites, imports, unresolved, syntax_errors)
 }
 
 fn parse_typescript(
@@ -735,15 +819,20 @@ fn parse_typescript(
         Regex::new(r#"(?m)(?:from|import)\s+['"](\.[^'"]+)['"]"#).expect("ts imports")
     });
     let imports_re = &*IMPORTS;
-    let exports = symbols::exports(path, source).unwrap_or_default();
+    let extracted = symbols::extract(path, source);
+    let syntax_errors = grammar_errors(path, &extracted);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in imports_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(resolved) = resolve_relative(path, spec, files, &["ts", "tsx", "js", "jsx"]) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_relative(path, spec, files, &["ts", "tsx", "js", "jsx"]),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
-    finish(source, exports, imports)
+    finish(source, extracted.sites, imports, unresolved, syntax_errors)
 }
 
 fn parse_python(path: &str, source: &str, files: &std::collections::HashSet<String>) -> ParsedFile {
@@ -751,15 +840,32 @@ fn parse_python(path: &str, source: &str, files: &std::collections::HashSet<Stri
         Regex::new(r"(?m)^from\s+(\.+[A-Za-z0-9_\.]*)\s+import").expect("py imports")
     });
     let imports_re = &*IMPORTS;
-    let exports = symbols::exports(path, source).unwrap_or_default();
+    let extracted = symbols::extract(path, source);
+    let syntax_errors = grammar_errors(path, &extracted);
     let mut imports = Vec::new();
+    let mut unresolved = Vec::new();
     for cap in imports_re.captures_iter(source) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        if let Some(resolved) = resolve_python_relative(path, spec, files) {
-            imports.push(resolved);
-        }
+        note_resolved(
+            resolve_python_relative(path, spec, files),
+            spec,
+            &mut imports,
+            &mut unresolved,
+        );
     }
-    finish(source, exports, imports)
+    finish(source, extracted.sites, imports, unresolved, syntax_errors)
+}
+
+/// A grammar that refuses the input is one error, not a clean file. A tree
+/// that parsed reports its own `ERROR` count.
+fn grammar_errors(path: &str, extracted: &symbols::Extract) -> u32 {
+    if extracted.parsed {
+        extracted.syntax_errors
+    } else if symbols::Grammar::from_path(path).is_some() {
+        1
+    } else {
+        0
+    }
 }
 
 fn resolve_rust_use(

@@ -17,11 +17,14 @@ use std::time::SystemTime;
 pub mod ast_edit;
 
 mod graph;
+mod lsp;
 mod parse;
 mod project;
+mod query;
 mod scan;
 mod symbols;
 
+pub use lsp::serve_lsp;
 pub use parse::Language;
 pub use project::render;
 pub use scan::list_files;
@@ -29,12 +32,52 @@ pub use scan::list_files;
 /// Crate version, mirrors the workspace release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportSite {
+    pub name: String,
+    /// 1-based.
+    pub line: u32,
+    /// 0-based UTF-8 byte offset on the line. ASCII matches an LSP character.
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Location {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileRecord {
     pub path: String,
     pub language: Language,
     pub exports: Vec<String>,
+    /// One site per export, same names as [`Self::exports`], source order.
+    pub export_sites: Vec<ExportSite>,
     pub imports: Vec<String>,
+    /// Specifiers that did not resolve to a known file. Not graph edges.
+    pub unresolved_imports: Vec<String>,
+    /// Tree-sitter `ERROR` nodes. Zero for languages without a grammar.
+    /// A grammar that refuses the file counts as 1.
+    pub syntax_errors: u32,
     /// Exported symbols defined elsewhere that this file mentions — the
     /// symbol-level half of the dependency graph.
     pub used_symbols: Vec<String>,
@@ -82,6 +125,8 @@ pub struct Genome {
     pub dependents: HashMap<String, usize>,
     /// Symbol name → defining files and how many files reference it.
     pub symbols: HashMap<String, SymbolRecord>,
+    /// Root of the last refresh, so definition can read the identifier.
+    root: std::path::PathBuf,
 }
 
 impl Genome {
@@ -96,6 +141,7 @@ impl Genome {
     /// relative to parsing).
     pub fn refresh(&mut self, root: impl AsRef<Path>) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
+        self.root = root.to_path_buf();
         let listed = scan::list_files(root)?;
         let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
         let stale: Vec<&scan::ListedFile> = listed
@@ -249,7 +295,10 @@ fn parse_one(file: &scan::ListedFile, known: &HashSet<String>) -> FileRecord {
         language: Language::from_path(&file.path),
         path: file.path.clone(),
         exports: result.exports,
+        export_sites: result.export_sites,
         imports: result.imports,
+        unresolved_imports: result.unresolved_imports,
+        syntax_errors: result.syntax_errors,
         // Resolved against the whole repo once every file has been parsed.
         used_symbols: result.refs,
         size: file.size,

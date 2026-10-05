@@ -105,28 +105,84 @@ pub(crate) fn parse(grammar: Grammar, source: &str) -> Option<tree_sitter::Tree>
 /// `None` means the file could not be parsed at all (no grammar for the
 /// extension, or the parser refused the input); the caller then contributes no
 /// symbols for the file rather than guessing at them.
+#[cfg(test)]
 pub fn exports(path: &str, source: &str) -> Option<Vec<String>> {
-    let grammar = Grammar::from_path(path)?;
-    let tree = parse(grammar, source)?;
-
-    let bytes = source.as_bytes();
-    let mut out = Vec::new();
-    match grammar {
-        Grammar::Rust => rust_items(tree.root_node(), bytes, false, &mut out),
-        Grammar::TypeScript | Grammar::Tsx => ts_module(tree.root_node(), bytes, &mut out),
-        Grammar::Python => python_module(tree.root_node(), bytes, &mut out),
+    let extracted = extract(path, source);
+    if !extracted.parsed {
+        return None;
     }
-    Some(out)
+    Some(extracted.sites.into_iter().map(|site| site.name).collect())
+}
+
+/// Export sites plus how many tree-sitter `ERROR` nodes the grammar reported.
+///
+/// `parsed` is false when there is no grammar or the parser refused the input.
+/// A refusal is one syntax error, not zero: the file was not clean, it was
+/// unreadable. Languages without a grammar stay at zero — this crate does not
+/// invent errors it did not parse.
+pub(crate) struct Extract {
+    pub parsed: bool,
+    pub sites: Vec<crate::ExportSite>,
+    pub syntax_errors: u32,
+}
+
+pub(crate) fn extract(path: &str, source: &str) -> Extract {
+    let Some(grammar) = Grammar::from_path(path) else {
+        return Extract {
+            parsed: false,
+            sites: Vec::new(),
+            syntax_errors: 0,
+        };
+    };
+    let Some(tree) = parse(grammar, source) else {
+        return Extract {
+            parsed: false,
+            sites: Vec::new(),
+            syntax_errors: 1,
+        };
+    };
+    let bytes = source.as_bytes();
+    let mut sites = Vec::new();
+    match grammar {
+        Grammar::Rust => rust_items(tree.root_node(), bytes, false, &mut sites),
+        Grammar::TypeScript | Grammar::Tsx => ts_module(tree.root_node(), bytes, &mut sites),
+        Grammar::Python => python_module(tree.root_node(), bytes, &mut sites),
+    }
+    Extract {
+        parsed: true,
+        sites,
+        syntax_errors: count_errors(tree.root_node()),
+    }
+}
+
+fn count_errors(node: Node) -> u32 {
+    let mut count = u32::from(node.is_error());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count = count.saturating_add(count_errors(child));
+    }
+    count
+}
+
+fn push_site(name_node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    let Some(name) = text(name_node, source) else {
+        return;
+    };
+    let point = name_node.start_position();
+    // Tree-sitter columns are UTF-8 bytes. Definition looks up a UTF-8 offset,
+    // and the fixtures are ASCII, where that matches an LSP character.
+    out.push(crate::ExportSite {
+        name,
+        line: u32::try_from(point.row)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1),
+        character: u32::try_from(point.column).unwrap_or(u32::MAX),
+    });
 }
 
 fn text(node: Node, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(str::to_owned)
 }
-
-fn field_text(node: Node, field: &str, source: &[u8]) -> Option<String> {
-    text(node.child_by_field_name(field)?, source)
-}
-
 fn has_child_kind(node: Node, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|child| child.kind() == kind)
@@ -135,7 +191,7 @@ fn has_child_kind(node: Node, kind: &str) -> bool {
 /// Rust: everything reachable from outside the module, so `pub` items at any
 /// nesting — including inherent and trait methods, which is what a caller
 /// actually names. Trait members inherit the trait's visibility.
-fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<String>) {
+fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let public = inherited || has_child_kind(child, "visibility_modifier");
@@ -150,21 +206,21 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<String>)
             | "static_item"
             | "associated_type"
             | "macro_definition" => {
-                if public && let Some(name) = field_text(child, "name", source) {
-                    out.push(name);
+                if public {
+                    push_field(child, source, out);
                 }
             }
             "mod_item" => {
-                if public && let Some(name) = field_text(child, "name", source) {
-                    out.push(name);
+                if public {
+                    push_field(child, source, out);
                 }
                 if let Some(body) = child.child_by_field_name("body") {
                     rust_items(body, source, false, out);
                 }
             }
             "trait_item" => {
-                if public && let Some(name) = field_text(child, "name", source) {
-                    out.push(name);
+                if public {
+                    push_field(child, source, out);
                 }
                 if let Some(body) = child.child_by_field_name("body") {
                     rust_items(body, source, public, out);
@@ -180,10 +236,16 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<String>)
     }
 }
 
+fn push_field(item: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    if let Some(name) = item.child_by_field_name("name") {
+        push_site(name, source, out);
+    }
+}
+
 /// TypeScript and JavaScript: what an `export` publishes, plus the public
 /// members of an exported class — `client.send(…)` names a symbol the file
 /// owns just as much as the class does.
-fn ts_module(node: Node, source: &[u8], out: &mut Vec<String>) {
+fn ts_module(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "export_statement" {
@@ -192,7 +254,7 @@ fn ts_module(node: Node, source: &[u8], out: &mut Vec<String>) {
     }
 }
 
-fn ts_export(node: Node, source: &[u8], out: &mut Vec<String>) {
+fn ts_export(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -206,15 +268,13 @@ fn ts_export(node: Node, source: &[u8], out: &mut Vec<String>) {
                     let name = spec
                         .child_by_field_name("alias")
                         .or_else(|| spec.child_by_field_name("name"));
-                    if let Some(name) = name.and_then(|node| text(node, source)) {
-                        out.push(name);
+                    if let Some(name) = name {
+                        push_site(name, source, out);
                     }
                 }
             }
             "class_declaration" | "abstract_class_declaration" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    out.push(name);
-                }
+                push_field(child, source, out);
                 if let Some(body) = child.child_by_field_name("body") {
                     ts_class_members(body, source, out);
                 }
@@ -226,9 +286,7 @@ fn ts_export(node: Node, source: &[u8], out: &mut Vec<String>) {
             | "interface_declaration"
             | "internal_module"
             | "module" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    out.push(name);
-                }
+                push_field(child, source, out);
             }
             "lexical_declaration" | "variable_declaration" => {
                 let mut declarators = child.walk();
@@ -241,10 +299,8 @@ fn ts_export(node: Node, source: &[u8], out: &mut Vec<String>) {
                     };
                     // Destructuring publishes several names; the pattern's own
                     // identifiers are the exported ones.
-                    if name.kind() == "identifier"
-                        && let Some(name) = text(name, source)
-                    {
-                        out.push(name);
+                    if name.kind() == "identifier" {
+                        push_site(name, source, out);
                     }
                 }
             }
@@ -253,7 +309,7 @@ fn ts_export(node: Node, source: &[u8], out: &mut Vec<String>) {
     }
 }
 
-fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<String>) {
+fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
         if !matches!(
@@ -276,10 +332,8 @@ fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<String>) {
         if name.kind() == "private_property_identifier" {
             continue;
         }
-        if let Some(name) = text(name, source)
-            && name != "constructor"
-        {
-            out.push(name);
+        if text(name, source).is_some_and(|name| name != "constructor") {
+            push_site(name, source, out);
         }
     }
 }
@@ -287,7 +341,7 @@ fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<String>) {
 /// Python: module-level definitions, the methods of module-level classes, and
 /// screaming-case module constants. Leading-underscore names are private by
 /// the language's own convention and stay out.
-fn python_module(node: Node, source: &[u8], out: &mut Vec<String>) {
+fn python_module(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let child = unwrap_decorated(child);
@@ -311,11 +365,11 @@ fn python_module(node: Node, source: &[u8], out: &mut Vec<String>) {
                     if left.kind() != "identifier" {
                         continue;
                     }
-                    if let Some(name) = text(left, source)
-                        && !name.starts_with('_')
-                        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
-                    {
-                        out.push(name);
+                    if text(left, source).is_some_and(|name| {
+                        !name.starts_with('_')
+                            && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                    }) {
+                        push_site(left, source, out);
                     }
                 }
             }
@@ -324,7 +378,7 @@ fn python_module(node: Node, source: &[u8], out: &mut Vec<String>) {
     }
 }
 
-fn python_class_members(body: Node, source: &[u8], out: &mut Vec<String>) {
+fn python_class_members(body: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
         let member = unwrap_decorated(member);
@@ -343,11 +397,12 @@ fn unwrap_decorated(node: Node) -> Node {
     }
 }
 
-fn push_python_name(node: Node, source: &[u8], out: &mut Vec<String>) {
-    if let Some(name) = field_text(node, "name", source)
-        && !name.starts_with('_')
-    {
-        out.push(name);
+fn push_python_name(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    if text(name, source).is_some_and(|name| !name.starts_with('_')) {
+        push_site(name, source, out);
     }
 }
 
