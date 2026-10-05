@@ -63,6 +63,19 @@
 
 Измерения в [prompt-cache.md](prompt-cache.md) сняты, когда маркер назывался `[NEW]`; строка маркера теперь `[RECENT]`, окно не менялось, поэтому тиканье осталось. `docs/ARCHITECTURE.md` описывает карту уже с `[RECENT]`, четырьмя экспортами и `genome.limit`.
 
+## Genome: проверка, LSP и живой дифф (2026-10-02, отлендилось)
+
+Карта в промпте перестала быть только картой; семь коммитов, по одному на правку:
+
+- `4eef588` feat(cli): turn the genome on and off from the terminal — `titi genome` идёт до движка и ключа не требует: голый печатает четыре строки статуса (вкл/выкл, причина — `setting`, `TITI_NO_GENOME` или `default` для незаданного ключа, действующий cap 1..=64 иначе 24, путь к agent-конфигу), `on`/`off` пишут булево в agent-конфиг, `limit <n>` — cap после проверки диапазона (0, 65 и не-число отвергаются с кодом 2 и без записи), а `/genome` в чате повторяет те же глаголы тем же форматтером (`engine::genome_note`), чтобы поверхности не разъезжались;
+- `6291441` feat(genome): check the index and serve a stdio LSP — `titi genome check` печатает по строке на диагностику (`path:line: code: message`), на чистом дереве `genome: clean` и выход 0, любая диагностика — выход 1; `titi genome lsp` поднимает stdio-LSP без сокета: `initialize`, `shutdown`, `textDocument/documentSymbol`, `textDocument/definition`, `textDocument/references`, `textDocument/diagnostic`, кадры — `Content-Length` (`crates/titi-genome/src/lsp.rs`), из новых зависимостей только `serde_json`;
+- `9b20f79` fix(genome): an unreadable root is an error, not an empty index — индекс, который не построился, винит себя (`genome: check failed (…)`, выход 1), а не отдаёт мнимо чистое дерево;
+- `79319d0` feat(cli): serve genome check and lsp — `check` работает локально и из чата, а `/genome lsp` в чате только называет терминальную команду (`crates/titi-cli/src/chat.rs`);
+- `c7813b9` feat(engine): show the working-tree diff to the turn — ход несёт блок `<diff>` с `git diff HEAD` сразу после `<genome>`: до 8 файлов, 120 строк, 6000 байт (`crates/titi-engine/src/difftrack.rs`), файлы с секретными именами и куски с секрето-образными присваиваниями выбрасываются целиком, пути диффа вливаются в touched-набор, который читает карта, а duck-режим не получает ни карты, ни диффа;
+- `4ae8574` chore(genome): depend on serde_json for LSP framing и `88630fb` docs(config): finish the genome.limit doc — зависимость и доки.
+
+Проверено в этом раунде: `cargo test -p titi-cli --test privacy` 14, `--test genome` 13, и весь набор на этом коммите — см. гейты в отчёте раунда. `docs/ARCHITECTURE.md` описывает оба глагола и блок `<diff>`.
+
 ## OAuth-вход в провайдера (2026-09-28, живой вход Codex пройден)
 
 Задача владельца: «исправить логин и oauth, чтобы OAuth был как в omp». Ресерч закрыт: [providers-streaming/oauth-login.md](providers-streaming/oauth-login.md) — точные authorize/token-endpoint'ы, scopes, callback, PKCE, refresh-skew, идентичность и инференс-заголовки Anthropic/Codex, разобранные по исходникам omp (`@oh-my-pi/pi-catalog`, `@oh-my-pi/pi-ai`, MIT). Ответ на «забрать из их кода»: забраны дескрипторы (client-id, URL, scopes, beta-заголовки — факты протокола, MIT с атрибуцией), движок — нет (TypeScript/Bun + KDL-компиляция); порт — таблица констант Rust и свой поток поверх неё.

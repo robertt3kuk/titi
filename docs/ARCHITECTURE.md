@@ -116,6 +116,11 @@ src/runtime.rs:(→3) [RECENT]
 - File limit: `EngineConfig::genome_limit`, default 24, overridden by the
   `genome.limit` setting (1..=64, the project `.titi/config.yml` winning);
   `TITI_NO_GENOME=1` drops the map.
+- The turn also carries a `<diff>` block — `git diff HEAD`, bounded to 8
+  files, 120 lines and 6000 bytes — right after `<genome>`, and its paths join
+  the touched set the map reads. Secret-named files and hunks with
+  secret-shaped assignments are dropped whole, and duck mode gets neither
+  block (`crates/titi-engine/src/difftrack.rs`).
 
 **Why it matters:** on the first turn the model already sees the core files
 ranked, how risky each is to touch, which symbols have real reach, and
@@ -126,12 +131,14 @@ where work is happening — for the cost of one text block.
 ```bash
 cargo run -p titi-genome --example map -- <path> <N>   # defaults: . and 24
 titi-map <path> <N>                                    # prebuilt, skill genome-map
+titi genome check                                      # index diagnostics, exit 1 on any
+titi genome lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
 ```
 
 stderr prints `"{files} files, {edges} edges"`, stdout the projection.
 `TITI_NO_GENOME=1` disables the map: `crates/titi-cli/src/engine.rs` sets
 `genome_root` to the cwd only when the variable is unset, and
-`genome_root = None` means no genome at all.
+`genome_root = None` means no genome at all. `titi genome check` prints `path:line: code: message` per diagnostic and exits 1 on any (`genome: clean`, exit 0, on none); `titi genome lsp` serves those symbols over LSP stdio framing.
 
 ## Tools and approval
 
