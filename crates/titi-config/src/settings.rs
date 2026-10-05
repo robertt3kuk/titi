@@ -80,6 +80,7 @@ pub const THEME_LIGHT_KEY: &str = "theme.light";
 ///
 /// Unset means the engine default (`EngineConfig::new` picks it, currently 24).
 /// This crate does not own that number — the constant is a key name, not a
+/// second source of the default, so it deliberately carries no value.
 pub const GENOME_LIMIT_KEY: &str = "genome.limit";
 
 /// Whether the prompt map is built.
