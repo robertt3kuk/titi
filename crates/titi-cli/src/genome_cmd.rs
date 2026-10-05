@@ -10,8 +10,9 @@ use std::path::Path;
 
 use titi_config::settings::{GENOME_ENABLED_KEY, GENOME_LIMIT_KEY, Settings};
 
-/// The exit every refusal uses: unknown subcommand, unreadable limit, and the
-/// not-wired `check`/`lsp` verbs.
+/// The exit every refusal uses: unknown subcommand and an out-of-range limit.
+/// A failed `check`/`lsp` exits 1 instead: the command was understood, the
+/// workspace was not.
 const USAGE_EXIT: i32 = 2;
 
 pub fn run(agent_dir: &Path, workspace: &Path) -> Option<()> {
@@ -47,11 +48,18 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
                 std::process::exit(USAGE_EXIT);
             }
         },
-        Some("check") | Some("lsp") => {
-            // The verbs exist so a later slice can fill them; the message is
-            // the contract, not a promise about what they will be.
-            eprintln!("genome: check and lsp are not wired in this build");
-            std::process::exit(USAGE_EXIT);
+        Some("check") => {
+            check_cmd(workspace);
+        }
+        Some("lsp") => {
+            // The blocks here are the server: a client is on the other side
+            // of the pipe, so nothing prints before the frames.
+            if let Err(reason) =
+                titi_genome::serve_lsp(workspace, std::io::stdin().lock(), std::io::stdout())
+            {
+                eprintln!("genome: lsp failed ({reason})");
+                std::process::exit(1);
+            }
         }
         Some(name) => {
             eprintln!("genome: unknown command {name}");
@@ -66,6 +74,33 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
 fn status(settings: &Option<Settings>, agent_dir: &Path) {
     println!("{}", crate::engine::genome_note(settings, agent_dir));
     std::process::exit(0);
+}
+
+/// `titi genome check`: index the workspace, print one line per diagnostic.
+///
+/// `path:line: code: message`, one line each; a clean tree says so and exits
+/// 0, any diagnostic exits 1, and an index that cannot even be built blames
+/// itself rather than reporting phantom clean trees.
+fn check_cmd(workspace: &Path) {
+    let genome = match titi_genome::Genome::index(workspace) {
+        Ok(genome) => genome,
+        Err(reason) => {
+            eprintln!("genome: check failed ({reason})");
+            std::process::exit(1);
+        }
+    };
+    let diagnostics = genome.check();
+    if diagnostics.is_empty() {
+        println!("genome: clean");
+        std::process::exit(0);
+    }
+    for diagnostic in &diagnostics {
+        println!(
+            "{}:{}: {}: {}",
+            diagnostic.path, diagnostic.line, diagnostic.code, diagnostic.message
+        );
+    }
+    std::process::exit(1);
 }
 
 /// Writes the boolean to the agent's own config: the canonical global file,

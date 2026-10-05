@@ -1420,10 +1420,8 @@ impl Chat {
                 }
             },
             "check" | "lsp" => {
-                self.push(
-                    LineKind::Note,
-                    "genome: check and lsp are not wired in this build".to_owned(),
-                );
+                let workspace = crate::app::current_workspace();
+                local_genome_note(self, bound, &workspace)
             }
             name => {
                 self.push(LineKind::Error, format!("genome: unknown command {name}"));
@@ -4333,6 +4331,45 @@ fn genome_set_limit(
             serde_json::json!(limit),
         )
         .map_err(|why| why.to_string())
+}
+
+/// `/genome check` and `/genome lsp`.
+///
+/// Check runs the same index + diagnostics pass the terminal verb runs, over
+/// the workspace passed in — the live caller passes
+/// [`crate::app::current_workspace`] — and pushes the same `path:line: code:
+/// message` lines — or one error line when the index itself fails. Lsp never
+/// starts a stdio server inside the chat: the pipe is the terminal's, so the
+/// note names the command instead.
+fn local_genome_note(chat: &mut Chat, verb: &str, workspace: &Path) {
+    if verb == "lsp" {
+        chat.push(
+            LineKind::Note,
+            "genome: lsp is 'titi genome lsp', not a chat command".to_owned(),
+        );
+        return;
+    }
+    let genome = match titi_genome::Genome::index(workspace) {
+        Ok(genome) => genome,
+        Err(reason) => {
+            chat.push(LineKind::Error, format!("genome: check failed ({reason})"));
+            return;
+        }
+    };
+    let diagnostics = genome.check();
+    if diagnostics.is_empty() {
+        chat.push(LineKind::Note, "genome: clean".to_owned());
+        return;
+    }
+    for diagnostic in &diagnostics {
+        chat.push(
+            LineKind::Note,
+            format!(
+                "{}:{}: {}: {}",
+                diagnostic.path, diagnostic.line, diagnostic.code, diagnostic.message
+            ),
+        );
+    }
 }
 
 /// One window of `room` rows around `selected`, before the `… N more` lines
@@ -12656,26 +12693,59 @@ mod tests {
         );
     }
 
-    /// `check` and `lsp` are named as verbs this build does not wire; the
-    /// chat never pretends to run a server.
+    /// `/genome check` runs the real index over the workspace and pushes the
+    /// diagnostic lines as a note; a broken import names itself with its code.
     #[test]
-    fn genome_check_and_lsp_say_they_are_not_wired() {
-        for verb in ["check", "lsp"] {
-            let dir = tempfile::tempdir().expect("temp");
-            let mut chat = chat();
-            chat.agent_dir = dir.path().to_path_buf();
-            std::fs::create_dir_all(&chat.agent_dir).unwrap();
+    fn genome_check_reports_diagnostics_from_the_workspace() {
+        let dir = tempfile::tempdir().expect("temp");
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("lib.rs"),
+            "use crate::missing::Thing;\npub fn present() {}\n",
+        )
+        .unwrap();
+        let agent = tempfile::tempdir().expect("temp agent");
+        let mut chat = chat();
+        chat.agent_dir = agent.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-            type_text(&mut chat, &format!("/genome {verb}"));
-            chat.on_key(Key::Enter, Instant::now());
-            assert!(
-                chat.lines
-                    .iter()
-                    .any(|line| line.text == "genome: check and lsp are not wired in this build"),
-                "verb {verb}: {:?}",
-                chat.lines
-            );
-        }
+        // The workspace comes in as a value: the test hands it the temp tree
+        // directly instead of moving the process `current_dir`, which every
+        // parallel test reads.
+        local_genome_note(&mut chat, "check", dir.path());
+        let names: Vec<&str> = chat.lines.iter().map(|line| line.text.as_str()).collect();
+        let hit = names
+            .iter()
+            .find(|text| text.contains("unresolved-import"))
+            .expect("the broken import names itself");
+        assert!(hit.contains("missing"), "{names:?}");
+        assert!(hit.contains("src/lib.rs:1:"), "{names:?}");
+        assert!(
+            hit.starts_with("src/lib.rs:1: unresolved-import: "),
+            "{names:?}"
+        );
+    }
+
+    /// `/genome lsp` never starts a stdio server inside the chat: the note
+    /// names the terminal command, exactly, instead of pretending.
+    #[test]
+    fn genome_lsp_names_the_terminal_command() {
+        let dir = tempfile::tempdir().expect("temp");
+        let mut chat = chat();
+        chat.agent_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(&chat.agent_dir).unwrap();
+
+        type_text(&mut chat, "/genome lsp");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "genome: lsp is 'titi genome lsp', not a chat command"),
+            "{:?}",
+            chat.lines
+        );
     }
 
     /// An unknown `/genome` word names itself and shows the usage line.

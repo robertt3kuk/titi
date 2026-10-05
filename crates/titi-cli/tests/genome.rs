@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn titi(agent_dir: &std::path::Path, cwd: &std::path::Path) -> Command {
@@ -23,6 +24,24 @@ fn run(agent_dir: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> (St
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.code().unwrap_or(-1),
     )
+}
+
+/// A directory the process may enter but not read, for the workspace the verbs
+/// must refuse. `None` when the run is privileged enough that the mode bits do
+/// not stop `read_dir` — the shape cannot be built there, so the caller skips.
+///
+/// The verbs take their workspace from the process cwd, so this is the one
+/// "cannot be read as a directory" shape a child process can be pointed at;
+/// the library tests cover the missing-path and regular-file roots.
+fn unreadable_root(parent: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = parent.join("locked");
+    std::fs::create_dir(&path).expect("temp dir");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o111)).expect("chmod");
+    if std::fs::read_dir(&path).is_ok() {
+        eprintln!("skipping: mode bits are bypassed, so no unreadable root exists");
+        return None;
+    }
+    Some(path)
 }
 
 /// A fresh agent directory reports the built-in state: on, unreasoned, at the
@@ -150,20 +169,96 @@ fn titi_no_genome_names_itself_as_the_reason() {
     assert!(stdout.contains("reason: TITI_NO_GENOME\n"), "{stdout}");
 }
 
-/// `check` and `lsp` are verbs this build does not wire: the message is the
-/// contract, exit 2, and neither invents a server.
+/// A broken import is named with its file, line, code and message, and the
+/// check exits 1. A tree with one valid function is clean at exit 0. Check
+/// reads the workspace, not the agent config, so neither test writes one.
 #[test]
-fn check_and_lsp_say_they_are_not_wired() {
-    for verb in ["check", "lsp"] {
-        let dir = tempfile::tempdir().expect("temp agent dir");
-        let (stdout, stderr, code) = run(dir.path(), dir.path(), &["genome", verb]);
-        assert_eq!(code, 2, "{stdout}");
-        assert!(stdout.is_empty(), "{stdout}");
-        assert_eq!(
-            stderr, "genome: check and lsp are not wired in this build\n",
-            "{stderr}"
-        );
+fn check_reports_unresolved_imports_and_a_clean_tree_is_clean() {
+    let broken = tempfile::tempdir().expect("temp tree");
+    let src_dir = broken.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "use crate::missing::Thing;\npub fn present() {}\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run(broken.path(), broken.path(), &["genome", "check"]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(
+        stdout.contains("unresolved-import") && stdout.contains("missing"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(":1: unresolved-import"), "{stdout}");
+
+    let clean = tempfile::tempdir().expect("temp tree");
+    let src_dir = clean.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "pub fn ok() {}\n").unwrap();
+    let (stdout, stderr, code) = run(clean.path(), clean.path(), &["genome", "check"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(stdout, "genome: clean\n", "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A tree the indexer cannot even walk blames itself, not a clean report.
+///
+/// The root is unreadable: that is a different case from a good root holding
+/// one odd child, and the only one the verbs must refuse.
+#[test]
+fn check_names_a_failed_index() {
+    let dir = tempfile::tempdir().expect("temp tree");
+    let Some(unreadable) = unreadable_root(dir.path()) else {
+        return;
+    };
+    let (_, stderr, code) = run(dir.path(), &unreadable, &["genome", "check"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("genome: check failed ("), "{stderr}");
+}
+
+/// The lsp verb is a server on stdio: one `initialize` request and an `exit`
+/// notification travel as Content-Length frames, the answer names the server,
+/// and the process ends 0 with no socket and no banner before the frames.
+#[test]
+fn lsp_answers_initialize_and_exits_cleanly() {
+    let dir = tempfile::tempdir().expect("temp tree");
+    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{body}", body.len());
+    let initialize = frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let exit = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    use std::io::Write as _;
+    let mut child = titi(dir.path(), dir.path())
+        .args(["genome", "lsp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin piped");
+        stdin.write_all(initialize.as_bytes()).unwrap();
+        stdin.write_all(exit.as_bytes()).unwrap();
     }
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stdout.contains("\"name\":\"titi-genome\""), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A workspace the server cannot index fails loudly rather than hanging.
+///
+/// Same unreadable root as `check`: the server must report it instead of
+/// answering an empty map.
+#[test]
+fn lsp_names_a_failed_index() {
+    let dir = tempfile::tempdir().expect("temp tree");
+    let Some(unreadable) = unreadable_root(dir.path()) else {
+        return;
+    };
+    let (_, stderr, code) = run(dir.path(), &unreadable, &["genome", "lsp"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("genome: lsp failed ("), "{stderr}");
 }
 
 /// Any other subcommand names itself and the usage line, exit 2.
