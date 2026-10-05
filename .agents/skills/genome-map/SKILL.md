@@ -32,3 +32,21 @@ titi-map <path> <N>
 It first prints `<files> files, <edges> edges` to stderr, then the ranked
 projection to stdout. Read the top of that list to find the load-bearing
 files before editing.
+
+## The genome from titi itself
+
+The same index answers two more questions, without the example binary:
+
+```bash
+titi genome            # status: on/off, why, the cap, the agent config path
+titi genome on|off     # write the boolean to the agent config.yml
+titi genome limit <n>  # write the cap (1..=64, else 24)
+titi genome check      # index diagnostics: path:line: code: message, exit 1 on any
+titi genome lsp        # stdio LSP: documentSymbol, definition, references, diagnostic
+```
+
+The same verbs work in the chat as `/genome` (`check` runs locally there;
+`lsp` only names the terminal command). Two settings decide what a turn
+gets: `genome.enabled` (unset means on) and `genome.limit` (1..=64, the
+project `.titi/config.yml` winning over the agent's); `TITI_NO_GENOME=1`
+forces the map off for one run without touching either.

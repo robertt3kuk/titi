@@ -54,7 +54,8 @@ One exception: check TUI changes by hand as well, in a real terminal with
 
 To map the code, run `cargo run -p titi-genome --example map -- <path> <N>`
 (skill `genome-map`); `~/bin/titi-map` is the optional prebuilt binary the
-skill documents, which may be older than the source.
+skill documents, which may be older than the source. `titi genome check`
+vets the tree the same way — index diagnostics, exit 1 on any.
 
 ## Code style
 
