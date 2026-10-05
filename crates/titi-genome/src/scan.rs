@@ -31,12 +31,20 @@ struct Rule {
     pattern: String,
 }
 
+/// Lists the source files under `root`, which must be a readable directory.
+///
+/// The two cases are decided separately. A **root** that cannot be read as a
+/// directory — a missing path, or a regular file where a directory is
+/// required — is an error: the caller asked for a map of something that is
+/// not a tree, and an empty map would be a lie. A **child** that cannot be
+/// read mid-walk is skipped instead (see [`walk`]), so one odd entry cannot
+/// sink an otherwise good tree.
 pub fn list_files(root: &Path) -> std::io::Result<Vec<ListedFile>> {
     let mut rules = Vec::new();
     rules.extend(load_rules(root, ".gitignore"));
     rules.extend(load_rules(root, ".reference-productignore"));
     let mut out = Vec::new();
-    walk(root, "", &rules, &mut out)?;
+    walk(root, "", &rules, &mut out, true)?;
     Ok(out)
 }
 
@@ -75,10 +83,23 @@ fn parse_rule(line: &str) -> Option<Rule> {
     })
 }
 
-fn walk(dir: &Path, rel: &str, rules: &[Rule], out: &mut Vec<ListedFile>) -> std::io::Result<()> {
-    // A directory that vanishes or is unreadable mid-walk is skipped, not fatal.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
+/// Walks `dir` into `out`.
+///
+/// `root` marks the top of the walk, and it is the only level that may fail:
+/// the caller's root is a contract, so an unreadable one returns the error. A
+/// directory that vanishes or is unreadable *below* the root is skipped, not
+/// fatal, because a large tree with one odd entry must still index.
+fn walk(
+    dir: &Path,
+    rel: &str,
+    rules: &[Rule],
+    out: &mut Vec<ListedFile>,
+    root: bool,
+) -> std::io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) if !root => return Ok(()),
+        Err(why) => return Err(why),
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -99,7 +120,7 @@ fn walk(dir: &Path, rel: &str, rules: &[Rule], out: &mut Vec<ListedFile>) -> std
             if should_prune_dir(&name) || is_ignored(&child_rel, true, rules) {
                 continue;
             }
-            walk(&entry.path(), &child_rel, rules, out)?;
+            walk(&entry.path(), &child_rel, rules, out, false)?;
             continue;
         }
         if !file_type.is_file() || is_ignored(&child_rel, false, rules) {

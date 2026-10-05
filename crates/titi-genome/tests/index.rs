@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -430,5 +431,50 @@ fn a_recently_modified_file_is_marked_recent_not_new() {
     assert!(
         !projected.contains("src/stale.rs:(→0) [RECENT]"),
         "a file older than 48h is not recent: {projected}"
+    );
+}
+
+/// The root and its children are decided separately.
+///
+/// A root that cannot be read as a directory — a missing path, or a regular
+/// file where a directory is required — is an error: an empty map would be a
+/// lie. The same shapes *below* a readable root are skipped, and the rest of
+/// the tree still indexes, so one odd entry cannot sink a large tree.
+#[test]
+fn an_unreadable_root_is_an_error_but_an_unreadable_child_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+
+    assert!(
+        Genome::index(dir.path().join("missing")).is_err(),
+        "a missing root must not index as empty"
+    );
+    let as_file = dir.path().join("plain.rs");
+    fs::write(&as_file, "pub fn ok() {}\n").unwrap();
+    assert!(
+        Genome::index(&as_file).is_err(),
+        "a file where a directory is required must not index as empty"
+    );
+
+    let root = dir.path().join("tree");
+    write(&root, "src/lib.rs", "pub fn kept() {}\n");
+    // A regular file where a directory of that name might be expected.
+    fs::write(root.join("odd"), "not a directory").unwrap();
+    // A directory the walker may not enter, when the process is not privileged
+    // enough to read through mode 000; a privileged process reads it as empty.
+    let locked = root.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let genome = Genome::index(&root).expect("one odd child must not sink the tree");
+    assert!(
+        genome.files.contains_key("src/lib.rs"),
+        "{:?}",
+        genome.files.keys()
+    );
+    assert!(!genome.files.contains_key("odd"));
+    assert!(
+        !genome.files.keys().any(|path| path.starts_with("locked/")),
+        "{:?}",
+        genome.files.keys()
     );
 }
