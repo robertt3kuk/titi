@@ -5,7 +5,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use smol_str::SmolStr;
 
-use crate::transport::TransportError;
+use crate::transport::{TransportError, WatchdogConfig};
 
 /// A fully-shaped HTTP request ready to send.
 #[derive(Debug, Clone)]
@@ -49,8 +49,20 @@ pub struct ReqwestFetch {
 }
 
 impl ReqwestFetch {
+    /// The production client, bounded by the default watchdog timings.
     pub fn new() -> Result<Self, TransportError> {
+        Self::with_watchdog(&crate::transport::WatchdogConfig::default())
+    }
+
+    /// A client bounded by the same watchdog the stream uses: a connection
+    /// that never completes fails at `first_event_timeout`, and a body that
+    /// stops mid-read fails at `idle_timeout`. The stream pump applies its own
+    /// typed verdict on top; this is the layer that keeps a black-holed
+    /// socket from holding the request at all.
+    pub fn with_watchdog(watchdog: &WatchdogConfig) -> Result<Self, TransportError> {
         let client = reqwest::Client::builder()
+            .connect_timeout(watchdog.first_event_timeout)
+            .read_timeout(watchdog.idle_timeout)
             .build()
             .map_err(|e| TransportError::Fatal {
                 status: None,
