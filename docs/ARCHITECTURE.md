@@ -25,8 +25,9 @@ and renders `EngineEvent`; everything else sits under `titi-engine`.
 
 ## Genome: a ranked map instead of blind search
 
-Code: `crates/titi-genome/src/{lib,scan,parse,graph,project}.rs`, example
-`examples/map.rs`. Обзор темы — `docs/research/README.md`.
+Code: `crates/titi-genome/src/{lib,scan,graph,project,refs,symbols}.rs`,
+`crates/titi-genome/src/lang/{mod,support}.rs` and one module per language,
+example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
 
 ### What gets built
 
@@ -63,35 +64,72 @@ and `symbols: HashMap<String, SymbolRecord>`.
 
 ### Languages
 
-`Language` (`parse.rs`) lists 12 named languages plus `Other`: Rust,
-TypeScript, Python, Go, Java, C, Cpp, CSharp, Ruby, Kotlin, Swift, Php. The
-`EXTENSIONS` table is the single source of truth for `Language::from_path`:
-`rs`; `ts tsx js jsx mjs cjs`; `py`; `go`; `java`; `c h`;
-`cpp cc cxx hpp hh hxx`; `cs`; `rb`; `kt kts`; `swift`; `php`.
+One language is one module under `crates/titi-genome/src/lang/` plus one row
+in `LANGS`. The row is the only place that says how a language is recognised:
+its extensions, its grammar when one is linked, and its parser. So
+`Language::from_path`, the extensions the scanner indexes, the grammar
+`ast_edit` needs and the dispatch in `lang::parse` all read the same table —
+adding a language is one module and one row, not four lists to keep in step.
+`refs.rs` holds the identifier work every language shares.
 
-- **Imports and symbols** (file edges and symbol edges): Rust (`use`, `mod`,
-  read from the syntax tree), TS/JS (relative `from '…'` / `import '…'`),
-  Python (relative `from .x import`), Go (block and line `import`, resolved
-  by package path suffix), Java and C# (shared `parse_path_imports`,
-  resolved by suffix), Kotlin, PHP, Ruby (`require` / `require_relative`),
-  C/C++ (`#include "…"` relative to the file).
-- **Symbols only:** Swift — `finish(source, swift_exports(source), Vec::new())`
-  parses no imports. That is why the README says "eleven languages": eleven
-  produce import edges.
+Every `Language` has a **level**, which is what a user sees when they ask:
+
+- **`Full`** — exports come from a real syntax tree (`lang::rust`,
+  `lang::typescript`, `lang::python`). Rust, TypeScript, JavaScript, Python.
+  JS/JSX parse with the TSX grammar; `.ts`/`.mts`/`.cts` with the TypeScript
+  one, the only extension-dependent grammar in the table.
+- **`Heuristic`** — patterns over the text: comments are blanked first (Go,
+  Java, C#, C/C++, Ruby, Kotlin, Swift, PHP), so a commented-out declaration
+  is not one, but a declaration the patterns do not recognise is missed, and
+  a declaration inside a multi-line string is still a gap. Exports and
+  imports can be wrong.
+- **`Unsupported`** — `Language::Unsupported`, the catch-all for a path no row
+  claims (`a.txt`). It is never indexed, and it contributes no symbols.
+
+The level is surfaced where a user can see it: `titi genome check` prints one
+`capability` line per language present (`src/lib.rs:1: capability: rust: Full
+— exported items and use/mod paths come from a syntax tree`), and `titi genome
+lsp` reports the same roster for the workspace in `initialize`'s
+`experimental.titiGenome.languages`. A capability line is `Info`, so it never
+decides `genome check`'s exit code, and the per-file LSP `diagnostic` reply
+leaves it out: a constant hint in every file is noise.
+
+- **Imports** (file edges): Rust (`use`, `mod`, read from the syntax tree and
+  resolved against the module its declaration sits in — `crate::`, `super::`,
+  `self::`, a glob, and `mod x;` beside a `mod.rs` all land on a file; a bare
+  path is an external crate, and a path that resolves to the importing file
+  is a self-edge and is dropped), TS/JS (`from '…'` / `import '…'`), Python
+  (`from .x import` / `from x.y import`), Go (`import` blocks and lines,
+  resolved by package path suffix), Java (`import`, resolved by suffix), C#
+  (`using`, by suffix), Kotlin (`import`, by suffix), PHP (`use`, by suffix),
+  Ruby (`require` / `require_relative`), C/C++ (`#include "…"` relative to the
+  file), Swift (`import`, resolved to `<Module>/<Module>.swift` when the
+  workspace holds it).
+- **An import that resolves to nothing is only a diagnostic when it is this
+  workspace's business.** A specifier that names something outside the
+  workspace — `java.util.List`, `using System;`, `require 'json'`, Go's `fmt`,
+  `from sqlalchemy.orm import x` — is not a missing file, and reporting it
+  would put a warning on every file that uses a library. Each module decides
+  this as honestly as the language lets it: the own root of the file's
+  `package`/`namespace` declaration for Java, C#, Kotlin and PHP (a specifier
+  under another root is another world), a dot in the first path segment for
+  Go (`fmt` is std, `example.com/x` is a module), the workspace-holds-that-
+  directory probe for Python, exact-for-relative and
+  module-path-for-bare for TS/JS, `require_relative` versus `require` for
+  Ruby, and the `<Module>/<Module>.swift` convention for Swift. Rust is exact:
+  only `crate::`, `self::` and `super::` name a file. A quoted `#include` that
+  names no file *is* reported — it is a real error — while `<system.h>` is not
+  an include this crate looks at.
 
 Symbol edges (`used_symbols`) come to every language through `finish()` →
-`collect_refs()`; Swift simply lacks the file-edge half.
+`refs::collect_refs()`, and every language contributes export sites.
 
-Rust symbols, Rust `use`/`mod` items and the syntax-error count come from
-tree-sitter; every other language is still regex heuristics. A Rust import
-resolves against the module its declaration sits in — the file's directory
-plus every enclosing inline `mod` — so `crate::`, `super::`, `self::`, a
-glob, and `mod x;` beside a `mod.rs` all land on a file. A bare path is an
-external crate, not a workspace lookup, and a path that resolves to the
-importing file is a self-edge and is dropped. `syntax_errors` counts
-`ERROR` nodes from a parse with the pinned grammar's `&raw` token ambiguity
-neutralised, so borrowing an ordinary identifier named `raw` is not
-reported as a syntax error — a file that genuinely does not parse still is.
+`syntax_errors` counts tree-sitter `ERROR` nodes for a parsed language, from a
+parse with the pinned grammar's `&raw` token ambiguity neutralised, so
+borrowing an ordinary identifier named `raw` is not reported as a syntax error
+— a file that genuinely does not parse still is. Heuristic languages with no
+grammar report zero: this crate does not invent errors it did not parse.
+
 
 ### How the map reaches the prompt
 
@@ -148,7 +186,12 @@ titi genome lsp                                        # stdio LSP: documentSymb
 stderr prints `"{files} files, {edges} edges"`, stdout the projection.
 `TITI_NO_GENOME=1` disables the map: `crates/titi-cli/src/engine.rs` sets
 `genome_root` to the cwd only when the variable is unset, and
-`genome_root = None` means no genome at all. `titi genome check` prints `path:line: code: message` per diagnostic and exits 1 on any (`genome: clean`, exit 0, on none); `titi genome lsp` serves those symbols over LSP stdio framing.
+`genome_root = None` means no genome at all. `titi genome check` prints
+`path:line: code: message` per diagnostic and exits 1 on any Warning or
+Error (`genome: clean`, exit 0, when there is nothing to say at all). An
+indexed workspace always says something: one `capability` line per language
+present, `Info`, so it does not change the exit code. `titi genome lsp`
+serves those symbols over LSP stdio framing.
 
 ## Tools and approval
 
@@ -238,7 +281,8 @@ clone carries no one's chat history or credentials.
 
 ## Sources
 
-- `crates/titi-genome/src/{lib,scan,parse,graph,project}.rs`, `examples/map.rs`
+- `crates/titi-genome/src/{lib,scan,graph,project,refs,symbols}.rs`,
+  `crates/titi-genome/src/lang/*.rs`, `examples/map.rs`
 - `crates/titi-tools/src/{lib,fs,cache}.rs`
 - `crates/titi-engine/src/{runtime,tool_loop,tool_agent,protocol}.rs`
 - `crates/titi-config/src/{lib,settings}.rs`, `crates/titi-cli/src/engine.rs`
