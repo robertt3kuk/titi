@@ -2351,7 +2351,8 @@ mod tests {
         );
         let ctx = RequestCtx::with_key("sk-test");
         let flag = Arc::clone(&ctx.aborted);
-        let mut stream = transport
+        // `collect` takes the stream by value, so nothing here needs it `mut`.
+        let stream = transport
             .stream(req(), ctx)
             .await
             .expect("the stream opens");
