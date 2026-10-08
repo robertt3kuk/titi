@@ -285,11 +285,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Php,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "php",
-        note: "declarations and `use` lines are matched by pattern; comments are masked first",
+        note: "declarations come from a syntax tree; a private method is not an export; `use` paths are resolved by vendor suffix",
         extensions: &["php"],
-        grammar: None,
+        grammar: Some(Grammar::Php),
         parse: php::parse,
     },
 ];

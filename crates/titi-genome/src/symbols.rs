@@ -34,6 +34,7 @@ pub enum Grammar {
     Kotlin,
     CSharp,
     Ruby,
+    Php,
 }
 
 impl Grammar {
@@ -50,6 +51,7 @@ impl Grammar {
             Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         }
     }
 }
@@ -67,6 +69,7 @@ struct Parsers {
     kotlin: Option<Parser>,
     csharp: Option<Parser>,
     ruby: Option<Parser>,
+    php: Option<Parser>,
 }
 
 impl Parsers {
@@ -83,6 +86,7 @@ impl Parsers {
             Grammar::Kotlin => &mut self.kotlin,
             Grammar::CSharp => &mut self.csharp,
             Grammar::Ruby => &mut self.ruby,
+            Grammar::Php => &mut self.php,
         }
     }
 }
@@ -181,6 +185,7 @@ mod tests {
             Grammar::Kotlin,
             Grammar::CSharp,
             Grammar::Ruby,
+            Grammar::Php,
         ] {
             assert!(grammar_available(grammar), "{grammar:?} failed to load");
         }

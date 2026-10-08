@@ -35,6 +35,10 @@ final class App {
 
 function topLevel(): void {}
 
+$doc = <<<DOC
+class Quoted {}
+DOC;
+
 // class Ghost {}
 "#,
     );
@@ -80,6 +84,13 @@ fn php_exports_skip_comments_and_private_methods() {
     assert!(
         !app.exports.iter().any(|export| export == "Ghost"),
         "a commented-out declaration is not an export: {:?}",
+        app.exports
+    );
+    // A `class` written inside a heredoc is string content: the pattern read
+    // it (only `//` and `/* */` were masked), the grammar does not.
+    assert!(
+        !app.exports.iter().any(|export| export == "Quoted"),
+        "a heredoc's content is not a declaration: {:?}",
         app.exports
     );
     for (path, name) in [
@@ -161,11 +172,12 @@ fn php_splits_vendor_imports_from_missing_workspace_ones() {
 }
 
 #[test]
-fn php_is_a_heuristic_language_in_the_capability_roster() {
+fn php_is_a_parsed_language_in_the_capability_roster() {
     let php = Genome::capabilities()
         .into_iter()
         .find(|capability| capability.language == "php")
         .expect("a php capability");
-    assert_eq!(php.level, Level::Heuristic, "{}", php.note);
+    assert_eq!(php.level, Level::Full, "{}", php.note);
+    assert!(php.note.contains("syntax tree"), "{}", php.note);
     assert_eq!(php.extensions, vec!["php"]);
 }
