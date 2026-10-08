@@ -40,30 +40,13 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::herdr::{self, AgentState};
 use crate::hub::{HubSession, HubUpdate};
+use crate::keys::*;
 use crate::login::{LoginDriver, LoginEvent, LoginFlow, OAuthProvider};
 use crate::pickers::*;
 use crate::session_log::SessionLog;
 use crate::transcript::*;
 
-const QUIT_WINDOW: Duration = Duration::from_secs(2);
 pub(crate) const TOOL_PREVIEW: usize = 120;
-
-/// Pastes longer than this many lines collapse to a marker instead of filling
-/// the draft (the deleted `composer.rs`'s `PASTE_INLINE_MAX_LINES`, restored).
-///
-/// Six is where a paste stops reading as something the user typed: a prompt, a
-/// path, a couple of log lines stay inline, while a stack trace or a file no
-/// longer becomes the prompt verbatim.
-const PASTE_INLINE_MAX_LINES: usize = 6;
-
-/// Where a collapsed paste's marker starts. Only a registered marker is ever
-/// expanded, and only from this prefix, so a literal in prose is never one.
-const PASTE_MARKER_HEAD: &str = "[Paste #";
-
-/// The line above the composer while a second press is owed, one per key: a
-/// two-press exit names the key that confirms *it*.
-const CTRL_C_HINT: &str = "ctrl-c again to quit";
-const EXIT_HINT: &str = "press Enter again to quit";
 
 /// How long after an OSC 11 query a reply's characters are recognized as one.
 ///
@@ -375,8 +358,8 @@ pub struct Chat {
     pub(crate) pastes: HashMap<String, String>,
     /// The number the next paste marker carries: monotonic for the run, so two
     /// markers in one draft can never stand for the same body.
-    next_paste: u32,
-    turn_active: bool,
+    pub(crate) next_paste: u32,
+    pub(crate) turn_active: bool,
     /// When the running turn was asked for. `Some` exactly while
     /// `turn_active`: the status row above the composer reads it for the
     /// spinner and the elapsed seconds, so a request in flight is visible
@@ -422,12 +405,12 @@ pub struct Chat {
     /// The part of the prompt counts above the provider read from its cache.
     session_cached_tokens: u32,
     last_cached_tokens: u32,
-    quit_armed: Option<Instant>,
+    pub(crate) quit_armed: Option<Instant>,
     /// When Esc was last pressed on an empty composer: the first press arms
     /// this, a second inside [`QUIT_WINDOW`] is the rewind chord, and typing
     /// clears it. One field, so the two-press shape has one window.
-    esc_armed: Option<Instant>,
-    hint: String,
+    pub(crate) esc_armed: Option<Instant>,
+    pub(crate) hint: String,
     /// Provider waiting for a key or an OAuth code. The composer masks
     /// whatever is typed in either case.
     pub(crate) login_for: Option<String>,
@@ -538,20 +521,20 @@ pub struct Chat {
     token_rate: titi_tui::status::TokenRate,
     /// The drag selection over the transcript, in screen coordinates; `None`
     /// when nothing is selected. The model is `titi_tui::selection`.
-    selection: Option<Selection>,
+    pub(crate) selection: Option<Selection>,
     /// The transcript's rows as the last frame drew them, as plain text: what
     /// a copy of a selection carries, style and padding left behind.
     pub(crate) last_rows: Vec<String>,
     /// The screen row the transcript starts on. A mouse event arrives in
     /// screen coordinates; this is what turns one into a row of
     /// [`Chat::last_rows`].
-    transcript_top: u16,
+    pub(crate) transcript_top: u16,
     /// The mouse preset this run has enabled. `/mouse` changes it, and the
     /// way out disables mouse reporting whatever it is.
     mouse_preset: MousePreset,
     /// Sequences to write before the next frame, outside ratatui's diff: the
     /// mouse preset switching over, an OSC 11 query, an OSC 52 copy.
-    output_flush: String,
+    pub(crate) output_flush: String,
     /// The appearance the palette on screen was chosen for. A probe reply that
     /// names the same one changes nothing, so a terminal that answers every
     /// focus gain does not repaint the screen each time.
@@ -687,95 +670,6 @@ impl Chat {
         out
     }
 
-    // ---- Mouse selection -------------------------------------------------
-    //
-    // The transcript is the only surface with a selection: the composer has a
-    // caret, the pickers have a cursor. A press anchors, a drag moves the
-    // anchor's other corner, a release copies. Nothing here scrolls — a drag
-    // that scrolled would move the text out from under the selection.
-
-    /// Mouse press: anchor a drag-select at a screen cell.
-    pub fn mouse_press(&mut self, x: u16, y: u16) {
-        self.selection = Some(Selection::anchor(x, y));
-    }
-
-    /// Mouse drag: move the selection's far corner.
-    pub fn mouse_drag(&mut self, x: u16, y: u16) {
-        if let Some(selection) = &mut self.selection {
-            selection.drag(x, y);
-        }
-    }
-
-    /// Mouse release: the selection stands, and its text is what was copied.
-    ///
-    /// Returns `None` for a click (an empty selection) so nothing reaches the
-    /// clipboard on a press that selected nothing.
-    pub fn mouse_release(&mut self) -> Option<String> {
-        let selection = self.selection.as_mut()?;
-        selection.release();
-        let text = self.selection_text();
-        (!text.is_empty()).then_some(text)
-    }
-
-    /// The wheel: a panel's cursor when one is open — the wheel moves it the
-    /// way the arrows do — and the transcript's scroll otherwise. The wheel
-    /// never *opens* anything: ↑ at an empty composer is the history's, and a
-    /// wheel is not a key.
-    pub fn mouse_wheel(&mut self, delta: isize, now: Instant) {
-        if self.panel_open() {
-            let key = if delta > 0 { Key::Up } else { Key::Down };
-            self.on_key(key, now);
-            return;
-        }
-        if delta > 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add(delta as usize);
-        } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub(delta.unsigned_abs());
-        }
-    }
-
-    /// Forget the selection — a key or a new press takes it away.
-    pub fn clear_selection(&mut self) {
-        self.selection = None;
-    }
-
-    /// The committed selection, if any.
-    pub fn selection(&self) -> Option<Selection> {
-        self.selection
-    }
-
-    /// The selection as the transcript sees it: the screen rows translated to
-    /// the transcript's own rows, and `None` when the selection never reached
-    /// the transcript at all (`None` after a release is the same as a selection
-    /// that holds no text).
-    pub(crate) fn transcript_selection(&self) -> Option<Selection> {
-        let selection = self.selection?;
-        if !selection.is_non_empty() {
-            return None;
-        }
-        let (_, top, _, bottom) = selection.rect()?;
-        let origin = self.transcript_top;
-        let last = origin.saturating_add(self.last_rows.len() as u16);
-        if bottom < origin || top >= last {
-            return None;
-        }
-        let shift = |y: u16| y.saturating_sub(origin);
-        Some(Selection {
-            anchor: (selection.anchor.0, shift(selection.anchor.1)),
-            current: (selection.current.0, shift(selection.current.1)),
-            active: selection.active,
-        })
-    }
-
-    /// What a copy of the selection carries: the plain text of the selected
-    /// columns, with no styling and no padding.
-    pub fn selection_text(&self) -> String {
-        match self.transcript_selection() {
-            Some(selection) => selection.text(&self.last_rows),
-            None => String::new(),
-        }
-    }
-
     // ---- Editing ----------------------------------------------------------
 
     /// Delete the word before the caret: the run of spaces first, then the word
@@ -784,7 +678,7 @@ impl Chat {
     ///
     /// The primitive is `titi_tui::space_hold`'s, character-counted, so a
     /// multi-byte or wide character is one character and not one byte.
-    fn delete_word(&mut self) {
+    pub(crate) fn delete_word(&mut self) {
         let trailing = self
             .input
             .chars()
@@ -1018,149 +912,6 @@ impl Chat {
             Err(reason) => self.push(LineKind::Error, format!("mouse: not saved ({reason})")),
         }
         Applied::none()
-    }
-
-    pub fn on_key(&mut self, key: Key, now: Instant) -> Applied {
-        // The next key takes a standing selection away, the way every terminal
-        // does: the highlight is about the copy that just happened, not a mode.
-        self.clear_selection();
-        if self.approval.is_some() {
-            return self.approval_key(key);
-        }
-        if self.login_for.is_some() {
-            return self.login_key(key);
-        }
-        if self.theme_picker.is_some() {
-            return self.theme_picker_key(key, now);
-        }
-        if self.session_picker.is_some() {
-            return self.session_picker_key(key, now);
-        }
-        if self.session_search.is_some() {
-            return self.session_search_key(key, now);
-        }
-        if self.login_picker.is_some() {
-            return self.login_picker_key(key, now);
-        }
-        if self.model_picker.is_some() {
-            return self.model_picker_key(key, now);
-        }
-        if self.emoji_picker.is_visible() {
-            return self.emoji_picker_key(key, now);
-        }
-        if self.history_picker.is_some() {
-            return self.history_picker_key(key, now);
-        }
-        match key {
-            Key::CtrlC if self.turn_active => {
-                self.disarm();
-                Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
-            }
-            Key::CtrlC => self.arm_quit(now, CTRL_C_HINT),
-            Key::CtrlR => self.open_history(),
-            Key::CtrlX => self.open_session_picker(),
-            Key::AltM => {
-                self.open_model_picker();
-                Applied::none()
-            }
-            Key::CtrlD if self.input.is_empty() => Applied::effect(ChatEffect::Quit),
-            Key::Up if self.picking() => {
-                self.move_picker(-1);
-                Applied::none()
-            }
-            Key::Down if self.picking() => {
-                self.move_picker(1);
-                Applied::none()
-            }
-            Key::Tab if self.picking() => {
-                self.accept_picker();
-                Applied::none()
-            }
-            Key::Enter => {
-                // A space terminates an emoticon as it is typed; Enter is the
-                // other terminator, so the line reaches the transcript as the
-                // glyph rather than the keystrokes.
-                self.expand_trailing_emoticon();
-                let token = slash_token(&self.input).map(|(start, name)| (start, name.to_owned()));
-                if let Some((start, name)) = token {
-                    let at_line_start = self.input[..start].trim().is_empty();
-                    if at_line_start && name.is_empty() {
-                        return Applied::none();
-                    }
-                    let rows = picker_rows(self);
-                    let exact = rows.iter().any(|row| self.row_name(row) == name);
-                    if !exact && !rows.is_empty() {
-                        self.accept_picker();
-                        // Mid-sentence the message is not finished: complete
-                        // the token and let the next Enter send it.
-                        if !at_line_start {
-                            return Applied::none();
-                        }
-                    }
-                }
-                self.submit(now)
-            }
-            Key::DeleteWord => {
-                self.disarm();
-                self.delete_word();
-                self.sync_emoji_picker();
-                Applied::none()
-            }
-            Key::Backspace => {
-                self.disarm();
-                self.input.pop();
-                // The query may still stand after the pop (`:sm` from `:smi`),
-                // so the picker follows the text here too.
-                self.sync_emoji_picker();
-                self.picker = 0;
-                self.scroll_offset = 0;
-                Applied::none()
-            }
-            Key::Char(ch) => {
-                self.disarm();
-                self.type_char(ch);
-                self.picker = 0;
-                self.scroll_offset = 0;
-                Applied::none()
-            }
-            Key::Esc => self.escape(now),
-            // ↑ at an empty composer is the prompt history's (omp
-            // `app.history.search`); with text in the composer it scrolls the
-            // transcript, as it always has.
-            Key::Up if self.input.is_empty() => self.open_history(),
-            Key::Up => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                Applied::none()
-            }
-            Key::Down => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                Applied::none()
-            }
-            Key::PageUp => {
-                let h = self.last_transcript_height;
-                self.scroll_offset = self.scroll_offset.saturating_add(h.saturating_sub(1));
-                Applied::none()
-            }
-            Key::PageDown => {
-                let h = self.last_transcript_height;
-                self.scroll_offset = self.scroll_offset.saturating_sub(h.saturating_sub(1));
-                Applied::none()
-            }
-            Key::PageUpHalf => {
-                let h = self.last_transcript_height / 2;
-                self.scroll_offset = self.scroll_offset.saturating_add(h.max(1));
-                Applied::none()
-            }
-            Key::PageDownHalf => {
-                let h = self.last_transcript_height / 2;
-                self.scroll_offset = self.scroll_offset.saturating_sub(h.max(1));
-                Applied::none()
-            }
-            Key::CtrlD | Key::Tab => {
-                self.disarm();
-                Applied::none()
-            }
-        }
     }
 
     pub fn on_event(&mut self, event: EngineEvent) -> Applied {
@@ -1538,107 +1289,14 @@ impl Chat {
         }
     }
 
-    /// Insert pasted text into the composer. A paste is usually code or a
-    /// log, so its line breaks and tabs are kept — a `\r\n` or lone `\r`
-    /// becomes `\n` — and every other control character is dropped.
-    ///
-    /// More than [`PASTE_INLINE_MAX_LINES`] lines do not go into the draft at
-    /// all: the draft takes a one-line marker and the body is kept aside, so a
-    /// pasted stack trace cannot read as the prompt the user is writing (and
-    /// the one-row composer can show the whole draft). [`Chat::submit`] swaps
-    /// the two, and the transcript echoes the marker rather than the wall.
-    pub fn paste(&mut self, text: &str) {
-        if self.approval.is_some() {
-            return;
-        }
-        self.disarm();
-        // A pasted body is composer input, not a picker keystroke.
-        self.login_picker = None;
-        self.model_picker = None;
-        self.emoji_picker.hide();
-        let body = paste_body(text);
-        let lines = body.lines().count();
-        if lines <= PASTE_INLINE_MAX_LINES {
-            self.input.push_str(&body);
-            return;
-        }
-        self.next_paste += 1;
-        let marker = paste_marker(self.next_paste, lines);
-        self.pastes.insert(marker.clone(), body);
-        self.input.push_str(&marker);
-    }
-
-    /// The draft as it will be sent: every marker this draft holds replaced by
-    /// the body it stands for.
-    ///
-    /// A marker is expanded only where the registry has it, and a substituted
-    /// body is never scanned again, so text that merely looks like a marker —
-    /// or a marker left over from a draft the user has moved on from — stays
-    /// literal and can never ship a body from somewhere else.
-    fn expand_pastes(&self, draft: &str) -> String {
-        if self.pastes.is_empty() {
-            return draft.to_owned();
-        }
-        let mut out = String::with_capacity(draft.len());
-        let mut rest = draft;
-        while let Some(at) = rest.find(PASTE_MARKER_HEAD) {
-            out.push_str(&rest[..at]);
-            let tail = &rest[at..];
-            match self
-                .pastes
-                .iter()
-                .find(|(marker, _)| tail.starts_with(marker.as_str()))
-            {
-                Some((marker, body)) => {
-                    out.push_str(body);
-                    rest = &tail[marker.len()..];
-                }
-                None => {
-                    out.push_str(PASTE_MARKER_HEAD);
-                    rest = &tail[PASTE_MARKER_HEAD.len()..];
-                }
-            }
-        }
-        out.push_str(rest);
-        out
-    }
-
     /// Drop the draft — and the pasted bodies its markers stood for, so a
     /// marker cannot outlive the message it was pasted into.
-    fn clear_input(&mut self) {
+    pub(crate) fn clear_input(&mut self) {
         self.input.clear();
         self.pastes.clear();
     }
 
-    fn approval_key(&mut self, key: Key) -> Applied {
-        let Some(pending) = self.approval.clone() else {
-            return Applied::none();
-        };
-        match key {
-            Key::Char('y') | Key::Char('Y') | Key::Enter => {
-                self.approval = None;
-                Applied::effect(ChatEffect::Send(EngineCommand::ApproveTool {
-                    call_id: pending.call_id.into(),
-                    approved: true,
-                }))
-            }
-            Key::Char('n') | Key::Char('N') | Key::Esc => {
-                self.approval = None;
-                Applied::effect(ChatEffect::Send(EngineCommand::ApproveTool {
-                    call_id: pending.call_id.into(),
-                    approved: false,
-                }))
-            }
-            Key::CtrlC => {
-                self.approval = None;
-                self.disarm();
-                Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
-            }
-            _ => Applied::none(),
-        }
-    }
-
-    fn submit(&mut self, now: Instant) -> Applied {
+    pub(crate) fn submit(&mut self, now: Instant) -> Applied {
         // The draft as the screen has it — markers, not the walls they stand
         // for. Every decision below reads this, so a collapsed paste can never
         // be mistaken for a command the user typed.
@@ -1679,25 +1337,6 @@ impl Chat {
             self.begin_rate();
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
-    }
-
-    /// Esc. On a draft it clears the composer, as it always has; on an empty
-    /// composer a second press inside [`QUIT_WINDOW`] is the rewind chord
-    /// (omp `doubleEscapeAction`, default `rewind`), which is exactly what
-    /// `/rewind` does, so the chord and the command cannot drift.
-    fn escape(&mut self, now: Instant) -> Applied {
-        let armed = self.esc_armed.take();
-        self.disarm();
-        if !self.input.is_empty() {
-            self.clear_input();
-            self.picker = 0;
-            return Applied::none();
-        }
-        if armed.is_some_and(|at| now.saturating_duration_since(at) <= QUIT_WINDOW) {
-            return self.rewind("");
-        }
-        self.esc_armed = Some(now);
-        Applied::none()
     }
 
     /// A new turn for the rate estimate: no reading until this turn's own
@@ -2319,7 +1958,7 @@ impl Chat {
         Applied::send(EngineCommand::SwitchModel { model: next.into() }, None)
     }
 
-    fn rewind(&mut self, args: &str) -> Applied {
+    pub(crate) fn rewind(&mut self, args: &str) -> Applied {
         let index = match args {
             "" => Ok(None),
             other => other
@@ -2454,7 +2093,7 @@ impl Chat {
     ///
     /// The caret is the end of the buffer, so an expansion lands it directly
     /// after the glyph and nothing else has to move.
-    fn type_char(&mut self, ch: char) {
+    pub(crate) fn type_char(&mut self, ch: char) {
         let terminator = matches!(ch, ' ' | '\n' | '\r');
         let expansion = if terminator {
             titi_tui::emoji::try_expand_emoticon(&self.input)
@@ -2480,7 +2119,7 @@ impl Chat {
     /// Expand an emoticon sitting at the end of the composer, for the Enter
     /// terminator: the space case is handled as the space is typed, and Enter
     /// does the same before the line is sent.
-    fn expand_trailing_emoticon(&mut self) {
+    pub(crate) fn expand_trailing_emoticon(&mut self) {
         if let Some((start, glyph)) = titi_tui::emoji::try_expand_emoticon(&self.input) {
             self.input.truncate(start);
             self.input.push_str(glyph);
@@ -2666,7 +2305,7 @@ impl Chat {
     /// Typing while a login prompt is up. In OAuth mode the line is the
     /// pasted code or redirect URL and Enter hands it to the flow; otherwise
     /// it is the API key and Enter stores it.
-    fn login_key(&mut self, key: Key) -> Applied {
+    pub(crate) fn login_key(&mut self, key: Key) -> Applied {
         // The device grant finishes in the browser: there is no line to type,
         // so only the way out is read.
         let device = self
@@ -3577,51 +3216,9 @@ impl Chat {
         );
     }
 
-    fn arm_quit(&mut self, now: Instant, hint: &str) -> Applied {
-        if let Some(armed) = self.quit_armed
-            && now.saturating_duration_since(armed) <= QUIT_WINDOW
-        {
-            return Applied::effect(ChatEffect::Quit);
-        }
-        self.quit_armed = Some(now);
-        self.hint = hint.to_owned();
-        Applied::none()
-    }
-
-    /// Leaving from the composer: the bare word `exit`/`quit`/`q`, or
-    /// `/exit`/`/quit` (omp `input.bareExitOnEmptySession`).
-    ///
-    /// A session with nothing in it has nothing to keep, so the first word
-    /// leaves; once a turn is on the screen — finished or in flight — the
-    /// same word only arms the exit, and a second press inside
-    /// [`QUIT_WINDOW`] leaves. The window is the one Ctrl+C uses: one shape
-    /// for "press it twice to be sure", so both keys confirm the same intent.
-    fn exit_word(&mut self, now: Instant) -> Applied {
-        if !self.has_conversation() {
-            return Applied::effect(ChatEffect::Quit);
-        }
-        self.arm_quit(now, EXIT_HINT)
-    }
-
-    /// Whether the screen holds something a leave would give up: a finished
-    /// turn's lines, or one still in flight.
-    fn has_conversation(&self) -> bool {
-        self.turn_active
-            || self
-                .lines
-                .iter()
-                .any(|line| matches!(line.kind, LineKind::User | LineKind::Assistant))
-    }
-
     /// Say one thing above the composer until the next key.
-    fn set_hint(&mut self, text: String) {
+    pub(crate) fn set_hint(&mut self, text: String) {
         self.hint = text;
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        self.quit_armed = None;
-        self.esc_armed = None;
-        self.hint.clear();
     }
 
     /// The reply text streamed since the last entry written for this turn.
@@ -5654,36 +5251,6 @@ fn composer_view(input: &str) -> String {
     input.replace('\n', "↵").replace('\t', "    ")
 }
 
-/// A pasted body as the composer keeps it: `\r\n` and a lone `\r` become `\n`,
-/// tabs and newlines are kept — a paste is usually code or a log, so its line
-/// breaks and indentation are part of it — and every other control character
-/// is dropped.
-fn paste_body(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\n');
-            }
-            '\n' | '\t' => out.push(ch),
-            ch if ch.is_control() => {}
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
-/// The one-line stand-in a collapsed paste leaves in the draft:
-/// `[Paste #2 · 14 lines]`. One line, so the one-row composer can show the
-/// whole draft, and bracketed so it cannot read as prose the user typed.
-fn paste_marker(seq: u32, lines: usize) -> String {
-    format!("[Paste #{seq} · {lines} lines]")
-}
-
 fn fit_tail(text: &str, width: usize) -> String {
     if titi_tui::width::visible_width(text) <= width {
         return text.to_owned();
@@ -5747,39 +5314,6 @@ fn tail_chars(text: &str, max: usize) -> String {
         text.to_owned()
     } else {
         chars[chars.len() - max..].iter().collect()
-    }
-}
-
-fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
-    let control = modifiers.contains(KeyModifiers::CONTROL);
-    match code {
-        KeyCode::Char('c') if control => Some(Key::CtrlC),
-        KeyCode::Char('d') if control => Some(Key::CtrlD),
-        // The crate's table binds `app.session.switch` to ctrl+x and
-        // `app.model.select` to alt+m; a live screen that drops the modifier
-        // leaves both chords with nothing to reach.
-        KeyCode::Char('x') if control => Some(Key::CtrlX),
-        KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
-        KeyCode::Char('r') if control => Some(Key::CtrlR),
-        KeyCode::Char('w') if control => Some(Key::DeleteWord),
-        // The two ends of the keyboard's own word delete: the macOS chord and
-        // the readline one. Both are a word at a time, which the composer
-        // otherwise cannot do — backspace takes exactly one character.
-        KeyCode::Backspace if modifiers.contains(KeyModifiers::ALT) => Some(Key::DeleteWord),
-        KeyCode::Char(ch) if !control && !modifiers.contains(KeyModifiers::ALT) => {
-            Some(Key::Char(ch))
-        }
-        KeyCode::Backspace => Some(Key::Backspace),
-        KeyCode::Enter => Some(Key::Enter),
-        KeyCode::Esc => Some(Key::Esc),
-        KeyCode::Up => Some(Key::Up),
-        KeyCode::Down => Some(Key::Down),
-        KeyCode::Tab => Some(Key::Tab),
-        KeyCode::PageUp => Some(Key::PageUp),
-        KeyCode::PageDown => Some(Key::PageDown),
-        KeyCode::Char('u') if control => Some(Key::PageUpHalf),
-        KeyCode::Char('d') if control => Some(Key::PageDownHalf),
-        _ => None,
     }
 }
 
@@ -5848,90 +5382,6 @@ fn pump(
     chat.poll_hub();
     chat.poll_login();
     Ok(false)
-}
-
-/// The OS clipboard writers this build knows, in the order they are asked for.
-///
-/// The same three the old `App` read the clipboard with, so a copy lands in
-/// the one clipboard a terminal, a browser and an editor all share.
-const CLIPBOARD_WRITERS: &[(&str, &[&str])] = &[
-    ("pbcopy", &[]),
-    ("wl-copy", &[]),
-    ("xclip", &["-selection", "clipboard"]),
-];
-
-/// The file `bin` would be run from, if one is on `path`.
-///
-/// The capability check for the OS clipboard: a build with no `pbcopy` and no
-/// selection tool falls back to OSC 52 rather than spawning a program that is
-/// not there. `path` is passed in (not read from the environment here) so the
-/// check is a pure function of what it is given.
-fn executable_path(bin: &str, path: &str) -> Option<PathBuf> {
-    path.split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(bin))
-        .find(|candidate| candidate.is_file())
-}
-
-/// The first OS clipboard writer on `path`, resolved to the file that will be
-/// run — never the bare name, so the check and the spawn cannot disagree about
-/// which `pbcopy` answered.
-fn clipboard_writer(path: &str) -> Option<(&'static str, &'static [&'static str], PathBuf)> {
-    CLIPBOARD_WRITERS
-        .iter()
-        .find_map(|(bin, args)| executable_path(bin, path).map(|program| (*bin, *args, program)))
-}
-
-/// Hand `text` to the OS clipboard writer at `program`.
-///
-/// The child's stdin is taken and dropped before the wait: leaving the pipe
-/// open would leave `pbcopy` waiting for an end of input that never comes.
-fn write_to_clipboard(program: &Path, args: &[&str], text: &str) -> Result<(), String> {
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_owned())?;
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|error| error.to_string())?;
-    drop(stdin);
-    let status = child.wait().map_err(|error| error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{} exited with {status}", program.display()))
-    }
-}
-
-/// Put a copied selection where the user can paste it, and say where.
-///
-/// The OS writer when this machine has one; otherwise OSC 52, which the
-/// terminal itself puts on the clipboard the user is at — the route that works
-/// over SSH. A copy with no route at all still names itself, so a screen that
-/// copied nothing does not look like one that did. `path` is the search path
-/// the OS writer is looked for on.
-fn copy_selection(chat: &mut Chat, text: &str, path: &str) {
-    let chars = text.chars().count();
-    let route = match clipboard_writer(path) {
-        Some((bin, args, program)) => match write_to_clipboard(&program, args, text) {
-            Ok(()) => format!("copied {chars} chars · {bin}"),
-            Err(reason) => {
-                chat.output_flush
-                    .push_str(&titi_tui::caps::osc52_copy(text));
-                format!("copied {chars} chars · OSC 52 ({reason})")
-            }
-        },
-        None => {
-            chat.output_flush
-                .push_str(&titi_tui::caps::osc52_copy(text));
-            format!("copied {chars} chars · OSC 52")
-        }
-    };
-    chat.set_hint(route);
 }
 
 /// Writes one cast record, and stops recording if the file has gone bad.
