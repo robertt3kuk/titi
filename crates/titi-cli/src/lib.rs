@@ -13,3 +13,4 @@ pub mod ompcast;
 pub mod recap;
 pub mod secrets;
 pub mod session_log;
+pub mod title;

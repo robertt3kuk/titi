@@ -532,6 +532,13 @@ pub struct Chat {
     /// Whether the running turn's request carried a non-empty history. Read
     /// once at the turn's start (see [`Chat::begin_usage_ledger`]).
     turn_history: bool,
+    /// The running turn ended in a failure the screen showed. It holds until
+    /// the next turn starts, so the tab title says the turn broke rather than
+    /// that it is your turn.
+    turn_failed: bool,
+    /// The title the terminal was last given, so a tick that changes nothing
+    /// writes nothing (`crate::title`).
+    last_title: Option<String>,
 }
 
 impl Chat {
@@ -597,6 +604,8 @@ impl Chat {
             intro: None,
             turn_usage: None,
             turn_history: false,
+            turn_failed: false,
+            last_title: None,
         }
     }
 
@@ -950,6 +959,7 @@ impl Chat {
                 turn_id, message, ..
             } => {
                 self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
+                self.turn_failed = true;
                 if turn_id.is_some() && turn_id == self.active_turn_id {
                     self.finish_turn()
                 } else {
@@ -1207,11 +1217,54 @@ impl Chat {
     /// cache there is a provider's norm and not a miss worth naming.
     fn begin_usage_ledger(&mut self) {
         self.turn_usage = None;
+        self.turn_failed = false;
         self.turn_history = self.session_prompt_tokens > 0
             || self
                 .lines
                 .iter()
                 .any(|line| line.kind == LineKind::Assistant);
+    }
+
+    /// The run state the tab title should show.
+    fn title_state(&self) -> crate::title::TitleState {
+        use crate::title::TitleState;
+        if self.approval.is_some() || self.quit_armed.is_some() || self.login_for.is_some() {
+            return TitleState::Blocked;
+        }
+        if self.turn_failed {
+            return TitleState::Error;
+        }
+        if !self.turn_active {
+            return TitleState::Idle;
+        }
+        match self.phase {
+            WorkPhase::Waiting => TitleState::Waiting,
+            WorkPhase::Streaming => TitleState::Streaming,
+            WorkPhase::Thinking => TitleState::Thinking,
+            WorkPhase::Tool { .. } => TitleState::Tool,
+        }
+    }
+
+    /// The OSC 2 sequence for the current run state, or `None` when the
+    /// terminal is already showing it.
+    ///
+    /// Called from the run loop's own tick — the 50 ms poll the progress row
+    /// already rides — so the tab follows the turn without a timer of its own.
+    /// The title is a function of the state and the label and not of the
+    /// clock, so a tick that changes neither writes nothing at all.
+    fn title_tick(&mut self) -> Option<String> {
+        let glyphs = crate::title::TitleGlyphs::for_theme(&self.theme);
+        let label = if self.session_label.is_empty() {
+            short_model(&self.model)
+        } else {
+            self.session_label.clone()
+        };
+        let composed = crate::title::title(self.title_state(), &label, &glyphs);
+        if self.last_title.as_deref() == Some(composed.as_str()) {
+            return None;
+        }
+        self.last_title = Some(composed.clone());
+        Some(crate::title::set_title(&composed))
     }
 
     fn switch_model(&mut self, text: &str) -> Option<Applied> {
@@ -3389,6 +3442,14 @@ pub fn run(
         if pump(&mut engine, &mut chat, &session_log, &mut cast)? {
             break Ok(());
         }
+        // The tab title rides the same tick as the progress row: the sequence
+        // is written only when the run state changed, so a tick in an
+        // unchanged state writes nothing (crate::title).
+        if let Some(sequence) = chat.title_tick() {
+            let backend = screen.terminal.backend_mut();
+            backend.write_all(sequence.as_bytes())?;
+            backend.flush()?;
+        }
         // The screen can end up on another session mid-run (the switcher does),
         // and the file this run appends to has to move with it: a transcript
         // written to the session the user left is a conversation that is lost
@@ -3428,6 +3489,12 @@ impl Drop for Screen {
             ratatui::crossterm::cursor::Show,
             LeaveAlternateScreen
         );
+        // The tab goes back with the screen: an empty OSC 2 hands the title to
+        // the shell, the same way leaving the alternate screen hands back the
+        // pane.
+        let backend = self.terminal.backend_mut();
+        let _ = backend.write_all(crate::title::reset_title().as_bytes());
+        let _ = backend.flush();
     }
 }
 
@@ -9910,6 +9977,83 @@ mod tests {
         assert!(!frame.contains("prompt"), "{frame}");
         assert!(!frame.contains("cached"), "{frame}");
         assert!(!frame.contains("cache miss"), "{frame}");
+    }
+
+    /// The tab title follows the run state, and the tick writes it exactly
+    /// once per state change — never once per tick.
+    #[test]
+    fn the_title_is_written_once_per_state_change() {
+        let mut chat = chat();
+        // The first tick claims the tab: it is the user's turn.
+        let first = chat.title_tick().unwrap_or_default();
+        assert!(first.starts_with("\x1b]2;titi "), "{first:?}");
+        assert_eq!(first.matches('\x07').count(), 1, "{first:?}");
+
+        // Five ticks in the same state: not one of them writes.
+        let idle_writes = (0..5).filter(|_| chat.title_tick().is_some()).count();
+        assert_eq!(idle_writes, 0, "an unchanged tick writes nothing");
+
+        // The turn starts — before the first token — and the tab says working.
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now());
+        chat.phase = WorkPhase::Waiting;
+        let writes = (0..5).filter(|_| chat.title_tick().is_some()).count();
+        assert_eq!(
+            writes, 1,
+            "one write for the one state change, not per tick"
+        );
+        let working = chat.last_title.clone().unwrap_or_default();
+        assert!(working.contains("titi "), "{working}");
+
+        // Every working phase is the same title: still no second write.
+        chat.phase = WorkPhase::Streaming;
+        assert!(chat.title_tick().is_none(), "{working}");
+        chat.phase = WorkPhase::Thinking;
+        assert!(chat.title_tick().is_none());
+        chat.phase = WorkPhase::Tool {
+            call_id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            detail: None,
+            since: Instant::now(),
+        };
+        assert!(
+            chat.title_tick().is_some(),
+            "a running tool is its own state"
+        );
+
+        // The turn ends: the tab goes back to the user's turn.
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let ended = chat.title_tick();
+        assert!(ended.is_some(), "the turn ended");
+        assert!(chat.title_tick().is_none());
+    }
+
+    /// A failed turn leaves the tab saying so, and the next turn clears it.
+    #[test]
+    fn a_failed_turn_shows_in_the_title_until_the_next_one() {
+        use crate::title::TitleState;
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::Failed {
+            turn_id: Some(TurnId(1)),
+            reason: titi_providers::ErrorReason::Connection,
+            message: "no route to host".into(),
+        });
+        assert_eq!(chat.title_state(), TitleState::Error);
+        let failed = chat.title_tick().unwrap_or_default();
+        assert!(failed.contains('✘'), "the error mark: {failed:?}");
+        assert!(chat.title_tick().is_none());
+
+        type_text(&mut chat, "again");
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.title_state(), TitleState::Waiting);
+        assert!(chat.title_tick().is_some(), "the next turn clears the tab");
     }
 
     /// The key hints are not what the status row replaces: whatever the row
