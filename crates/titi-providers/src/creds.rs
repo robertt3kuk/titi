@@ -477,6 +477,8 @@ mod tests {
             },
             TransportError::Stalled {
                 phase: crate::transport::StallPhase::Idle,
+                model: "m".into(),
+                waited: std::time::Duration::from_millis(1),
             },
         ];
         for err in not_rate_limits {

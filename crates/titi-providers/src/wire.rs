@@ -15,7 +15,8 @@ use crate::http::{BodyChunk, HttpFetch, HttpRequest, ReqwestFetch};
 use crate::sse::{SseDecoder, SseFrame};
 use crate::stream::{ErrorReason, StopReason, StreamEvent};
 use crate::transport::{
-    ApiKind, EventStream, RequestCtx, Role, Transport, TransportError, WatchdogConfig, WireRequest,
+    ApiKind, EventStream, RequestCtx, Role, StallPhase, Transport, TransportError, WatchdogConfig,
+    WireRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -650,6 +651,11 @@ struct PumpState {
     usage_seen: bool,
     /// How long a held `Done` waits for the rest of the stream.
     grace: std::time::Duration,
+    /// How long the next chunk may be silent before the reply counts as
+    /// stalled.
+    idle: std::time::Duration,
+    /// The model this stream belongs to, for the stall message.
+    model: SmolStr,
 }
 
 impl PumpState {
@@ -717,12 +723,16 @@ impl PumpState {
 /// Pump raw body bytes into normalized events.
 ///
 /// A `Done` that comes before any usage report waits up to `grace` for the
-/// count to follow, then goes out with or without it.
+/// count to follow, then goes out with or without it. Between chunks the
+/// stream may be silent for at most `watchdog.idle_timeout` before the reply
+/// is reported as stalled. The first-event timeout is applied by
+/// `FamilyTransport::stream` before this pump starts.
 pub fn sse_event_stream(
     body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
     api: ApiKind,
     policy: StreamDecodePolicy,
-    grace: std::time::Duration,
+    watchdog: WatchdogConfig,
+    model: SmolStr,
 ) -> impl Stream<Item = StreamEvent> + Send {
     let family = match api {
         ApiKind::AnthropicMessages => FamilyDecoder::Anthropic(Default::default()),
@@ -742,7 +752,9 @@ pub fn sse_event_stream(
             ended: false,
             held: None,
             usage_seen: false,
-            grace,
+            grace: watchdog.post_finish_grace,
+            idle: watchdog.idle_timeout,
+            model,
         },
         pump_step,
     )
@@ -767,18 +779,27 @@ async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
             state.ended = true;
             return Some((last, state));
         }
-        let next = if state.held.is_some() {
-            match tokio::time::timeout(state.grace, state.body.next()).await {
-                Ok(next) => next,
-                // The server keeps the response open after the finish; the
-                // answer is complete without the count.
-                Err(_) => {
-                    state.done = true;
-                    continue;
-                }
-            }
+        let limit = if state.held.is_some() {
+            state.grace
         } else {
-            state.body.next().await
+            state.idle
+        };
+        let next = match read_next(&mut state.body, limit).await {
+            // The server keeps the response open after the finish; the answer
+            // is complete without the count.
+            ReadStep::Idle if state.held.is_some() => {
+                state.done = true;
+                continue;
+            }
+            ReadStep::Idle => {
+                state.done = true;
+                state.queued.push_back(StreamEvent::Error {
+                    reason: ErrorReason::Connection,
+                    message: stall_message(&state.model, state.idle),
+                });
+                continue;
+            }
+            ReadStep::Chunk(next) => next,
         };
         match next {
             Some(Ok(chunk)) => {
@@ -809,6 +830,34 @@ async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
             }
         }
     }
+}
+
+/// One step of waiting for a body chunk.
+enum ReadStep {
+    /// The body produced an item, or ended (`None`).
+    Chunk(Option<Result<BodyChunk, String>>),
+    /// Nothing arrived within the limit.
+    Idle,
+}
+
+/// Wait for the next body chunk, or the limit, whichever comes first. This is
+/// the one place a silent server can be waited on, so the watchdog resolves
+/// here rather than at the mercy of the socket.
+async fn read_next(
+    body: &mut Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
+    limit: std::time::Duration,
+) -> ReadStep {
+    match tokio::time::timeout(limit, body.next()).await {
+        Ok(next) => ReadStep::Chunk(next),
+        Err(_) => ReadStep::Idle,
+    }
+}
+
+/// The words for a mid-stream stall: which model, and how long it was silent.
+fn stall_message(model: &str, waited: std::time::Duration) -> SmolStr {
+    SmolStr::new(format!(
+        "the reply from {model} stalled for {waited:?} mid-stream"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +955,7 @@ pub struct FamilyTransport {
     api: ApiKind,
     base_url: SmolStr,
     fetch: Arc<dyn HttpFetch>,
+    watchdog: WatchdogConfig,
 }
 
 impl FamilyTransport {
@@ -914,17 +964,28 @@ impl FamilyTransport {
             api,
             base_url: base_url.into(),
             fetch,
+            watchdog: WatchdogConfig::default(),
         }
+    }
+
+    /// Override the declared watchdog timings. The defaults are the
+    /// production ones; tests give themselves short windows this way rather
+    /// than by reaching for a process-global.
+    pub fn with_watchdog(mut self, watchdog: WatchdogConfig) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     pub fn with_default_fetch(
         api: ApiKind,
         base_url: impl Into<SmolStr>,
     ) -> Result<Self, TransportError> {
+        let watchdog = WatchdogConfig::default();
         Ok(Self {
             api,
             base_url: base_url.into(),
-            fetch: Arc::new(ReqwestFetch::new()?),
+            fetch: Arc::new(ReqwestFetch::with_watchdog(&watchdog)?),
+            watchdog,
         })
     }
 }
@@ -936,7 +997,7 @@ impl Transport for FamilyTransport {
     }
 
     fn watchdog(&self) -> WatchdogConfig {
-        WatchdogConfig::default()
+        self.watchdog.clone()
     }
 
     async fn stream(
@@ -961,11 +1022,31 @@ impl Transport for FamilyTransport {
                 }
             });
         }
+        let watchdog = self.watchdog.clone();
+        let model = req.model.clone();
+        // The first-event timeout is the one the caller can be told about in
+        // typed form: a server that opens the response and then says nothing
+        // is the documented stall, and `stream` is still on the stack to
+        // return it. The chunk, if any, goes back in front of the body.
+        let mut body = resp.body;
+        let first = match read_next(&mut body, watchdog.first_event_timeout).await {
+            ReadStep::Chunk(item) => item,
+            ReadStep::Idle => {
+                return Err(TransportError::Stalled {
+                    phase: StallPhase::FirstEvent,
+                    model,
+                    waited: watchdog.first_event_timeout,
+                });
+            }
+        };
+        let body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>> =
+            Box::pin(futures::stream::iter(first).chain(body));
         Ok(Box::pin(sse_event_stream(
-            resp.body,
+            body,
             self.api,
             StreamDecodePolicy::default(),
-            self.watchdog().post_finish_grace,
+            watchdog,
+            model,
         )))
     }
 }
@@ -1893,6 +1974,12 @@ mod tests {
 
     async fn completions_events(fetch: Arc<dyn HttpFetch>) -> Vec<StreamEvent> {
         let transport = FamilyTransport::new(ApiKind::OpenAiCompletions, "http://x/v1", fetch);
+        collect_from(transport).await
+    }
+
+    /// Drive an already-built transport to its end, with a wall-clock guard so
+    /// a test that hangs fails instead of wedging the suite.
+    async fn collect_from(transport: FamilyTransport) -> Vec<StreamEvent> {
         let stream = match transport
             .stream(req(), RequestCtx::with_key("sk-test"))
             .await
@@ -1903,6 +1990,44 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(60), stream.collect())
             .await
             .expect("the stream must end on its own")
+    }
+
+    /// A body that emits its chunks with a real pause before each one, so an
+    /// idle window can be exercised without a live socket.
+    struct SlowFetch {
+        chunks: Vec<String>,
+        gap: std::time::Duration,
+    }
+
+    impl HttpFetch for SlowFetch {
+        fn fetch<'a>(
+            &'a self,
+            _req: HttpRequest,
+        ) -> futures::future::BoxFuture<'a, Result<crate::http::HttpResponse, TransportError>>
+        {
+            let chunks = self.chunks.clone();
+            let gap = self.gap;
+            Box::pin(async move {
+                let body =
+                    futures::stream::unfold(chunks.into_iter(), move |mut rest| async move {
+                        tokio::time::sleep(gap).await;
+                        rest.next()
+                            .map(|chunk| (Ok::<BodyChunk, String>(chunk.into_bytes()), rest))
+                    });
+                Ok(crate::http::HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Box::pin(body),
+                })
+            })
+        }
+    }
+
+    /// A watched transport with test-sized windows, and the model it will ask
+    /// for.
+    fn watched(fetch: Arc<dyn HttpFetch>, watchdog: WatchdogConfig) -> FamilyTransport {
+        FamilyTransport::new(ApiKind::OpenAiCompletions, "http://x/v1", fetch)
+            .with_watchdog(watchdog)
     }
 
     fn assert_ends_once(events: &[StreamEvent]) {
@@ -2030,6 +2155,101 @@ mod tests {
                 })
             ),
             "{events:?}"
+        );
+    }
+
+    fn short_watchdog(first: std::time::Duration, idle: std::time::Duration) -> WatchdogConfig {
+        WatchdogConfig {
+            first_event_timeout: first,
+            idle_timeout: idle,
+            ..WatchdogConfig::default()
+        }
+    }
+
+    /// The audited hang: a server opens the response and never sends a byte.
+    /// The read must give up inside the configured window and say which model
+    /// and how long it waited, not hold the turn until the process dies.
+    #[tokio::test]
+    async fn a_body_that_never_starts_stalls_at_the_first_event_timeout() {
+        let window = std::time::Duration::from_millis(40);
+        let fetch = Arc::new(TailFetch {
+            chunks: Vec::new(),
+            tail: Tail::Hang,
+        });
+        let transport = watched(fetch, short_watchdog(window, window));
+        let started = std::time::Instant::now();
+        match transport
+            .stream(req(), RequestCtx::with_key("sk-test"))
+            .await
+        {
+            Err(TransportError::Stalled {
+                phase,
+                model,
+                waited,
+            }) => {
+                assert_eq!(phase, StallPhase::FirstEvent);
+                assert_eq!(model, "gpt-test");
+                assert_eq!(waited, window);
+            }
+            Ok(_) => panic!("a stalled open must not return a stream"),
+            Err(other) => panic!("expected a first-event stall, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed >= window, "gave up too early: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A slow server is not a stalled one: a chunk every 10ms stays under a
+    /// 50ms idle window from open to finish, and the reply arrives whole.
+    #[tokio::test]
+    async fn a_chunk_inside_the_idle_window_keeps_the_stream_alive() {
+        let fetch = Arc::new(SlowFetch {
+            chunks: vec![says("a"), says("b"), finish()],
+            gap: std::time::Duration::from_millis(10),
+        });
+        let transport = watched(
+            fetch,
+            short_watchdog(
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(50),
+            ),
+        );
+        let events = collect_from(transport).await;
+        assert_ends_once(&events);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Error { .. })),
+            "{events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab");
+    }
+
+    /// A gap wider than the idle window ends the reply as a connection error
+    /// naming the model and the waited time, rather than hanging.
+    #[tokio::test]
+    async fn a_gap_wider_than_the_idle_window_is_reported_as_stalled() {
+        let gap = std::time::Duration::from_millis(200);
+        let idle = std::time::Duration::from_millis(40);
+        let fetch = Arc::new(SlowFetch {
+            chunks: vec![says("a"), says("b"), finish()],
+            gap,
+        });
+        let transport = watched(fetch, short_watchdog(gap * 4, idle));
+        let events = collect_from(transport).await;
+        assert_eq!(
+            events.last(),
+            Some(&StreamEvent::Error {
+                reason: ErrorReason::Connection,
+                message: "the reply from gpt-test stalled for 40ms mid-stream".into(),
+            })
         );
     }
 }

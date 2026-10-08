@@ -380,6 +380,8 @@ mod tests {
         let mut c = chain();
         let stalled = TransportError::Stalled {
             phase: crate::transport::StallPhase::Idle,
+            model: "m".into(),
+            waited: std::time::Duration::from_millis(1),
         };
         assert!(c.next(&stalled).is_some());
     }

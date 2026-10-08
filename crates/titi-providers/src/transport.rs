@@ -134,8 +134,14 @@ pub enum TransportError {
         status: Option<u16>,
         message: SmolStr,
     },
-    /// Watchdog: no first event or too long between events.
-    Stalled { phase: StallPhase },
+    /// Watchdog: no first event or too long between events. `model` and
+    /// `waited` are what the person needs to see: which endpoint was silent
+    /// and for how long.
+    Stalled {
+        phase: StallPhase,
+        model: SmolStr,
+        waited: Duration,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,10 +181,20 @@ impl std::fmt::Display for TransportError {
             } => write!(f, "rejected: {message}"),
             TransportError::Stalled {
                 phase: StallPhase::FirstEvent,
-            } => f.write_str("no reply before the first-event timeout"),
+                model,
+                waited,
+            } => write!(
+                f,
+                "no reply from {model} within {waited:?} (first-event timeout)"
+            ),
             TransportError::Stalled {
                 phase: StallPhase::Idle,
-            } => f.write_str("the reply stalled mid-stream"),
+                model,
+                waited,
+            } => write!(
+                f,
+                "the reply from {model} stalled for {waited:?} mid-stream"
+            ),
         }
     }
 }
@@ -258,7 +274,9 @@ mod tests {
         );
         assert!(
             TransportError::Stalled {
-                phase: StallPhase::Idle
+                phase: StallPhase::Idle,
+                model: "m".into(),
+                waited: Duration::from_millis(1),
             }
             .is_retryable()
         );
@@ -320,14 +338,18 @@ mod tests {
             (
                 TransportError::Stalled {
                     phase: StallPhase::FirstEvent,
+                    model: "gpt-x".into(),
+                    waited: Duration::from_secs(120),
                 },
-                "no reply before the first-event timeout",
+                "no reply from gpt-x within 120s (first-event timeout)",
             ),
             (
                 TransportError::Stalled {
                     phase: StallPhase::Idle,
+                    model: "gpt-x".into(),
+                    waited: Duration::from_secs(60),
                 },
-                "the reply stalled mid-stream",
+                "the reply from gpt-x stalled for 60s mid-stream",
             ),
         ];
         for (error, expected) in cases {
