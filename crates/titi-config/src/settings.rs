@@ -117,6 +117,16 @@ pub const TERMINAL_PROGRESS_KEY: &str = "terminal.progress";
 /// counts and is an estimate, not a provider count.
 pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 
+/// Whether the composer is edited the vim way: Esc leaves Insert for Normal,
+/// and Normal has vim's motions and edits over the draft.
+///
+/// Unset means **off**, unlike the cosmetic switches above: a key that changes
+/// what typing does is not turned on by a config that says nothing, so a typo
+/// in this name cannot make the composer swallow a draft. omp's `tui.vimMode`
+/// is the same switch, off by default and named for the same surface
+/// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
+pub const EDITOR_VIM_KEY: &str = "editor.vim";
+
 /// Whether a finished turn's footer names its wall time.
 ///
 /// Unset means on. The footer is the dim row under the answer; this is the
@@ -566,6 +576,27 @@ pub fn switch_off(settings: &Settings, key: &str) -> bool {
         Some(Value::Bool(on)) => !on,
         Some(Value::String(text)) => {
             matches!(text.to_ascii_lowercase().as_str(), "off" | "false" | "no")
+        }
+        Some(_) => false,
+    }
+}
+
+/// Whether an off-by-default switch is on at `key`.
+///
+/// The mirror of [`switch_off`], for a switch whose being on *changes* what
+/// the screen does rather than taking a channel away ([`EDITOR_VIM_KEY`]):
+/// unset means off, a JSON `true` means on, and the strings `on`/`true`/`yes`
+/// (case-insensitive) mean on. Anything else — a number, a list, `maybe` —
+/// leaves it off, because a typo in a key like this must not quietly change
+/// how the composer reads a keystroke.
+///
+/// Read through the effective view, so a project file can set it too.
+pub fn switch_on(settings: &Settings, key: &str) -> bool {
+    match settings.get(key) {
+        None => false,
+        Some(Value::Bool(on)) => on,
+        Some(Value::String(text)) => {
+            matches!(text.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
         }
         Some(_) => false,
     }

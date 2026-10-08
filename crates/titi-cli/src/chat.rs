@@ -450,6 +450,11 @@ pub struct Chat {
     /// The number the next paste marker carries: monotonic for the run, so two
     /// markers in one draft can never stand for the same body.
     pub(crate) next_paste: u32,
+    /// The vim keys, when `editor.vim` asks for them: which mode the draft is
+    /// in and what is half-typed. `None` — the setting off, which is the
+    /// default — is what makes every path in [`crate::vim`] unreachable, so
+    /// the composer answers keys exactly as it did before the mode existed.
+    pub(crate) vim: Option<crate::vim::VimState>,
     pub(crate) turn_active: bool,
     /// When the running turn was asked for. `Some` exactly while
     /// `turn_active`: the status row above the composer reads it for the
@@ -689,6 +694,7 @@ impl Chat {
             caret: 0,
             pastes: HashMap::new(),
             next_paste: 0,
+            vim: None,
             turn_active: false,
             turn_started: None,
             phase: WorkPhase::Waiting,
@@ -885,7 +891,7 @@ impl Chat {
     /// A marker is one unit to the caret: it stands for a body the person
     /// pasted, so a caret inside one, or a backspace through one, would leave
     /// text that no longer stands for anything.
-    fn marker_spans(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn marker_spans(&self) -> Vec<(usize, usize)> {
         let mut spans: Vec<(usize, usize)> = self
             .pastes
             .keys()
@@ -901,7 +907,7 @@ impl Chat {
 
     /// The nearest offset outside every marker, travelling `forward`: an offset
     /// that would land inside one is pushed to the end it was heading for.
-    fn skip_markers(&self, at: usize, forward: bool) -> usize {
+    pub(crate) fn skip_markers(&self, at: usize, forward: bool) -> usize {
         for (start, end) in self.marker_spans() {
             if at > start && at < end {
                 return if forward { end } else { start };
@@ -919,7 +925,7 @@ impl Chat {
     /// character, the word, the whole prefix — so the rule is stated once. A
     /// range that merely *touches* a marker (ends where it begins, begins
     /// where it ends) is left alone: it cuts nothing of it.
-    fn whole_markers(&self, start: usize, end: usize) -> (usize, usize) {
+    pub(crate) fn whole_markers(&self, start: usize, end: usize) -> (usize, usize) {
         let mut start = start;
         let mut end = end;
         for (at, to) in self.marker_spans() {
@@ -936,7 +942,7 @@ impl Chat {
     /// A marker that was cut away stands for nothing, so its body goes with
     /// it: a paste that is gone from the screen must not stay alive in the
     /// registry of a draft that can no longer expand it.
-    fn forget_cut_markers(&mut self) {
+    pub(crate) fn forget_cut_markers(&mut self) {
         let gone: Vec<String> = self
             .pastes
             .keys()
@@ -1712,6 +1718,11 @@ impl Chat {
         self.input.clear();
         self.pastes.clear();
         self.caret = 0;
+        // A half-typed vim command (`2d`) is about the draft that just went
+        // away, so it goes with it.
+        if let Some(state) = self.vim.as_mut() {
+            *state = state.cleared();
+        }
     }
 
     pub(crate) fn submit(&mut self, now: Instant) -> Applied {
@@ -2507,7 +2518,14 @@ impl Chat {
     /// table is `keys.rs`'s, beside the `on_key` that answers those keys, so
     /// the listing and the screen cannot be written twice (`hotkey_lines`).
     fn hotkeys(&mut self) -> Applied {
-        for line in hotkey_lines() {
+        // The vim rows only while the mode is on: a mode the config did not
+        // ask for must not read as a binding the screen answers.
+        let vim = if self.vim.is_some() {
+            crate::vim::VIM_HOTKEYS
+        } else {
+            &[]
+        };
+        for line in hotkey_lines(vim) {
             self.push(LineKind::Note, line);
         }
         Applied::none()
@@ -3864,6 +3882,14 @@ pub fn run(
         .as_ref()
         .and_then(|settings| settings.paste_menu_threshold())
         .unwrap_or(PASTE_MENU_AFTER);
+    // The vim keys, off unless `editor.vim` asks for them: a switch that
+    // changes what typing does is not turned on by a config that says nothing.
+    chat.vim = settings
+        .as_ref()
+        .is_some_and(|settings| {
+            titi_config::settings::switch_on(settings, titi_config::settings::EDITOR_VIM_KEY)
+        })
+        .then(crate::vim::VimState::default);
     // The status line's preset and gauge come from the same settings, resolved
     // before the first frame: an unknown or unset name is `default`/`off`, so a
     // typo in a cosmetic key changes nothing and never refuses to start.
@@ -5274,6 +5300,39 @@ mod tests {
 
     fn chat() -> Chat {
         chat_with_theme(test_theme())
+    }
+
+    /// A chat with the vim keys on (`editor.vim`), in Insert mode: what the
+    /// setting produces at startup, and where every vim test starts.
+    fn vim_chat() -> Chat {
+        let mut chat = chat();
+        chat.vim = Some(crate::vim::VimState::default());
+        chat
+    }
+
+    /// The same, with Normal already entered — Esc, the way a person gets
+    /// there.
+    fn vim_normal_chat() -> Chat {
+        let mut chat = vim_chat();
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        chat
+    }
+
+    /// A Normal-mode chat with `text` in the draft: typed in Insert, then Esc,
+    /// which is how a person gets there. The caret is left where Esc leaves
+    /// it — one character back, over a paste marker whole.
+    fn vim_normal_with(text: &str) -> Chat {
+        let mut chat = vim_chat();
+        type_text(&mut chat, text);
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        chat
+    }
+
+    /// One Normal-mode key.
+    fn vim_key(chat: &mut Chat, ch: char) -> Applied {
+        chat.on_key(Key::Char(ch), Instant::now())
     }
 
     /// Pins the invariant the helper above exists for: no helper-built chat
@@ -10880,9 +10939,16 @@ mod tests {
                 .join("\n"),
         );
 
+        // The vim mode, on: Normal swallows printable keys, so a character
+        // that types in every other state moves the caret in this one.
+        let mut vimming = chat();
+        vimming.vim = Some(crate::vim::VimState::default());
+
         vec![
             ("bare", chat()),
             ("draft", draft),
+            ("vim insert", vimming),
+            ("vim normal", vim_normal_chat()),
             ("list", list),
             ("turn", turn),
             ("approval", approval),
@@ -10982,7 +11048,6 @@ mod tests {
     /// single `Key` a probe can press.
     #[test]
     fn every_key_the_screen_answers_is_named_in_the_hotkeys_listing() {
-        let listing = hotkey_lines();
         let now = Instant::now();
         let mut unlisted: Vec<String> = Vec::new();
         for key in pressable_keys() {
@@ -10990,6 +11055,13 @@ mod tests {
                 continue;
             };
             for (state, mut chat) in probe_chats() {
+                // Each state is checked against the listing its own config
+                // prints: the vim rows are there only while the mode is on.
+                let listing = if chat.vim.is_some() {
+                    hotkey_lines(crate::vim::VIM_HOTKEYS)
+                } else {
+                    hotkey_lines(&[])
+                };
                 let before = key_fingerprint(&chat);
                 let applied = chat.on_key(key, now);
                 let answered = key_fingerprint(&chat) != before || applied.effect.is_some();
@@ -15365,6 +15437,442 @@ mod tests {
             frame.contains("▍xxx"),
             "the caret is in the middle: {frame}"
         );
+    }
+
+    /// The setting is off unless it is asked for: with `editor.vim` unset the
+    /// composer is exactly the composer it was, and no key here is special.
+    #[test]
+    fn without_the_setting_the_composer_is_the_one_it_always_was() {
+        let mut chat = chat();
+        assert_eq!(chat.vim_mode(), None, "off by default");
+        // Every key of the vim vocabulary types or edits as it always has:
+        // `h` is a letter, `0` is a digit, Esc clears the draft.
+        for ch in "hlwbe0^$xXdcDCsSiIaA".chars() {
+            type_text(&mut chat, &ch.to_string());
+        }
+        assert_eq!(chat.input, "hlwbe0^$xXdcDCsSiIaA");
+        assert_eq!(chat.caret(), chat.input.len(), "the caret is at the end");
+        assert!(chat.on_key(Key::Esc, Instant::now()).effect.is_none());
+        assert_eq!(chat.input, "", "Esc still clears the draft");
+        // And the listing has no vim block.
+        assert!(
+            !hotkey_lines(&[])
+                .iter()
+                .any(|line| line.contains("editor.vim")),
+            "the vim rows are not listed while the mode is off"
+        );
+    }
+
+    /// Esc leaves Insert for Normal and steps the caret back one, the way
+    /// vim's does; `i`, `a`, `I` and `A` come back at the right place.
+    #[test]
+    fn esc_enters_normal_and_the_insert_keys_come_back_where_they_say() {
+        let mut chat = vim_chat();
+        type_text(&mut chat, "one two");
+        assert_eq!(chat.caret(), 7);
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        assert_eq!(chat.caret(), 6, "the caret steps back one");
+
+        // `i` at the caret, and Insert types there.
+        vim_key(&mut chat, 'i');
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+        assert_eq!(chat.caret(), 6);
+        type_text(&mut chat, "X");
+        assert_eq!(chat.input, "one twXo");
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.caret(), 6, "and Esc steps back over it");
+
+        // `a` after the character under the caret.
+        vim_key(&mut chat, 'a');
+        assert_eq!(chat.caret(), 7, "after the character under the caret");
+
+        // `I` at the first non-blank, `A` at the end.
+        chat.on_key(Key::Esc, Instant::now());
+        vim_key(&mut chat, 'I');
+        assert_eq!(chat.caret(), 0);
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.caret(), 0, "nothing before the first character");
+        vim_key(&mut chat, 'A');
+        assert_eq!(chat.caret(), 8);
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+
+        // And Normal swallows a printable key rather than typing it.
+        chat.on_key(Key::Esc, Instant::now());
+        vim_key(&mut chat, 'z');
+        assert_eq!(chat.input, "one twXo", "nothing was typed");
+    }
+
+    /// The motions, through the key path: a character, a word, and the three
+    /// edges of the draft.
+    #[test]
+    fn normal_motions_move_the_caret() {
+        let mut chat = vim_normal_with("one two");
+        assert_eq!(chat.caret(), 6, "where Esc left it");
+
+        vim_key(&mut chat, 'h');
+        assert_eq!(chat.caret(), 5, "h");
+        vim_key(&mut chat, 'l');
+        assert_eq!(chat.caret(), 6, "l");
+        vim_key(&mut chat, 'b');
+        assert_eq!(chat.caret(), 4, "b: the word before");
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.caret(), 7, "w: the next word's start");
+        vim_key(&mut chat, '0');
+        assert_eq!(chat.caret(), 0, "0");
+        vim_key(&mut chat, '$');
+        assert_eq!(chat.caret(), 7, "$");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'e');
+        assert_eq!(chat.caret(), 2, "e: the end of the word");
+
+        // `^` skips the spaces the draft opens with.
+        let mut chat = vim_normal_with("   two");
+        vim_key(&mut chat, '0');
+        assert_eq!(chat.caret(), 0);
+        vim_key(&mut chat, '^');
+        assert_eq!(chat.caret(), 3, "^: the first non-blank");
+    }
+
+    /// A count repeats the motion: `3w`, and a digit that extends one.
+    #[test]
+    fn a_count_repeats_the_motion() {
+        let mut chat = vim_normal_with("a b c d");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, '3');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.caret(), 6, "3w");
+        vim_key(&mut chat, '1');
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'h');
+        assert_eq!(chat.caret(), 0, "10h past the start stops there");
+        vim_key(&mut chat, '2');
+        vim_key(&mut chat, 'l');
+        assert_eq!(chat.caret(), 2, "2l");
+    }
+
+    /// The edits: the character under the caret and the one before it, with
+    /// the caret left where vim leaves it.
+    #[test]
+    fn normal_edits_take_the_character_under_the_caret() {
+        let mut chat = vim_normal_with("abc");
+        assert_eq!(chat.caret(), 2);
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'x');
+        assert_eq!(chat.input, "bc", "x");
+        assert_eq!(chat.caret(), 0);
+        vim_key(&mut chat, 'X');
+        assert_eq!(chat.input, "bc", "X at the start takes nothing");
+        vim_key(&mut chat, 'l');
+        vim_key(&mut chat, 'X');
+        assert_eq!(chat.input, "c", "X");
+        assert_eq!(chat.caret(), 0);
+
+        // `2x` takes two characters, and `s` opens Insert where they were.
+        let mut chat = vim_normal_with("abcd");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, '2');
+        vim_key(&mut chat, 'x');
+        assert_eq!(chat.input, "cd", "2x");
+        assert_eq!(
+            chat.vim_mode(),
+            Some(crate::vim::VimMode::Normal),
+            "x stays"
+        );
+        vim_key(&mut chat, 's');
+        assert_eq!(chat.input, "d", "s takes the character under the caret");
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+        type_text(&mut chat, "Z");
+        assert_eq!(chat.input, "Zd");
+    }
+
+    /// The operators with a motion: `dw`, `db`, and the whole draft for `dd`.
+    #[test]
+    fn normal_operators_take_a_motion() {
+        let mut chat = vim_normal_with("one two three");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.input, "two three", "dw");
+        assert_eq!(chat.caret(), 0);
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'b');
+        assert_eq!(chat.input, "two three", "db at the start takes nothing");
+
+        vim_key(&mut chat, 'l');
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'b');
+        assert_eq!(chat.input, "wo three", "db takes the word before");
+
+        // `dd` is the whole draft, and `2dw` is the motion with a count.
+        let mut chat = vim_normal_with("one two three");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, '2');
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.input, "three", "2dw");
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'd');
+        assert_eq!(chat.input, "", "dd");
+        assert_eq!(chat.caret(), 0);
+    }
+
+    /// The change operators open Insert where the text was: `cw`, `cc`, `C`
+    /// and `S`. `cw` keeps vim's quirk — on a word it stops at the word's end
+    /// rather than taking the space after it.
+    #[test]
+    fn normal_changes_open_insert_where_the_text_was() {
+        let mut chat = vim_normal_with("one two");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'c');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.input, " two", "cw: the word, not the space after it");
+        assert_eq!(chat.caret(), 0);
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+        type_text(&mut chat, "ONE");
+        assert_eq!(chat.input, "ONE two");
+
+        // `C` takes the tail of the draft, `cc` and `S` take all of it.
+        let mut chat = vim_normal_with("one two");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'l');
+        vim_key(&mut chat, 'C');
+        assert_eq!(chat.input, "o", "C: to the end");
+        assert_eq!(chat.caret(), 1);
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+
+        for key in ['c', 'S'] {
+            let mut chat = vim_normal_with("one two");
+            vim_key(&mut chat, key);
+            if key == 'c' {
+                vim_key(&mut chat, 'c');
+            }
+            assert_eq!(chat.input, "", "{key}: the whole draft");
+            assert_eq!(chat.caret(), 0);
+            assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Insert));
+        }
+
+        // `D` takes the tail and stays in Normal.
+        let mut chat = vim_normal_with("one two");
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'D');
+        assert_eq!(chat.input, "");
+        assert_eq!(
+            chat.vim_mode(),
+            Some(crate::vim::VimMode::Normal),
+            "D stays"
+        );
+    }
+
+    /// The named keys a terminal has for vim's motions: the arrows are `h`/`l`,
+    /// home/end are `0`/`$`, delete is `x` and backspace is `h`. ↑/↓ keep
+    /// scrolling the transcript, which is what they do everywhere else.
+    #[test]
+    fn normal_reads_the_named_keys_as_motions() {
+        let mut chat = vim_normal_with("abc");
+        chat.on_key(Key::Left, Instant::now());
+        assert_eq!(chat.caret(), 1, "← is h");
+        chat.on_key(Key::Right, Instant::now());
+        assert_eq!(chat.caret(), 2, "→ is l");
+        chat.on_key(Key::Home, Instant::now());
+        assert_eq!(chat.caret(), 0, "home is 0");
+        chat.on_key(Key::End, Instant::now());
+        assert_eq!(chat.caret(), 3, "end is $");
+        chat.on_key(Key::Backspace, Instant::now());
+        assert_eq!(chat.caret(), 2, "backspace is h");
+        assert_eq!(chat.input, "abc", "and takes nothing");
+        chat.on_key(Key::Delete, Instant::now());
+        assert_eq!(chat.input, "ab", "delete is x");
+
+        // ↑ still scrolls the transcript.
+        let mut chat = vim_normal_with("abc");
+        chat.on_key(Key::Up, Instant::now());
+        assert_eq!(chat.scroll_offset, 1, "↑ is the transcript's");
+    }
+
+    /// Enter is not the mode's: in Normal it sends the draft, exactly as it
+    /// does in Insert (omp's editor leaves Enter to its host too).
+    #[test]
+    fn enter_in_normal_sends_the_draft() {
+        let mut chat = vim_normal_with("hello");
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.effect.is_some(), "the draft went to the engine");
+        assert!(chat.input.is_empty(), "and the composer is clear");
+    }
+
+    /// Esc keeps its precedence: a list that is open is the list's, then the
+    /// mode's, and only a quiet Normal Esc reaches the screen's own clear and
+    /// rewind.
+    #[test]
+    fn esc_is_the_lists_then_the_modes_then_the_screens() {
+        // A list that is open: Esc hides it and the mode does not move.
+        let mut chat = vim_chat();
+        type_text(&mut chat, "/he");
+        assert!(chat.picking());
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.picker_hidden, "the list went");
+        assert_eq!(
+            chat.vim_mode(),
+            Some(crate::vim::VimMode::Insert),
+            "still Insert"
+        );
+        assert_eq!(chat.input, "/he", "and the draft stayed");
+
+        // Insert: Esc is the mode's, and it does not clear the draft.
+        let mut chat = vim_chat();
+        type_text(&mut chat, "draft");
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        assert_eq!(chat.input, "draft", "the draft stayed");
+
+        // A half-typed operator is cancelled first, and stays in Normal.
+        let mut chat = vim_normal_with("draft");
+        vim_key(&mut chat, 'd');
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.vim_mode(), Some(crate::vim::VimMode::Normal));
+        assert_eq!(chat.input, "draft", "and nothing was cut");
+        vim_key(&mut chat, 'd');
+        assert_eq!(
+            chat.input, "draft",
+            "the `d` was cancelled, so this is not `dd`"
+        );
+
+        // A quiet Normal Esc on a draft is the screen's: it clears it.
+        let mut chat = vim_normal_with("draft");
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.input, "", "the screen's clear");
+
+        // And on an empty draft the rewind chord is still the screen's: two
+        // Normal presses inside the window, the first arming and the second
+        // firing.
+        let mut chat = vim_normal_chat();
+        let now = Instant::now();
+        chat.on_key(Key::Esc, now);
+        assert!(chat.esc_armed.is_some(), "the first Normal Esc arms");
+        chat.on_key(Key::Esc, now + Duration::from_millis(50));
+        assert!(chat.esc_armed.is_none(), "the second spends the window");
+        assert_eq!(
+            chat.vim_mode(),
+            Some(crate::vim::VimMode::Normal),
+            "and it was not a mode change"
+        );
+    }
+
+    /// A motion and an operator cross a paste marker whole, the same way
+    /// `ctrl+w` does: the caret never rests inside one and no cut leaves half
+    /// of one behind.
+    #[test]
+    fn a_marker_is_one_unit_to_a_vim_motion_and_a_vim_cut() {
+        // Esc out of Insert steps back over the marker whole, so the caret
+        // lands before it rather than inside it.
+        let mut chat = vim_chat();
+        type_text(&mut chat, "see ");
+        chat.paste(&stack_trace());
+        assert_eq!(chat.input, "see [Paste #1 · 8 lines]");
+        let len = chat.input.len();
+        chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(chat.caret(), 4, "Esc stepped back over the marker");
+
+        // `w` from before the marker lands on its first character; the next
+        // `w` would land on the space inside it, so it crosses it whole
+        // instead of resting inside.
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.caret(), 4, "w: the marker's first character");
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.caret(), len, "w: across it whole");
+
+        // `b` crosses back, and `e` rests on the marker's last character.
+        vim_key(&mut chat, 'b');
+        assert_eq!(chat.caret(), 4, "b: across it back");
+        vim_key(&mut chat, 'e');
+        assert_eq!(chat.caret(), len - 1, "e: its last character, not one past");
+
+        // `x` there takes the whole marker, body and all.
+        vim_key(&mut chat, 'x');
+        assert_eq!(chat.input, "see ", "x took the marker whole");
+        assert!(!chat.input.contains("[Paste"), "no half marker");
+        assert!(chat.pastes.is_empty(), "and the body went with it");
+
+        // The same cut through `dw`, from the marker's last character.
+        let mut chat = vim_chat();
+        type_text(&mut chat, "see ");
+        chat.paste(&stack_trace());
+        chat.on_key(Key::Esc, Instant::now());
+        vim_key(&mut chat, '0');
+        vim_key(&mut chat, 'w');
+        vim_key(&mut chat, 'e');
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'w');
+        assert_eq!(chat.input, "see ", "dw took the marker whole");
+        assert!(chat.pastes.is_empty());
+
+        // `dd` takes a draft that is nothing but a marker, and `D` from before
+        // it takes its tail.
+        let mut chat = vim_normal_chat();
+        chat.paste(&stack_trace());
+        vim_key(&mut chat, 'd');
+        vim_key(&mut chat, 'd');
+        assert_eq!(chat.input, "");
+        assert!(chat.pastes.is_empty(), "dd took the body with it");
+    }
+
+    /// The mode is in the composer's own border, and the draft it shows is the
+    /// same draft: `NORMAL` is up while Normal swallows typing, `INSERT` after
+    /// `i`.
+    #[test]
+    fn the_mode_is_shown_in_the_composer() {
+        let mut vim = vim_chat();
+        let insert = frame_text(&mut vim);
+        assert!(insert.contains("INSERT"), "{insert}");
+        assert!(!insert.contains("NORMAL"));
+        vim.on_key(Key::Esc, Instant::now());
+        let normal = frame_text(&mut vim);
+        assert!(normal.contains("NORMAL"), "{normal}");
+        assert!(!normal.contains("INSERT"));
+        vim_key(&mut vim, 'i');
+        assert!(frame_text(&mut vim).contains("INSERT"));
+
+        // A chat without the setting has no chip at all.
+        let mut bare = chat();
+        let frame = frame_text(&mut bare);
+        assert!(
+            !frame.contains("NORMAL") && !frame.contains("INSERT"),
+            "{frame}"
+        );
+    }
+
+    /// `/hotkeys` lists the vim keys while the mode is on and nothing while it
+    /// is off, in the same column as the rest of the listing.
+    #[test]
+    fn hotkeys_lists_the_vim_keys_only_while_the_mode_is_on() {
+        let mut vim = vim_normal_chat();
+        vim.hotkeys();
+        let text: String = vim
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("hotkeys · vim (editor.vim)"), "{text}");
+        for key in ["h · l", "w · b · e", "x · X", "d w · d b · d d", "esc"] {
+            assert!(text.contains(key), "{key} missing from {text}");
+        }
+        assert!(text.contains("d w · d b · d d  "), "the keys are padded");
+
+        let mut bare = chat();
+        bare.hotkeys();
+        let text: String = bare
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("editor.vim"), "{text}");
+        assert!(text.contains("any character"), "the rest is still listed");
     }
 
     /// A word delete takes a paste marker whole: a marker holds spaces, so a

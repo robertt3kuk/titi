@@ -370,10 +370,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
 /// The `/hotkeys` listing: one heading per group, one row per binding, the keys
 /// padded into a column. The screen pushes each line as a note, the way
 /// `/help` lists the commands.
-pub(crate) fn hotkey_lines() -> Vec<String> {
+pub(crate) fn hotkey_lines(extra: &[(&str, &str)]) -> Vec<String> {
     let room = HOTKEYS
         .iter()
         .map(|row| row.keys.chars().count())
+        .chain(extra.iter().map(|(keys, _)| keys.chars().count()))
         .max()
         .unwrap_or(0);
     let mut lines = Vec::new();
@@ -385,6 +386,14 @@ pub(crate) fn hotkey_lines() -> Vec<String> {
                 keys = row.keys,
                 what = row.what
             ));
+        }
+    }
+    // A mode that is off unless the config asks for it brings its own block:
+    // the vim vocabulary, under its own heading, in the same column.
+    if !extra.is_empty() {
+        lines.push("hotkeys · vim (editor.vim)".to_owned());
+        for (keys, what) in extra {
+            lines.push(format!("  {keys:<room$}  {what}"));
         }
     }
     lines
@@ -519,6 +528,13 @@ impl Chat {
         }
         if self.history_picker.is_some() {
             return self.history_picker_key(key, now);
+        }
+        // The vim keys, when the mode is on: Normal's own vocabulary first —
+        // it swallows printable keys — then Insert, which is the composer the
+        // screen always had but for Esc. `None` is a key the mode does not
+        // own, and it falls through to the match below.
+        if let Some(applied) = self.vim_key(key) {
+            return applied;
         }
         match key {
             Key::CtrlC if self.turn_active => {

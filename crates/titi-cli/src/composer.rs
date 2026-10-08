@@ -22,21 +22,36 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
         } else {
             (ThemeColor::Border, ThemeColor::Dim)
         };
-    let caption = titi_tui::width::truncate_to_width(
-        &composer_caption(chat),
-        (width as usize).saturating_sub(4),
-    );
+    // The mode the draft is in, when the vim keys are on, in the composer's
+    // own border. `NORMAL` is the mode that swallows typing, so it is the one
+    // the border shouts about; `INSERT` is the composer the screen always had.
+    let chip = chat.vim_mode();
+    let room = (width as usize)
+        .saturating_sub(4)
+        .saturating_sub(chip.map_or(0, |mode| mode.label().len() + 3));
+    let caption = titi_tui::width::truncate_to_width(&composer_caption(chat), room);
+    let title = match chip {
+        Some(mode) => {
+            let color = if mode == crate::vim::VimMode::Normal {
+                ThemeColor::Accent
+            } else {
+                caption_color
+            };
+            Line::from(vec![
+                Span::styled(format!(" {} ", mode.label()), fg(theme, color)),
+                Span::styled(format!("· {caption} "), fg(theme, caption_color)),
+            ])
+        }
+        None => Line::from(Span::styled(
+            format!(" {caption} "),
+            fg(theme, caption_color),
+        )),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(fg(theme, border))
-        .title_bottom(
-            Line::from(Span::styled(
-                format!(" {caption} "),
-                fg(theme, caption_color),
-            ))
-            .centered(),
-        )
+        .title_bottom(title.centered())
         .padding(Padding::horizontal(1))
         .style(surface(theme));
     let inner = (width as usize).saturating_sub(6).max(4);

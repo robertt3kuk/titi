@@ -20,4 +20,5 @@ pub mod session_log;
 pub mod themes;
 pub mod title;
 pub mod transcript;
+pub mod vim;
 pub mod welcome;
