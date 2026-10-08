@@ -22,6 +22,11 @@
 //! - Ordered lists (`1. `) — numbered, same hanging indent
 //! - Horizontal rules (`---`) — styled with `ThemeColor::MdHr`
 //! - Links (`[text](url)`) — text with `MdLink`, url with `MdLinkUrl`
+//! - GFM tables — a header row, a delimiter row (`|---|:--:|--:|`) and body
+//!   rows drawn as a `boxSharp` grid in `ThemeColor::MdCodeBlockBorder`, with
+//!   one space of padding per side, column widths from the widest cell's
+//!   display width, and per-column alignment; a ragged or malformed block
+//!   stays literal text rather than losing a cell
 //! - Paragraphs — wrapped to `width`
 //!
 //! # Section visibility
@@ -32,7 +37,7 @@
 //! `SectionVisibility::apply` implements `/details <section> <mode>`.
 
 use crate::theme::{Theme, ThemeColor};
-use crate::width::{replace_tabs, visible_width, wrap_text_with_ansi};
+use crate::width::{replace_tabs, truncate_to_width, visible_width, wrap_text_with_ansi};
 
 // ---------------------------------------------------------------------------
 // Section visibility
@@ -168,7 +173,14 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
     let mut code_lang = String::new();
     let mut code_lines = Vec::new();
 
-    for raw in text.lines() {
+    // Indexed rather than `for … in lines()`: a table needs the rows after the
+    // header, so the loop must be able to look ahead and consume several.
+    let source: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < source.len() {
+        let idx = i;
+        let raw = source[idx];
+        i += 1;
         if in_code_block {
             if raw.trim().starts_with("```") {
                 // End of code block.
@@ -219,6 +231,25 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
                 lines.extend(wrap_text_with_ansi(&body, w));
                 continue;
             }
+        }
+
+        // GFM table: a header row, a delimiter row, then body rows.  A
+        // mismatched delimiter or a ragged row is not a table, so the literal
+        // text still reaches the screen instead of losing a cell.
+        if let Some((table, used)) = parse_table(&source[idx..]) {
+            let raw = &source[idx..idx + used];
+            if table_fits(table.header.len(), w) {
+                // A table opens a block, like a heading: a leading blank row
+                // unless it already starts the answer or follows one.
+                if lines.last().is_some_and(|l| !l.is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.append(&mut render_table(&table, theme, w));
+            } else {
+                lines.append(&mut literal_rows(raw, theme, w));
+            }
+            i = idx + used;
+            continue;
         }
 
         // Blockquote: a gutter, never a literal `>`.
@@ -315,6 +346,398 @@ fn render_code_block(code: &[&str], lang: &str, theme: &Theme, w: usize) -> Vec<
     out.push(theme.fg(
         ThemeColor::MdCodeBlockBorder,
         &format!("╰{}╯", "─".repeat(w.saturating_sub(2))),
+    ));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// GFM tables
+// ---------------------------------------------------------------------------
+
+/// Column alignment taken from a delimiter cell (`---`, `:--`, `--:`, `:-:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// A parsed GFM table.
+///
+/// Cells hold raw inline markdown: styling happens at render time through
+/// [`style_inline`], the same path prose takes, so a second inline parser
+/// never has to agree with the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableBlock {
+    header: Vec<String>,
+    aligns: Vec<TableAlign>,
+    rows: Vec<Vec<String>>,
+}
+
+/// Body rows folded into one table before the rest falls back to literal text.
+const MAX_TABLE_ROWS: usize = 512;
+/// Columns a row may carry and still count as a table; wider rows are prose.
+const MAX_TABLE_COLS: usize = 32;
+/// A column never demands more than this many cells before it wraps.
+const MAX_WORD_WIDTH: usize = 30;
+
+/// Split one GFM table row into its cells.
+///
+/// A `|` escaped as `\|` is literal text, so it neither opens nor closes a
+/// cell; the backslash is dropped so the pipe itself reaches the screen.  The
+/// leading and trailing pipes are optional and are not cells.  `None` when the
+/// line holds no unescaped pipe at all.
+fn split_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    let mut cells: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut pipes = 0usize;
+    let mut ended_on_pipe = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+                ended_on_pipe = false;
+            }
+            '|' => {
+                pipes += 1;
+                cells.push(std::mem::take(&mut cell).trim().to_owned());
+                ended_on_pipe = true;
+            }
+            _ => {
+                cell.push(c);
+                ended_on_pipe = false;
+            }
+        }
+    }
+    if pipes == 0 {
+        return None;
+    }
+    if !ended_on_pipe {
+        cells.push(cell.trim().to_owned());
+    }
+    // A leading pipe opens an empty first cell; drop it so `| a |` and `a`
+    // name the same single column.
+    if trimmed.starts_with('|') {
+        cells.remove(0);
+    }
+    Some(cells)
+}
+
+/// The alignment a delimiter cell declares, or `None` when it is not a
+/// delimiter (`-` runs only, at most one colon per side).
+fn delimiter_align(cell: &str) -> Option<TableAlign> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.len() > 1 && cell.ends_with(':');
+    let body = cell.strip_prefix(':').unwrap_or(cell);
+    let body = body.strip_suffix(':').unwrap_or(body);
+    if body.is_empty() || !body.chars().all(|c| c == '-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => TableAlign::Center,
+        (false, true) => TableAlign::Right,
+        _ => TableAlign::Left,
+    })
+}
+
+/// Parse a table starting at `source[0]` — a header row, a delimiter row, then
+/// body rows — returning the block and how many source lines it consumed.
+///
+/// `None` when the lines are not a table: no header pipe, a delimiter that is
+/// not dashes/colons, a delimiter whose cell count differs from the header, or
+/// a header wider than [`MAX_TABLE_COLS`].  Body rows stop at the first line
+/// that is not a row of the same shape (a blank line, prose, or a ragged row);
+/// that line is left to the caller, so nothing is dropped and no cell is
+/// invented.
+fn parse_table(source: &[&str]) -> Option<(TableBlock, usize)> {
+    let header = split_table_row(source.first()?)?;
+    if header.is_empty() || header.len() > MAX_TABLE_COLS {
+        return None;
+    }
+    let delim = split_table_row(source.get(1)?)?;
+    if delim.len() != header.len() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(delim.len());
+    for cell in &delim {
+        aligns.push(delimiter_align(cell)?);
+    }
+    let mut rows = Vec::new();
+    let mut used = 2;
+    for line in &source[2..] {
+        if rows.len() >= MAX_TABLE_ROWS {
+            break;
+        }
+        let Some(cells) = split_table_row(line) else {
+            break;
+        };
+        if cells.len() != header.len() {
+            break;
+        }
+        rows.push(cells);
+        used += 1;
+    }
+    Some((
+        TableBlock {
+            header,
+            aligns,
+            rows,
+        },
+        used,
+    ))
+}
+
+/// Whether a `cols`-column table fits `w`: one cell per column plus the
+/// `│ `…` │` border, which is `3n + 1` columns of chrome.
+fn table_fits(cols: usize, w: usize) -> bool {
+    cols > 0 && w >= 4 * cols + 1
+}
+
+/// Render source lines as ordinary paragraph text — the fallback for a block
+/// that is not a table, or a table too narrow to draw.
+fn literal_rows(raw: &[&str], theme: &Theme, w: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw {
+        let styled = style_inline(line.trim(), theme);
+        out.extend(wrap_text_with_ansi(&styled, w.max(1)));
+    }
+    out
+}
+
+/// Display width of the longest whitespace-delimited run in a styled cell.
+fn longest_word_width(cell: &str) -> usize {
+    cell.split_whitespace()
+        .map(visible_width)
+        .max()
+        .unwrap_or(1)
+}
+
+/// Shrink natural column widths to `avail` cells.
+///
+/// Slack (the room above each column's longest word) is given up
+/// proportionally, so columns that wrap anyway wrap together; when even the
+/// minimums overflow, every column gets one cell and the rest is handed out by
+/// weight.  The result never sums to more than `avail`.
+fn fit_widths(natural: &[usize], min: &[usize], avail: usize) -> Vec<usize> {
+    let n = natural.len();
+    let total: usize = natural.iter().sum();
+    if total <= avail {
+        return natural.to_vec();
+    }
+    let mut widths = natural.to_vec();
+    let slack: Vec<usize> = (0..n).map(|i| natural[i].saturating_sub(min[i])).collect();
+    let total_slack: usize = slack.iter().sum();
+    let need = total - avail;
+    if total_slack >= need {
+        let mut taken = 0usize;
+        for i in 0..n {
+            let share = slack[i] * need / total_slack;
+            widths[i] -= share;
+            taken += share;
+        }
+        // Flooring loses at most one cell per column; shave the widest of
+        // those that still have slack.
+        let mut left = need - taken;
+        while left > 0 {
+            let mut best: Option<usize> = None;
+            for i in 0..n {
+                if widths[i] > min[i] && best.is_none_or(|b| widths[b] < widths[i]) {
+                    best = Some(i);
+                }
+            }
+            match best {
+                Some(i) => {
+                    widths[i] -= 1;
+                    left -= 1;
+                }
+                None => break,
+            }
+        }
+        return widths;
+    }
+    // Even the longest words do not fit: one cell each, then by weight.
+    let mut widths = vec![1usize; n];
+    let left = avail - n;
+    let weight: Vec<usize> = min.iter().map(|m| m.saturating_sub(1)).collect();
+    let total_weight: usize = weight.iter().sum();
+    let mut rest = left;
+    if total_weight > 0 {
+        let mut given = 0usize;
+        for i in 0..n {
+            let share = weight[i] * left / total_weight;
+            widths[i] += share;
+            given += share;
+        }
+        rest = left - given;
+    }
+    let mut i = 0;
+    while rest > 0 {
+        widths[i % n] += 1;
+        rest -= 1;
+        i += 1;
+    }
+    widths
+}
+
+/// Replace every whitespace-delimited run wider than `width` with a hard cut
+/// plus `…`, so [`wrap_text_with_ansi`] never silently clamps one and the cut
+/// is visible.
+fn cap_long_words(text: &str, width: usize) -> String {
+    if visible_width(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for seg in text.split(' ') {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        if visible_width(seg) > width {
+            out.push_str(&truncate_to_width(seg, width.saturating_sub(1)));
+            out.push('…');
+        } else {
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
+/// Wrap a styled cell to `width` columns on word boundaries, hard-cutting a
+/// word that cannot fit.  Always returns at least one (possibly empty) row.
+fn wrap_cell(cell: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let capped = cap_long_words(cell, width);
+    let mut rows = wrap_text_with_ansi(&capped, width);
+    while rows.len() > 1 && rows.last().is_some_and(|r| r.is_empty()) {
+        rows.pop();
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// Pad a styled cell to `width` columns, honouring the column alignment.
+fn pad_cell(text: &str, width: usize, align: TableAlign) -> String {
+    let pad = width.saturating_sub(visible_width(text));
+    match align {
+        TableAlign::Left => format!("{text}{}", " ".repeat(pad)),
+        TableAlign::Right => format!("{}{text}", " ".repeat(pad)),
+        TableAlign::Center => {
+            let left = pad / 2;
+            format!("{}{text}{}", " ".repeat(left), " ".repeat(pad - left))
+        }
+    }
+}
+
+/// Draw a parsed table as a `boxSharp` grid spanning at most `w` columns.
+///
+/// Column widths come from the widest cell's display width (UAX#11, never
+/// bytes), so a CJK or emoji cell pads correctly.  Each cell is wrapped inside
+/// its column; the frame is exactly `3n + 1 + Σwidth` columns, which
+/// [`table_fits`] has already checked against the pane.
+fn render_table(table: &TableBlock, theme: &Theme, w: usize) -> Vec<String> {
+    let n = table.header.len();
+    debug_assert!(table_fits(n, w));
+    let avail = w.saturating_sub(3 * n + 1);
+    let border = |s: &str| theme.fg(ThemeColor::MdCodeBlockBorder, s);
+    let h = theme.symbol("boxSharp.horizontal").to_owned();
+    let v = theme.symbol("boxSharp.vertical").to_owned();
+
+    // Render every cell through the prose inline path once, then measure.
+    // Tabs are expanded first: a raw `\t` in a cell would otherwise measure
+    // eight columns and knock the frame out of alignment.
+    let header_cells: Vec<String> = table
+        .header
+        .iter()
+        .map(|c| style_inline(&replace_tabs(c), theme))
+        .collect();
+    let body_cells: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| style_inline(&replace_tabs(c), theme))
+                .collect()
+        })
+        .collect();
+
+    let mut natural = vec![0usize; n];
+    let mut min = vec![1usize; n];
+    for cells in std::iter::once(&header_cells).chain(body_cells.iter()) {
+        for (i, cell) in cells.iter().enumerate() {
+            natural[i] = natural[i].max(visible_width(cell));
+            min[i] = min[i].max(longest_word_width(cell).clamp(1, MAX_WORD_WIDTH));
+        }
+    }
+    let widths = fit_widths(&natural, &min, avail);
+
+    // A rule with `left`/`mid`/`right` joints (symbol keys), one segment per
+    // column.
+    let rule = |left: &str, mid: &str, right: &str| -> String {
+        let mut s = String::new();
+        s.push_str(theme.symbol(left));
+        s.push_str(&h);
+        for (i, cw) in widths.iter().enumerate() {
+            if i > 0 {
+                s.push_str(&h);
+                s.push_str(theme.symbol(mid));
+                s.push_str(&h);
+            }
+            s.push_str(&h.repeat(*cw));
+        }
+        s.push_str(&h);
+        s.push_str(theme.symbol(right));
+        border(&s)
+    };
+
+    // One logical row, its cells wrapped and padded line by line.  The bars
+    // carry the border token like the rules, so a cell's own colour never
+    // bleeds into the frame.
+    let vbar = border(&v);
+    let row_lines = |cells: &[String], bold: bool| -> Vec<String> {
+        let wrapped: Vec<Vec<String>> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| wrap_cell(c, widths[i]))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        let mut rows = Vec::with_capacity(height);
+        for line in 0..height {
+            let mut s = String::new();
+            s.push_str(&vbar);
+            for (i, cell_lines) in wrapped.iter().enumerate() {
+                let text = cell_lines.get(line).map(String::as_str).unwrap_or("");
+                let padded = pad_cell(text, widths[i], table.aligns[i]);
+                s.push(' ');
+                s.push_str(&if bold { theme.bold(&padded) } else { padded });
+                s.push(' ');
+                s.push_str(&vbar);
+            }
+            rows.push(s);
+        }
+        rows
+    };
+
+    let mut out = Vec::new();
+    out.push(rule("boxSharp.topLeft", "boxSharp.teeDown", "boxSharp.topRight"));
+    out.extend(row_lines(&header_cells, true));
+    out.push(rule("boxSharp.teeRight", "boxSharp.cross", "boxSharp.teeLeft"));
+    for (i, row) in body_cells.iter().enumerate() {
+        out.extend(row_lines(row, false));
+        if i + 1 < body_cells.len() {
+            out.push(rule("boxSharp.teeRight", "boxSharp.cross", "boxSharp.teeLeft"));
+        }
+    }
+    out.push(rule(
+        "boxSharp.bottomLeft",
+        "boxSharp.teeUp",
+        "boxSharp.bottomRight",
     ));
     out
 }
@@ -1074,5 +1497,198 @@ Done in `AGENTS.md`.";
                 );
             }
         }
+    }
+
+    // ---- GFM tables -------------------------------------------------------
+
+    /// A two-column table with a CJK cell and an emoji cell: every column must
+    /// be as wide as the widest cell's *display* width, so the borders line up.
+    /// Counting chars instead would make the CJK column two cells too narrow.
+    #[test]
+    fn table_column_widths_come_from_display_width() {
+        let theme = colored_theme();
+        let rows = plain(&render_markdown("| a | 日本 |\n|---|---|\n| b | 🎉c |", &theme, 80));
+        // col0 = 1, col1 = max(4, 3) = 4 → chrome 7 + 5 = 12 columns.
+        assert_eq!(
+            rows,
+            vec![
+                "┌───┬──────┐",
+                "│ a │ 日本 │",
+                "├───┼──────┤",
+                "│ b │ 🎉c  │",
+                "└───┴──────┘",
+            ]
+        );
+        for row in render_markdown("| a | 日本 |\n|---|---|\n| b | 🎉c |", &theme, 80) {
+            assert_eq!(visible_width(&row), 12, "{row:?}");
+        }
+    }
+
+    /// A table drawn at any pane width stays inside it, however wide the cells
+    /// are: an over-wide column wraps, and a word that cannot fit is cut.
+    #[test]
+    fn table_never_exceeds_the_pane() {
+        let theme = colored_theme();
+        let md = "| Name | 日本語のテキスト | Note |\n\
+                  |:-----|:--------------:|-----:|\n\
+                  | supercalifragilisticexpialidocious | 🎉🎉🎉 | ok |\n\
+                  | b | c | a much longer note than the header |";
+        for w in 12u16..=80 {
+            let lines = render_markdown(md, &theme, w);
+            for row in &lines {
+                assert!(
+                    visible_width(row) <= w as usize,
+                    "w={w} width={} row={row:?}",
+                    visible_width(row)
+                );
+            }
+            // The frame is drawn only when a cell per column fits.
+            if w >= 13 {
+                assert!(plain(&lines)[0].starts_with('┌'), "w={w} {lines:?}");
+            }
+        }
+    }
+
+    /// `\|` is literal text inside a cell, not a column separator.
+    #[test]
+    fn escaped_pipe_is_literal_text() {
+        let theme = colored_theme();
+        let lines = render_markdown("| a \\| b | c |\n|---|---|\n| 1 | 2 |", &theme, 40);
+        let rows = plain(&lines);
+        assert_eq!(
+            rows,
+            vec![
+                "┌───────┬───┐",
+                "│ a | b │ c │",
+                "├───────┼───┤",
+                "│ 1     │ 2 │",
+                "└───────┴───┘",
+            ]
+        );
+    }
+
+    /// The alignment colons of the delimiter row pad the cell: left against
+    /// the left edge, center split, right against the right edge.
+    #[test]
+    fn alignment_pads_each_column() {
+        let theme = colored_theme();
+        let rows = plain(&render_markdown(
+            "| L | C | R |\n|:--|:-:|--:|\n| a | b | c |",
+            &theme,
+            40,
+        ));
+        assert_eq!(rows[3], "│ a │ b │ c │");
+        // Wider cells make the padding visible.
+        let rows = plain(&render_markdown(
+            "| Left | Center | Right |\n|:-----|:------:|------:|\n| aa | bb | cc |",
+            &theme,
+            40,
+        ));
+        assert_eq!(rows[3], "│ aa   │   bb   │    cc │");
+    }
+
+    /// A word wider than its column is hard-cut with `…`, so the cut shows and
+    /// the frame still closes.
+    #[test]
+    fn over_wide_word_is_cut_with_an_ellipsis() {
+        let theme = colored_theme();
+        let lines = render_markdown("| a | b |\n|---|---|\n| supercalifragilistic | x |", &theme, 20);
+        let rows = plain(&lines);
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(rows[3].contains('…'), "the cut is marked: {rows:?}");
+        assert!(!rows[3].contains("supercalifragilistic"), "{rows:?}");
+        for row in &lines {
+            assert!(visible_width(row) <= 20, "{row:?}");
+        }
+    }
+
+    /// A malformed block is not a table: the delimiter must match the header
+    /// cell count, and a ragged body row ends the table instead of losing the
+    /// cell it does not have.
+    #[test]
+    fn malformed_tables_stay_literal() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown("| a | b |\n|---|", &theme, 40)),
+            vec!["| a | b |", "|---|"]
+        );
+        assert_eq!(
+            plain(&render_markdown("| a | b |\n|---|---|\n| only one |", &theme, 40)),
+            vec![
+                "┌───┬───┐",
+                "│ a │ b │",
+                "├───┼───┤",
+                "└───┴───┘",
+                "| only one |",
+            ]
+        );
+        // A row with no pipe at all is never a table row.
+        assert_eq!(
+            plain(&render_markdown("a\n|---|", &theme, 40)),
+            vec!["a", "|---|"]
+        );
+    }
+
+    /// A table opens a block like a heading: a blank row before it unless it
+    /// already starts the answer or follows one.
+    #[test]
+    fn table_opens_a_block() {
+        let theme = colored_theme();
+        let rows = plain(&render_markdown("Summary:\n| a |\n|---|\n| 1 |", &theme, 40));
+        assert_eq!(rows[0], "Summary:");
+        assert_eq!(rows[1], "");
+        assert!(rows[2].starts_with('┌'), "{rows:?}");
+        // First row of the answer: no leading blank.
+        let rows = plain(&render_markdown("| a |\n|---|\n| 1 |", &theme, 40));
+        assert!(rows[0].starts_with('┌'), "{rows:?}");
+    }
+
+    /// Header plus delimiter and nothing else still draws a closed frame.
+    #[test]
+    fn header_only_table_is_a_closed_frame() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown("| a | b |\n|---|---|", &theme, 40)),
+            vec!["┌───┬───┐", "│ a │ b │", "├───┼───┤", "└───┴───┘"]
+        );
+    }
+
+    /// Empty cells pad to their column; the header is bold, the border is the
+    /// code-block token.
+    #[test]
+    fn empty_cells_and_theme_tokens() {
+        let theme = colored_theme();
+        let lines = render_markdown("| a |  |\n|---|---|\n|  | 2 |", &theme, 40);
+        assert_eq!(
+            plain(&lines),
+            vec!["┌───┬───┐", "│ a │   │", "├───┼───┤", "│   │ 2 │", "└───┴───┘"]
+        );
+        let border = "\x1b[38;2;68;68;68m";
+        assert!(lines[0].starts_with(border), "{:?}", lines[0]);
+        assert!(lines[1].contains("\x1b[1ma\x1b[22m"), "{:?}", lines[1]);
+    }
+
+    /// Bold, italic and inline code inside a cell keep their prose styling.
+    #[test]
+    fn inline_styling_survives_inside_a_cell() {
+        let theme = colored_theme();
+        let lines = render_markdown("| K | V |\n|---|---|\n| **b** | *i* and `c` |", &theme, 40);
+        let body = &lines[3];
+        assert!(body.contains("\x1b[1mb\x1b[22m"), "{body:?}");
+        assert!(body.contains("\x1b[3mi\x1b[23m"), "{body:?}");
+        assert!(
+            body.contains("\x1b[38;2;255;123;114mc\x1b[39m"),
+            "{body:?}"
+        );
+        assert_eq!(
+            plain(&lines),
+            vec![
+                "┌───┬─────────┐",
+                "│ K │ V       │",
+                "├───┼─────────┤",
+                "│ b │ i and c │",
+                "└───┴─────────┘",
+            ]
+        );
     }
 }
