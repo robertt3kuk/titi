@@ -47,6 +47,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 );
 ";
 
+/// Schema version recorded in `PRAGMA user_version`.
+///
+/// Read before anything else is done to the file: a database stamped with a
+/// number this build does not know cannot be interpreted with the column
+/// meanings it was written under, and guessing is worse than refusing.
+const SCHEMA_VERSION: i64 = 1;
+
 impl SessionIndex {
     /// Opens (or creates) the index database, running the schema migration.
     pub fn open(path: &Path) -> Result<Self, SessionError> {
@@ -54,6 +61,7 @@ impl SessionIndex {
             std::fs::create_dir_all(parent).map_err(SessionError::Io)?;
         }
         let conn = Connection::open(path).map_err(SessionError::Db)?;
+        Self::check_version(&conn)?;
         // Two handles now write here: the store on the surface's thread and
         // the session namer from its own task. A busy timeout makes the
         // loser of that race wait instead of failing the write.
@@ -62,6 +70,32 @@ impl SessionIndex {
         conn.execute_batch(SCHEMA).map_err(SessionError::Db)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Accepts this build's schema and anything older, and refuses anything
+    /// newer.
+    ///
+    /// `0` is what SQLite reports for a file that never stamped one — every
+    /// `state.db` written before this constant existed — so it is treated as
+    /// current and stamped now. A stamp *below* the constant cannot happen
+    /// while version 1 is the first version; when it can, that branch is where
+    /// a migration is called, and refusing a newer file is what keeps this
+    /// from needing one in the other direction.
+    fn check_version(conn: &Connection) -> Result<(), SessionError> {
+        let found: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(SessionError::Db)?;
+        if found > SCHEMA_VERSION {
+            return Err(SessionError::SchemaTooNew {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if found != SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(SessionError::Db)?;
+        }
+        Ok(())
     }
 
     /// Adds what a database from an earlier release is missing.
@@ -446,5 +480,67 @@ mod tests {
             index.title("s1").unwrap_or_else(|e| panic!("{e}")),
             Some("fix the parser".to_owned())
         );
+    }
+
+    /// A fresh index is stamped, and the stamp survives the open.
+    #[test]
+    fn a_new_index_records_the_schema_version() {
+        let (_dir, index) = tmp_index();
+        drop(index);
+        let reopened = SessionIndex::open(&_dir.path().join("state.db"))
+            .unwrap_or_else(|e| panic!("open: {e}"));
+        let found: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or_else(|e| panic!("user_version: {e}"));
+        assert_eq!(found, SCHEMA_VERSION);
+    }
+
+    /// An index from before the stamp existed is adopted, not refused: it has
+    /// the current schema, it just never said so.
+    #[test]
+    fn an_unstamped_index_is_adopted_and_stamped() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("state.db");
+        Connection::open(&path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL,
+                     bot_id TEXT, source TEXT
+                 );",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let index = SessionIndex::open(&path).unwrap_or_else(|e| panic!("open: {e}"));
+        index
+            .insert_session("s1", 1, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let found: i64 = index
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or_else(|e| panic!("user_version: {e}"));
+        assert_eq!(found, SCHEMA_VERSION);
+    }
+
+    /// A file from a later release is refused with a typed error instead of
+    /// being read with this build's column meanings.
+    #[test]
+    fn an_index_from_a_newer_release_is_refused() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("state.db");
+        Connection::open(&path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 7)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        match SessionIndex::open(&path) {
+            Err(SessionError::SchemaTooNew { found, supported }) => {
+                assert_eq!(found, SCHEMA_VERSION + 7);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            Err(other) => panic!("expected a newer-schema refusal, got {other}"),
+            Ok(_) => panic!("a file from a newer release was opened instead of refused"),
+        }
     }
 }

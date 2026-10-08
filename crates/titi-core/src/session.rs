@@ -22,6 +22,14 @@ pub enum SessionError {
     Db(rusqlite::Error),
     /// Session or entry id does not resolve to anything on disk.
     NotFound(String),
+    /// The index file was written by a release that knew a newer schema.
+    ///
+    /// Reading it with this build's column meanings would misinterpret
+    /// whatever changed, so the file is refused instead.
+    SchemaTooNew {
+        found: i64,
+        supported: i64,
+    },
 }
 
 impl fmt::Display for SessionError {
@@ -31,6 +39,10 @@ impl fmt::Display for SessionError {
             SessionError::Json(e) => write!(f, "session json: {e}"),
             SessionError::Db(e) => write!(f, "session index: {e}"),
             SessionError::NotFound(what) => write!(f, "not found: {what}"),
+            SessionError::SchemaTooNew { found, supported } => write!(
+                f,
+                "session index is schema {found}; this build understands {supported}"
+            ),
         }
     }
 }
@@ -41,7 +53,7 @@ impl std::error::Error for SessionError {
             SessionError::Io(e) => Some(e),
             SessionError::Json(e) => Some(e),
             SessionError::Db(e) => Some(e),
-            SessionError::NotFound(_) => None,
+            SessionError::NotFound(_) | SessionError::SchemaTooNew { .. } => None,
         }
     }
 }
