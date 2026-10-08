@@ -11,6 +11,8 @@
 //! keeps compiling when a variant is added instead of breaking; this file is
 //! what makes adding one deliberate.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 use titi_providers::{ChatMessage, ErrorReason, Role, StopReason, ToolCallRef};

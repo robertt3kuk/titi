@@ -8,7 +8,7 @@
 //! fresh one rather than failing, and that without either switch a launch
 //! ignores the stored sessions entirely.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 
