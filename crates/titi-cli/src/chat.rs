@@ -4559,9 +4559,13 @@ impl Chat {
 
     /// `/budget [amount|off]` caps what this session may spend.
     ///
-    /// The cap is counted in tokens. Money is not offered: nothing in the
-    /// project knows what a model costs, and a dollar figure derived from a
-    /// made-up rate would be a number the user could not act on.
+    /// The cap is counted in tokens, and that is the engine's
+    /// (`runtime.rs`'s `budget`, tripped against `prompt + completion`). A cap
+    /// in money is still refused, and now the refusal can say exactly what is
+    /// missing: the engine counts tokens, not dollars, and prompt and
+    /// completion tokens bill at different rates, so no single dollar figure
+    /// converts into one token cap. Enforcing it needs a cost ledger in the
+    /// engine, which is a change to a file this surface does not own.
     fn budget(&mut self, args: &str) -> Applied {
         let args = args.trim();
         if args.is_empty() {
@@ -4583,9 +4587,39 @@ impl Chat {
                 )
             }
             Err(error) => {
-                self.push(LineKind::Error, error.to_string());
+                let said = match error {
+                    BudgetArgError::Money => self.money_budget_refusal(),
+                    other => other.to_string(),
+                };
+                self.push(LineKind::Error, said);
                 Applied::none()
             }
+        }
+    }
+
+    /// Why a cap in money cannot be honoured here, said with whatever this
+    /// machine knows about the model.
+    ///
+    /// The refusal is not a shrug: when the current model has a price, the
+    /// refusal states it, so the user can see what a dollar would have bought
+    /// and that the missing piece is the engine's tally and not the price.
+    /// Nobody's price is guessed into a token cap — a rate the user did not
+    /// state would be a number they could not act on.
+    fn money_budget_refusal(&self) -> String {
+        match self.catalog.price(&self.model) {
+            Some(price) => format!(
+                "budget: {} costs {} in / {} out per MTok, but the engine's cap counts tokens, \
+                 and those bill at different rates — a cap in money needs the engine's cost \
+                 ledger; cap tokens instead (e.g. /budget 200k)",
+                self.model,
+                titi_tui::status::format_usd(price.input, 2),
+                titi_tui::status::format_usd(price.output, 2),
+            ),
+            None => format!(
+                "budget: {} has no price here — the engine's cap counts tokens, not money, so \
+                 cap tokens instead (e.g. /budget 200k)",
+                self.model,
+            ),
         }
     }
 
@@ -5786,7 +5820,11 @@ fn parse_interval(word: &str) -> Option<u64> {
 /// Why `/budget` could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BudgetArgError {
-    /// A cap in money, which nothing here can convert into tokens.
+    /// A cap in money, which no token cap can stand for: prompt and
+    /// completion tokens bill at different rates, so one dollar figure has no
+    /// single token answer. [`Chat::money_budget_refusal`] says this with the
+    /// model's own price; this is the reading's own sentence, for callers
+    /// that only parse.
     Money,
     Unreadable(String),
     Zero,
@@ -5796,7 +5834,8 @@ impl std::fmt::Display for BudgetArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Money => f.write_str(
-                "budget: no price table, so a cap in money cannot be enforced — cap tokens instead (e.g. /budget 200k)",
+                "budget: the engine's cap counts tokens, not money, so a cap in dollars cannot \
+                 be enforced — cap tokens instead (e.g. /budget 200k)",
             ),
             Self::Unreadable(word) => {
                 write!(
@@ -14954,17 +14993,20 @@ mod tests {
         );
     }
 
-    /// A cap in money cannot be enforced without a price table, so it is
-    /// refused instead of being converted from a guess.
+    /// A cap in money cannot be enforced by a token cap — the engine counts
+    /// tokens, and those bill at different rates — so it is refused, and the
+    /// refusal names what is missing instead of converting at a guessed rate.
     #[test]
     fn budget_refuses_money_and_nonsense() {
         let mut chat = chat();
         type_text(&mut chat, "/budget $5");
         assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
         assert!(
-            chat.lines
-                .iter()
-                .any(|line| line.kind == LineKind::Error && line.text.contains("no price table"))
+            chat.lines.iter().any(|line| line.kind == LineKind::Error
+                && line.text.contains("has no price here")
+                && line.text.contains("cap tokens instead")),
+            "the refusal says which piece is missing: {:?}",
+            chat.lines.last()
         );
 
         type_text(&mut chat, "/budget plenty");
@@ -14974,6 +15016,23 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == LineKind::Error && line.text.contains("plenty"))
         );
+    }
+
+    /// When the model does have a price, the refusal states it: the user can
+    /// see that the price is known and that the missing piece is the engine's
+    /// tally, not a number this screen failed to look up.
+    #[test]
+    fn budget_refusal_states_a_price_it_does_know() {
+        let mut chat = priced_chat();
+        type_text(&mut chat, "/budget $2");
+        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
+        let said = chat
+            .lines
+            .last()
+            .map(|line| line.text.clone())
+            .unwrap_or_default();
+        assert!(said.contains("$3.00 in / $15.00 out per MTok"), "{said}");
+        assert!(said.contains("cost ledger"), "{said}");
     }
 
     /// Hitting the cap pauses: the next prompt is held instead of sent.
