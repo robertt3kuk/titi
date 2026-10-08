@@ -21,6 +21,15 @@ pub enum Error {
     InvalidLabel(String),
     /// Provider id is empty.
     InvalidProvider(String),
+    /// The file was written by a newer titi than this one.
+    ///
+    /// A credential store is not a file to migrate downwards: this build
+    /// cannot know what a future version's columns mean, and rewriting them
+    /// under the older reading would lose tokens rather than refuse them.
+    SchemaTooNew {
+        found: i64,
+        supported: i64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -35,6 +44,10 @@ impl fmt::Display for Error {
             Error::InvalidProvider(provider) => {
                 write!(f, "invalid provider id {provider:?}: must not be empty")
             }
+            Error::SchemaTooNew { found, supported } => write!(
+                f,
+                "auth store schema {found} was written by a newer titi; this build understands {supported}"
+            ),
         }
     }
 }
@@ -44,7 +57,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Db(e) => Some(e),
-            Error::InvalidLabel(_) | Error::InvalidProvider(_) => None,
+            Error::InvalidLabel(_) | Error::InvalidProvider(_) | Error::SchemaTooNew { .. } => None,
         }
     }
 }
@@ -208,6 +221,14 @@ fn validate_label(label: &str) -> Result<()> {
     }
 }
 
+/// Schema version recorded in `PRAGMA user_version`.
+///
+/// `1` is the labelled `credentials` table. A file that carries `0` is one
+/// written before this constant existed — every `auth.db` from an earlier
+/// release — and is stamped current on open, which is what [`migrate`] has
+/// always done by probing columns.
+const SCHEMA_VERSION: i64 = 1;
+
 /// SQLite-backed credential store (`credentials` table, upsert semantics,
 /// several accounts per provider).
 pub struct AuthStore {
@@ -229,6 +250,9 @@ impl AuthStore {
         opts.open(path)?;
 
         let conn = rusqlite::Connection::open(path)?;
+        // Before anything is written to the file: a store from a newer build
+        // is refused, not migrated downwards.
+        check_version(&conn)?;
         migrate(&conn)?;
         #[cfg(unix)]
         restrict_permissions(path)?;
@@ -434,6 +458,28 @@ impl AuthStore {
 /// `(provider, label)` and every existing row becomes its provider's
 /// [`DEFAULT_LABEL`] account. A v2 table (has `label`, lacks `refresh_token`)
 /// keeps its labels and gains the OAuth columns as NULL. Nothing is dropped.
+/// Accepts this build's schema and anything older, and refuses anything newer.
+///
+/// A stamp below the constant is a file from an earlier release, and `0` is
+/// what SQLite reports for a file that never stamped one at all; both are
+/// stamped current here, and [`migrate`] then adds whatever they are missing.
+/// Refusing a newer file is what keeps this from needing a migration in the
+/// other direction — and it refuses *before* `migrate` has touched the file,
+/// so a store this build does not understand is left exactly as it was.
+fn check_version(conn: &rusqlite::Connection) -> Result<()> {
+    let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if found > SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if found != SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
+
 fn migrate(conn: &rusqlite::Connection) -> Result<()> {
     if !table_exists(conn, "credentials")? {
         conn.execute_batch(SCHEMA)?;
@@ -521,11 +567,90 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Writes `user_version` straight into the file, the way a build of
+    /// another release would have left it.
+    fn stamp(path: &Path, version: i64) {
+        let conn = rusqlite::Connection::open(path).unwrap_or_else(|e| panic!("{e}"));
+        conn.pragma_update(None, "user_version", version)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn stamp_of(path: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap_or_else(|e| panic!("{e}"));
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
     fn open_tmp(tag: &str) -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir failed: {e}"));
         let store =
             AuthStore::open(&dir.path().join(tag)).unwrap_or_else(|e| panic!("open failed: {e}"));
         (dir, store)
+    }
+
+    /// A store written by a newer build is refused by name, and left exactly
+    /// as it was: migrating it downwards under this build's reading would
+    /// rewrite the user's tokens rather than refuse them.
+    #[test]
+    fn a_store_from_a_newer_build_is_refused_untouched() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("auth.db");
+        let store = AuthStore::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        store
+            .store_account("anthropic", DEFAULT_LABEL, "api_key", "sk-test-abc", None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(store);
+        stamp(&path, SCHEMA_VERSION + 1);
+
+        // Not `expect_err`: `AuthStore` carries credentials and deliberately
+        // has no `Debug`, which `expect_err` requires of the success type.
+        let error = match AuthStore::open(&path) {
+            Ok(_) => panic!("a store from a newer build must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "auth store schema {} was written by a newer titi; this build understands {SCHEMA_VERSION}",
+                SCHEMA_VERSION + 1
+            )
+        );
+        assert_eq!(
+            stamp_of(&path),
+            SCHEMA_VERSION + 1,
+            "the refusal must not lower the stamp"
+        );
+        // The file is untouched, so the build that wrote it still reads it.
+        stamp(&path, SCHEMA_VERSION);
+        let reopened = AuthStore::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        let accounts = reopened
+            .accounts("anthropic")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(accounts.len(), 1, "the token survived the refusal");
+    }
+
+    /// A store that never stamped a version — every `auth.db` written before
+    /// the constant existed — is opened and stamped current, not refused.
+    #[test]
+    fn a_store_that_never_stamped_one_is_stamped_current() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("auth.db");
+        let store = AuthStore::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        store
+            .store_account("anthropic", DEFAULT_LABEL, "api_key", "sk-test-old", None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(store);
+        stamp(&path, 0);
+
+        let reopened = AuthStore::open(&path).expect("an unstamped store opens");
+        assert_eq!(stamp_of(&path), SCHEMA_VERSION, "and is stamped current");
+        assert_eq!(
+            reopened
+                .accounts("anthropic")
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            1
+        );
     }
 
     #[test]
