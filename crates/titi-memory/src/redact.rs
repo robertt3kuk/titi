@@ -405,8 +405,9 @@ const MARKERS: [&str; 16] = [
     "-----BEGIN ",
     // A JWT header always starts as base64 of `{"`.
     "eyJ",
-    // Covers api_key, api-key, apikey and Bearer (`bearer` contains no
-    // caseless marker itself, so it rides in MARKERS).
+    // Covers api_key, api-key and apikey. `bearer` rides here too for the
+    // cheap lowercase hit, and in CASELESS_MARKERS because the header is
+    // written with a capital B.
     "api",
     "bearer",
     "token",
@@ -415,7 +416,7 @@ const MARKERS: [&str; 16] = [
 /// The tail of [`MARKERS`] that is matched case-insensitively, because the
 /// patterns needing them are `(?i)`. Kept lowercase: [`contains_ignore_ascii_case`]
 /// lowercases only the text it compares against.
-const CASELESS_MARKERS: [&str; 4] = ["api", "token", "secret", "passw"];
+const CASELESS_MARKERS: [&str; 5] = ["api", "token", "secret", "passw", "bearer"];
 
 /// Whether any pattern could match at all.
 fn has_marker(text: &str) -> bool {
