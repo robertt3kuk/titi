@@ -12911,12 +12911,21 @@ mod tests {
     /// The frames of the four live states, with the token each is painted with:
     /// this is the whole claim of the step, read off the screen rather than off
     /// a helper.
+    ///
+    /// The needle is the row's stable half. Two things in a live row move on
+    /// their own: the spinner turns every 50 ms and the seconds are the wall
+    /// clock, so a needle built from one drawn row (`⠋ … · 0.0s`) misses the
+    /// next draw as soon as the two straddle a tick — which is how this test
+    /// flaked on a loaded runner. The label and the token are the state; the
+    /// clock is checked by shape, through the same [`shown_seconds`] the other
+    /// row tests use.
     #[test]
     fn the_frame_paints_each_state_with_its_own_token() {
         let theme = test_theme();
         /// Drives a chat into one state of the row.
         type Drive = fn(&mut Chat);
-        let states: [(&str, Drive, ThemeColor); 5] = [
+        // `(label, drive, the row's stable text, its token, whether it runs a clock)`.
+        let states: [(&str, Drive, &str, ThemeColor, bool); 5] = [
             (
                 "waiting",
                 |chat| {
@@ -12925,7 +12934,9 @@ mod tests {
                         model: "openai/gpt-4.1".into(),
                     });
                 },
+                "waiting for the first token",
                 ThemeColor::Accent,
+                true,
             ),
             (
                 "streaming",
@@ -12939,7 +12950,9 @@ mod tests {
                         text: "hello".into(),
                     });
                 },
+                "streaming · 5 chars",
                 ThemeColor::Accent,
+                true,
             ),
             (
                 "thinking",
@@ -12953,7 +12966,9 @@ mod tests {
                         text: "weighing it".into(),
                     });
                 },
+                "thinking · 11 chars",
                 ThemeColor::Accent,
+                true,
             ),
             (
                 "tool",
@@ -12969,7 +12984,9 @@ mod tests {
                         detail: Some("read docs/README.md".into()),
                     });
                 },
+                "read docs/README.md",
                 ThemeColor::ToolOutput,
+                true,
             ),
             (
                 "needs you",
@@ -12986,24 +13003,45 @@ mod tests {
                         name: "write".into(),
                     });
                 },
+                "needs you · write",
                 ThemeColor::Warning,
+                false,
             ),
         ];
-        for (label, drive, token) in states {
+        for (label, drive, needle, token, clocked) in states {
             let mut chat = chat();
             drive(&mut chat);
-            let row = above_composer(&mut chat, 80, 20);
-            let buffer = frame_buffer(&mut chat, 80, 20);
-            let symbols: Vec<String> = (0..20)
+            // The work row is the line above the composer box, and only that
+            // line is searched: a tool's own chip in the transcript carries the
+            // same words (`tool read docs/README.md`), and this test is about
+            // the row, not the chip.
+            const ROWS: u16 = 20;
+            const ROW: usize = (ROWS - 5) as usize;
+            let row = above_composer(&mut chat, 80, ROWS);
+            let buffer = frame_buffer(&mut chat, 80, ROWS);
+            let symbols: Vec<String> = (0..ROWS)
                 .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect())
                 .collect();
-            let (x, y) = cell_of(&symbols, row.trim())
+            let (x, _) = cell_of(&symbols[ROW..=ROW], needle)
                 .unwrap_or_else(|| panic!("{label}: the row is not on screen: {row:?}"));
             assert_eq!(
-                buffer[(x, y)].fg,
+                buffer[(x, ROW as u16)].fg,
                 fg(&theme, token).fg.unwrap_or(Color::Reset),
                 "{label} is not painted in {token:?}: {row:?}"
             );
+            // The clock is the row's shape and never its value: the value is
+            // the wall clock, and pinning it is what this test used to do.
+            if clocked {
+                assert!(
+                    shown_seconds(&row).is_some(),
+                    "{label}: the row carries no running clock: {row:?}"
+                );
+            } else {
+                assert!(
+                    shown_seconds(&row).is_none(),
+                    "{label}: a row with no clock printed one: {row:?}"
+                );
+            }
         }
     }
 
