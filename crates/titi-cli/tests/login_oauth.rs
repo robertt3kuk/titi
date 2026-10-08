@@ -410,10 +410,33 @@ fn agent_dir_with_env_provider() -> tempfile::TempDir {
 
 #[test]
 fn keys_shows_an_env_key_and_a_stored_subscription_together() {
+    // The environment is process-wide and `unsafe_code` is forbidden, so the
+    // nested run carries the
+    // variable on its own `Command` instead of this test mutating its own
+    // environment.
+    let exe = std::env::current_exe().expect("test binary");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", "keys_env_child_sees_the_variable", "--test-threads=1"])
+        .env("TITI_TEST_OAUTH_ENV_KEY", "sk-test-env")
+        .output()
+        .expect("child test runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn keys_env_child_sees_the_variable() {
+    // In the file's own plain in-process pass this child test runs too, but
+    // with no variable set there is nothing to prove, so it steps aside: the
+    // only caller is the parent test above, which spawns the test binary again
+    // with `TITI_TEST_OAUTH_ENV_KEY` on the child's Command.
+    if std::env::var("TITI_TEST_OAUTH_ENV_KEY").is_err() {
+        return;
+    }
     let dir = agent_dir_with_env_provider();
-    // The environment is process-wide, so the variable is this test's own and
-    // no other test reads it.
-    unsafe { std::env::set_var("TITI_TEST_OAUTH_ENV_KEY", "sk-test-env") };
     let tokens = OAuthTokens {
         access: "sk-test-access".to_owned(),
         refresh: None,
@@ -427,7 +450,6 @@ fn keys_shows_an_env_key_and_a_stored_subscription_together() {
 
     let mut chat = chat(dir.path());
     send(&mut chat, "/keys");
-    unsafe { std::env::remove_var("TITI_TEST_OAUTH_ENV_KEY") };
 
     assert!(
         has_line(&chat, "envsub  env + oauth"),
