@@ -19,10 +19,11 @@ Audited 2026-10-08 at `3aa6774` (2026-10-05) by two readers:
 5–10) and [`audits/2026-10-08-security.md`](audits/2026-10-08-security.md)
 (areas 3–4); every number below comes from
 [`audits/2026-10-08-facts.md`](audits/2026-10-08-facts.md). The three audit
-files are untracked at this revision. HEAD moved while this was synthesized
-(`3aa6774` → `af985e1`): three of the five fixes that were landing in parallel
-are committed — `899c89a`, `af985e1`, `e7c48e1` + `fe1abf2` — and two are still
-only in the working tree (see *Fix in flight*).
+files are committed in `8848055`. HEAD moved while this was synthesized
+(`3aa6774` → `af985e1`): all five of the fixes that were landing in parallel
+are committed — `899c89a`, `af985e1`, `e7c48e1` + `fe1abf2`, `8b33ed9` (whose
+bearer header needed `d24f5b1`) and `cbb8abd` — and their rows are struck
+through below.
 
 | Area | State | Evidence |
 | --- | --- | --- |
@@ -67,10 +68,10 @@ or security hole; high = wrong behaviour on a main path).
 | --- | --- | --- |
 | critical | ~~A test deletes the developer's real provider key — `titi-cli/src/chat.rs:10969` builds its chat with the bare helper, so `/logout openai` reaches `~/.titi/agent/auth.db`~~ fixed 2026-10-08 in 899c89a (the bare helper now builds on a temp dir, and a test pins that it never points at the real agent dir) | data loss when running `cargo test -p titi-cli`; kept for one more cycle |
 | critical | ~~The `git diff HEAD` block leaks credential files the read tools refuse — `titi-engine/src/difftrack.rs:279-288` (+ `runtime.rs:179-209,1816`): a modified `id_rsa` or service-account JSON reaches the provider~~ fixed 2026-10-08 in af985e1 (one `SensitivePolicy` for both paths, a redact pass per section, angle-bracket paths dropped and headers sanitised) | automatic secret egress; kept for one more cycle |
-| high | Tool/output masking misses quoted and `_`-suffixed key names — `titi-memory/src/redact.rs:349-370` | `{"api_key": …}`, `client_secret:`, `AWS_SECRET_ACCESS_KEY=`, `Authorization: Bearer …` |
+| high | ~~Tool/output masking misses quoted and `_`-suffixed key names — `titi-memory/src/redact.rs:349-370`~~ fixed 2026-10-08 in 8b33ed9, and the bearer header's prefilter in d24f5b1 (the pattern matched only a lowercase `bearer`, so a real `Authorization: Bearer …` never reached it) | `{"api_key": …}`, `client_secret:`, `AWS_SECRET_ACCESS_KEY=`, `Authorization: Bearer …`; kept for one more cycle |
 | high | Error lints are inert in 8 of 11 crates — `Cargo.toml:38-43`; only `titi-engine`, `titi-providers` and `titi-genome` opt in | `titi-cli/tests/login_oauth.rs:416,430` (`unsafe env::set_var`) must be rewritten first, since `unsafe_code = "forbid"` cannot be allowed back; clippy still runs without `-D warnings` on purpose |
 | high | Session files are written without `fsync` and rewritten in place — `titi-core/src/session/store.rs:102-107,215,262,281` | reuse the tmp + `sync_all` + rename pattern of `titi-memory/src/store.rs:291-304` |
-| high | The `fd-lock` helper runs the guarded write after a failed acquire, then unlinks the lock — `titi-config/src/config_file.rs:176-185` | advisory lock in name only; fix in flight |
+| high | ~~The `fd-lock` helper runs the guarded write after a failed acquire, then unlinks the lock — `titi-config/src/config_file.rs:176-185`~~ fixed 2026-10-08 in cbb8abd (the body runs only under a held lock, a refused lock is an error to the caller, and the lock file survives as the rendezvous point) | advisory lock in name only; kept for one more cycle |
 | high | A stalled provider hangs the turn and `Cancel` cannot unblock it — `titi-providers/src/transport.rs:190-212`, `http.rs:53-55`, `wire.rs:770-777` | `TransportError::Stalled` is produced by tests only; `RequestCtx::aborted` is never read in production |
 | high | `titi_cli::app::App` (2492 lines) is unreachable from the binary and kept alive by five integration test files | decide: wire it in or delete it with the test files |
 | medium | Raw tool arguments are persisted unmasked and the file mode is not set — `titi-engine/src/tool_loop.rs:167-171`, `titi-core/src/trajectory.rs:99-107` | the result is masked two blocks later; `write` is the only content tool without a `policy` field (`titi-tools/src/fs.rs:431-437`) |
@@ -92,25 +93,11 @@ or security hole; high = wrong behaviour on a main path).
 | low | `write` can plant code that runs later — `titi-tools/src/fs.rs:469`; `.git` sits inside the jail | refuse `.git/` for write/edit |
 | low | Checkpoint commits ignore the `SensitivePolicy` — `titi-cli/src/git_checkpoint.rs:17-40` | a staged `.env` gets committed |
 | low | ~~The `<diff>` frame around the snapshot is not sanitised — `runtime.rs:204-209`, `difftrack.rs:152-158,168-183`~~ fixed 2026-10-08 in af985e1 (`sanitize_headers` plus angle-bracket paths dropped) | prompt injection only |
-| low | ~~`titi genome check` reports false positives on a clean tree — 13 `syntax-error` + 19 `unresolved-import` (facts §7)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2 (documented in b1fe30a); a re-run reports 10 `ambiguous-symbol` and neither of the two codes, so the gate still exits 1 on a clean tree | the remaining 10 are same-name types in two crates each (`AgentState`, `Entry`, `Role`, `VERSION`, …); whether the checker should call those ambiguous is not settled here |
+| low | ~~`titi genome check` reports false positives on a clean tree — 13 `syntax-error` + 19 `unresolved-import` (facts §7)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2 (documented in b1fe30a); a re-run reports 10 `ambiguous-symbol` and neither of the two codes, and since 4c2f465 only a real problem exits non-zero: those ten are informational and the gate exits 0 on a clean tree | the remaining 10 are same-name types in two crates each (`AgentState`, `Entry`, `Role`, `VERSION`, …); whether the checker should call those ambiguous is not settled here |
+| low | The mask consumes the credential's key name, so a masked line can end with a dangling quote — `titi-memory/src/redact.rs:349-370` | `"password": "…"` → `[redacted]"`; preserving the key needs a per-pattern capture template (Rust's regex has no lookbehind) |
 | low | The README header test count is stale — `README.md:9` says 1279 passed (2026-09-23); CI says 1805 | |
 | low | STATE.md mixes Russian history and English notes | readability only |
 | medium | ~~`goal-loop` branch (goal loop, AGENTS.md injection, skills list, modelRoles) not in `master`~~ fixed 2026-09-23 in 324c6eb (goal loop shipped on `master` as `/goal`) | kept for one more cycle |
-
-## Fix in flight (2026-10-08, working tree, uncommitted)
-
-Five fixes were landing while this was synthesized. Three are committed at
-HEAD — the destructive test and the unisolated test chat in `899c89a`, the
-diff-block credential leak and its frame in `af985e1`, the genome false
-positives in `e7c48e1` + `fe1abf2` (documented in `b1fe30a`) — and are struck
-through above. These two were still only in the working tree when this was
-written, so their rows stay open until they land:
-
-1. Masking gaps — `crates/titi-memory/src/redact.rs`: the catch-all now folds a
-   quoted or `_`-suffixed name into the match, plus a bearer-header pattern.
-2. File-lock helper — `crates/titi-config/src/config_file.rs`: the guarded
-   write no longer runs after a failed acquire, the lock file is no longer
-   unlinked, and an interrupted acquire retries instead of falling through.
 
 ## Known risks
 
@@ -124,11 +111,12 @@ written, so their rows stay open until they land:
   alone — and the trajectory records raw args before masking.
 - Dependency advisories are unchecked: no `cargo audit` was available, so
   RustSec status is unknown, not clean.
-- `titi genome check` still exits 1 on a clean tree (10 `ambiguous-symbol`), so
-  it is not yet usable as a gate.
+- `titi genome check` exits 0 on a clean tree with 10 informational
+  `ambiguous-symbol` lines (`4c2f465`), so it is usable as a gate; the ten are
+  same-name types in two crates each, which the checker does not yet call noise.
 
 ## Audit history
 
 | Date | Auditor | Summary |
 | --- | --- | --- |
-| 2026-10-08 | `audit-general` (areas 1, 2, 5–10) + `audit-security` (areas 3–4), facts from `2026-10-08-facts.md` | First full audit at `3aa6774`: CI green (1805/0), boundary, tools and retry semantics hold; 2 critical (a test deletes the real stored key; the `git diff` block leaks credential files to the provider) raised from the auditors' `high` by the definitions, 6 high, one dead 2492-line `app.rs`; no critical in the general half. Rejections carried: "no picture fallback on non-kitty terminals" is the documented contract, not a defect, and the `titi-tui/src/theme/tests.rs` occurrences are a `#[cfg(test)]` module; one measurement corrected — the facts file's 451 `unwrap` + 507 `expect` are raw `src` counts with inline test modules included (outside them ≈36, ~19 behind the `genome/parse.rs` allow), and RustSec is unverified because `cargo audit` is absent. Both criticals were fixed the same day (`899c89a`, `af985e1`) |
+| 2026-10-08 | `audit-general` (areas 1, 2, 5–10) + `audit-security` (areas 3–4), facts from `2026-10-08-facts.md` | First full audit at `3aa6774`: CI green (1805/0), boundary, tools and retry semantics hold; 2 critical (a test deletes the real stored key; the `git diff` block leaks credential files to the provider) raised from the auditors' `high` by the definitions, 6 high, one dead 2492-line `app.rs`; no critical in the general half. Rejections carried: "no picture fallback on non-kitty terminals" is the documented contract, not a defect, and the `titi-tui/src/theme/tests.rs` occurrences are a `#[cfg(test)]` module; one measurement corrected — the facts file's 451 `unwrap` + 507 `expect` are raw `src` counts with inline test modules included (outside them ≈36, ~19 behind the `genome/parse.rs` allow), and RustSec is unverified because `cargo audit` is absent. Both criticals were fixed the same day (`899c89a`, `af985e1`); one fix landed with a test its own pattern could not satisfy (`8b33ed9`), unseen because the range was unpushed, and pinned to the real contract in `98d40bb` |
