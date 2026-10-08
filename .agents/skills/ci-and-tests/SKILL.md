@@ -35,3 +35,17 @@ focused commit. Never weaken a test to make it pass.
 
 See `docs/COMMITS.md`: conventional `type(scope): summary`, one concern
 per commit, prose bodies, straight-to-master push, never force-push.
+
+## Never share a target directory between checkouts
+
+Never point another checkout's build at this checkout's `target/` — build
+inside the other checkout with its own target dir (or none). A binary built
+from a foreign tree bakes *that* tree's `CARGO_MANIFEST_DIR` into itself, so a
+test run through this `target/` fails with a filesystem error on a file you
+can see on disk:
+
+    Os { code: 2, kind: NotFound }
+
+It also fails only on the full run — a `-p <crate>` run of the same test
+rebuilds with local paths and passes — so it reads like flake. If you see
+this, `cargo clean -p <crate>` to drop the foreign artifacts and rebuild.
