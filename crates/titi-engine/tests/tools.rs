@@ -986,7 +986,7 @@ async fn a_cancel_stops_the_shell_command_the_turn_waits_on() {
     let transport = Arc::new(MockTransport::new(vec![
         MockBody::Events(tool_call_events(
             "bash",
-            r#"{"command": "trap 'touch stopped; exit 1' TERM; sleep 30 & wait"}"#,
+            r#"{"command": "trap 'touch stopped; exit 1' TERM; touch ready; sleep 30 & wait"}"#,
         )),
         MockBody::Events(tool_call_events("bash", r#"{"command": "echo fine"}"#)),
         MockBody::Events(vec![StreamEvent::Done {
@@ -1012,12 +1012,23 @@ async fn a_cancel_stops_the_shell_command_the_turn_waits_on() {
             break;
         }
     }
-    // Give the shell time to set its trap before the cancel lands.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait for the shell to arm its trap instead of guessing how long that
+    // takes. `touch ready` runs after `trap`, so the file is the gate: once
+    // it exists the cancel cannot land before the handler is installed. The
+    // timeout is a hang-guard, not the thing under test.
+    let ready = dir.path().join("ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(ready.exists(), "the shell never armed its trap");
     engine.send(EngineCommand::Cancel).await.unwrap();
 
+    // What is asserted is that the interrupt reached the running command and
+    // its TERM handler ran; the deadline only fails a command that never
+    // reacts at all.
     let stopped = dir.path().join("stopped");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !stopped.exists() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
