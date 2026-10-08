@@ -8,6 +8,7 @@ use smol_str::SmolStr;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::compat::StreamDecodePolicy;
 use crate::creds::{CredKind, Credential};
@@ -656,6 +657,8 @@ struct PumpState {
     idle: std::time::Duration,
     /// The model this stream belongs to, for the stall message.
     model: SmolStr,
+    /// The turn's abort flag: a set flag ends the stream at the next chunk.
+    aborted: Arc<AtomicBool>,
 }
 
 impl PumpState {
@@ -725,14 +728,16 @@ impl PumpState {
 /// A `Done` that comes before any usage report waits up to `grace` for the
 /// count to follow, then goes out with or without it. Between chunks the
 /// stream may be silent for at most `watchdog.idle_timeout` before the reply
-/// is reported as stalled. The first-event timeout is applied by
-/// `FamilyTransport::stream` before this pump starts.
+/// is reported as stalled; a set abort flag ends the stream without a word.
+/// The first-event timeout is applied by `FamilyTransport::stream` before
+/// this pump starts.
 pub fn sse_event_stream(
     body: Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
     api: ApiKind,
     policy: StreamDecodePolicy,
     watchdog: WatchdogConfig,
     model: SmolStr,
+    aborted: Arc<AtomicBool>,
 ) -> impl Stream<Item = StreamEvent> + Send {
     let family = match api {
         ApiKind::AnthropicMessages => FamilyDecoder::Anthropic(Default::default()),
@@ -755,6 +760,7 @@ pub fn sse_event_stream(
             grace: watchdog.post_finish_grace,
             idle: watchdog.idle_timeout,
             model,
+            aborted,
         },
         pump_step,
     )
@@ -784,7 +790,10 @@ async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
         } else {
             state.idle
         };
-        let next = match read_next(&mut state.body, limit).await {
+        let next = match read_next(&mut state.body, limit, &state.aborted).await {
+            // The turn is over and nobody will read the rest; leave without a
+            // terminal event, which the caller treats as a cancel.
+            ReadStep::Aborted => return None,
             // The server keeps the response open after the finish; the answer
             // is complete without the count.
             ReadStep::Idle if state.held.is_some() => {
@@ -832,24 +841,51 @@ async fn pump_step(mut state: PumpState) -> Option<(StreamEvent, PumpState)> {
     }
 }
 
+/// How often a read re-checks the abort flag while it waits for bytes.
+///
+/// The flag is a plain `AtomicBool` shared with the turn; there is no wakeup
+/// channel, so the read polls it on a short tick. The tick bounds how long
+/// Ctrl+C can wait, and is only spent while the body is silent.
+const ABORT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// One step of waiting for a body chunk.
 enum ReadStep {
     /// The body produced an item, or ended (`None`).
     Chunk(Option<Result<BodyChunk, String>>),
     /// Nothing arrived within the limit.
     Idle,
+    /// The turn was cancelled while the read waited.
+    Aborted,
 }
 
-/// Wait for the next body chunk, or the limit, whichever comes first. This is
-/// the one place a silent server can be waited on, so the watchdog resolves
-/// here rather than at the mercy of the socket.
+/// Wait for the next body chunk, the abort flag, or the limit, whichever
+/// comes first. This is the one place a silent server can be waited on, so
+/// both the watchdog and Cancel resolve here rather than at the mercy of the
+/// socket.
 async fn read_next(
     body: &mut Pin<Box<dyn Stream<Item = Result<BodyChunk, String>> + Send>>,
     limit: std::time::Duration,
+    aborted: &AtomicBool,
 ) -> ReadStep {
-    match tokio::time::timeout(limit, body.next()).await {
-        Ok(next) => ReadStep::Chunk(next),
-        Err(_) => ReadStep::Idle,
+    let read = tokio::time::timeout(limit, body.next());
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            // A ready read wins even with `biased`: the sleep is pending and
+            // is polled first only once it has already elapsed.
+            biased;
+            _ = tokio::time::sleep(ABORT_POLL) => {
+                if aborted.load(Ordering::Relaxed) {
+                    return ReadStep::Aborted;
+                }
+            }
+            outcome = &mut read => {
+                return match outcome {
+                    Ok(next) => ReadStep::Chunk(next),
+                    Err(_) => ReadStep::Idle,
+                };
+            }
+        }
     }
 }
 
@@ -1024,13 +1060,20 @@ impl Transport for FamilyTransport {
         }
         let watchdog = self.watchdog.clone();
         let model = req.model.clone();
+        let aborted = Arc::clone(&ctx.aborted);
         // The first-event timeout is the one the caller can be told about in
         // typed form: a server that opens the response and then says nothing
         // is the documented stall, and `stream` is still on the stack to
         // return it. The chunk, if any, goes back in front of the body.
         let mut body = resp.body;
-        let first = match read_next(&mut body, watchdog.first_event_timeout).await {
+        let first = match read_next(&mut body, watchdog.first_event_timeout, &aborted).await {
             ReadStep::Chunk(item) => item,
+            ReadStep::Aborted => {
+                return Err(TransportError::Fatal {
+                    status: None,
+                    message: "cancelled before the stream opened".into(),
+                });
+            }
             ReadStep::Idle => {
                 return Err(TransportError::Stalled {
                     phase: StallPhase::FirstEvent,
@@ -1047,6 +1090,7 @@ impl Transport for FamilyTransport {
             StreamDecodePolicy::default(),
             watchdog,
             model,
+            aborted,
         )))
     }
 }
@@ -2250,6 +2294,89 @@ mod tests {
                 reason: ErrorReason::Connection,
                 message: "the reply from gpt-test stalled for 40ms mid-stream".into(),
             })
+        );
+    }
+
+    /// Cancel must end a read the server is holding open at the first byte:
+    /// the read polls the existing abort flag and returns within the stated
+    /// bound (well under a second here; the tick is 25ms).
+    #[tokio::test]
+    async fn cancel_ends_a_stalled_open_at_the_first_byte() {
+        let fetch = Arc::new(TailFetch {
+            chunks: Vec::new(),
+            tail: Tail::Hang,
+        });
+        let transport = watched(
+            fetch,
+            short_watchdog(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(30),
+            ),
+        );
+        let ctx = RequestCtx::with_key("sk-test");
+        let flag = Arc::clone(&ctx.aborted);
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result = transport.stream(req(), ctx).await;
+        let elapsed = started.elapsed();
+        canceller.await.expect("the canceller task");
+        match result {
+            Err(TransportError::Fatal { .. }) => {}
+            Err(other) => panic!("a cancel is not a stall: {other:?}"),
+            Ok(_) => panic!("a cancelled open must not return a stream"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cancel took {elapsed:?}"
+        );
+    }
+
+    /// Cancel must also end a read already inside the pump, where a server
+    /// went silent after its first chunk.
+    #[tokio::test]
+    async fn cancel_ends_a_stalled_mid_stream_read() {
+        let fetch = Arc::new(TailFetch {
+            chunks: vec![says("hi")],
+            tail: Tail::Hang,
+        });
+        let transport = watched(
+            fetch,
+            short_watchdog(
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(30),
+            ),
+        );
+        let ctx = RequestCtx::with_key("sk-test");
+        let flag = Arc::clone(&ctx.aborted);
+        let mut stream = transport
+            .stream(req(), ctx)
+            .await
+            .expect("the stream opens");
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let events: Vec<StreamEvent> =
+            tokio::time::timeout(std::time::Duration::from_secs(60), stream.collect())
+                .await
+                .expect("cancel must end the stream");
+        let elapsed = started.elapsed();
+        canceller.await.expect("the canceller task");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hi");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cancel took {elapsed:?}"
         );
     }
 }

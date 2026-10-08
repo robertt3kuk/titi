@@ -2160,9 +2160,10 @@ async fn stream_attempt(
 ) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
     // Every request the turn makes goes through here, including each transient
     // retry, so this is the one place that can be the last look at the flag
-    // before bytes leave. It cannot close the window completely: a cancel that
-    // lands after `stream` was called hits a request already in flight, and
-    // only `RequestCtx::aborted` can cut that connection short.
+    // before bytes leave. A cancel that lands after `stream` was called hits a
+    // request already in flight; the transport reads the same flag through
+    // `RequestCtx::aborted` and drops a silent read on a short tick, so the
+    // turn still ends promptly instead of waiting out the socket.
     if aborted.load(Ordering::SeqCst) {
         return Ok((SmolStr::default(), Vec::new()));
     }
