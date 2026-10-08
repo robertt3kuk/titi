@@ -1,113 +1,183 @@
-//! Ruby: `def`/`class`/`module`/`attr_*` and `require` lines, from patterns.
+//! Ruby: `def`/`class`/`module`/`attr_*` and `require` lines, read off the
+//! grammar's nodes.
 //!
-//! Comments are masked before the patterns run, so a commented-out `def` is
-//! not an export. `=begin`/`=end` block comments are still a gap: they are not
-//! masked, so a declaration written inside one is read as an export. So are
-//! declarations whose name is not a bare identifier — operator methods
-//! (`def <=>`) — and `attr_*` symbol lists written as `%i[a b]`.
+//! Comments are comments to the grammar, `=begin`/`=end` blocks included, so a
+//! commented-out `def` is not an export — the pattern masked `#` and nothing
+//! else, so it read one out of an `=begin` block. A method is the grammar's
+//! own `method`/`singleton_method` node, so `def self.run` publishes `run`,
+//! and an operator method the bare-identifier pattern could not name is
+//! exported under the name the grammar gives it.
 //!
 //! A `require_relative` names a file beside this one, so it is resolved
 //! against the workspace and reported when it names nothing. A plain `require`
 //! searches the load path — this workspace, a `-I` directory, or a gem — so a
 //! specifier that names no workspace file is left alone rather than reported.
-use std::collections::HashSet;
-use std::sync::LazyLock;
 
-use regex::Regex;
+use std::collections::HashSet;
+
+use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{
-    Comments, Placement, export_sites_from, finish, internal, line_character, mask_comments,
-    record, resolve_relative, resolve_suffix,
-};
-use crate::ExportSite;
+use super::support::{Placement, finish, internal, record, resolve_relative, resolve_suffix};
 
-/// `require_relative 'x'`: file-shaped by definition, resolved beside the file.
-static REQUIRE_RELATIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^\s*require_relative\s+['"]([^'"]+)['"]"#).expect("ruby require_relative")
-});
-/// A plain `require`: the load path may be a gem, so a miss is not a warning.
-static REQUIRE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"(?m)^\s*require\s+['"]([^'"]+)['"]"#).expect("ruby require"));
-/// `def name`, or a singleton `def self.name` / `def Foo.name` whose published
-/// name is the one after the dot.
-static DEF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*def\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*[!?=]?)")
-        .expect("ruby def")
-});
-/// `class`/`module`, possibly namespaced (`module Acme::App`).
-static TYPE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(?:class|module)\s+([A-Za-z_][A-Za-z0-9_:]*)").expect("ruby type")
-});
-/// `attr_reader`/`attr_writer`/`attr_accessor` with their symbol arguments,
-/// with or without the parenthesised call form.
-static ATTR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*attr_(?:reader|writer|accessor)\s*\(?([^\n]+)").expect("ruby attr")
-});
-/// A `:symbol`, `'symbol'` or `"symbol"` inside an `attr_*` argument list.
-static SYMBOL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"[:'"]([A-Za-z_][A-Za-z0-9_!?]*)"#).expect("ruby attr symbol"));
+use crate::symbols::{self, Grammar, push_site, text};
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
-    let masked = mask_comments(source, Comments::Hash);
-
-    let mut sites = export_sites_from(&DEF, &masked);
-    // `class Acme::App` names `App`: the last `::` segment is the constant.
-    for cap in TYPE.captures_iter(&masked) {
-        let matched = &cap[1];
-        let name = matched.rsplit("::").next().unwrap_or(matched);
-        let offset = cap.get(1).map(|m| m.start()).unwrap_or(0) + (matched.len() - name.len());
-        push_site(&mut sites, &masked, offset, name);
-    }
-    // `attr_reader :a, :b` is the idiomatic public reader, and one line is
-    // several exports.
-    for cap in ATTR.captures_iter(&masked) {
-        let Some(args) = cap.get(1) else {
-            continue;
+    let Some(tree) = symbols::parse(Grammar::Ruby, source) else {
+        return ParsedFile {
+            syntax_errors: 1,
+            ..ParsedFile::default()
         };
-        for symbol in SYMBOL.captures_iter(args.as_str()) {
-            if let Some(name) = symbol.get(1) {
-                push_site(
-                    &mut sites,
-                    &masked,
-                    args.start() + name.start(),
-                    name.as_str(),
-                );
-            }
-        }
-    }
-    sites.sort_by_key(|site| (site.line, site.character));
-
+    };
+    let bytes = source.as_bytes();
+    let mut sites = Vec::new();
     let mut imports = Vec::new();
     let mut unresolved = Vec::new();
-    for cap in REQUIRE_RELATIVE.captures_iter(&masked) {
-        let spec = &cap[1];
-        record(
-            spec,
-            internal(resolve_relative(path, spec, files, &["rb"])),
-            &mut imports,
-            &mut unresolved,
-        );
-    }
-    for cap in REQUIRE.captures_iter(&masked) {
-        let spec = &cap[1];
-        let stem = spec.strip_suffix(".rb").unwrap_or(spec);
-        // Nothing found means a gem or a `-I` directory, not a missing file.
-        let placement = match resolve_suffix(stem, &["rb"], files) {
-            Some(found) => Placement::Resolved(found),
-            None => Placement::External,
-        };
-        record(spec, placement, &mut imports, &mut unresolved);
-    }
-
-    finish(&masked, sites, imports, unresolved, 0)
+    ruby_items(
+        tree.root_node(),
+        bytes,
+        path,
+        files,
+        &mut sites,
+        &mut imports,
+        &mut unresolved,
+    );
+    finish(
+        source,
+        sites,
+        imports,
+        unresolved,
+        symbols::error_count(tree.root_node()),
+    )
 }
 
-fn push_site(sites: &mut Vec<ExportSite>, masked: &str, byte: usize, name: &str) {
-    let (line, character) = line_character(masked, byte);
-    sites.push(ExportSite {
+/// Every declaration and every `require`, from the grammar's nodes: a `def`
+/// (singleton included), a `class`/`module`, an `attr_*` call and the two
+/// require forms. A commented-out one is not a node, so it cannot reach here.
+fn ruby_items(
+    node: Node,
+    source: &[u8],
+    path: &str,
+    files: &HashSet<String>,
+    sites: &mut Vec<crate::ExportSite>,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "method" | "singleton_method" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    push_site(name, source, sites);
+                }
+            }
+            "class" | "module" => {
+                // `class Acme::App` names `App`: the last `::` segment is the
+                // constant, and the site points at that segment.
+                if let Some(name) = child.child_by_field_name("name") {
+                    push_site(last_segment(name), source, sites);
+                }
+            }
+            "call" => ruby_call(child, source, path, files, sites, imports, unresolved),
+            _ => {}
+        }
+        ruby_items(child, source, path, files, sites, imports, unresolved);
+    }
+}
+
+/// The constant a `class`/`module` name ends with: `Acme::App` → the `App`
+/// node, a bare constant as it is.
+fn last_segment(node: Node) -> Node {
+    if node.kind() == "scope_resolution"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        return last_segment(name);
+    }
+    node
+}
+
+/// One call: an `attr_*` publishes its symbol arguments, and the two require
+/// forms name a file. Any other call is left alone.
+fn ruby_call(
+    node: Node,
+    source: &[u8],
+    path: &str,
+    files: &HashSet<String>,
+    sites: &mut Vec<crate::ExportSite>,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    let Some(method) = node.child_by_field_name("method") else {
+        return;
+    };
+    let Some(name) = text(method, source) else {
+        return;
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    match name.as_str() {
+        "attr_reader" | "attr_writer" | "attr_accessor" => {
+            let mut cursor = arguments.walk();
+            for argument in arguments.named_children(&mut cursor) {
+                if !matches!(argument.kind(), "simple_symbol" | "symbol") {
+                    continue;
+                }
+                let Some(symbol) = text(argument, source) else {
+                    continue;
+                };
+                let symbol = symbol.trim_start_matches(':').trim_matches(['"', '\'']);
+                push_site_at(argument, symbol, sites);
+            }
+        }
+        "require_relative" | "require" => {
+            let mut cursor = arguments.walk();
+            let Some(argument) = arguments
+                .named_children(&mut cursor)
+                .find(|argument| argument.kind() == "string")
+            else {
+                return;
+            };
+            let Some(spec) = string_content(argument, source) else {
+                return;
+            };
+            if name == "require_relative" {
+                let resolved = resolve_relative(path, &spec, files, &["rb"]);
+                record(&spec, internal(resolved), imports, unresolved);
+            } else {
+                let stem = spec.strip_suffix(".rb").unwrap_or(&spec);
+                // Nothing found means a gem or a `-I` directory, not a
+                // missing file.
+                let placement = match resolve_suffix(stem, &["rb"], files) {
+                    Some(found) => Placement::Resolved(found),
+                    None => Placement::External,
+                };
+                record(&spec, placement, imports, unresolved);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The text inside a `string` node, which is its `string_content` child: the
+/// quotes are part of the string node, not of what it names.
+fn string_content(string: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = string.walk();
+    string
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "string_content")
+        .and_then(|content| text(content, source))
+}
+
+/// Records `name` at the position of `at`, rather than at a node that may
+/// carry a `:` prefix or quote of its own.
+fn push_site_at(at: Node, name: &str, out: &mut Vec<crate::ExportSite>) {
+    let point = at.start_position();
+    out.push(crate::ExportSite {
         name: name.to_owned(),
-        line,
-        character,
+        line: u32::try_from(point.row)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1),
+        character: u32::try_from(point.column).unwrap_or(u32::MAX),
     });
 }

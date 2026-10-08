@@ -258,11 +258,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Ruby,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "ruby",
-        note: "`def`/`class`/`require` lines are matched by pattern; comments are masked first",
+        note: "`def`/`class`/`module`/`attr_*` come from a syntax tree; `require_relative` resolves beside the file and a plain `require` stays external",
         extensions: &["rb"],
-        grammar: None,
+        grammar: Some(Grammar::Ruby),
         parse: ruby::parse,
     },
     Lang {

@@ -345,6 +345,7 @@ fn the_roster_needs_no_workspace() {
             "javascript",
             "kotlin",
             "python",
+            "ruby",
             "rust",
             "typescript"
         ]

@@ -23,6 +23,11 @@ const APP: &str = r#"
 require_relative 'helper'
 require 'json'
 
+=begin
+def block_ghost
+end
+=end
+
 # def ghost
 module Acme::App
   def self.run
@@ -70,6 +75,13 @@ fn ruby_exports_singletons_namespaced_types_attrs_and_requires() {
     assert!(
         !app.exports.contains(&"ghost".to_owned()),
         "a commented-out def is not an export: {:?}",
+        app.exports
+    );
+    // The pattern masked `#` and nothing else, so it read `block_ghost` out of
+    // an `=begin`/`=end` block; the grammar knows a comment from code.
+    assert!(
+        !app.exports.contains(&"block_ghost".to_owned()),
+        "a `=begin` block comment is not a declaration: {:?}",
         app.exports
     );
 
@@ -120,5 +132,5 @@ fn ruby_exports_singletons_namespaced_types_attrs_and_requires() {
         .into_iter()
         .find(|capability| capability.language == "ruby")
         .expect("a ruby capability");
-    assert_eq!(ruby.level, Level::Heuristic, "{}", ruby.note);
+    assert_eq!(ruby.level, Level::Full, "{}", ruby.note);
 }
