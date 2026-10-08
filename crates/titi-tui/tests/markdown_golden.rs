@@ -203,7 +203,8 @@ const TABLE_BAR: &str = "\x1b[38;2;68;68;68m│\x1b[39m";
 /// cell.  Widths are 4 and 5, so the frame is `3*2+1 + 9 = 16` columns.
 #[test]
 fn golden_table_two_columns() {
-    let got = golden_render("| Name | Value |\n|------|-------|\n| a    | 1     |\n| b    | 2     |");
+    let got =
+        golden_render("| Name | Value |\n|------|-------|\n| a    | 1     |\n| b    | 2     |");
     let expected = format!(
         "{TABLE_BORDER}┌──────┬───────┐\x1b[39m\n\
          {TABLE_BAR} \x1b[1mName\x1b[22m {TABLE_BAR} \x1b[1mValue\x1b[22m {TABLE_BAR}\n\
@@ -266,7 +267,9 @@ fn golden_table_wraps_a_wide_cell_at_a_narrow_pane() {
     );
     let expected = vec![
         format!("{TABLE_BORDER}┌─────┬────────────────┐\x1b[39m"),
-        format!("{TABLE_BAR} \x1b[1mCol\x1b[22m {TABLE_BAR} \x1b[1mDescription   \x1b[22m {TABLE_BAR}"),
+        format!(
+            "{TABLE_BAR} \x1b[1mCol\x1b[22m {TABLE_BAR} \x1b[1mDescription   \x1b[22m {TABLE_BAR}"
+        ),
         format!("{TABLE_BORDER}├─────┼────────────────┤\x1b[39m"),
         format!("{TABLE_BAR} a   {TABLE_BAR} one two three  {TABLE_BAR}"),
         format!("{TABLE_BAR}     {TABLE_BAR} four           {TABLE_BAR}"),

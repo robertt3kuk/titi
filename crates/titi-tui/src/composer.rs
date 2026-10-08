@@ -363,11 +363,7 @@ pub fn render_box_composer(
 
 fn glyph<'a>(theme: &'a Theme, key: &str, fallback: &'a str) -> &'a str {
     let s = theme.symbol(key);
-    if s.is_empty() {
-        fallback
-    } else {
-        s
-    }
+    if s.is_empty() { fallback } else { s }
 }
 
 fn prompt_text(input: &str, highlighted: bool, show_cursor: bool) -> String {

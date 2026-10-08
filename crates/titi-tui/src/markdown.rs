@@ -751,13 +751,25 @@ fn render_table(table: &TableBlock, theme: &Theme, w: usize) -> Vec<String> {
     };
 
     let mut out = Vec::new();
-    out.push(rule("boxSharp.topLeft", "boxSharp.teeDown", "boxSharp.topRight"));
+    out.push(rule(
+        "boxSharp.topLeft",
+        "boxSharp.teeDown",
+        "boxSharp.topRight",
+    ));
     out.extend(row_lines(&header_cells, true));
-    out.push(rule("boxSharp.teeRight", "boxSharp.cross", "boxSharp.teeLeft"));
+    out.push(rule(
+        "boxSharp.teeRight",
+        "boxSharp.cross",
+        "boxSharp.teeLeft",
+    ));
     for (i, row) in body_cells.iter().enumerate() {
         out.extend(row_lines(row, false));
         if i + 1 < body_cells.len() {
-            out.push(rule("boxSharp.teeRight", "boxSharp.cross", "boxSharp.teeLeft"));
+            out.push(rule(
+                "boxSharp.teeRight",
+                "boxSharp.cross",
+                "boxSharp.teeLeft",
+            ));
         }
     }
     out.push(rule(
@@ -1535,7 +1547,11 @@ Done in `AGENTS.md`.";
     #[test]
     fn table_column_widths_come_from_display_width() {
         let theme = colored_theme();
-        let rows = plain(&render_markdown("| a | 日本 |\n|---|---|\n| b | 🎉c |", &theme, 80));
+        let rows = plain(&render_markdown(
+            "| a | 日本 |\n|---|---|\n| b | 🎉c |",
+            &theme,
+            80,
+        ));
         // col0 = 1, col1 = max(4, 3) = 4 → chrome 7 + 5 = 12 columns.
         assert_eq!(
             rows,
@@ -1620,7 +1636,11 @@ Done in `AGENTS.md`.";
     #[test]
     fn over_wide_word_is_cut_with_an_ellipsis() {
         let theme = colored_theme();
-        let lines = render_markdown("| a | b |\n|---|---|\n| supercalifragilistic | x |", &theme, 20);
+        let lines = render_markdown(
+            "| a | b |\n|---|---|\n| supercalifragilistic | x |",
+            &theme,
+            20,
+        );
         let rows = plain(&lines);
         assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(rows[3].contains('…'), "the cut is marked: {rows:?}");
@@ -1641,7 +1661,11 @@ Done in `AGENTS.md`.";
             vec!["| a | b |", "|---|"]
         );
         assert_eq!(
-            plain(&render_markdown("| a | b |\n|---|---|\n| only one |", &theme, 40)),
+            plain(&render_markdown(
+                "| a | b |\n|---|---|\n| only one |",
+                &theme,
+                40
+            )),
             vec![
                 "┌───┬───┐",
                 "│ a │ b │",
@@ -1662,7 +1686,11 @@ Done in `AGENTS.md`.";
     #[test]
     fn table_opens_a_block() {
         let theme = colored_theme();
-        let rows = plain(&render_markdown("Summary:\n| a |\n|---|\n| 1 |", &theme, 40));
+        let rows = plain(&render_markdown(
+            "Summary:\n| a |\n|---|\n| 1 |",
+            &theme,
+            40,
+        ));
         assert_eq!(rows[0], "Summary:");
         assert_eq!(rows[1], "");
         assert!(rows[2].starts_with('┌'), "{rows:?}");
@@ -1689,7 +1717,13 @@ Done in `AGENTS.md`.";
         let lines = render_markdown("| a |  |\n|---|---|\n|  | 2 |", &theme, 40);
         assert_eq!(
             plain(&lines),
-            vec!["┌───┬───┐", "│ a │   │", "├───┼───┤", "│   │ 2 │", "└───┴───┘"]
+            vec![
+                "┌───┬───┐",
+                "│ a │   │",
+                "├───┼───┤",
+                "│   │ 2 │",
+                "└───┴───┘"
+            ]
         );
         let border = "\x1b[38;2;68;68;68m";
         assert!(lines[0].starts_with(border), "{:?}", lines[0]);
@@ -1704,10 +1738,7 @@ Done in `AGENTS.md`.";
         let body = &lines[3];
         assert!(body.contains("\x1b[1mb\x1b[22m"), "{body:?}");
         assert!(body.contains("\x1b[3mi\x1b[23m"), "{body:?}");
-        assert!(
-            body.contains("\x1b[38;2;255;123;114mc\x1b[39m"),
-            "{body:?}"
-        );
+        assert!(body.contains("\x1b[38;2;255;123;114mc\x1b[39m"), "{body:?}");
         assert_eq!(
             plain(&lines),
             vec![
