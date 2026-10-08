@@ -85,15 +85,69 @@ pub fn list_sessions() -> Vec<String> {
 }
 
 /// The session a `--continue` or `session.autoResume` launch resumes: the
-/// newest the agent directory holds, which is the first row Ctrl+X lists.
+/// newest session recorded in the workspace titi is running in.
 ///
-/// `None` means there is nothing to resume. There is no narrower scope to pick
-/// from: a session records no workspace — `SessionMeta` carries a title,
-/// a bot and a source, and its entries are the conversation — so "the newest
-/// session in this workspace" is, for the store that exists, the newest in the
-/// agent directory, the same scope `/sessions` and the switcher read.
+/// [`newest_session_in`] is the whole rule — including the fallback that keeps
+/// a session from before workspaces were recorded reachable; this passes the
+/// directory titi runs in, the same one [`current_workspace`] pins a
+/// checkpoint to.
 pub fn newest_session(agent_dir: &std::path::Path) -> Option<String> {
-    list_sessions_from(agent_dir).into_iter().next()
+    newest_session_in(agent_dir, &current_workspace())
+}
+
+/// The newest session recorded in `workspace`, or the newest session overall
+/// when this workspace has none.
+///
+/// Both branches answer in the order the picker lists — the sessions
+/// directory by modification time, which is the first row Ctrl+X shows — so
+/// `--continue` resumes the row the user would have picked, not merely the
+/// one created last:
+///
+/// * a session whose recorded workspace is `workspace` answers first, however
+///   old it is. This is the branch that makes two projects separate: the
+///   session of the project you are in wins over a newer one from another;
+/// * nothing recorded for this workspace falls back to the newest session
+///   anywhere. That is the answer this used to give unconditionally, and it
+///   is what serves a session written before sessions carried a workspace, or
+///   a first run in a new project — such a session is reachable rather than
+///   hidden behind a filter it cannot satisfy;
+/// * an index that cannot be read at all (absent, or written by a newer
+///   release) falls back the same way, because the JSONL files, not the
+///   index, are the sessions.
+///
+/// `None` means there is nothing to resume at all.
+pub fn newest_session_in(
+    agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Option<String> {
+    let listed = list_sessions_from(agent_dir);
+    if let Some(here) = ids_in_workspace(agent_dir, workspace)
+        && let Some(id) = listed.iter().find(|id| here.contains(id.as_str()))
+    {
+        return Some(id.clone());
+    }
+    listed.into_iter().next()
+}
+
+/// The session ids the index records as started in `workspace`.
+///
+/// `None` when the index cannot be read — there is none yet, it is
+/// unreadable, or it was written by a newer release — because no session can
+/// be shown to belong to `workspace` without it. The lookup answers "which
+/// sessions are this project's", so it does not create an index to do it:
+/// `SessionStore::new` would, and an agent directory that has none is
+/// answered from its files alone, which is what the caller falls back to.
+fn ids_in_workspace(
+    agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Option<std::collections::HashSet<String>> {
+    if !agent_dir.join("state.db").exists() {
+        return None;
+    }
+    let store = titi_core::session::SessionStore::new(agent_dir).ok()?;
+    let root = workspace.to_string_lossy();
+    let ids = store.sessions_in(Some(root.as_ref())).ok()?;
+    Some(ids.into_iter().collect())
 }
 
 /// Delete a session's JSONL file.  Callers must gate this behind an
