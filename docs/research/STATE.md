@@ -305,14 +305,15 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   http client gets a timeout), 46fa805 (the declared first-event and idle
   windows are applied and `Stalled` is produced in production) and 0169bbb (a
   cancel ends a silent read).
-- [ ] `high` `titi_cli::app::App` (2492 lines) is unreachable from the binary
-  and kept alive by five integration test files — `crates/titi-cli/src/app.rs`
-  (decide: wire in or delete; the pre-existing NEXT item below is this one).
-  Phase 1 landed in 7ace4a6 + 27dc55c: the live helpers moved to
-  `session_fs.rs`/`themes.rs` and 54 call sites were repointed, so `App` has
-  zero production callers now; phase 2 — delete the struct and rehome its
-  ~600–800 lines of tests — is planned in
-  `docs/research/agent-ux/app-rs-decision.md`.
+- [x] `high` ~~`titi_cli::app::App` (2492 lines) is unreachable from the binary
+  and kept alive by five integration test files~~ fixed 2026-10-09, delete
+  chosen over wire-in: phase 1 moved the live helpers to
+  `session_fs.rs`/`themes.rs` (7ace4a6, 27dc55c, 54 call sites repointed), and
+  phase 2 deleted the struct (`9364bb4`, `app.rs` 2129 lines), the eleven
+  `titi-tui` modules only it used (`1ff6889`, 5315 lines) and the seven test
+  files that only drove it (`4f13833`). `selection.rs` and `space_hold.rs`
+  were kept on purpose and are ported (item below); the memo records what was
+  recoverable and where.
 - [x] `medium` ~~raw tool arguments are persisted unmasked —
   `crates/titi-engine/src/tool_loop.rs:167-171`,
   `crates/titi-core/src/trajectory.rs:99-107`~~ fixed 2026-10-08 in 907f821
@@ -323,22 +324,47 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
 - [ ] `medium` stringly-typed errors and discarded writes at the CLI seam —
   `crates/titi-cli/src/session_log.rs:25`, `headless.rs:198,227,252,292,314,336`,
   `headless.rs:218,270,329`.
-- [ ] `medium` the retry can replay thinking deltas —
+- [x] `medium` ~~the retry can replay thinking deltas —
   `crates/titi-providers/src/stream.rs:140-148`,
-  `crates/titi-engine/src/runtime.rs:2002-2005`.
-- [ ] `medium` `fallback_chain` / `fallback_cooldown` are dead config —
+  `crates/titi-engine/src/runtime.rs:2002-2005`~~ fixed 2026-10-09 in
+  8ba2604: `StreamEvent::is_visible_output` puts answer text, tool arguments
+  and reasoning on the visible side of the retry gate — the surface has
+  already painted them, so a second attempt would stream its own reasoning
+  into the same block and the transcript would read the previous attempt's
+  thinking twice.
+- [x] `medium` ~~`fallback_chain` / `fallback_cooldown` are dead config —
   `crates/titi-engine/src/runtime.rs:489-491,530-533`,
-  `crates/titi-config/src/fallback.rs:46-49`.
-- [ ] `medium` a panic in the alternate screen erases its own message — no
-  `set_hook`; `crates/titi-cli/src/chat.rs:3362-3370`.
+  `crates/titi-config/src/fallback.rs:46-49`~~ fixed 2026-10-09 in 25235e5:
+  both files deleted outright (−732 lines) rather than documented, because
+  the settings were parsed into a value no code read — per-role ordered
+  chains and a cooldown-based revert to the primary never affected routing.
+  The routing that does work stays: `fallback_models`, which `titi-cli` fills
+  from its resolved model list, is exercised by
+  `falls_back_after_transient_budget`; `fallback.chains` is now simply an
+  unrecognized key.
+- [x] `medium` ~~a panic in the alternate screen erases its own message — no
+  `set_hook`; `crates/titi-cli/src/chat.rs:3362-3370`~~ fixed 2026-10-09 in
+  d913076: a hook installed before the screen opens restores what
+  `Screen::Drop` restores (raw mode, the alternate screen, the cursor, focus
+  reporting) and then prints one plain line to stderr, so the message
+  survives; the hook neither exits nor swallows the panic, which still
+  unwinds to 101. Verified on a PTY (below).
 - [x] `medium` ~~the default test chat is not isolated —
   `crates/titi-cli/src/chat.rs:539,7295-7299`~~ fixed 2026-10-08 in 899c89a.
 - [ ] `medium` wall-clock assertions that can flake —
   `crates/titi-cli/tests/first_frame.rs:58,79-82`,
-  `crates/titi-tools/src/pipe.rs:306`, `pty.rs:423`,
-  `crates/titi-engine/tests/tools.rs:953`.
-- [ ] `medium` the headless JSONL protocol is serde-tested on one sample —
-  `crates/titi-cli/tests/headless.rs:8-20`.
+  `crates/titi-tools/src/pipe.rs:306`, `pty.rs:423`. The fourth file the
+  audit named, `crates/titi-engine/tests/tools.rs:953`, is gate-driven since
+  2cce9f3: the cancel test waits on the trap the turn actually sets instead
+  of on a sleep, so a slow machine cannot fail it.
+- [x] `medium` ~~the headless JSONL protocol is serde-tested on one sample —
+  `crates/titi-cli/tests/headless.rs:8-20`~~ fixed 2026-10-09 in 6e97627:
+  `EngineCommand` and `EngineEvent` are `#[non_exhaustive]` now, and
+  `crates/titi-engine/tests/protocol.rs` builds one value per variant,
+  serializes it against a hand-written JSON fixture and decodes the fixture
+  back, so a renamed, dropped or reordered field fails there; both optional
+  shapes are pinned (`detail` absent vs present, `Consult.question` as `Some`
+  and `None`).
 - [x] `medium` ~~the README slash table is wrong in three ways —
   `README.md:99,174,303,378` (`/skillful` does not exist; `/council` and
   `/graph` do)~~ fixed 2026-10-08 in 268a159, which took the header test count
@@ -354,18 +380,32 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `medium` the workspace lints surface 1304 `unwrap`/`expect` warning
-  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`, down from
-  1392 before the `App` deletion), nearly all of them inside
-  test modules — the audit counted ≈36 sites outside them; turning that into a
-  rule (per-module allow-lists, or a real fix pass) is its own task.
-- [ ] `medium` `selection.rs` and `space_hold.rs` are kept while nothing calls
-  them — `crates/titi-tui/src/selection.rs`, `space_hold.rs`; dead on purpose
-  after the `App` deletion, so the next wave ports them into `chat.rs` (mouse
-  selection, the space-hold gesture) or deletes them. The other `App`-only
-  behaviours (history search, hub revive/stop, the details accordion,
-  keybinding customization) are recoverable from git history at `65a2f8b` and
-  are work, not losses.
+- [ ] `medium` the workspace lints surface 435 `unwrap`/`expect` warning
+  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`; 535
+  `warning:` lines in all, down from 1304/1477 before this wave) — the wave
+  scoped the two lints to production code in nine crates with a crate-level
+  `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`
+  (b7396f9 config, 23ea652 core, 0e71d27 providers, 00908d8 tools, 483806c
+  soul, a8b7cc2 secrets, ebaaf15 memory, 22614cf genome, ad76f7c engine), which
+  removed the test-only noise. `titi-cli` and `titi-tui` are not scoped yet and
+  hold most of what is left (183 headers in `titi-cli/src/chat.rs`, 33 in
+  `git_checkpoint.rs`, 25 in `titi-tui/src/theme/schema.rs`), and the audit's
+  ≈36 production sites — ~19 of them behind the module-wide allow at
+  `titi-genome/src/parse.rs:3` — still need either a rule or a fix pass.
+- [x] `medium` ~~`selection.rs` and `space_hold.rs` are kept while nothing
+  calls them~~ ported into `chat.rs` 2026-10-09 in 92c08c8, with the status
+  `app-rs-decision.md` keeps: `selection.rs` is live again (a press anchors,
+  a drag moves the far corner, a release copies, the frame paints the region
+  with `Selection::apply_background` and the text comes from
+  `Selection::text` — every part of the module has a caller), and
+  `space_hold.rs` is half live: `delete_before_cursor` is behind
+  alt+backspace / ctrl+w in the composer, while `SpaceHold` itself — the
+  push-to-talk detector — stays dead on purpose, because a hold-space key
+  that opened a microphone nothing listens to would be a key that does
+  nothing; whoever lands STT wires it to the live composer in one commit or
+  deletes it in one. History search is ported with them; hub revive/stop, the
+  details accordion and keybinding customization remain queue items,
+  recoverable from git history at `65a2f8b`.
 - [ ] `low` five direct dependencies are unused or over-declared —
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
@@ -383,10 +423,22 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `README.md:205-208,409-412`.
 - [ ] `low` the engine boundary is guarded by a manifest substring test —
   `crates/titi-tui/tests/dependency_rule.rs:14-27`.
-- [ ] `low` `write` can plant code that runs later (`titi-tools/src/fs.rs:469`;
-  `.git` is inside the jail).
-- [ ] `low` checkpoint commits ignore the `SensitivePolicy` —
-  `crates/titi-cli/src/git_checkpoint.rs:17-40`.
+- [x] `low` ~~`write` can plant code that runs later (`titi-tools/src/fs.rs:469`;
+  `.git` is inside the jail)~~ the `.git` half fixed 2026-10-09 in b494564:
+  `refuse_git_dir` rejects any write, edit or hashline path carrying a `.git`
+  component inside the jail and names it, because hooks, `config` or
+  `fsmonitor` there are executed by the next git command the user runs.
+  Reading is untouched, and a `.git` that is a plain file (a linked
+  worktree's `gitdir:` pointer) is not mistaken for the directory.
+- [x] `low` ~~checkpoint commits ignore the `SensitivePolicy`~~ fixed
+  2026-10-09 in ca0f406: `snapshot_with_policy` reads the same policy the
+  runtime tools read and refuses to commit when a staged path is blocked,
+  naming the file and the remedy (`git restore --staged <file>`, or
+  allow-list it if it really is not a credential). It refuses rather than
+  unstaging in the user's place — silently rewriting the index under the
+  cover of a "checkpoint" would drop the file the user believes is saved —
+  and when settings cannot load it falls back to the built-in list, never to
+  nothing. The tests assert on the commit tree, not on log text.
 - [x] `low` ~~the `<diff>` frame around the snapshot is not sanitised —
   `crates/titi-engine/src/runtime.rs:204-209`,
   `crates/titi-engine/src/difftrack.rs:152-158,168-183`~~ fixed 2026-10-08 in
@@ -399,8 +451,11 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Entry`, `AgentKind` and `AgentStatus`); 3624fe8 moved the per-language capability lines out of the findings.
 - [ ] `low` `export_to_file` in `crates/titi-core` is the one in-place write the
   durability pass left alone.
-- [ ] `low` the README header test count is stale — `README.md:9` (`1279
-  passed`) against 1805 on CI.
+- [x] `low` ~~the README header test count is stale — `README.md:9` (`1279
+  passed`) against 1805 on CI~~ fixed 2026-10-09 in 18997b6: the cell names
+  the run it quotes (`1774 passed (CI run 37780191533)`), summed from that
+  run's `test result:` lines, so it is a dated measurement rather than a
+  claim about the newest run.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -454,3 +509,56 @@ the contract that nothing is ever deleted: an unknown command prints verbatim,
 a multi-character script keeps its meaning, an inline fraction stays flat; and
 7d83722 lets a maths-only answer take the markdown path at all.
 
+
+The ports-and-guards wave (2026-10-09) finished the `App` deletion's queue. The
+three behaviours the deletion parked are back in the live chat, in one commit
+(`92c08c8`): mouse selection and copy (`selection.rs` is live again — a press
+anchors, a drag moves the far corner, a release copies through
+`pbcopy`/`wl-copy`/`xclip` when one is on `PATH` and OSC 52 otherwise, and the
+frame paints the region with `Selection::apply_background`), the appearance
+re-probe on a focus gain (focus reporting goes on with the screen; the OSC 11
+query's answer is reassembled byte for byte out of the key events it arrives as
+— a reply's `BEL` comes back as ctrl-`g` — inside a 300 ms window, and nothing
+of it reaches the composer), and the prompt-history browser (Ctrl+R, or ↑ at an
+empty composer: the prompts *this session* carried, newest first, read from the
+session's own store through `session_fs::session_history`, filtered as you
+type; Enter puts one in the composer and starts nothing, Esc leaves the draft
+alone). The composer also gained the word delete it lacked — alt+backspace /
+ctrl+w through `titi_tui::space_hold::delete_before_cursor` — while `SpaceHold`
+itself, the push-to-talk detector, stays dead on purpose: a hold-space key that
+opened a microphone nothing listens to would be a key that does nothing, and
+whoever lands STT either wires it to the live composer in one commit or deletes
+it in one.
+
+Four fixes landed alongside them: a panic now reports itself instead of being
+erased by the alternate-screen restore (`d913076`; verified on a PTY —
+`./target/debug/titi --panic-test` prints `panic: deliberate panic for the
+panic-report check  crates/titi-cli/src/main.rs:57:9` and exits 101), the write
+jail refuses a `.git` component for write, edit and hashline (`b494564`), a
+checkpoint refuses to commit a staged path the `SensitivePolicy` blocks and
+names the remedy (`ca0f406`), and the engine's cancel test waits on the trap
+the turn sets instead of on a sleep (`2cce9f3`). Engine correctness: a retry no
+longer replays reasoning (`8ba2604`, `StreamEvent::is_visible_output`),
+`fallback_chain`/`fallback_cooldown` are deleted rather than documented
+(`25235e5`, −732 lines, because per-role chains and a cooldown-based revert
+never routed anything), and `EngineCommand`/`EngineEvent` are
+`#[non_exhaustive]` with every variant pinned against hand-written JSON
+fixtures (`6e97627`).
+
+Lints: nine crates now scope `unwrap_used`/`expect_used` to production code
+with a crate-level `#![cfg_attr(test, allow(...))]` (b7396f9 … ad76f7c), which
+took the `unwrap`/`expect` warning headers from 1304 to 435 (`cargo clippy
+--workspace --all-targets`; 1477 → 535 `warning:` lines). `titi-cli` and
+`titi-tui` are not scoped yet and carry most of what is left. The test suite
+went 1774 → 1784 passed in the same wave, which is not only growth: deleting
+`titi-providers/src/fallback.rs` and `titi-config/src/fallback.rs` took 20
+tests with it (14 + 6).
+
+Process, learned the hard way: three agents staged into one git index, which
+produced two commits whose subject named one crate and whose stat listed
+another and swept a docs fix into a peer's commit; `.agents/skills/commit/
+SKILL.md` now carries a `mkdir`-based commit lock taken before staging and
+released after the commit, explicit-path staging and the report-don't-rewrite
+rule (`408c44e`). The two mislabeled commits were reconciled with an
+interactive rebase — one subject reworded, one commit split — that left
+`HEAD^{tree}` byte-identical, so the rewrite moved messages, not content.
