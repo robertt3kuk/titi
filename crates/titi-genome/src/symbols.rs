@@ -151,17 +151,87 @@ pub(crate) fn extract(path: &str, source: &str) -> Extract {
     Extract {
         parsed: true,
         sites,
-        syntax_errors: count_errors(tree.root_node()),
+        syntax_errors: count_errors(tree.root_node(), source, grammar),
     }
 }
 
-fn count_errors(node: Node) -> u32 {
+fn count_errors(node: Node, source: &str, grammar: Grammar) -> u32 {
+    let errors = count_error_nodes(node);
+    if errors == 0 || grammar != Grammar::Rust {
+        return errors;
+    }
+    // The pinned tree-sitter-rust reads `&raw` as the opening of a raw borrow
+    // (`&raw const`/`&raw mut`) and fails on `&raw` where `raw` is an ordinary
+    // identifier — `f(&raw)`, `&raw[i]`, `assemble(&raw, false)` — which is
+    // everyday code. Reparse with every such `&raw` renamed and keep the
+    // smaller count: an error the grammar reports only because of that token
+    // ambiguity is not a claim this crate can make about the file.
+    let Some(scrubbed) = neutralise_raw_refs(source) else {
+        return errors;
+    };
+    let Some(tree) = parse(grammar, &scrubbed) else {
+        return errors;
+    };
+    count_error_nodes(tree.root_node()).min(errors)
+}
+
+fn count_error_nodes(node: Node) -> u32 {
     let mut count = u32::from(node.is_error());
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count = count.saturating_add(count_errors(child));
+        count = count.saturating_add(count_error_nodes(child));
     }
     count
+}
+
+/// Rewrites every `&raw` that the grammar cannot tell from a raw borrow into
+/// `&rawx`. Returns `None` when there is nothing to rewrite, so the common
+/// clean file pays no second parse.
+///
+/// A `&raw` is genuine raw-borrow syntax only when `const` or `mut` follows it;
+/// anything else — `)`, `,`, `.`, `[`, `;`, or end of input — means `raw` is an
+/// identifier being borrowed.
+fn neutralise_raw_refs(source: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut copied = 0;
+    let mut index = 0;
+    let mut changed = false;
+    while index < bytes.len() {
+        if bytes[index] == b'&' && source[index + 1..].starts_with("raw") {
+            let after = index + 4;
+            let word_end = after >= bytes.len() || !is_ident_byte(bytes[after]);
+            if word_end
+                && !next_word_is(&source[after..], "const")
+                && !next_word_is(&source[after..], "mut")
+            {
+                out.push_str(&source[copied..index]);
+                out.push_str("&rawx");
+                copied = after;
+                index = after;
+                changed = true;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&source[copied..]);
+    Some(out)
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether `rest`, after leading whitespace, begins with `word` as a whole word.
+fn next_word_is(rest: &str, word: &str) -> bool {
+    let trimmed = rest.trim_start_matches(|c: char| c.is_whitespace());
+    trimmed
+        .strip_prefix(word)
+        .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 fn push_site(name_node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
