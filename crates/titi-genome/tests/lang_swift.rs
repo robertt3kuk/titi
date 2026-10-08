@@ -31,6 +31,10 @@ public struct Widget {}
 public let token = 1
 
 actor Counter {}
+
+let doc = """
+public func quoted() {}
+"""
 "#;
 
 #[test]
@@ -64,6 +68,14 @@ fn swift_resolves_module_imports_and_reads_declarations() {
     assert!(
         !mylib.exports.contains(&"ghost".to_owned()),
         "a commented-out declaration is not an export: {:?}",
+        mylib.exports
+    );
+    // A `public func` written inside a multi-line `"""` string is string
+    // content: the pattern read it (its odd quote count confused the masker),
+    // the grammar does not.
+    assert!(
+        !mylib.exports.contains(&"quoted".to_owned()),
+        "a multi-line string's content is not a declaration: {:?}",
         mylib.exports
     );
 
@@ -120,5 +132,6 @@ fn swift_resolves_module_imports_and_reads_declarations() {
         .into_iter()
         .find(|capability| capability.language == "swift")
         .expect("a swift capability");
-    assert_eq!(swift.level, Level::Heuristic, "{}", swift.note);
+    assert_eq!(swift.level, Level::Full, "{}", swift.note);
+    assert!(swift.note.contains("syntax tree"), "{}", swift.note);
 }

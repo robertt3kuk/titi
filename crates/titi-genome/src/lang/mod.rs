@@ -276,11 +276,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Swift,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "swift",
-        note: "declaration and `import` lines are matched by pattern; a module import names no file to resolve against",
+        note: "declarations come from a syntax tree; only a `public`/`open` property is an export; an `import` names a module, resolved by its own file convention",
         extensions: &["swift"],
-        grammar: None,
+        grammar: Some(Grammar::Swift),
         parse: swift::parse,
     },
     Lang {

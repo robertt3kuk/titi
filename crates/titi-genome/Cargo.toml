@@ -25,6 +25,7 @@ tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-c-sharp = "=0.23.1"
 tree-sitter-ruby = "0.23.1"
 tree-sitter-php = "0.23.11"
+tree-sitter-swift = "=0.7.0"
 # Typed ast-edit errors. Already in the workspace tree (titi-core,
 # titi-providers, titi-memory), so this adds no new compile unit.
 thiserror = "2"

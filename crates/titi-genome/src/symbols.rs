@@ -35,6 +35,7 @@ pub enum Grammar {
     CSharp,
     Ruby,
     Php,
+    Swift,
 }
 
 impl Grammar {
@@ -52,6 +53,7 @@ impl Grammar {
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
 }
@@ -70,6 +72,7 @@ struct Parsers {
     csharp: Option<Parser>,
     ruby: Option<Parser>,
     php: Option<Parser>,
+    swift: Option<Parser>,
 }
 
 impl Parsers {
@@ -87,6 +90,7 @@ impl Parsers {
             Grammar::CSharp => &mut self.csharp,
             Grammar::Ruby => &mut self.ruby,
             Grammar::Php => &mut self.php,
+            Grammar::Swift => &mut self.swift,
         }
     }
 }
@@ -186,6 +190,7 @@ mod tests {
             Grammar::CSharp,
             Grammar::Ruby,
             Grammar::Php,
+            Grammar::Swift,
         ] {
             assert!(grammar_available(grammar), "{grammar:?} failed to load");
         }

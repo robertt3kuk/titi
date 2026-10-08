@@ -348,6 +348,7 @@ fn the_roster_needs_no_workspace() {
             "python",
             "ruby",
             "rust",
+            "swift",
             "typescript"
         ]
     );
@@ -380,9 +381,9 @@ fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
     let text = String::from_utf8(output).unwrap();
     assert!(
         text.contains(r#""language":"swift""#)
-            && text.contains(r#""level":"Heuristic""#)
+            && text.contains(r#""level":"Full""#)
             && text.contains(r#""language":"rust""#)
-            && text.contains(r#""level":"Full""#),
+            && text.contains(r#""language":"typescript""#),
         "the handshake must report the roster: {text}"
     );
     assert!(
