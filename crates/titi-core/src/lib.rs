@@ -1,5 +1,7 @@
 //! Agent runtime: sessions, agent loop, memory, trajectory capture.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod compaction;
 pub mod context_files;
 pub mod hub;
