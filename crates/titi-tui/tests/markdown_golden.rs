@@ -330,3 +330,240 @@ fn golden_table_after_paragraph() {
         "\n--- got ---\n{got}\n--- want ---\n{expected}"
     );
 }
+
+// ---- LaTeX math -----------------------------------------------------------
+
+/// Display maths is drawn in the code-block pair: the body in mdCodeBlock, the
+/// rule row (the fraction bar, a radical's overline) in the border token.
+const MATH_BODY: &str = "\x1b[38;2;201;209;217m";
+const MATH_RULE: &str = "\x1b[38;2;68;68;68m";
+
+/// Inline maths is converted inside the inline pipeline, so no `$`, brace or
+/// backslash reaches the screen: `$O(n\log n)$` is the formula the model meant.
+#[test]
+fn golden_math_inline_log() {
+    let got = golden_render("$O(n\\log n)$");
+    let expected = "O(n log n)";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// Greek and relations become their Unicode glyphs.
+#[test]
+fn golden_math_inline_greek() {
+    let got = golden_render("$\\alpha \\le \\beta$");
+    let expected = "α ≤ β";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A one-character script becomes a real superscript/subscript glyph.
+#[test]
+fn golden_math_inline_scripts() {
+    let got = golden_render("$x^2 + y_i$");
+    let expected = "x² + yᵢ";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// The maths is plain text inside the inline pipeline, so a bold span around it
+/// styles it like the words: the formula inherits the surrounding style.
+#[test]
+fn golden_math_inline_inside_bold() {
+    let got = golden_render("The cost is **$O(n)$** here.");
+    let expected = "The cost is \x1b[1mO(n)\x1b[22m here.";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// `\frac` inline stays on one line — a stacked fraction would push extra rows
+/// into the middle of the sentence and break the style span around it — and
+/// parenthesises a part that is not a single atom.
+#[test]
+fn golden_math_frac_inline() {
+    let got = golden_render("So $\\frac{1}{1-x}$ converges.");
+    let expected = "So 1/(1-x) converges.";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A display block: the limits of `\sum` stack above and below the symbol, the
+/// block is centred, and it opens and closes with a blank row like a code block.
+#[test]
+fn golden_math_display_sum_at_80() {
+    let lines = golden_render_w("Here it is:\n$$\\sum_{i=1}^{n} i$$", 80);
+    let expected = vec![
+        "Here it is:".to_owned(),
+        String::new(),
+        format!("{MATH_BODY}{} n\x1b[39m", " ".repeat(37)),
+        format!("{MATH_BODY}{} ∑  i\x1b[39m", " ".repeat(37)),
+        format!("{MATH_BODY}{}i=1\x1b[39m", " ".repeat(37)),
+        String::new(),
+    ];
+    assert_eq!(
+        lines, expected,
+        "\n--- got ---\n{lines:?}\n--- want ---\n{expected:?}"
+    );
+    for row in &lines {
+        assert!(visible_width(row) <= 80, "row fits the pane: {row:?}");
+    }
+}
+
+/// The same block in a 40-column pane: still centred, still inside the frame.
+#[test]
+fn golden_math_display_sum_at_40() {
+    let lines = golden_render_w("Here it is:\n$$\\sum_{i=1}^{n} i$$", 40);
+    let expected = vec![
+        "Here it is:".to_owned(),
+        String::new(),
+        format!("{MATH_BODY}{} n\x1b[39m", " ".repeat(17)),
+        format!("{MATH_BODY}{} ∑  i\x1b[39m", " ".repeat(17)),
+        format!("{MATH_BODY}{}i=1\x1b[39m", " ".repeat(17)),
+        String::new(),
+    ];
+    assert_eq!(
+        lines, expected,
+        "\n--- got ---\n{lines:?}\n--- want ---\n{expected:?}"
+    );
+    for row in &lines {
+        assert!(visible_width(row) <= 40, "row fits the pane: {row:?}");
+    }
+}
+
+/// `\frac` in display style stacks over a rule, and the rule row takes the
+/// border token so the bar reads as a bar.
+#[test]
+fn golden_math_display_frac() {
+    let lines = golden_render_w("$$\\frac{1}{1-x}$$", 40);
+    let expected = vec![
+        format!("{MATH_BODY}{} 1\x1b[39m", " ".repeat(18)),
+        format!("{MATH_RULE}{}───\x1b[39m", " ".repeat(18)),
+        format!("{MATH_BODY}{}1-x\x1b[39m", " ".repeat(18)),
+        String::new(),
+    ];
+    assert_eq!(
+        lines, expected,
+        "\n--- got ---\n{lines:?}\n--- want ---\n{expected:?}"
+    );
+}
+
+/// Guards: a price is money, not maths.  `$5 and $6` stays exactly as written.
+#[test]
+fn golden_math_price_stays_literal() {
+    let got = golden_render("It costs $5 and $6 here.");
+    let expected = "It costs $5 and $6 here.";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A `$` inside inline code belongs to the code span, which is styled as code.
+#[test]
+fn golden_math_dollar_in_inline_code() {
+    let got = golden_render("Print `$x$` literally.");
+    let expected = "Print \x1b[38;2;255;123;114m$x$\x1b[39m literally.";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A `$` inside a fenced block is code, never maths.
+#[test]
+fn golden_math_dollar_in_fence() {
+    let got = golden_render("```sh\necho $HOME\n```");
+    let border = "\x1b[38;2;68;68;68m";
+    let body = "\x1b[38;2;201;209;217m";
+    let expected = format!(
+        "{border}╭─ sh {}╮\x1b[39m\n\
+         {border}│\x1b[39m {body}echo $HOME\x1b[39m{} {border}│\x1b[39m\n\
+         {border}╰{}╯\x1b[39m",
+        "─".repeat(33),
+        " ".repeat(26),
+        "─".repeat(38),
+    );
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A dollar at the start and at the end of a line has no partner, so the line
+/// stays literal: a lone `$` is a dollar sign.
+#[test]
+fn golden_math_lone_dollar_stays_literal() {
+    let got = golden_render("$ and $");
+    let expected = "$ and $";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// A backslash in front of the `$` suppresses the maths; both characters stay,
+/// so the escape is never silently eaten either.
+#[test]
+fn golden_math_escaped_dollar_stays_literal() {
+    let got = golden_render("Costs \\$5 today.");
+    let expected = "Costs \\$5 today.";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// An unknown command is left verbatim, braces included — never deleted to hide
+/// a gap in the tables.
+#[test]
+fn golden_math_unknown_command_stays_verbatim() {
+    let got = golden_render("$\\foobar{x}$ and \\foobar{x}");
+    let expected = "\\foobar{x} and \\foobar{x}";
+    assert_eq!(
+        got, expected,
+        "\n--- got ---\n{got}\n--- want ---\n{expected}"
+    );
+}
+
+/// Width safety: a display formula too wide to lay out falls back to the flat
+/// form, which is wrapped — no row ever crosses the pane.
+#[test]
+fn golden_math_display_never_exceeds_the_pane() {
+    let lines = golden_render_w("$$\\sum_{k=1}^{100} \\frac{k^2}{k+1} \\cdot \\ln k$$", 24);
+    assert!(
+        lines.len() > 1,
+        "the block is laid out, not swallowed: {lines:?}"
+    );
+    for row in &lines {
+        assert!(
+            visible_width(row) <= 24,
+            "row fits a 24-column pane: {row:?}"
+        );
+    }
+}
+
+/// Width safety for inline maths too: a long formula in prose wraps like the
+/// words around it.
+#[test]
+fn golden_math_inline_never_exceeds_the_pane() {
+    let lines = golden_render_w(
+        "Sum $\\alpha + \\beta + \\gamma + \\delta + \\epsilon$ here.",
+        20,
+    );
+    for row in &lines {
+        assert!(
+            visible_width(row) <= 20,
+            "row fits a 20-column pane: {row:?}"
+        );
+    }
+}
