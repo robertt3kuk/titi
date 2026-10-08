@@ -24,6 +24,7 @@ the real binary and the real HTTP stack:
   "markdown table"  a GFM table: alignment colons, a bold and an inline-code
                   cell, a CJK cell, and a wide cell that must wrap
   "latex math"    inline `$O(\log n)$` plus a display `$$…$$` block
+  "latex only"    the same maths and nothing else (needs the chat gate)
   "wide text"     CJK and emoji
   "fail401" / "fail429" / "fail500"   that HTTP status with an error body
   a tool result   "tool said: <first line of the result>"
@@ -155,6 +156,15 @@ def script(last: dict) -> list[tuple[dict, float]]:
             "**Binary search** is $O(\\log n)$ and the harmonic sum is:\n\n"
             "$$\\sum_{i=1}^{n} \\frac{i}{i+1}$$\n\n"
             "with $\\alpha \\le \\beta$ as the bound.\n"
+        )
+        return words(answer, 0.01) + [(chunk({}, "stop"), 0)]
+    if "latex only" in content:
+        # Maths and nothing else: the case that needs the chat gate
+        # (`has_markdown`) to know about `$`, since no other markdown marker is
+        # in the answer for it to route on.
+        answer = (
+            "The bound is $O(\\log n)$ and the sum is:\n\n"
+            "$$\\sum_{i=1}^{n} \\frac{i}{i+1}$$\n"
         )
         return words(answer, 0.01) + [(chunk({}, "stop"), 0)]
     if "wide text" in content:
