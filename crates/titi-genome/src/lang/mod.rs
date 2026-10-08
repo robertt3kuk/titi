@@ -372,8 +372,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::exports;
     use super::*;
+    use crate::lang::test_support::exports;
 
     #[test]
     fn a_language_without_a_grammar_is_not_claimed() {

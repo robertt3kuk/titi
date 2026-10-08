@@ -182,7 +182,7 @@ fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<crate::ExportSite>)
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::exports;
+    use crate::lang::test_support::exports;
 
     fn names(path: &str, source: &str) -> Vec<String> {
         exports(path, source).unwrap_or_else(|| panic!("{path} parses"))
