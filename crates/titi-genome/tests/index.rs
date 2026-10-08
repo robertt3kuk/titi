@@ -15,6 +15,21 @@ fn write(root: &Path, rel: &str, body: &str) {
     fs::write(path, body).unwrap();
 }
 
+/// Move a file's mtime an hour back, so a walk sees it as settled.
+///
+/// A file written within `RACY_MTIME` of the walk is read whatever its
+/// metadata says - two writes inside one timestamp tick look identical. A
+/// test about the *unchanged* case has to age its files past that window
+/// before the metadata gate is the thing under test.
+fn settle(root: &Path, rel: &str) {
+    fs::File::options()
+        .write(true)
+        .open(root.join(rel))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+}
+
 #[test]
 fn indexes_rust_graph_and_projects_ranked_map() {
     let dir = tempfile::tempdir().unwrap();
@@ -510,6 +525,8 @@ fn a_no_op_mtime_touch_does_not_reparse() {
     let root = dir.path();
     write(root, "src/a.rs", "pub fn a() {}\n");
     write(root, "src/b.rs", "pub fn b() {}\n");
+    settle(root, "src/a.rs");
+    settle(root, "src/b.rs");
     let mut genome = Genome::index(root).unwrap();
 
     // Untouched tree: the pre-filter skips every file, so nothing is read.
@@ -567,6 +584,9 @@ fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
     let root = dir.path();
     write(root, "src/hub.rs", "pub fn hub() {}\n");
     write(root, "src/leaf.rs", "pub fn leaf() { hub(); }\n");
+    // The hub is not what this test edits; a just-written file would be read
+    // on its own account and counted, so age it into a settled one.
+    settle(root, "src/hub.rs");
     let mut genome = Genome::index(root).unwrap();
     assert_eq!(
         genome.dependents["src/hub.rs"], 1,
@@ -660,6 +680,7 @@ fn apply_changes_on_unchanged_paths_touches_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "src/a.rs", "pub fn a() {}\n");
+    settle(root, "src/a.rs");
     let mut genome = Genome::index(root).unwrap();
     genome.ranks.insert("src/a.rs".to_owned(), 7.0);
 
@@ -671,6 +692,37 @@ fn apply_changes_on_unchanged_paths_touches_nothing() {
     assert_eq!(stats.removed, 0, "a path never in the index is no removal");
     assert!(!stats.graph_recomputed);
     assert_eq!(genome.ranks["src/a.rs"], 7.0);
+}
+
+/// The metadata gate is not the whole truth. A second write inside the
+/// filesystem's timestamp tick leaves `size` and `mtime` exactly as the record
+/// has them; only the bytes tell the two apart, and only a read finds them.
+/// A file that fresh is read on the walk's behalf, so the edit lands instead
+/// of being silently skipped.
+#[test]
+fn a_write_inside_one_mtime_tick_is_still_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn aa() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+    let recorded = genome.files["src/a.rs"].clone();
+
+    // Same length, different bytes, and the clock put back: as far as the walk
+    // can tell from the metadata, this is the file it already has.
+    write(root, "src/a.rs", "pub fn ab() {}\n");
+    fs::File::options()
+        .write(true)
+        .open(root.join("src/a.rs"))
+        .unwrap()
+        .set_modified(recorded.mtime)
+        .unwrap();
+    let now = fs::metadata(root.join("src/a.rs")).unwrap();
+    assert_eq!(now.len(), recorded.size, "the same length");
+    assert_eq!(now.modified().unwrap(), recorded.mtime, "the same clock");
+
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 1, "the bytes moved inside one tick");
+    assert!(genome.files["src/a.rs"].exports.contains(&"ab".to_owned()));
 }
 
 /// A targeted update confirms content by hash exactly as a walk does: a

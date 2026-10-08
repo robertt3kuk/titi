@@ -116,6 +116,12 @@ fn parse_rule(line: &str) -> Option<Rule> {
 /// the caller's root is a contract, so an unreadable one returns the error. A
 /// directory that vanishes or is unreadable *below* the root is skipped, not
 /// fatal, because a large tree with one odd entry must still index.
+///
+/// The `stat` per file happens here, in the walk's own order, and it is what a
+/// listing costs: measured on 20k files it is ~25 ms of the ~33 ms a warm walk
+/// takes, against ~8 ms of `readdir` and name filtering. A second pass that
+/// read the metadata over several cores was measured too and did not pay for
+/// itself (see the commit); the walk stays one pass.
 fn walk(
     dir: &Path,
     rel: &str,

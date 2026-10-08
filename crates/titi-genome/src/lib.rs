@@ -169,6 +169,17 @@ pub struct FileRecord {
 /// is not a use of the file that uniquely exports `join`.
 pub const MAX_DEFINERS: usize = 1;
 
+/// How fresh a file's `mtime` may be before the walk stops trusting it.
+///
+/// A file modified within this window of the moment it is listed is re-read
+/// even when `size` and `mtime` match its record: two writes inside one
+/// filesystem timestamp tick are indistinguishable by metadata alone, and the
+/// content hash that would tell them apart is only computed for a file that
+/// was read. Two seconds is the margin git's index uses for the same reason.
+/// It bounds the extra reads to what was just written; a settled tree pays
+/// nothing.
+pub const RACY_MTIME: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One symbol the workspace defines, and who leans on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRecord {
@@ -521,10 +532,28 @@ impl Genome {
                 // An open buffer is always stale, whatever the clock says: its
                 // text is the file as the editor has it, and the record it has
                 // to replace was parsed from something else.
-                self.overlay.contains_key(&file.path)
-                    || !self.files.get(&file.path).is_some_and(|record| {
-                        record.size == file.size && record.mtime == file.mtime
-                    })
+                if self.overlay.contains_key(&file.path) {
+                    return true;
+                }
+                // A file whose mtime is this fresh is not trusted by its
+                // metadata: the filesystem's timestamp tick can swallow a
+                // second write inside it, leaving size and mtime exactly as
+                // they were - the case the content hash exists to settle, but
+                // the hash only runs once the file is read, and this is the
+                // gate in front of that read. git's own index calls this the
+                // racy-timestamp case and re-checks the file; so does this.
+                // The cost is one re-read of whatever was written in the last
+                // couple of seconds, and nothing at all for a settled tree.
+                // An mtime in the future (a skewed clock) is no better: the
+                // elapsed age is an error there, and that is not settled.
+                let settled = file.mtime.elapsed().is_ok_and(|age| age >= RACY_MTIME);
+                if !settled {
+                    return true;
+                }
+                !self
+                    .files
+                    .get(&file.path)
+                    .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
             })
             .collect();
         let stale = prioritize(stale, urgent);
