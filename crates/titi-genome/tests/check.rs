@@ -311,9 +311,9 @@ fn a_healthy_tree_has_no_findings_and_capability_is_not_one() {
         .iter()
         .find(|cap| cap.language == "java")
         .expect("java");
-    assert_eq!(java.level, Level::Heuristic);
+    assert_eq!(java.level, Level::Full);
     assert_eq!(java.extensions, vec!["java"]);
-    assert!(java.note.contains("pattern"), "{}", java.note);
+    assert!(java.note.contains("syntax tree"), "{}", java.note);
 
     // Two rows parse TypeScript and its `.tsx`, and they are one language.
     let typescript = roster
@@ -336,7 +336,7 @@ fn the_roster_needs_no_workspace() {
         .collect();
     assert_eq!(
         full,
-        vec!["go", "javascript", "python", "rust", "typescript"]
+        vec!["go", "java", "javascript", "python", "rust", "typescript"]
     );
     let heuristic = roster
         .iter()
@@ -366,7 +366,7 @@ fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
     serve_lsp(root, Cursor::new(input), &mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
     assert!(
-        text.contains(r#""language":"java""#)
+        text.contains(r#""language":"swift""#)
             && text.contains(r#""level":"Heuristic""#)
             && text.contains(r#""language":"rust""#)
             && text.contains(r#""level":"Full""#),

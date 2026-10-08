@@ -222,11 +222,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Java,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "java",
-        note: "types, public methods and imports are matched by pattern; comments are masked first, string literals are not",
+        note: "types and public/protected methods come from a syntax tree; import paths are resolved by package suffix",
         extensions: &["java"],
-        grammar: None,
+        grammar: Some(Grammar::Java),
         parse: java::parse,
     },
     Lang {

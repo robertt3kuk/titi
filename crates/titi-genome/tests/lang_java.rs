@@ -29,6 +29,9 @@ public class App {
     public void run() {}
     private void secret() {}
     protected static <T> List<T> wrap(T value) { return null; }
+    String doc = """
+        public void quoted() {}
+        """;
 }
 
 // public class Ghost {}
@@ -85,6 +88,13 @@ fn java_exports_named_methods_and_places_imports_by_package_root() {
         "{:?}",
         app.exports
     );
+    // A `public void quoted() {}` inside a text block is not a declaration:
+    // the line patterns read it, the grammar knows it is string content.
+    assert!(
+        !app.exports.contains(&"quoted".to_owned()),
+        "{:?}",
+        app.exports
+    );
 
     assert!(
         hash.exports.contains(&"Hash".to_owned()),
@@ -136,7 +146,7 @@ fn java_reports_its_level_in_the_capability_roster() {
         .into_iter()
         .find(|capability| capability.language == "java")
         .expect("a java capability");
-    assert_eq!(java.level, Level::Heuristic, "{}", java.note);
+    assert_eq!(java.level, Level::Full, "{}", java.note);
     assert_eq!(java.extensions, vec!["java"]);
-    assert_eq!(Language::Java.level(), Level::Heuristic);
+    assert_eq!(Language::Java.level(), Level::Full);
 }
