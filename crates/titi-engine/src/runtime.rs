@@ -612,9 +612,14 @@ pub struct EngineConfig {
     /// cancel raises it and the next turn lowers it as it starts.
     pub interrupt: titi_tools::Interrupt,
     /// How long a `bash` call may hold a turn before it is handed to the
-    /// background, where its output reaches the session when it ends. `None`
-    /// reads `TITI_BASH_BACKGROUND_MS`, then [`titi_tools::BACKGROUND_AFTER`];
-    /// tests set a tiny one so a `sleep 5` need not take five seconds.
+    /// background, where its output reaches the session when it ends.
+    ///
+    /// The surface resolves the setting — `bash.autoBackground.thresholdMs`,
+    /// with `TITI_BASH_BACKGROUND_MS` overriding it, through
+    /// [`titi_tools::background_after_with`] — and passes the result here. A
+    /// caller that passes `None` gets [`titi_tools::background_after`]: the
+    /// environment variable, then [`titi_tools::BACKGROUND_AFTER`]. Tests set
+    /// a tiny one so a `sleep 5` need not take five seconds.
     pub background_after: Option<std::time::Duration>,
 }
 
@@ -1001,6 +1006,18 @@ impl EngineRuntime {
         // cache and findings bus, so it cannot write a file the parent holds,
         // its reads warm the parent's cache, and the parent can read what it
         // learned.
+        // The index is built once, here, and its worker started behind it: a
+        // root that cannot be read leaves the session without a map, which is
+        // the same degradation the per-turn refresh already had, and a cold
+        // start is a full walk either way — doing it now rather than inside
+        // the first turn is what lets the first turn's map be a snapshot
+        // instead of a walk. It is built before the subagent runner below so
+        // that runner can fold its own writes in the same way the main turn
+        // does.
+        let genome = config
+            .genome_root
+            .as_ref()
+            .and_then(|root| GenomeHandle::spawn(root, titi_genome::live::Options::default()).ok());
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
@@ -1039,7 +1056,8 @@ impl EngineRuntime {
                 )
                 .with_approval_mode(approval)
                 .with_max_rounds(config.agent_rounds)
-                .with_mask_ips(config.mask_ips),
+                .with_mask_ips(config.mask_ips)
+                .with_genome(genome.clone()),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
         // The surface builds the session's tools before the engine starts —
@@ -1054,16 +1072,6 @@ impl EngineRuntime {
                 findings.clone(),
             )
         });
-        // The index is built once, here, and its worker started behind it: a
-        // root that cannot be read leaves the session without a map, which is
-        // the same degradation the per-turn refresh already had, and a cold
-        // start is a full walk either way — doing it now rather than inside
-        // the first turn is what lets the first turn's map be a snapshot
-        // instead of a walk.
-        let genome = config
-            .genome_root
-            .as_ref()
-            .and_then(|root| GenomeHandle::spawn(root, titi_genome::live::Options::default()).ok());
         let runtime = Self {
             mode: config.mode,
             config,

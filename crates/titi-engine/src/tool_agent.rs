@@ -43,6 +43,10 @@ pub struct ToolAgentRunner {
     tools: ToolRegistry,
     claims: Claims,
     touched: TouchedSink,
+    /// The session's live index, when there is one. A subagent's `write` or
+    /// `edit` folds its path in through this exactly as the main turn's does,
+    /// instead of waiting for the session's next walk to notice the file.
+    genome: Option<titi_genome::GenomeHandle>,
     approval_mode: ApprovalMode,
     max_rounds: u32,
     mask_ips: bool,
@@ -64,11 +68,24 @@ impl ToolAgentRunner {
             tools,
             claims,
             touched,
+            genome: None,
             // Read-tier calls proceed; the registry decides what else exists.
             approval_mode: ApprovalMode::Write,
             max_rounds: DEFAULT_AGENT_ROUNDS,
             mask_ips: true,
         }
+    }
+
+    /// The session's index, so this runner's writes are folded in as they
+    /// happen rather than at the session's next walk.
+    ///
+    /// `None` is the honest value for a runner built before the index exists
+    /// — a caller with no root, or a test with no graph: the write still
+    /// happens, and the session's next turn picks it up the way it picks up
+    /// any other change no tool named.
+    pub fn with_genome(mut self, genome: Option<titi_genome::GenomeHandle>) -> Self {
+        self.genome = genome;
+        self
     }
 
     /// Whether IPv4 addresses in tool output are masked; keys always are.
@@ -196,10 +213,12 @@ impl AgentRunner for ToolAgentRunner {
                 &aborted,
                 &trajectory,
                 &self.touched,
-                // A subagent runs under the CLI's runner, which is built
-                // before the session's index exists and has no handle for it.
-                // Its writes are folded in by the session's next turn walk.
-                None,
+                // The same publish point the main turn's tool loop gets: a
+                // subagent's write is folded in as the call returns, so the
+                // session's next map is current by construction rather than
+                // by the walk that would otherwise be the only thing to see
+                // it.
+                self.genome.as_ref().map(titi_genome::GenomeHandle::shared),
                 &self.claims,
                 &request.id,
                 self.mask_ips,
@@ -217,5 +236,139 @@ impl AgentRunner for ToolAgentRunner {
         } else {
             Ok(summary.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Arc;
+
+    use titi_genome::GenomeHandle;
+    use titi_providers::mock::{MockBody, MockTransport};
+    use titi_providers::{BlockId, StopReason, StreamEvent, ToolCallRef, Transport};
+    use titi_tools::{ApprovalMode, ToolRegistry};
+
+    use super::ToolAgentRunner;
+    use crate::agents::{AgentContext, AgentRequest, AgentRunner};
+    use crate::claims::Claims;
+    use crate::protocol::AgentKind;
+    use crate::registry::{RegistryError, ResolvedModel};
+    use crate::runtime::TransportResolver;
+    use crate::tool_loop::TouchedSink;
+
+    struct MapResolver(HashMap<String, Arc<dyn Transport>>);
+
+    impl TransportResolver for MapResolver {
+        fn resolve(&self, model: &str) -> Result<ResolvedModel, RegistryError> {
+            self.0
+                .get(model)
+                .cloned()
+                .map(|transport| ResolvedModel::without_credential(model, transport))
+                .ok_or_else(|| RegistryError::UnknownModel(model.into()))
+        }
+    }
+
+    /// One complete tool call, then a report.
+    fn write_then_report(path: &str, content: &str) -> Arc<MockTransport> {
+        let arguments = serde_json::json!({ "path": path, "content": content }).to_string();
+        Arc::new(MockTransport::new(vec![
+            MockBody::Events(vec![
+                StreamEvent::ToolcallStart {
+                    id: BlockId::new("tool"),
+                    call: ToolCallRef {
+                        call_id: "call-1".into(),
+                        name: "write".into(),
+                    },
+                },
+                StreamEvent::ToolcallDelta {
+                    id: BlockId::new("tool"),
+                    json: arguments.clone().into(),
+                },
+                StreamEvent::ToolcallEnd {
+                    id: BlockId::new("tool"),
+                },
+                StreamEvent::Done {
+                    reason: StopReason::ToolUse,
+                },
+            ]),
+            MockBody::Events(vec![
+                StreamEvent::TextDelta {
+                    id: BlockId::new("text"),
+                    text: "wrote it".into(),
+                },
+                StreamEvent::Done {
+                    reason: StopReason::Stop,
+                },
+            ]),
+        ]))
+    }
+
+    /// A subagent's write reaches the index as it happens, exactly as the main
+    /// turn's does — not at the session's next walk.
+    ///
+    /// The evidence is the handle's own record of the last update: a targeted
+    /// fold reports `walked: false` and one re-parse, where a runner that
+    /// passed `None` leaves the cold start's walk standing and the file out of
+    /// the graph.
+    #[tokio::test]
+    async fn a_subagent_write_reaches_the_index_without_a_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/hub.rs"), "pub fn hub() {}\n").unwrap();
+        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        assert!(
+            genome.last_stats().is_some_and(|stats| stats.walked),
+            "the cold start is a walk"
+        );
+
+        let transport = write_then_report("src/fresh.rs", "pub fn fresh() {}\n");
+        let resolver: Arc<dyn TransportResolver> = Arc::new(MapResolver(
+            [("worker".to_owned(), transport as Arc<dyn Transport>)]
+                .into_iter()
+                .collect(),
+        ));
+        let mut tools = ToolRegistry::new();
+        for tool in titi_tools::workspace_tools(root) {
+            tools.register(Arc::from(tool));
+        }
+        let runner = ToolAgentRunner::new(
+            resolver,
+            "worker",
+            tools,
+            Claims::new(),
+            TouchedSink::default(),
+        )
+        .with_approval_mode(ApprovalMode::Yolo)
+        .with_genome(Some(genome.clone()));
+
+        let summary = runner
+            .run(
+                AgentRequest {
+                    id: "worker-1".into(),
+                    name: "Worker".into(),
+                    task: "write the file".into(),
+                    kind: AgentKind::Subagent,
+                    parent_id: None,
+                },
+                AgentContext::detached(),
+            )
+            .await
+            .expect("the subagent finished");
+        assert_eq!(summary, "wrote it");
+
+        let stats = genome.last_stats().expect("the fold was recorded");
+        assert!(
+            !stats.walked,
+            "the write folded in as it happened, not by a walk: {stats:?}"
+        );
+        assert_eq!(stats.parsed, 1, "one path, one parse: {stats:?}");
+        assert!(
+            genome.snapshot().0.files.contains_key("src/fresh.rs"),
+            "the index knows the file the subagent wrote: {:?}",
+            genome.snapshot().0.files.keys().collect::<Vec<_>>()
+        );
     }
 }
