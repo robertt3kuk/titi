@@ -268,14 +268,13 @@ Source: `docs/audits/2026-10-08-general.md` (areas 1, 2, 5–10),
 0 failed). Synthesis and severities: `docs/BRAIN.md`. Pointers are the ones
 the audits gave; nothing here is re-verified by this list.
 
-**Five fixes were already in flight while the audit ran — do not start these
-again.** As of this writing three have landed on `master` (the destructive test
-and the unisolated test chat in `899c89a`, the diff-block credential leak and
-its `<diff>` frame in `af985e1`, the genome checker's `syntax-error` /
-`unresolved-import` false positives in `e7c48e1` + `fe1abf2`) and two are still
-only in the working tree, uncommitted: the masking gaps
-(`crates/titi-memory/src/redact.rs`) and the file-lock helper
-(`crates/titi-config/src/config_file.rs`).
+**Five fixes were already in flight while the audit ran — all five have since
+landed, so none of them needs starting again.** The destructive test and the
+unisolated test chat are in `899c89a`, the diff-block credential leak and its
+`<diff>` frame in `af985e1`, the genome checker's `syntax-error` /
+`unresolved-import` false positives in `e7c48e1` + `fe1abf2`, the masking gaps
+in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
+`98d40bb`), and the file-lock helper in `cbb8abd`.
 
 - [x] `critical` ~~a test deletes the developer's real stored provider key —
   `crates/titi-cli/src/chat.rs:10969` (`/logout openai` → real
@@ -284,17 +283,17 @@ only in the working tree, uncommitted: the masking gaps
 - [x] `critical` ~~the `git diff HEAD` block leaks credential files the read
   tools refuse — `crates/titi-engine/src/difftrack.rs:279-288`,
   `runtime.rs:179-209,1816`~~ fixed 2026-10-08 in af985e1.
-- [ ] `high` tool-output masking misses quoted and `_`-suffixed key names —
-  `crates/titi-memory/src/redact.rs:349-370` — fix in the working tree,
-  uncommitted.
+- [x] `high` ~~tool-output masking misses quoted and `_`-suffixed key names —
+  `crates/titi-memory/src/redact.rs:349-370`~~ fixed 2026-10-08 in 8b33ed9,
+  with the bearer-header prefilter in d24f5b1 and the test pinned in 98d40bb.
 - [ ] `high` error lints are inert in 8 of 11 crates —
   `Cargo.toml:38-43`; blocked by `crates/titi-cli/tests/login_oauth.rs:416,430`
   (`unsafe env::set_var` under `unsafe_code = "forbid"`).
 - [ ] `high` session files are written without `fsync` and rewritten in place —
   `crates/titi-core/src/session/store.rs:102-107,215,262,281`.
-- [ ] `high` the `fd-lock` helper runs the guarded write after a failed acquire
-  and unlinks the lock — `crates/titi-config/src/config_file.rs:176-185` —
-  fix in the working tree, uncommitted.
+- [x] `high` ~~the `fd-lock` helper runs the guarded write after a failed acquire
+  and unlinks the lock — `crates/titi-config/src/config_file.rs:176-185`~~
+  fixed 2026-10-08 in cbb8abd.
 - [ ] `high` a stalled provider hangs the turn and `Cancel` cannot unblock it —
   `crates/titi-providers/src/transport.rs:190-212`, `http.rs:53-55`,
   `wire.rs:770-777`, `runtime.rs:2159-2165`.
