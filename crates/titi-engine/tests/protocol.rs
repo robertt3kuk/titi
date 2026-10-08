@@ -177,6 +177,16 @@ fn every_engine_command_round_trips_through_its_fixture() {
         r#"{"SetBudget":{"tokens":10}}"#,
     );
     command(
+        EngineCommand::SetMoneyBudget {
+            micro_usd: Some(2_000_000),
+        },
+        r#"{"SetMoneyBudget":{"micro_usd":2000000}}"#,
+    );
+    command(
+        EngineCommand::SetMoneyBudget { micro_usd: None },
+        r#"{"SetMoneyBudget":{"micro_usd":null}}"#,
+    );
+    command(
         EngineCommand::SetMode {
             mode: SessionMode::Plan,
         },
@@ -302,6 +312,19 @@ fn every_engine_event_round_trips_through_its_fixture() {
             prompt_tokens: 11,
             completion_tokens: 22,
             cached_tokens: 3,
+            cost_micro_usd: Some(45),
+        },
+        r#"{"TurnUsage":{"turn_id":1,"prompt_tokens":11,"completion_tokens":22,"cached_tokens":3,"cost_micro_usd":45}}"#,
+    );
+    // The same report from a turn on an unpriced model: the money is absent
+    // from the frame rather than zero in it.
+    event(
+        EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 11,
+            completion_tokens: 22,
+            cached_tokens: 3,
+            cost_micro_usd: None,
         },
         r#"{"TurnUsage":{"turn_id":1,"prompt_tokens":11,"completion_tokens":22,"cached_tokens":3}}"#,
     );
@@ -416,6 +439,26 @@ fn every_engine_event_round_trips_through_its_fixture() {
             limit: 10,
         },
         r#"{"BudgetExceeded":{"spent":10,"limit":10}}"#,
+    );
+    event(
+        EngineEvent::MoneyBudgetUpdated {
+            spent_micro_usd: 4500,
+            limit_micro_usd: Some(1_000_000),
+        },
+        r#"{"MoneyBudgetUpdated":{"spent_micro_usd":4500,"limit_micro_usd":1000000}}"#,
+    );
+    event(
+        EngineEvent::MoneyBudgetExceeded {
+            spent_micro_usd: 1_000_000,
+            limit_micro_usd: 1_000_000,
+        },
+        r#"{"MoneyBudgetExceeded":{"spent_micro_usd":1000000,"limit_micro_usd":1000000}}"#,
+    );
+    event(
+        EngineEvent::MoneyBudgetUnpriced {
+            model: "local".into(),
+        },
+        r#"{"MoneyBudgetUnpriced":{"model":"local"}}"#,
     );
     event(
         EngineEvent::ModeChanged {

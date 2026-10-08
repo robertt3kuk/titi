@@ -157,6 +157,18 @@ pub enum EngineCommand {
     SetBudget {
         tokens: Option<u64>,
     },
+    /// Cap the money this session may spend, in micro-dollars (millionths of
+    /// a US dollar). `None` lifts the cap.
+    ///
+    /// A sibling of [`Self::SetBudget`] rather than a field beside its
+    /// `tokens`, because the two bounds are independent: setting one does not
+    /// restate the other, and clearing one leaves the other standing. The
+    /// engine refuses a money cap over a model it cannot price — see
+    /// [`EngineEvent::MoneyBudgetUnpriced`] — instead of accepting a bound it
+    /// would then be unable to enforce.
+    SetMoneyBudget {
+        micro_usd: Option<u64>,
+    },
     /// Switch what the next turns are allowed to do.
     SetMode {
         mode: SessionMode,
@@ -273,6 +285,17 @@ pub enum EngineEvent {
         /// cache. Zero when it reported none, or reported nothing at all.
         #[serde(default)]
         cached_tokens: u32,
+        /// What those tokens cost, in micro-dollars, when the model the turn
+        /// ran on states a price.
+        ///
+        /// The engine's own figure for the turn, from the same three counts
+        /// above and the same [`crate::ModelPrice::cost_micro_usd`] a surface
+        /// would use — so a footer and a budget can never disagree about what
+        /// a turn cost. `None` is *unpriced* (not free), and also the answer
+        /// for a turn whose rounds did not all have a price: a figure that
+        /// covered only part of a turn would read as the whole of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micro_usd: Option<u64>,
     },
     TurnFinished {
         turn_id: TurnId,
@@ -370,6 +393,35 @@ pub enum EngineEvent {
     BudgetExceeded {
         spent: u64,
         limit: u64,
+    },
+    /// What this session has spent in money, and against what money cap.
+    ///
+    /// Micro-dollars (millionths of a US dollar), the unit a price is stated
+    /// in, so nothing here is a float that could drift. `spent_micro_usd` is
+    /// what the engine could *measure*: a turn that ran on a model with no
+    /// price adds nothing to it, and [`Self::MoneyBudgetUnpriced`] is what
+    /// says so — the figure is a floor, never a total, once that has been
+    /// reported.
+    MoneyBudgetUpdated {
+        spent_micro_usd: u64,
+        limit_micro_usd: Option<u64>,
+    },
+    /// The money cap was reached. Same stop as [`Self::BudgetExceeded`]: no
+    /// further turn starts until it is raised or lifted, and anything queued
+    /// behind it was returned.
+    MoneyBudgetExceeded {
+        spent_micro_usd: u64,
+        limit_micro_usd: u64,
+    },
+    /// A money cap is in force over a model the engine cannot price.
+    ///
+    /// An unpriced model is not a free one — a local server, a subscription
+    /// backend, a price nobody wrote down — so the engine neither treats its
+    /// turns as costing nothing nor pretends the cap it was given can be
+    /// enforced against them. It says this instead, naming the model, once
+    /// per cap: the bound stays in force, and its spend becomes a floor.
+    MoneyBudgetUnpriced {
+        model: SmolStr,
     },
     /// The mode the engine is now in. A surface badge follows this, never
     /// its own keypress: the mode that matters is the one the turns run in.
