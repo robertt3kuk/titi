@@ -437,3 +437,73 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<crate::E
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::lang::test_support::exports;
+
+    fn names(path: &str, source: &str) -> Vec<String> {
+        exports(path, source).unwrap_or_else(|| panic!("{path} parses"))
+    }
+
+    #[test]
+    fn rust_symbols_include_methods_and_skip_private_ones() {
+        let names = names(
+            "src/lib.rs",
+            r#"
+pub struct Engine { field: u32 }
+struct Hidden;
+pub const LIMIT: usize = 8;
+static PRIVATE: u8 = 0;
+pub static SHARED: u8 = 1;
+pub trait Runner { fn run(&self); }
+impl Engine {
+    pub fn spawn(&self) {}
+    fn internal(&self) {}
+}
+pub mod inner { pub fn nested() {} }
+"#,
+        );
+        assert!(names.contains(&"Engine".to_owned()));
+        assert!(names.contains(&"LIMIT".to_owned()));
+        assert!(names.contains(&"SHARED".to_owned()));
+        assert!(names.contains(&"Runner".to_owned()));
+        // A trait method is as public as its trait.
+        assert!(names.contains(&"run".to_owned()));
+        // The inherent method the line-anchored regex could only find by luck.
+        assert!(names.contains(&"spawn".to_owned()), "{names:?}");
+        assert!(names.contains(&"nested".to_owned()));
+        assert!(!names.contains(&"Hidden".to_owned()));
+        assert!(!names.contains(&"PRIVATE".to_owned()));
+        assert!(!names.contains(&"internal".to_owned()));
+    }
+
+    /// The old pattern was line-anchored, so a declaration that started its
+    /// own line counted even inside a block comment or a string literal:
+    /// `^\s*pub\s+(?:fn|struct|…)` matched `block_ghost` and `quoted` here.
+    /// The grammar knows a comment from code.
+    #[test]
+    fn declarations_inside_comments_and_strings_are_not_symbols() {
+        let names = names(
+            "src/lib.rs",
+            "pub fn real() {}\n\
+             /*\n\
+             pub fn block_ghost() {}\n\
+             */\n\
+             pub const SNIPPET: &str = \"\n\
+             pub fn quoted() {}\n\
+             \";\n",
+        );
+        // Names come back sorted (that is what the ranker keys off); the
+        // source order lives in the export sites.
+        assert_eq!(names, vec!["SNIPPET".to_owned(), "real".to_owned()]);
+    }
+
+    /// A half-written file is the normal state of a file being edited: the
+    /// parser recovers and the symbols before the damage still land.
+    #[test]
+    fn a_file_with_a_syntax_error_still_yields_what_parsed() {
+        let names = names("src/lib.rs", "pub fn first() {}\npub fn second( {\n");
+        assert!(names.contains(&"first".to_owned()), "{names:?}");
+    }
+}
