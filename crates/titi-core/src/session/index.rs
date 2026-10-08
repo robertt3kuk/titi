@@ -8,12 +8,23 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::entry::Entry;
 use super::{SessionError, SessionMeta};
 
-/// A full-text search hit.
+/// A full-text search hit, carrying what a surface needs to draw its row.
+///
+/// The matching text is the entry's own; `ts` is when the entry was written
+/// and `title` is the session's name, both read in the same query rather than
+/// looked up per hit — a search that answers a list should answer it in one
+/// pass, and a caller rendering "session, time and the matching line" needs
+/// exactly these three beside the id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub session_id: String,
     pub entry_id: String,
     pub text: String,
+    /// When the entry was written, as the entry recorded it.
+    pub ts: u64,
+    /// The session's title, when it has one. A session nobody named yet has
+    /// none, which is a state a surface shows as unnamed rather than blank.
+    pub title: Option<String>,
 }
 
 /// SQLite index at `<agent_dir>/state.db` (WAL): session catalog, entries,
@@ -208,8 +219,12 @@ impl SessionIndex {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT entries_fts.entry_id, entries_fts.session_id, entries_fts.text
-                 FROM entries_fts JOIN sessions ON sessions.id = entries_fts.session_id
+                "SELECT entries_fts.entry_id, entries_fts.session_id, entries_fts.text,
+                        entries.ts, sessions.title
+                 FROM entries_fts
+                 JOIN sessions ON sessions.id = entries_fts.session_id
+                 JOIN entries ON entries.session_id = entries_fts.session_id
+                             AND entries.entry_id = entries_fts.entry_id
                  WHERE entries_fts MATCH ?1
                    AND (?2 IS NULL OR sessions.bot_id = ?2)
                    AND (?3 IS NULL OR sessions.cwd = ?3)
@@ -222,6 +237,8 @@ impl SessionIndex {
                     entry_id: row.get(0)?,
                     session_id: row.get(1)?,
                     text: row.get(2)?,
+                    ts: row.get::<_, i64>(3)?.max(0) as u64,
+                    title: row.get(4)?,
                 })
             })
             .map_err(SessionError::Db)?
@@ -514,6 +531,58 @@ mod tests {
                 .len()
                 == 1
         );
+    }
+
+    /// A hit carries the two things a row needs besides the matching text:
+    /// when it was written, and which session it belongs to. Both are read in
+    /// the same query, so a surface draws its list without a lookup per hit —
+    /// and the session's name is the one the user gave it, not its id.
+    #[test]
+    fn a_hit_says_when_it_was_said_and_in_which_session() {
+        let (_dir, index) = tmp_index();
+        index
+            .insert_session("s1", 1, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .insert_session("s2", 2, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .set_title("s2", "the kafka decision")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let older = Entry {
+            ts: 1_700_000_000,
+            ..Entry::new(None, super::super::Role::User, "kafka first")
+        };
+        let newer = Entry {
+            ts: 1_700_000_999,
+            ..Entry::new(None, super::super::Role::User, "kafka later")
+        };
+        index
+            .index_entry("s1", &older)
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .index_entry("s2", &newer)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let hits = index
+            .search("kafka", None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits.len(), 2);
+        let hit_in = |session: &str| {
+            hits.iter()
+                .find(|hit| hit.session_id == session)
+                .unwrap_or_else(|| panic!("a hit in {session}: {hits:?}"))
+        };
+
+        let first = hit_in("s1");
+        assert_eq!(first.text, "kafka first");
+        assert_eq!(first.ts, 1_700_000_000);
+        assert_eq!(first.title, None, "an unnamed session says so");
+
+        let second = hit_in("s2");
+        assert_eq!(second.text, "kafka later");
+        assert_eq!(second.ts, 1_700_000_999);
+        assert_eq!(second.title.as_deref(), Some("the kafka decision"));
     }
 
     #[test]
