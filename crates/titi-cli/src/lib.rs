@@ -1,4 +1,3 @@
-pub mod app;
 pub mod chat;
 pub mod engine;
 pub mod first_frame;
