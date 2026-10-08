@@ -19,6 +19,17 @@ impl SettingsTool {
     }
 }
 
+/// The segments of a dotted settings key, or `None` when it names nothing: a
+/// key with an empty segment (`display.`, `.theme`, `a..b`) is not a path.
+/// The scope guard and the approval description judge the same segments.
+fn key_segments(key: &str) -> Option<Vec<&str>> {
+    let segments: Vec<&str> = key.split('.').collect();
+    segments
+        .iter()
+        .all(|segment| !segment.is_empty())
+        .then_some(segments)
+}
+
 #[async_trait]
 impl ToolHandler for SettingsTool {
     fn definition(&self) -> ToolDefinition {
@@ -40,6 +51,23 @@ impl ToolHandler for SettingsTool {
         }
     }
 
+    /// The dotted path this call reads or writes — never the value. A write
+    /// of a value is approved blind otherwise, and the path is exactly what
+    /// the scope guard below already judges.
+    fn describe(&self, args: &serde_json::Value) -> Option<String> {
+        let key = args.get("key").and_then(|v| v.as_str())?;
+        key_segments(key)?;
+        let verb = if args.get("value").is_some() {
+            "write"
+        } else {
+            "read"
+        };
+        Some(format!(
+            "settings {verb} {}",
+            crate::fs::describe_line(key, crate::fs::DESCRIBE_MAX)
+        ))
+    }
+
     async fn invoke(&self, args: serde_json::Value) -> ToolResult {
         let key = match args.get("key").and_then(|v| v.as_str()) {
             Some(k) => k,
@@ -52,14 +80,13 @@ impl ToolHandler for SettingsTool {
             }
         };
 
-        let segments: Vec<&str> = key.split('.').collect();
-        if segments.iter().any(|segment| segment.is_empty()) {
+        let Some(segments) = key_segments(key) else {
             return ToolResult {
                 output: format!("'{key}' is not a dotted settings key").into(),
                 is_error: true,
                 detail: None,
             };
-        }
+        };
         if is_protected(&segments) || is_credential(&segments) {
             return ToolResult {
                 output: "changing this setting via tool is blocked for security reasons".into(),
@@ -333,6 +360,51 @@ mod tests {
         assert_eq!(writes[0].0, "display.theme");
         assert_eq!(writes[0].2, "global");
         assert_eq!(writes[5].1, Value::Null);
+    }
+
+    /// The approval line names the path and the verb, and never the value:
+    /// the key is the same one the scope guard already judges, and it is the
+    /// whole of what the person needs to see.
+    #[test]
+    fn the_description_names_the_path_it_reads_or_writes() {
+        let tool = SettingsTool::new(Arc::new(DummyBackend));
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "key": "display.theme" })),
+            Some("settings read display.theme".to_owned())
+        );
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "key": "display.theme", "value": "dark" })),
+            Some("settings write display.theme".to_owned())
+        );
+
+        let detail = tool
+            .describe(&serde_json::json!({
+                "key": "compaction.thresholdPercent",
+                "value": "sk-live-abcdefgh"
+            }))
+            .expect("a key describes itself");
+        assert_eq!(detail, "settings write compaction.thresholdPercent");
+        assert!(
+            !detail.contains("sk-live-abcdefgh"),
+            "the value never rides along: {detail}"
+        );
+
+        assert_eq!(tool.describe(&serde_json::json!({})), None);
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "key": "display." })),
+            None,
+            "a malformed path describes nothing"
+        );
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "key": ".display" })),
+            None
+        );
+
+        let long = "display.".to_owned() + &"x".repeat(crate::fs::DESCRIBE_MAX + 25);
+        let detail = tool
+            .describe(&serde_json::json!({ "key": long }))
+            .expect("a key describes itself");
+        assert!(detail.ends_with('…'), "the line is bounded: {detail}");
     }
 
     #[tokio::test]

@@ -5,7 +5,13 @@
 //! filesystem read, and a URL is a channel out of the machine. What comes
 //! back is ordinary tool output and goes through the engine's redaction on
 //! the way to the model; nothing here builds a second path around it.
+//!
+//! Both name the call in one row before anyone is asked to approve it, and
+//! `fetch` refuses a cloud metadata host outright: that endpoint answers with
+//! the machine's credentials rather than with a page. Nothing else about a
+//! fetch changes — the scheme check, the timeout and the body cap stand.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,8 +20,12 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use titi_providers::ToolSpec;
 
-use crate::fs::{arg_str, err, ok};
+use crate::fs::{DESCRIBE_MAX, arg_str, describe_line, err, ok};
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
+
+/// The one placeholder this crate puts on a value it will not repeat: a
+/// secret never comes back out in the clear, it comes back as this.
+pub(crate) const REDACTED: &str = "<redacted>";
 
 /// Most of a response body the model ever sees. The rest is dropped: a page
 /// is untrusted input and a megabyte of it is a megabyte of context gone.
@@ -55,6 +65,8 @@ pub enum WebError {
     NoSearchProvider,
     #[error("http client unavailable: {message}")]
     Client { message: String },
+    #[error("{reason}")]
+    Refused { reason: String },
 }
 
 /// Where `web_search` sends a query and how the key rides along. Held by
@@ -153,6 +165,12 @@ impl FetchTool {
     async fn fetch(&self, args: Value) -> Result<String, WebError> {
         let raw = arg_str(&args, "url").ok_or(WebError::MissingArg("url"))?;
         let url = http_url(raw.trim())?;
+        // The same refusal the engine asks for before approval, asked again
+        // here: `invoke` is reachable on its own, and a metadata service must
+        // not be reached through it either.
+        if let Some(reason) = metadata_refusal(&url) {
+            return Err(WebError::Refused { reason });
+        }
         let response = self
             .client
             .get(url.clone())
@@ -185,6 +203,24 @@ impl ToolHandler for FetchTool {
             },
             approval: ApprovalTier::Network,
         }
+    }
+
+    fn describe(&self, args: &serde_json::Value) -> Option<String> {
+        let raw = arg_str(args, "url")?;
+        let url = http_url(raw.trim()).ok()?;
+        Some(format!(
+            "fetch {}",
+            describe_line(&masked_url(&url), DESCRIBE_MAX)
+        ))
+    }
+
+    /// Asked before anyone is asked to approve the call: a metadata service
+    /// hands the instance's credentials to whoever can reach it, so a call
+    /// there is answered instead of put to the person.
+    fn refusal(&self, args: &serde_json::Value) -> Option<String> {
+        let raw = arg_str(args, "url")?;
+        let url = http_url(raw.trim()).ok()?;
+        metadata_refusal(&url)
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -245,7 +281,7 @@ impl WebSearchTool {
     fn scrub(&self, message: String) -> String {
         match &self.provider {
             Some(provider) if !provider.api_key.is_empty() => {
-                message.replace(provider.api_key.as_str(), "<redacted>")
+                redact_occurrences(message, provider.api_key.as_str())
             }
             _ => message,
         }
@@ -267,6 +303,18 @@ impl ToolHandler for WebSearchTool {
             },
             approval: ApprovalTier::Network,
         }
+    }
+
+    fn describe(&self, args: &serde_json::Value) -> Option<String> {
+        let query = arg_str(args, "query")?;
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "web_search \"{}\"",
+            describe_line(query, DESCRIBE_MAX)
+        ))
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -322,6 +370,109 @@ fn request_error(error: reqwest::Error) -> WebError {
     }
     WebError::Request {
         message: error.to_string(),
+    }
+}
+
+/// Replaces every occurrence of `secret` in `text` with [`REDACTED`].
+/// `scrub` and the URL printer share this one replacement, so the crate has a
+/// single mask and not two that can drift.
+fn redact_occurrences(text: String, secret: &str) -> String {
+    if secret.is_empty() {
+        return text;
+    }
+    text.replace(secret, REDACTED)
+}
+
+/// The URL an approval prompt shows: scheme, host, port and path as written,
+/// and the query reduced to its keys. A query *value* is where a credential
+/// rides (`?access_token=…`) and cannot be vouched for from the outside, so
+/// it is never repeated — the key survives, the value becomes [`REDACTED`].
+/// Userinfo (`https://user:pass@host/`) goes with it: it is the same kind of
+/// value and nothing about it belongs on a one-row screen.
+fn masked_url(url: &reqwest::Url) -> String {
+    let mut out = String::new();
+    out.push_str(url.scheme());
+    out.push_str("://");
+    if let Some(host) = url.host_str() {
+        out.push_str(host);
+    }
+    if let Some(port) = url.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push_str(url.path());
+    for (index, (key, _)) in url.query_pairs().enumerate() {
+        out.push(if index == 0 { '?' } else { '&' });
+        out.push_str(key.as_ref());
+        out.push('=');
+        out.push_str(REDACTED);
+    }
+    out
+}
+
+/// Hosts that answer with the cloud instance's credentials rather than with a
+/// page. Only names confirmed by their vendor's own metadata documentation go
+/// here — a wrong entry would refuse an ordinary host.
+const METADATA_HOSTS: &[&str] = &[
+    // Google Compute Engine (the alias `metadata.goog` is not listed here).
+    "metadata.google.internal",
+    // Tencent Cloud CVM.
+    "metadata.tencentyun.com",
+];
+
+/// Alibaba Cloud's metadata service, which has one fixed address and no name.
+const ALIBABA_METADATA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// The refusal a cloud metadata endpoint earns, or `None` for every other
+/// host. It is decided from the URL alone, so the engine can hand the person
+/// this sentence instead of an approval, and `fetch` can refuse the same call
+/// before it builds a request — no socket opens either way.
+///
+/// The whole link-local block (`169.254.0.0/16`, `fe80::/10`) is refused, not
+/// just the two addresses AWS and Google happen to document: nothing on
+/// link-local is a public host, while loopback (`127.0.0.0/8`, `::1`) stays
+/// allowed because titi's own smoke servers and local model backends live
+/// there — a link-local address reaches out to the network your machine is
+/// attached to, loopback never leaves it.
+fn metadata_refusal(url: &reqwest::Url) -> Option<String> {
+    let raw = url.host_str()?;
+    // `host_str` keeps the brackets around an IPv6 literal and the trailing
+    // dot a name may carry; both name the same host, so both are stripped
+    // before the host is judged.
+    let host = raw
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(raw);
+    let host = host.trim_end_matches('.');
+
+    if let Some(name) = METADATA_HOSTS
+        .iter()
+        .find(|name| host.eq_ignore_ascii_case(name))
+    {
+        return Some(format!(
+            "refusing {name}: it is a cloud metadata service, which answers with the machine's credentials"
+        ));
+    }
+    let Ok(address) = host.parse::<IpAddr>() else {
+        return None;
+    };
+    if address == IpAddr::V4(ALIBABA_METADATA) {
+        return Some(format!(
+            "refusing {host}: it is the Alibaba Cloud metadata service, which answers with the machine's credentials"
+        ));
+    }
+    if is_link_local(address) {
+        return Some(format!(
+            "refusing {host}: link-local addresses (169.254.0.0/16, fe80::/10) are the cloud metadata service, which answers with the machine's credentials"
+        ));
+    }
+    None
+}
+
+fn is_link_local(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
     }
 }
 
@@ -467,6 +618,126 @@ mod tests {
         assert!(result.output.contains("url"), "{}", result.output);
     }
 
+    #[test]
+    fn fetch_describe_names_the_url_and_masks_the_query() {
+        let tool = fetch_tool();
+        let detail = tool
+            .describe(&serde_json::json!({
+                "url": "https://api.example/s?q=x&token=sk-live-abcdefgh"
+            }))
+            .expect("a url describes itself");
+        assert_eq!(
+            detail,
+            "fetch https://api.example/s?q=<redacted>&token=<redacted>"
+        );
+        assert!(!detail.contains("sk-live-abcdefgh"), "{detail}");
+
+        // A url longer than the one row a description gets is cut, never
+        // unmasked: the query is already gone before the bound applies.
+        let long = tool
+            .describe(&serde_json::json!({
+                "url": format!("https://api.example/{}/page?token=sk-live-abcdefgh", "d".repeat(80))
+            }))
+            .expect("a url describes itself");
+        assert!(long.ends_with('…'), "{long}");
+        assert!(!long.contains("sk-live-abcdefgh"), "{long}");
+    }
+
+    #[test]
+    fn fetch_describe_keeps_a_plain_url_and_drops_userinfo() {
+        let tool = fetch_tool();
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "url": "https://docs.rs/serde" })),
+            Some("fetch https://docs.rs/serde".to_owned())
+        );
+        let detail = tool
+            .describe(&serde_json::json!({ "url": "https://user:pass@example.invalid/private" }))
+            .expect("a url describes itself");
+        assert_eq!(detail, "fetch https://example.invalid/private");
+        assert!(!detail.contains("pass"), "{detail}");
+    }
+
+    #[test]
+    fn fetch_describe_without_a_http_url_says_nothing() {
+        let tool = fetch_tool();
+        assert_eq!(tool.describe(&serde_json::json!({})), None);
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "url": "file:///etc/passwd" })),
+            None,
+            "a scheme fetch refuses needs no description either"
+        );
+    }
+
+    /// A metadata host is answered, not fetched: the sentence names the host
+    /// and the reason. `invoke` hands back exactly that sentence rather than
+    /// a transport error, which is what "refused before the request was
+    /// built" looks like from outside the process.
+    #[tokio::test]
+    async fn a_metadata_host_is_refused_by_name() {
+        let tool = fetch_tool();
+        for (url, named) in [
+            (
+                "http://169.254.169.254/latest/meta-data/",
+                "169.254.169.254",
+            ),
+            ("http://169.254.170.2/v2/metadata", "169.254.170.2"),
+            ("http://[fe80::1]/x", "fe80::1"),
+            (
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "metadata.google.internal",
+            ),
+            (
+                "http://metadata.google.internal./computeMetadata/v1/",
+                "metadata.google.internal",
+            ),
+            (
+                "http://100.100.100.200/latest/meta-data/",
+                "100.100.100.200",
+            ),
+            (
+                "http://metadata.tencentyun.com/latest/meta-data/",
+                "metadata.tencentyun.com",
+            ),
+        ] {
+            let args = serde_json::json!({ "url": url });
+            let refusal = tool.refusal(&args).expect("a metadata host is refused");
+            assert!(refusal.contains(named), "{refusal}");
+            assert!(refusal.contains("metadata service"), "{refusal}");
+            let result = tool.invoke(args).await;
+            assert!(result.is_error, "{url}");
+            assert_eq!(
+                result.output.as_str(),
+                refusal,
+                "invoke answers the same sentence, not a transport error"
+            );
+            assert!(
+                !result.output.contains("request failed"),
+                "no request was made: {}",
+                result.output
+            );
+        }
+    }
+
+    /// The guard is narrow: loopback (where titi's own smoke servers and local
+    /// model backends live) and ordinary hosts go through untouched, and an
+    /// address in the path is not the address of the host.
+    #[test]
+    fn loopback_and_ordinary_hosts_are_allowed() {
+        let tool = fetch_tool();
+        for url in [
+            "http://127.0.0.1:8080/status",
+            "http://[::1]:11434/api/tags",
+            "https://docs.rs/serde",
+            "https://example.invalid/169.254.169.254",
+        ] {
+            assert_eq!(
+                tool.refusal(&serde_json::json!({ "url": url })),
+                None,
+                "{url} was refused"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn web_search_without_a_provider_is_an_error() {
         let tool = WebSearchTool::new(None).expect("a tls client builds");
@@ -531,6 +802,35 @@ mod tests {
             "{request}"
         );
         assert!(request.contains("?query=titi"), "{request}");
+    }
+
+    #[test]
+    fn web_search_describe_quotes_and_bounds_the_query() {
+        let tool = WebSearchTool::new(None).expect("a tls client builds");
+        assert_eq!(
+            tool.describe(&serde_json::json!({ "query": "  rust ownership  " })),
+            Some("web_search \"rust ownership\"".to_owned()),
+            "the query is quoted, trimmed, and nothing else rides along"
+        );
+
+        let detail = tool
+            .describe(&serde_json::json!({ "query": "line\none" }))
+            .expect("a query describes itself");
+        assert_eq!(detail, "web_search \"line one\"");
+
+        let long = "x".repeat(DESCRIBE_MAX + 25);
+        let detail = tool
+            .describe(&serde_json::json!({ "query": long }))
+            .expect("a query describes itself");
+        assert!(detail.contains('…'), "{detail}");
+        assert!(detail.ends_with('"'), "{detail}");
+        assert!(
+            detail.chars().count() <= DESCRIBE_MAX + "web_search \"\"".len() + 1,
+            "the line is bounded: {detail}"
+        );
+
+        assert_eq!(tool.describe(&serde_json::json!({ "query": "   " })), None);
+        assert_eq!(tool.describe(&serde_json::json!({})), None);
     }
 
     #[tokio::test]
