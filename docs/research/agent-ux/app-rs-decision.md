@@ -125,9 +125,11 @@ value is the behaviour, not the `App` wiring. Phase 3 closed most of that:
   wires it to the live composer in one commit or deletes it in one.
 
 Nothing else in the `App`-only list is dead *code* today: mouse selection,
-the appearance re-probe and history search are ported
-(`feat(cli): select and copy with the mouse`,
-`feat(cli): re-probe the terminal background on focus`,
-`feat(cli): search the prompt history`). Hub revive/stop, the details
-accordion and keybinding customization remain queue items, recoverable from
-git history at `65a2f8b`.
+the appearance re-probe and history search are ported, all three in one
+commit — `92c08c8 feat(cli): port the mouse, the appearance probe and the
+history`. (It landed as one because the branch's history was rewritten while
+it was being written: the two earlier commits it grew from, `feat(cli):
+select and copy with the mouse` and `feat(cli): re-probe the terminal
+background on focus`, are intact as objects but are no longer ancestors of
+`master`.) Hub revive/stop, the details accordion and keybinding
+customization remain queue items, recoverable from git history at `65a2f8b`.
