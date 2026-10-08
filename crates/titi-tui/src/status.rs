@@ -179,6 +179,137 @@ fn one_decimal(value: f64, unit: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Generation rate
+// ---------------------------------------------------------------------------
+
+/// How long the rolling window reaches back.
+const RATE_WINDOW: Duration = Duration::from_secs(4);
+
+/// The least time a reading may stand on. A rate computed from one delta and
+/// 30 ms is arithmetic, not a measurement.
+const RATE_MIN_SAMPLE: f64 = 0.4;
+
+/// Tokens per character, omp's rough four characters to a token. The number is
+/// the whole reason the row's reading wears a `~`.
+const TOKENS_PER_CHAR: f64 = 0.25;
+
+/// A rolling estimate of the model's generation rate, in tokens per second.
+///
+/// **An estimate, not a count.** The samples are the characters the working
+/// row already counts — the answer's, or the reasoning's while no answer has
+/// started — so no second counter exists to drift from the row's own number.
+/// That count is divided by four, because the provider's real token counts
+/// arrive with the turn's usage report and nothing reports them while the
+/// text is still arriving. The row prints the `~` that says so.
+///
+/// Rolling: samples older than [`RATE_WINDOW`] are dropped, so the figure
+/// follows a slow stretch after a fast one. The last reading is kept across a
+/// tool call or a round boundary — a row between two bursts keeps its number
+/// rather than blinking out — and a new turn clears it, so a turn with nothing
+/// streamed yet shows no number at all.
+#[derive(Debug, Clone)]
+pub struct TokenRate {
+    window: Duration,
+    /// `(when, cumulative characters)`, oldest first.
+    samples: std::collections::VecDeque<(Instant, usize)>,
+    reading: Option<f64>,
+}
+
+impl Default for TokenRate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TokenRate {
+    pub fn new() -> Self {
+        Self {
+            window: RATE_WINDOW,
+            samples: std::collections::VecDeque::new(),
+            reading: None,
+        }
+    }
+
+    /// A new turn: no reading until this turn's own deltas arrive.
+    pub fn begin(&mut self) {
+        self.samples.clear();
+        self.reading = None;
+    }
+
+    /// Feed the run's cumulative character count at `now`.
+    ///
+    /// A count below the previous sample is a series that started over — the
+    /// row swaps from reasoning to the answer, and the reasoning it counted is
+    /// dropped with it — so the samples are thrown away and the count becomes
+    /// the new baseline. A count that did not move is not a sample: pushing it
+    /// would make the reading decay while nothing happened, and the row would
+    /// show a number falling for a stream that had merely paused. The reading
+    /// itself is kept across both, because the last honest number beats a
+    /// blank row between two bursts.
+    pub fn observe(&mut self, chars: usize, now: Instant) {
+        match self.samples.back() {
+            Some((_, last)) if chars < *last => self.samples.clear(),
+            Some((_, last)) if chars == *last => {
+                self.evict(now);
+                self.recompute();
+                return;
+            }
+            _ => {}
+        }
+        self.samples.push_back((now, chars));
+        self.evict(now);
+        self.recompute();
+    }
+
+    /// Drop the samples the window no longer reaches.
+    ///
+    /// Never below two: the window bounds the reading, but the pair that
+    /// actually produced text is the least that can measure anything, and
+    /// throwing it away would blind the row on a stream that had paused once.
+    fn evict(&mut self, now: Instant) {
+        while self.samples.len() > 2
+            && self
+                .samples
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > self.window)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The last reading in tokens per second, or `None` before any has been
+    /// earned.
+    pub fn reading(&self) -> Option<f64> {
+        self.reading
+    }
+
+    /// Recompute the reading from the window; too little time or no growth
+    /// leaves the previous one standing.
+    fn recompute(&mut self) {
+        let (Some((first_at, first)), Some((last_at, last))) =
+            (self.samples.front().copied(), self.samples.back().copied())
+        else {
+            return;
+        };
+        let elapsed = last_at.duration_since(first_at).as_secs_f64();
+        let chars = last.saturating_sub(first);
+        if elapsed < RATE_MIN_SAMPLE || chars == 0 {
+            return;
+        }
+        self.reading = Some(chars as f64 / elapsed * TOKENS_PER_CHAR);
+    }
+}
+
+/// A reading as the working row prints it: `~42 tok/s`, or `~<1 tok/s` under
+/// one — the `~` is the row's own mark for an estimate.
+pub fn format_rate(tokens_per_second: f64) -> String {
+    if tokens_per_second < 1.0 {
+        return "~<1 tok/s".to_owned();
+    }
+    format!("~{} tok/s", tokens_per_second.round() as u64)
+}
+
+// ---------------------------------------------------------------------------
 // Busy indicator
 // ---------------------------------------------------------------------------
 
@@ -696,5 +827,77 @@ mod tests {
         let line = sl.render(80);
         assert!(!line.contains("⏱"), "no timer before prompt: {line}");
         assert!(!line.contains("⏲"), "no frozen timer: {line}");
+    }
+
+    // ---- Generation rate --------------------------------------------------
+
+    #[test]
+    fn a_rate_needs_time_and_text_before_it_says_anything() {
+        let mut rate = TokenRate::new();
+        let start = Instant::now();
+        rate.observe(0, start);
+        assert_eq!(rate.reading(), None, "one sample is not a rate");
+        // A tenth of a second later, a hundred characters: still too soon.
+        rate.observe(100, start + Duration::from_millis(100));
+        assert_eq!(rate.reading(), None);
+        // A second in, 400 characters: a four-characters-a-token estimate.
+        rate.observe(400, start + Duration::from_secs(1));
+        let reading = rate.reading().expect("a reading");
+        assert!((reading - 100.0).abs() < 0.01, "{reading}");
+        assert_eq!(format_rate(reading), "~100 tok/s");
+    }
+
+    #[test]
+    fn a_series_that_starts_over_is_a_new_baseline_not_a_negative_rate() {
+        let mut rate = TokenRate::new();
+        let start = Instant::now();
+        // Reasoning arrives, then the answer starts and the reasoning counter
+        // it was read from is dropped: the count falls back to zero.
+        rate.observe(2000, start);
+        rate.observe(2400, start + Duration::from_secs(1));
+        let reasoning = rate.reading().expect("a reading");
+        rate.observe(0, start + Duration::from_secs(2));
+        assert_eq!(rate.reading(), Some(reasoning), "the last reading stands");
+        rate.observe(800, start + Duration::from_secs(3));
+        let answer = rate.reading().expect("a reading");
+        assert!(
+            answer > 0.0 && answer.is_finite(),
+            "a restart is not a negative rate: {answer}"
+        );
+    }
+
+    #[test]
+    fn a_new_turn_clears_the_reading_and_the_window_forgets_old_samples() {
+        let mut rate = TokenRate::new();
+        let start = Instant::now();
+        rate.observe(0, start);
+        rate.observe(400, start + Duration::from_secs(1));
+        assert!(rate.reading().is_some());
+        rate.begin();
+        assert_eq!(rate.reading(), None, "a new turn shows no number");
+
+        // Growth that stopped four seconds ago no longer counts: the window
+        // reaches back, so a stalled stream reads as slower, not as its old
+        // average.
+        let mut rolling = TokenRate::new();
+        rolling.observe(0, start);
+        rolling.observe(400, start + Duration::from_secs(1));
+        let fast = rolling.reading().expect("a reading");
+        rolling.observe(400, start + Duration::from_secs(5));
+        assert_eq!(
+            rolling.reading(),
+            Some(fast),
+            "a stall keeps the last number"
+        );
+        rolling.observe(440, start + Duration::from_secs(6));
+        let slow = rolling.reading().expect("a reading");
+        assert!(slow < fast, "the window moved on: {slow} vs {fast}");
+    }
+
+    #[test]
+    fn a_rate_under_one_reads_as_under_one() {
+        assert_eq!(format_rate(0.4), "~<1 tok/s");
+        assert_eq!(format_rate(1.4), "~1 tok/s");
+        assert_eq!(format_rate(41.6), "~42 tok/s");
     }
 }

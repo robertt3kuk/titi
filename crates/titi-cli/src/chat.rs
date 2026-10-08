@@ -57,6 +57,9 @@ struct TerminalFeatures {
     /// The terminal shows its own progress for a running turn
     /// (`terminal.progress`).
     progress: bool,
+    /// The working row shows the generation-rate estimate
+    /// (`composer.tokenRate`).
+    token_rate: bool,
     /// The channel a notification takes: OSC 777, the BEL, or nothing.
     channel: titi_tui::caps::NotifyChannel,
 }
@@ -71,6 +74,7 @@ impl Default for TerminalFeatures {
             notify_error: true,
             notify_ask: true,
             progress: true,
+            token_rate: true,
             channel: titi_tui::caps::NotifyChannel::Osc777,
         }
     }
@@ -92,6 +96,7 @@ impl TerminalFeatures {
             // The bar is the terminal's to draw: the switch alone is not
             // enough, and a terminal without one is left quiet.
             progress: on(titi_config::settings::TERMINAL_PROGRESS_KEY) && env.shows_progress(),
+            token_rate: on(titi_config::settings::COMPOSER_TOKEN_RATE_KEY),
             channel: env.notification_channel(),
         }
     }
@@ -646,6 +651,9 @@ pub struct Chat {
     /// an approval — never by a streaming delta, and taken by the tick so it
     /// cannot be written twice.
     pending_notify: Option<NotifyKind>,
+    /// The generation-rate estimate the working row shows, fed from the
+    /// character counts that row already keeps.
+    token_rate: titi_tui::status::TokenRate,
 }
 
 impl Chat {
@@ -717,6 +725,7 @@ impl Chat {
             terminal: TerminalFeatures::default(),
             progress_on: false,
             pending_notify: None,
+            token_rate: titi_tui::status::TokenRate::new(),
         }
     }
 
@@ -925,6 +934,7 @@ impl Chat {
                 // starts before its first token: only a delta moves it on.
                 self.phase = WorkPhase::Waiting;
                 self.begin_usage_ledger();
+                self.begin_rate();
                 self.active_turn_id = Some(turn_id);
                 self.model = model.to_string();
                 self.reply.clear();
@@ -1338,8 +1348,36 @@ impl Chat {
             self.turn_active = true;
             self.turn_started = Some(now);
             self.begin_usage_ledger();
+            self.begin_rate();
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
+    }
+
+    /// A new turn for the rate estimate: no reading until this turn's own
+    /// deltas arrive. Called where a turn opens, so a stale figure from the
+    /// last one cannot be read as this one's.
+    fn begin_rate(&mut self) {
+        self.token_rate.begin();
+    }
+
+    /// Feed the rate estimate with the characters the working row already
+    /// counts — the answer's, or the reasoning's while no answer has started —
+    /// so there is no second counter to drift from the row's own number.
+    fn sample_rate(&mut self, now: Instant) {
+        if !self.turn_active {
+            return;
+        }
+        let chars = self.reply.chars().count() + self.thinking.chars().count();
+        self.token_rate.observe(chars, now);
+    }
+
+    /// The rate segment for the working row: the last reading, or nothing when
+    /// the switch is off or no deltas have arrived yet.
+    fn rate_segment(&self) -> Option<String> {
+        if !self.terminal.token_rate {
+            return None;
+        }
+        self.token_rate.reading().map(titi_tui::status::format_rate)
     }
 
     /// Opens the running turn's usage ledger: nothing reported yet, and
@@ -3752,6 +3790,10 @@ pub fn run(
     let mut screen = Screen::open(chat.terminal.progress)?;
     chat.start_intro(Instant::now());
     let result = loop {
+        // The rate the working row shows is sampled from the character counts
+        // that row already keeps, once per tick rather than once per frame, so
+        // the number it prints is the row's own text seen over time.
+        chat.sample_rate(Instant::now());
         let state = chat.agent_state();
         if state != reported
             && let Some(reporter) = &herdr_reporter
@@ -5767,6 +5809,13 @@ fn context_segment(snapshot: &StatusSnapshot, theme: &Theme) -> String {
 /// row existed: the caller gives it no height, so it cannot even leave a blank
 /// line behind.
 ///
+/// The `~N tok/s` a streaming phase may carry is an **estimate**: it is the
+/// characters this row already counts — the answer's, or the reasoning's —
+/// divided by four, because the provider's real token counts arrive only with
+/// the turn's usage report, after the number is needed. The `~` is the row's
+/// own mark for that; a phase with nothing streamed yet shows no number at
+/// all. See [`titi_tui::status::TokenRate`].
+///
 /// Honest limit for the wait: the Responses/Codex decoder does emit
 /// `ThinkingDelta` for reasoning deltas (crates/titi-providers/src/openai.rs:286),
 /// but a Codex request does not ask for a reasoning summary
@@ -5804,6 +5853,15 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
         );
     }
     let elapsed = chat.turn_elapsed().unwrap_or_default();
+    // The generation rate stands next to the phase word, where "how fast"
+    // belongs. It is the last reading the estimator earned, so a row between
+    // two bursts keeps its number instead of blinking out; before the turn's
+    // first delta there is no reading and the wording is exactly what it was.
+    let rate = chat.rate_segment();
+    let streaming_fact = |phase: &str, chars: usize| match &rate {
+        Some(rate) => format!("{phase} · {rate} · {chars} chars"),
+        None => format!("{phase} · {chars} chars"),
+    };
     let (glyph, fact, color) = match &chat.phase {
         // The three states are told apart by colour as well as by glyph: the
         // activity spinner in the accent the rest of the screen uses for a
@@ -5824,7 +5882,7 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
         WorkPhase::Streaming => (
             spinner_frame(elapsed),
             WorkFact {
-                wording: format!("streaming · {} chars", chat.reply.chars().count()),
+                wording: streaming_fact("streaming", chat.reply.chars().count()),
                 argument: None,
                 compact: "streaming".to_owned(),
                 seconds: Some(elapsed_label(elapsed)),
@@ -5834,7 +5892,7 @@ fn work_row(chat: &Chat, width: u16, theme: &Theme) -> Option<Paragraph<'static>
         WorkPhase::Thinking => (
             spinner_frame(elapsed),
             WorkFact {
-                wording: format!("thinking · {} chars", chat.thinking.chars().count()),
+                wording: streaming_fact("thinking", chat.thinking.chars().count()),
                 argument: None,
                 compact: "thinking".to_owned(),
                 seconds: Some(elapsed_label(elapsed)),
@@ -10934,6 +10992,7 @@ mod tests {
         assert!(!features.notify_ask, "the config turned it off");
         assert!(features.notify_completion, "and left its siblings on");
         assert!(!features.progress, "the config turned the bar off");
+        assert!(features.token_rate);
         // An unnamed terminal gets the BEL, which it certainly understands.
         assert_eq!(features.channel, NotifyChannel::Bell);
 
@@ -11068,6 +11127,93 @@ mod tests {
         let row = above_composer(&mut chat, 80, 20);
         assert!(row.contains("streaming"), "{row:?}");
         assert!(!row.contains("thinking"), "{row:?}");
+    }
+
+    /// The generation rate stands next to the phase word, marked as the
+    /// estimate it is: characters the row already counts, over four.
+    #[test]
+    fn the_working_row_shows_the_rate_the_estimate_earned() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "x".repeat(400).into(),
+        });
+        // One sample is not a rate: the row shows the count alone.
+        let start = Instant::now();
+        chat.sample_rate(start);
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(!row.contains("tok/s"), "{row:?}");
+        assert!(row.contains("400 chars"), "{row:?}");
+
+        // A second of streaming later the characters over that second are the
+        // reading — 400 more over four characters a token: ~100 tok/s.
+        chat.reply.push_str(&"y".repeat(400));
+        chat.sample_rate(start + Duration::from_secs(1));
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("~100 tok/s"), "{row:?}");
+        assert!(row.contains("800 chars"), "{row:?}");
+        assert!(
+            row.contains("streaming · ~100 tok/s · 800 chars"),
+            "{row:?}"
+        );
+
+        // The reading is kept between bursts: a later tick that streams
+        // nothing new leaves the number standing.
+        chat.sample_rate(start + Duration::from_secs(2));
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("~100 tok/s"), "{row:?}");
+    }
+
+    /// A new turn starts with no number — nothing has streamed yet — and the
+    /// switch takes the segment off the row entirely.
+    #[test]
+    fn a_new_turn_and_a_disabled_switch_show_no_rate() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "x".repeat(400).into(),
+        });
+        let start = Instant::now();
+        chat.sample_rate(start);
+        chat.reply.push_str(&"y".repeat(400));
+        chat.sample_rate(start + Duration::from_secs(1));
+        assert!(
+            above_composer(&mut chat, 80, 20).contains("tok/s"),
+            "the reading the next assertions are about"
+        );
+
+        // The next turn clears it: a number from the last turn would be a lie
+        // about this one.
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(2),
+            model: "openai/gpt-4.1".into(),
+        });
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(!row.contains("tok/s"), "{row:?}");
+        assert!(row.contains("waiting for the first token"), "{row:?}");
+
+        // With the switch off the segment is not painted at all, even with a
+        // reading standing behind it.
+        chat.terminal.token_rate = false;
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(2),
+            text: "z".repeat(400).into(),
+        });
+        chat.sample_rate(start);
+        chat.reply.push_str(&"w".repeat(400));
+        chat.sample_rate(start + Duration::from_secs(1));
+        assert!(chat.token_rate.reading().is_some(), "the reading is there");
+        let row = above_composer(&mut chat, 80, 20);
+        assert!(row.contains("streaming"), "{row:?}");
+        assert!(!row.contains("tok/s"), "the switch is off: {row:?}");
     }
 
     /// A tool call closes the reply line: the text of the round after it is

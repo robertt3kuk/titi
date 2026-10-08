@@ -111,6 +111,12 @@ pub const NOTIFY_ASK_KEY: &str = "notify.ask";
 /// terminal that has no such bar is left quiet.
 pub const TERMINAL_PROGRESS_KEY: &str = "terminal.progress";
 
+/// Whether the working row shows a generation-rate estimate.
+///
+/// Unset means on. The rate is read from the characters the row already
+/// counts and is an estimate, not a provider count.
+pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
+
 impl Settings {
     /// Discover and load all layers.
     ///
@@ -891,7 +897,7 @@ mod tests {
         assert_eq!(s.get("theme.dark"), Some(Value::from("titanium")));
     }
 
-    /// The four switches this crate names for the screen's own channels
+    /// The five switches this crate names for the screen's own channels
     /// resolve from a real file, unset means on, and `off` — as a string or a
     /// bool — turns exactly that one off.
     #[test]
@@ -903,6 +909,7 @@ mod tests {
             NOTIFY_ERROR_KEY,
             NOTIFY_ASK_KEY,
             TERMINAL_PROGRESS_KEY,
+            COMPOSER_TOKEN_RATE_KEY,
         ];
         assert_eq!(
             keys,
@@ -911,6 +918,7 @@ mod tests {
                 "notify.error",
                 "notify.ask",
                 "terminal.progress",
+                "composer.tokenRate",
             ]
         );
 
@@ -923,7 +931,7 @@ mod tests {
         write(
             &agent.join("config.yml"),
             "notify:\n  completion: off\n  error: false\n  ask: \"no\"\n\
-             terminal:\n  progress: \"OFF\"\n",
+             terminal:\n  progress: \"OFF\"\ncomposer:\n  tokenRate: 12\n",
         );
         let s = Settings::load(&agent, tmp.path(), &[]).unwrap();
         assert!(switch_off(&s, NOTIFY_COMPLETION_KEY));
@@ -931,5 +939,8 @@ mod tests {
         assert!(switch_off(&s, NOTIFY_ASK_KEY));
         // The string is read case-insensitively.
         assert!(switch_off(&s, TERMINAL_PROGRESS_KEY));
+        // A number is not a switch: it leaves the key on rather than guessing.
+        assert!(!switch_off(&s, COMPOSER_TOKEN_RATE_KEY));
+        assert_eq!(s.get(COMPOSER_TOKEN_RATE_KEY), Some(Value::from(12)));
     }
 }
