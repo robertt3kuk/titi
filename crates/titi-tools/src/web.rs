@@ -8,10 +8,15 @@
 //!
 //! Both name the call in one row before anyone is asked to approve it, and
 //! `fetch` refuses a cloud metadata host outright: that endpoint answers with
-//! the machine's credentials rather than with a page. Nothing else about a
-//! fetch changes — the scheme check, the timeout and the body cap stand.
+//! the machine's credentials rather than with a page. The refusal is decided
+//! twice, because a URL is not an address: by name for the URL the model
+//! wrote (and for every redirect hop), and by *address* in the client's
+//! resolver, where a name becomes the addresses a request may actually be
+//! sent to. Nothing else about a fetch changes — the scheme check, the
+//! timeout and the body cap stand.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -165,8 +170,17 @@ pub struct FetchTool {
 
 impl FetchTool {
     pub fn new() -> Result<Self, WebError> {
+        Self::with_resolver(Arc::new(GuardedResolver::system()))
+    }
+
+    /// The same tool over the caller's resolver.
+    ///
+    /// The address guard is the resolver's, so replacing it replaces that too:
+    /// this is the seam a test uses to put a name at an address of its
+    /// choosing, and what `new` does with [`GuardedResolver::system`].
+    pub fn with_resolver(resolver: Arc<dyn reqwest::dns::Resolve>) -> Result<Self, WebError> {
         Ok(Self {
-            client: http_client()?,
+            client: http_client_with(resolver)?,
             cap: FETCH_BYTE_CAP,
         })
     }
@@ -390,6 +404,16 @@ pub fn web_tools(provider: Option<SearchProvider>) -> Vec<Box<dyn ToolHandler>> 
 }
 
 fn http_client() -> Result<reqwest::Client, WebError> {
+    http_client_with(Arc::new(GuardedResolver::system()))
+}
+
+/// The same client with the caller's resolver.
+///
+/// The injection is the production path, not a test-only branch: `new` builds
+/// the guarded system resolver, and a caller with its own (a test that has to
+/// decide where a name goes, a deployment with a resolver of its own) hands
+/// one over. What it must keep is the guard — see [`GuardedResolver`].
+fn http_client_with(resolver: Arc<dyn reqwest::dns::Resolve>) -> Result<reqwest::Client, WebError> {
     reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         // `fetch` follows redirects itself, one hop at a time, so that every
@@ -397,11 +421,286 @@ fn http_client() -> Result<reqwest::Client, WebError> {
         // client's own policy follows a `Location` it never shows anyone, and
         // a redirect to a metadata service would land there unchecked.
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver2(resolver)
         .build()
         .map_err(|error| WebError::Client {
             message: error.to_string(),
         })
 }
+
+/// A service that answers with the machine's credentials rather than with a
+/// page. The forbidden set is these two, and every sentence about it is built
+/// from the same [`forbidden_address`], so the URL check and the resolver
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Service {
+    /// One fixed address, and no name to catch it by.
+    Alibaba,
+    /// The whole block, which no public host lives in.
+    LinkLocal,
+}
+
+impl Service {
+    /// The service as a noun phrase, for a sentence about a name or an
+    /// address.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Alibaba => "the Alibaba Cloud metadata service",
+            Self::LinkLocal => "the cloud metadata service",
+        }
+    }
+
+    /// Where it lives, for a sentence about an address.
+    fn block(self) -> &'static str {
+        match self {
+            Self::Alibaba => "100.100.100.200",
+            Self::LinkLocal => "link-local (169.254.0.0/16, fe80::/10)",
+        }
+    }
+}
+
+/// Why an address must never be reached, or `None` when it may be.
+///
+/// The one place the forbidden set lives. The whole link-local block is
+/// refused, not just the addresses AWS and Google happen to document: nothing
+/// on link-local is a public host, while loopback (`127.0.0.0/8`, `::1`) stays
+/// allowed because titi's own smoke servers and local model backends live
+/// there — a link-local address reaches out to the network the machine is
+/// attached to, loopback never leaves it.
+fn forbidden_address(address: IpAddr) -> Option<Service> {
+    if address == IpAddr::V4(ALIBABA_METADATA) {
+        return Some(Service::Alibaba);
+    }
+    is_link_local(address).then_some(Service::LinkLocal)
+}
+
+/// How a name is turned into addresses. A function so the filter below can be
+/// tested without a DNS server; [`GuardedResolver::system`] is the real one.
+type Lookup = Arc<dyn Fn(&str) -> std::io::Result<Vec<SocketAddr>> + Send + Sync>;
+
+/// Resolves names, and refuses the addresses a request must never be sent to.
+///
+/// The URL check cannot do this job. A name is not an address, and the address
+/// a name resolves to is only known here: resolving in the tool and letting
+/// the client resolve again would check one address and connect to another —
+/// a rebind between the two, or a second answer in the same set. So the
+/// refusal happens where the addresses are handed to the connector, and the
+/// addresses a request may use are the only ones that get through: a name with
+/// one public answer and one link-local answer keeps the public one, and a
+/// name whose every answer is forbidden fails the lookup with the sentence the
+/// URL check would have used.
+#[derive(Clone)]
+struct GuardedResolver {
+    lookup: Lookup,
+}
+
+impl GuardedResolver {
+    /// The system's own resolution (`getaddrinfo`), on a blocking thread, as
+    /// the client's default resolver does.
+    fn system() -> Self {
+        Self::with_lookup(Arc::new(|host: &str| {
+            (host, 0)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect::<Vec<_>>())
+        }))
+    }
+
+    /// The same filter over a caller's lookup, which is how a test drives a
+    /// name to an address of its choosing.
+    fn with_lookup(lookup: Lookup) -> Self {
+        Self { lookup }
+    }
+}
+
+/// One blocking lookup, on a thread of its own, as the client's own resolver
+/// does: `getaddrinfo` parks the thread it runs on, and the thread it must not
+/// park is the runtime's.
+///
+/// Hand-rolled rather than `spawn_blocking` because this crate has no tokio in
+/// its dependencies — it is a dev-dependency, for the tests — and a lookup is
+/// the one blocking call the library makes. A thread, a shared slot and the
+/// waker the runtime handed us are the whole of it.
+struct LookupState {
+    done: Mutex<Option<std::io::Result<Vec<SocketAddr>>>>,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+struct LookupFuture {
+    state: Option<Arc<LookupState>>,
+    failed: Option<String>,
+}
+
+impl LookupFuture {
+    /// Starts the lookup on a thread of its own and returns the future that
+    /// waits for it.
+    fn start(lookup: Lookup, host: String) -> Self {
+        let state = Arc::new(LookupState {
+            done: Mutex::new(None),
+            waker: Mutex::new(None),
+        });
+        let worker = Arc::clone(&state);
+        // A thread that cannot be spawned is reported, not swallowed: the
+        // request it was for must fail rather than hang.
+        let spawned = std::thread::Builder::new()
+            .name("titi-dns".to_owned())
+            .spawn(move || {
+                let result = lookup(&host);
+                let waker = {
+                    let mut done = worker
+                        .done
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    *done = Some(result);
+                    worker
+                        .waker
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        match spawned {
+            Ok(_) => LookupFuture {
+                state: Some(state),
+                failed: None,
+            },
+            Err(error) => LookupFuture {
+                state: None,
+                failed: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+impl std::future::Future for LookupFuture {
+    type Output = Result<std::io::Result<Vec<SocketAddr>>, String>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(failed) = self.failed.take() {
+            return std::task::Poll::Ready(Err(failed));
+        }
+        let Some(state) = self.state.take() else {
+            return std::task::Poll::Ready(Err(
+                "the lookup was polled after it finished".to_owned()
+            ));
+        };
+        let ready = {
+            let mut done = state.done.lock().unwrap_or_else(|error| error.into_inner());
+            done.take()
+        };
+        match ready {
+            Some(result) => std::task::Poll::Ready(Ok(result)),
+            None => {
+                // The result is not in yet: leave the waker for the thread and
+                // wait. Registering before re-checking is what keeps a result
+                // that landed between the two locks from being lost.
+                *state
+                    .waker
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(cx.waker().clone());
+                let landed = {
+                    let mut done = state.done.lock().unwrap_or_else(|error| error.into_inner());
+                    done.take()
+                };
+                match landed {
+                    Some(result) => std::task::Poll::Ready(Ok(result)),
+                    None => {
+                        self.state = Some(state);
+                        std::task::Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let lookup = Arc::clone(&self.lookup);
+        Box::pin(async move {
+            let addrs = LookupFuture::start(lookup, host.clone())
+                .await
+                .map_err(|error| Box::new(ResolveFailure { message: error }) as BoxError)?
+                .map_err(|error| {
+                    Box::new(ResolveFailure {
+                        message: format!("{host} did not resolve: {error}"),
+                    }) as BoxError
+                })?;
+            let mut refused: Option<Service> = None;
+            // Port 0: the connector takes the port from the URL, or the
+            // scheme's default, when a resolved address carries none — which
+            // is what keeps `http://host:8080/` working.
+            let usable: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|addr| match forbidden_address(addr.ip()) {
+                    Some(service) => {
+                        refused.get_or_insert(service);
+                        false
+                    }
+                    None => true,
+                })
+                .collect();
+            if usable.is_empty() {
+                return match refused {
+                    Some(service) => Err(Box::new(RefusedAddress { host, service }) as BoxError),
+                    None => Err(Box::new(ResolveFailure {
+                        message: format!("{host} did not resolve to any address"),
+                    }) as BoxError),
+                };
+            }
+            Ok(Box::new(usable.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The error a resolver returns when a name resolves only to addresses a
+/// request must not be sent to.
+///
+/// A type of its own, not a string, so the tool can tell this refusal from a
+/// network failure after the client has wrapped it: the sentence the URL check
+/// would have used is built here from the same [`forbidden_address`].
+#[derive(Debug)]
+struct RefusedAddress {
+    host: String,
+    service: Service,
+}
+
+impl std::fmt::Display for RefusedAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing {}: it resolves only to {}, which answers with the machine's credentials",
+            self.host,
+            self.service.name()
+        )
+    }
+}
+
+impl std::error::Error for RefusedAddress {}
+
+/// Anything else that stopped a lookup.
+#[derive(Debug)]
+struct ResolveFailure {
+    message: String,
+}
+
+impl std::fmt::Display for ResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ResolveFailure {}
+
+/// The box the `Resolve` trait asks for. reqwest does not export its own
+/// alias, so this is the same type spelled out.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 fn http_url(raw: &str) -> Result<reqwest::Url, WebError> {
     let url = reqwest::Url::parse(raw).map_err(|error| WebError::InvalidUrl {
@@ -417,6 +716,12 @@ fn http_url(raw: &str) -> Result<reqwest::Url, WebError> {
 }
 
 fn request_error(error: reqwest::Error) -> WebError {
+    // The resolver refuses an address by failing the lookup, which reaches
+    // here wrapped in the client's own error: it is a refusal, not a network
+    // failure, and it has to read like the one the URL check gives.
+    if let Some(reason) = refusal_in(&error) {
+        return WebError::Refused { reason };
+    }
     if error.is_timeout() {
         return WebError::Timeout {
             seconds: FETCH_TIMEOUT.as_secs(),
@@ -425,6 +730,27 @@ fn request_error(error: reqwest::Error) -> WebError {
     WebError::Request {
         message: error.to_string(),
     }
+}
+
+/// The refusal a failed request carries, when its cause was an address this
+/// tool will not reach rather than the network.
+///
+/// The client prints its own sentence and keeps the cause in the error's
+/// source chain, so the sentence a person needs is walked for rather than
+/// assumed to be the message. The cause keeps its *type* through the client's
+/// wrapping, which is what makes this a check and not a guess at words — and
+/// `fetch_refuses_a_name_that_resolves_to_metadata` fails if a future client
+/// stops preserving it, rather than letting the refusal read as
+/// `request failed`.
+fn refusal_in(error: &reqwest::Error) -> Option<String> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(refused) = source.downcast_ref::<RefusedAddress>() {
+            return Some(refused.to_string());
+        }
+        current = source.source();
+    }
+    None
 }
 
 /// Replaces every occurrence of `secret` in `text` with [`REDACTED`].
@@ -510,17 +836,13 @@ fn metadata_refusal(url: &reqwest::Url) -> Option<String> {
     let Ok(address) = host.parse::<IpAddr>() else {
         return None;
     };
-    if address == IpAddr::V4(ALIBABA_METADATA) {
-        return Some(format!(
-            "refusing {host}: it is the Alibaba Cloud metadata service, which answers with the machine's credentials"
-        ));
-    }
-    if is_link_local(address) {
-        return Some(format!(
-            "refusing {host}: link-local addresses (169.254.0.0/16, fe80::/10) are the cloud metadata service, which answers with the machine's credentials"
-        ));
-    }
-    None
+    forbidden_address(address).map(|service| {
+        format!(
+            "refusing {host}: it is {} at {}, which answers with the machine's credentials",
+            service.name(),
+            service.block()
+        )
+    })
 }
 
 fn is_link_local(address: IpAddr) -> bool {
@@ -650,6 +972,30 @@ mod tests {
         FetchTool::new().expect("a tls client builds")
     }
 
+    /// A resolver over a fixed set of addresses, so a name's answers are the
+    /// test's to choose: no DNS server, no network.
+    fn resolver_lookup(addrs: Vec<SocketAddr>) -> GuardedResolver {
+        GuardedResolver::with_lookup(Arc::new(move |_host: &str| Ok(addrs.clone())))
+    }
+
+    fn link_local() -> SocketAddr {
+        SocketAddr::from(([169, 254, 169, 254], 0))
+    }
+
+    fn public() -> SocketAddr {
+        SocketAddr::from(([93, 184, 216, 34], 0))
+    }
+
+    /// What the resolver answers for a name: the addresses a request may use,
+    /// or the sentence it refused with.
+    async fn resolved(resolver: &GuardedResolver, host: &str) -> Result<Vec<SocketAddr>, String> {
+        let name: reqwest::dns::Name = host.parse().expect("a name");
+        match reqwest::dns::Resolve::resolve(resolver, name).await {
+            Ok(addrs) => Ok(addrs.collect()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn fetch_returns_the_body() {
         let server = MockServer::start("200 OK", "hello from example.invalid");
@@ -750,6 +1096,108 @@ mod tests {
             result.output.contains("file://"),
             "the refusal names the scheme: {}",
             result.output
+        );
+    }
+
+    /// A name whose every answer is a metadata address is refused, in the
+    /// words the URL check would have used: the address a name resolves to is
+    /// only known at resolution, and that is where the refusal has to happen.
+    #[tokio::test]
+    async fn a_name_that_resolves_only_to_metadata_is_refused() {
+        let resolver = resolver_lookup(vec![link_local()]);
+        let error = resolved(&resolver, "metadata.test")
+            .await
+            .expect_err("the lookup fails");
+        assert!(error.contains("refusing metadata.test"), "{error}");
+        assert!(error.contains("metadata service"), "{error}");
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    /// A name with one public answer and one forbidden one keeps the public
+    /// one: the request goes where it was meant to, and the address it may not
+    /// use is simply not offered to the connector.
+    #[tokio::test]
+    async fn a_name_with_a_public_and_a_forbidden_answer_keeps_the_public_one() {
+        let resolver = resolver_lookup(vec![link_local(), public()]);
+        let kept = resolved(&resolver, "mixed.test").await.expect("resolved");
+        assert_eq!(kept, vec![public()]);
+    }
+
+    /// The whole path: a name the model wrote, resolved to a metadata address,
+    /// refused with the sentence a URL-literal metadata host gets.
+    #[tokio::test]
+    async fn fetch_refuses_a_name_that_resolves_to_metadata() {
+        let tool = FetchTool::with_resolver(Arc::new(resolver_lookup(vec![link_local()])))
+            .expect("a tls client builds");
+        let result = tool
+            .invoke(serde_json::json!({ "url": "http://metadata.test/latest/meta-data/" }))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("metadata.test"),
+            "the refusal names the host: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("metadata service"),
+            "and what it resolved to: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("request failed"),
+            "it is a refusal, not a transport error: {}",
+            result.output
+        );
+    }
+
+    /// A name the resolver sends to loopback is fetched, port and all: the
+    /// resolved address carries no port and the URL's is the one used.
+    #[tokio::test]
+    async fn fetch_reaches_the_address_the_resolver_chose() {
+        let server = MockServer::start("200 OK", "resolved by name");
+        let port = server.port;
+        let tool = FetchTool::with_resolver(Arc::new(resolver_lookup(vec![SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))])))
+        .expect("a tls client builds");
+        let result = tool
+            .invoke(serde_json::json!({ "url": format!("http://chosen.test:{port}/page") }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "resolved by name");
+    }
+
+    /// A URL that is already an address is never resolved — the connector
+    /// short-circuits a literal — so the URL check is what refuses it, and the
+    /// resolver is not asked at all.
+    #[tokio::test]
+    async fn a_literal_metadata_address_is_refused_by_the_url_check_alone() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let resolver = GuardedResolver::with_lookup(Arc::new(move |host: &str| {
+            seen.lock().expect("the list").push(host.to_owned());
+            Ok(Vec::new())
+        }));
+        let tool = FetchTool::with_resolver(Arc::new(resolver)).expect("a tls client builds");
+        let result = tool
+            .invoke(serde_json::json!({ "url": "http://169.254.169.254/latest/meta-data/" }))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("169.254.169.254"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("metadata service"),
+            "{}",
+            result.output
+        );
+        assert!(
+            asked.lock().expect("the list").is_empty(),
+            "a literal address must not reach the resolver: {:?}",
+            asked.lock().expect("the list")
         );
     }
 
