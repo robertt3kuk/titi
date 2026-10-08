@@ -1,5 +1,6 @@
 //! Terminal rendering kit: theme, width, panels, markdown, diff, image
 //! (widgets the chat's own frame loop composes).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod caps;
 /// Crate version, mirrors the workspace release.
