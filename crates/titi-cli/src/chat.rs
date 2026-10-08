@@ -135,6 +135,25 @@ impl TerminalFeatures {
     }
 }
 
+/// Which parts of a finished turn's footer the settings leave on.
+///
+/// Unset means on, the way every other cosmetic switch here reads: a config
+/// that cannot be read, or says nothing, leaves the row exactly as it was. The
+/// three keys are omp's three `display.*` switches for the same row, named for
+/// the surface and the part (`statusLine.preset`, `composer.tokenRate`).
+fn footer_switches(
+    settings: Option<&titi_config::settings::Settings>,
+) -> titi_tui::status::TurnFooterSwitches {
+    let off = |key: &str| {
+        settings.is_some_and(|settings| titi_config::settings::switch_off(settings, key))
+    };
+    titi_tui::status::TurnFooterSwitches {
+        time: !off(titi_config::settings::DISPLAY_TURN_FOOTER_TIME_KEY),
+        tokens: !off(titi_config::settings::DISPLAY_TURN_FOOTER_TOKENS_KEY),
+        cache_miss: !off(titi_config::settings::DISPLAY_TURN_FOOTER_CACHE_MISS_KEY),
+    }
+}
+
 /// One notification the run state owes the terminal, from an event the screen
 /// saw once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +533,10 @@ pub struct Chat {
     /// The channels this run may use: which of the settings are on and what
     /// the terminal itself supports.
     terminal: TerminalFeatures,
+    /// Which parts of a finished turn's footer the settings leave on
+    /// (`display.turnFooter.time`/`.tokens`/`.cacheMiss`), resolved once with
+    /// the terminal's own switches. Unset means on.
+    pub(crate) turn_footer: titi_tui::status::TurnFooterSwitches,
     /// Whether the terminal is currently showing the turn's progress bar, so
     /// the tick writes the clear exactly once.
     progress_on: bool,
@@ -639,6 +662,7 @@ impl Chat {
             turn_failed: false,
             last_title: None,
             terminal: TerminalFeatures::default(),
+            turn_footer: titi_tui::status::TurnFooterSwitches::default(),
             progress_on: false,
             pending_notify: None,
             token_rate: titi_tui::status::TokenRate::new(),
@@ -3287,7 +3311,9 @@ impl Chat {
                 // than `$0.000`, which would read as free.
                 cost_micro_usd: self.turn_cost_micro,
             };
-            self.push(LineKind::Usage, footer.row());
+            if let Some(row) = footer.row(self.turn_footer) {
+                self.push(LineKind::Usage, row);
+            }
         }
         if reply.trim().is_empty() {
             Applied::none()
@@ -3437,6 +3463,7 @@ pub fn run(
     .ok();
     let term_env = titi_tui::caps::TermEnv::from_env();
     chat.terminal = TerminalFeatures::resolve(settings.as_ref(), &term_env);
+    chat.turn_footer = footer_switches(settings.as_ref());
     // The status line's preset and gauge come from the same settings, resolved
     // before the first frame: an unknown or unset name is `default`/`off`, so a
     // typo in a cosmetic key changes nothing and never refuses to start.
@@ -8090,6 +8117,87 @@ mod tests {
         assert!(chat.turn_elapsed().is_none());
         assert!(!chat.turn_active);
         assert!(!frame_text(&mut chat).contains("working"));
+    }
+
+    /// A muted part is not in the row, and muting everything leaves no row at
+    /// all — the turn's own totals are untouched, so `/usage` still knows what
+    /// the turn cost.
+    #[test]
+    fn a_muted_footer_states_only_what_is_left() {
+        use titi_tui::status::TurnFooterSwitches;
+
+        fn finished(switches: TurnFooterSwitches) -> Chat {
+            let mut chat = chat();
+            chat.turn_footer = switches;
+            chat.turn_active = true;
+            chat.turn_started = Some(Instant::now() - Duration::from_millis(1_400));
+            chat.on_event(EngineEvent::StreamDelta {
+                turn_id: TurnId(1),
+                text: "answer".into(),
+            });
+            chat.on_event(EngineEvent::TurnUsage {
+                turn_id: TurnId(1),
+                prompt_tokens: 3_400,
+                completion_tokens: 250,
+                cached_tokens: 2_900,
+            });
+            chat.on_event(EngineEvent::TurnFinished {
+                turn_id: TurnId(1),
+                reason: StopReason::Stop,
+            });
+            chat
+        }
+
+        let no_time = finished(TurnFooterSwitches {
+            time: false,
+            ..Default::default()
+        });
+        let row = last_footer(&no_time).unwrap_or_default();
+        assert_eq!(row, "3.4k prompt (2.9k cached) · 250 out", "{row}");
+
+        let no_tokens = finished(TurnFooterSwitches {
+            tokens: false,
+            ..Default::default()
+        });
+        let row = last_footer(&no_tokens).unwrap_or_default();
+        assert!(shown_seconds(&row).is_some(), "{row}");
+        assert!(!row.contains("prompt") && !row.contains("out"), "{row}");
+
+        let nothing = finished(TurnFooterSwitches {
+            time: false,
+            tokens: false,
+            cache_miss: false,
+        });
+        assert_eq!(last_footer(&nothing), None, "no row, not an empty one");
+        assert_eq!(
+            nothing.last_prompt_tokens, 3_400,
+            "the totals `/usage` reads are untouched"
+        );
+    }
+
+    /// The three keys are read once, and an unset one leaves its part on — a
+    /// typo in a cosmetic key must not change what the screen does.
+    #[test]
+    fn the_footer_switches_read_the_config() {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(
+            dir.path().join("config.yml"),
+            "display:\n  turnFooter:\n    time: off\n    cacheMiss: false\n",
+        )
+        .expect("config");
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("load");
+        let switches = footer_switches(Some(&settings));
+        assert!(!switches.time, "the config turned the seconds off");
+        assert!(switches.tokens, "and left its sibling on");
+        assert!(!switches.cache_miss, "a false is off too");
+
+        let switches = footer_switches(None);
+        assert_eq!(
+            switches,
+            titi_tui::status::TurnFooterSwitches::default(),
+            "unset means on"
+        );
     }
 
     /// The last usage footer the transcript holds, as its text.

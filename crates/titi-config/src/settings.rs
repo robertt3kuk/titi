@@ -117,6 +117,28 @@ pub const TERMINAL_PROGRESS_KEY: &str = "terminal.progress";
 /// counts and is an estimate, not a provider count.
 pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 
+/// Whether a finished turn's footer names its wall time.
+///
+/// Unset means on. The footer is the dim row under the answer; this is the
+/// `1.4s` it opens with. Off, the row starts at whatever is left of it, and a
+/// row with nothing left is not drawn at all ([`DISPLAY_TURN_FOOTER_TOKENS_KEY`],
+/// [`DISPLAY_TURN_FOOTER_CACHE_MISS_KEY`]).
+pub const DISPLAY_TURN_FOOTER_TIME_KEY: &str = "display.turnFooter.time";
+
+/// Whether a finished turn's footer names its token counts.
+///
+/// Unset means on. This covers the prompt, its cached share, the completion
+/// count and the money that rides with them: a price is what those tokens
+/// cost, and `$0.004` on its own is a figure without its subject.
+pub const DISPLAY_TURN_FOOTER_TOKENS_KEY: &str = "display.turnFooter.tokens";
+
+/// Whether a finished turn's footer marks a request that re-paid for its own
+/// history.
+///
+/// Unset means on. The marker only exists on a turn that had a cache miss, so
+/// turning it off says nothing about a warm one.
+pub const DISPLAY_TURN_FOOTER_CACHE_MISS_KEY: &str = "display.turnFooter.cacheMiss";
+
 /// Which pre-built status line the screen paints.
 ///
 /// The names are `default` (today's line, the fallback for anything this key

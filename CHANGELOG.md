@@ -29,6 +29,7 @@ All notable user-facing changes to titi, newest first.
 - Cancelled or failed turns still report their token usage, so `/usage` and the budget do not lose a paid round.
 - Model switches in headless JSONL now answer `ModelSwitched`, so a client can switch a model before a turn.
 - `/hotkeys` lists the keys the screen answers, grouped — composer, lists & pickers, transcript & mouse, turn control, session — one row per binding and what it does. The table sits beside the `on_key` that answers those keys, and a test walks every key `map_key` can produce through every state `on_key` branches on, so a binding missing from the listing fails the suite rather than going unadvertised.
+- `display.turnFooter.time`, `display.turnFooter.tokens` and `display.turnFooter.cacheMiss` mute one part of the dim row under a finished turn's answer — the seconds, the token counts with the money, the cache-miss marker. Unset means on; with all three off the row is not drawn at all, and `/usage` still totals the session.
 
 ### Fixed
 

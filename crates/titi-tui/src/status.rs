@@ -122,37 +122,76 @@ pub const TURN_COST_DECIMALS: usize = 4;
 /// what a user reads.
 pub const SESSION_COST_DECIMALS: usize = 2;
 
+/// Which parts of a finished turn's footer the screen leaves on.
+///
+/// The three switches omp keeps for the same row (`display.showTokenUsage`,
+/// `display.showTurnTime`, `display.cacheMissMarker` in its settings registry),
+/// read here rather than in the settings crate: this is the reader's side of
+/// the row, and what an unset key means is the screen's decision. The screen
+/// resolves them once and hands them to [`TurnFooter::row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnFooterSwitches {
+    /// The turn's wall time (`1.4s`).
+    pub time: bool,
+    /// The token counts and the money that rides with them.
+    pub tokens: bool,
+    /// The marker on a request that re-paid for its own history.
+    pub cache_miss: bool,
+}
+
+impl Default for TurnFooterSwitches {
+    /// Everything on: what a screen that read no settings draws, and what
+    /// every key leaves unset.
+    fn default() -> Self {
+        Self {
+            time: true,
+            tokens: true,
+            cache_miss: true,
+        }
+    }
+}
+
 impl TurnFooter {
     /// The row: `1.4s · 3.4k prompt (2.9k cached) · 250 out`, a trailing
     /// `· $0.004` when the model has a price, and a `· cache miss` when the
     /// request re-paid for its own history.
     ///
+    /// `switches` is the reader's half of it: a muted part is not built at all,
+    /// and a row with no part left is `None` — the screen adds no line rather
+    /// than a line that says nothing. The money rides with the token counts
+    /// ([`TurnFooterSwitches::tokens`]): a price is what those tokens cost, and
+    /// `$0.004` alone is a figure without its subject.
+    ///
     /// The cached share is named only when there is one: `(0 cached)` would be
     /// a zero dressed as data, and the miss marker already says the honest
     /// thing about a cold request. The money is the same rule — a descriptor
     /// without a price prints no figure at all.
-    pub fn row(&self) -> String {
-        let prompt = if self.cached_tokens > 0 {
-            format!(
-                "{} prompt ({} cached)",
-                compact_tokens(self.prompt_tokens),
-                compact_tokens(self.cached_tokens)
-            )
-        } else {
-            format!("{} prompt", compact_tokens(self.prompt_tokens))
-        };
-        let mut parts = vec![
-            format_turn_time(self.elapsed),
-            prompt,
-            format!("{} out", compact_tokens(self.completion_tokens)),
-        ];
-        if self.cache_miss {
+    pub fn row(&self, switches: TurnFooterSwitches) -> Option<String> {
+        let mut parts = Vec::new();
+        if switches.time {
+            parts.push(format_turn_time(self.elapsed));
+        }
+        if switches.tokens {
+            parts.push(if self.cached_tokens > 0 {
+                format!(
+                    "{} prompt ({} cached)",
+                    compact_tokens(self.prompt_tokens),
+                    compact_tokens(self.cached_tokens)
+                )
+            } else {
+                format!("{} prompt", compact_tokens(self.prompt_tokens))
+            });
+            parts.push(format!("{} out", compact_tokens(self.completion_tokens)));
+        }
+        if switches.cache_miss && self.cache_miss {
             parts.push("cache miss".to_owned());
         }
-        if let Some(cost) = self.cost_micro_usd {
+        if switches.tokens
+            && let Some(cost) = self.cost_micro_usd
+        {
             parts.push(format_usd(cost, TURN_COST_DECIMALS));
         }
-        parts.join(" · ")
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 
@@ -760,6 +799,14 @@ mod tests {
 
     // ---- Turn footer ------------------------------------------------------
 
+    /// The row as a screen that read no settings draws it: every part on, which
+    /// is what an unset `display.turnFooter.*` key means.
+    fn shown(footer: &TurnFooter) -> String {
+        footer
+            .row(TurnFooterSwitches::default())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn turn_footer_names_every_part_it_has() {
         let footer = TurnFooter {
@@ -770,7 +817,7 @@ mod tests {
             cache_miss: false,
             cost_micro_usd: None,
         };
-        assert_eq!(footer.row(), "1.4s · 3.4k prompt (2.9k cached) · 250 out");
+        assert_eq!(shown(&footer), "1.4s · 3.4k prompt (2.9k cached) · 250 out");
     }
 
     #[test]
@@ -783,7 +830,7 @@ mod tests {
             cache_miss: false,
             cost_micro_usd: None,
         };
-        assert_eq!(footer.row(), "0.9s · 900 prompt · 40 out");
+        assert_eq!(shown(&footer), "0.9s · 900 prompt · 40 out");
     }
 
     #[test]
@@ -796,7 +843,7 @@ mod tests {
             cache_miss: false,
             cost_micro_usd: None,
         };
-        assert_eq!(footer.row(), "1m 15s · 999 prompt (12 cached) · 7 out");
+        assert_eq!(shown(&footer), "1m 15s · 999 prompt (12 cached) · 7 out");
     }
 
     #[test]
@@ -810,7 +857,7 @@ mod tests {
             cost_micro_usd: None,
         };
         assert_eq!(
-            footer.row(),
+            shown(&footer),
             "1.2s · 12k prompt · 80 out · cache miss",
             "the miss is named, and no zero is dressed as data"
         );
@@ -829,7 +876,7 @@ mod tests {
             cost_micro_usd: Some(4_500),
         };
         assert_eq!(
-            footer.row(),
+            shown(&footer),
             "1.4s · 3.4k prompt (2.9k cached) · 250 out · $0.0045"
         );
 
@@ -839,7 +886,7 @@ mod tests {
             ..footer
         };
         assert_eq!(
-            cold.row(),
+            shown(&cold),
             "1.4s · 3.4k prompt (2.9k cached) · 250 out · cache miss · $0.0045"
         );
     }
@@ -856,9 +903,88 @@ mod tests {
             cache_miss: false,
             cost_micro_usd: None,
         };
-        let row = footer.row();
+        let row = shown(&footer);
         assert_eq!(row, "0.9s · 900 prompt · 40 out");
         assert!(!row.contains('$'), "no price, no figure: {row}");
+    }
+
+    /// A muted part is not built at all, so the row left behind reads as it
+    /// would have without it — no empty `· ·` where something was cut.
+    #[test]
+    fn turn_footer_leaves_out_what_is_switched_off() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(1_400),
+            prompt_tokens: 3_400,
+            cached_tokens: 2_900,
+            completion_tokens: 250,
+            cache_miss: true,
+            cost_micro_usd: Some(4_000),
+        };
+        let no_time = TurnFooterSwitches {
+            time: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            footer.row(no_time).unwrap_or_default(),
+            "3.4k prompt (2.9k cached) · 250 out · cache miss · $0.004"
+        );
+        let no_tokens = TurnFooterSwitches {
+            tokens: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            footer.row(no_tokens).unwrap_or_default(),
+            "1.4s · cache miss",
+            "the money rides with the token counts"
+        );
+        let no_marker = TurnFooterSwitches {
+            cache_miss: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            footer.row(no_marker).unwrap_or_default(),
+            "1.4s · 3.4k prompt (2.9k cached) · 250 out · $0.004"
+        );
+        // A marker switch off on a warm turn changes nothing: there was none.
+        let warm = TurnFooter {
+            cache_miss: false,
+            ..footer
+        };
+        assert_eq!(
+            warm.row(no_marker).unwrap_or_default(),
+            "1.4s · 3.4k prompt (2.9k cached) · 250 out · $0.004"
+        );
+    }
+
+    /// Nothing left is no row: the screen adds no line, so a quiet transcript
+    /// has no blank one either.
+    #[test]
+    fn a_footer_with_every_part_switched_off_is_no_row() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(1_400),
+            prompt_tokens: 3_400,
+            cached_tokens: 2_900,
+            completion_tokens: 250,
+            cache_miss: true,
+            cost_micro_usd: Some(4_000),
+        };
+        let off = TurnFooterSwitches {
+            time: false,
+            tokens: false,
+            cache_miss: false,
+        };
+        assert_eq!(footer.row(off), None);
+        // …and a warm turn is no row with only the marker switch left on.
+        let warm = TurnFooter {
+            cache_miss: false,
+            ..footer
+        };
+        let only_marker = TurnFooterSwitches {
+            time: false,
+            tokens: false,
+            cache_miss: true,
+        };
+        assert_eq!(warm.row(only_marker), None);
     }
 
     /// Money is rounded to the places the figure carries, trailing zeros
