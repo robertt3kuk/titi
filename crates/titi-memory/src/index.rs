@@ -71,7 +71,26 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("no memory #{0}")]
     NotFound(i64),
+    /// The file was written by a newer titi than this one.
+    ///
+    /// An index is rebuildable, but it is not a file to migrate downwards
+    /// blind: this build cannot know what a future version's columns mean, and
+    /// reading them under the older shape would answer from rows it
+    /// misunderstood. Refusing costs a rebuild; guessing costs wrong memories.
+    #[error(
+        "memory schema {found} was written by a newer titi; this build understands {supported}"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
 }
+
+/// Schema version recorded in `PRAGMA user_version`.
+///
+/// `1` is the memories table with `embedder`, `pinned` and `hidden`. A file
+/// that carries `0` is one written before this constant existed, and is
+/// stamped current on open — the columns it is missing are added by
+/// [`MemoryIndex::open`] on every open anyway, so the stamp never has to be
+/// trusted for the shape of the table.
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memories (
@@ -104,6 +123,9 @@ impl MemoryIndex {
     pub fn open(agent_dir: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(agent_dir)?;
         let conn = Connection::open(agent_dir.join("memory.db"))?;
+        // Before anything is written to the file: an index from a newer build
+        // is refused, not migrated downwards.
+        Self::check_version(&conn)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         // Columns added after the first release. CREATE IF NOT EXISTS does not
@@ -116,6 +138,30 @@ impl MemoryIndex {
             ensure_column(&conn, name, ddl)?;
         }
         Ok(Self { conn })
+    }
+
+    /// Accepts this build's schema and anything older, and refuses anything
+    /// newer.
+    ///
+    /// A stamp below the constant is a file from an earlier release, and `0` is
+    /// what SQLite reports for a file that never stamped one at all; both are
+    /// stamped current here, and the caller then adds whatever columns they are
+    /// missing. Refusing a newer file is what keeps this from needing a
+    /// migration in the other direction — and it refuses *before* anything has
+    /// been written, so an index this build does not understand is left as it
+    /// was.
+    fn check_version(conn: &Connection) -> Result<(), Error> {
+        let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if found > SCHEMA_VERSION {
+            return Err(Error::SchemaTooNew {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if found != SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        Ok(())
     }
 
     /// Stores a memory, or bumps the counter when the same text exists.
@@ -523,10 +569,73 @@ pub fn parse_remember(args: &Value) -> Option<(&str, &str, &str)> {
 mod tests {
     use super::*;
 
+    /// Writes `user_version` straight into the file, the way a build of
+    /// another release would have left it.
+    fn stamp(dir: &Path, version: i64) {
+        let conn = Connection::open(dir.join("memory.db")).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
+    fn stamp_of(dir: &Path) -> i64 {
+        let conn = Connection::open(dir.join("memory.db")).unwrap();
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
     fn idx() -> (tempfile::TempDir, MemoryIndex) {
         let dir = tempfile::tempdir().unwrap();
         let index = MemoryIndex::open(dir.path()).unwrap();
         (dir, index)
+    }
+
+    /// An index written by a newer build is refused by name, and left exactly
+    /// as it was: reading a future schema under this build's shape would
+    /// answer from rows it misunderstood.
+    #[test]
+    fn an_index_from_a_newer_build_is_refused_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MemoryIndex::open(dir.path()).unwrap();
+        index.remember("decision", "use sqlite", "", &[]).unwrap();
+        drop(index);
+        stamp(dir.path(), SCHEMA_VERSION + 1);
+
+        let error = match MemoryIndex::open(dir.path()) {
+            Ok(_) => panic!("an index from a newer build must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "memory schema {} was written by a newer titi; this build understands {SCHEMA_VERSION}",
+                SCHEMA_VERSION + 1
+            )
+        );
+        assert_eq!(
+            stamp_of(dir.path()),
+            SCHEMA_VERSION + 1,
+            "the refusal must not lower the stamp"
+        );
+    }
+
+    /// An index that never stamped a version is opened and stamped current,
+    /// not refused: older is readable, and the columns it is missing are added
+    /// on every open anyway.
+    #[test]
+    fn an_index_that_never_stamped_one_is_stamped_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MemoryIndex::open(dir.path()).unwrap();
+        index.remember("decision", "use sqlite", "", &[]).unwrap();
+        drop(index);
+        stamp(dir.path(), 0);
+
+        let reopened = MemoryIndex::open(dir.path()).expect("an unstamped index opens");
+        assert_eq!(
+            stamp_of(dir.path()),
+            SCHEMA_VERSION,
+            "and is stamped current"
+        );
+        let recalled = reopened.recall("sqlite", &[]).unwrap();
+        assert_eq!(recalled.len(), 1, "the memory survived");
     }
 
     #[test]
