@@ -102,19 +102,32 @@ App-dispatch against chat's loop.
 
 ## Kept on purpose (2026-10-09)
 
-Two `titi-tui` modules survive phase 2 with no live importer, because their
-value is the behaviour, not the `App` wiring:
+Two `titi-tui` modules survived phase 2 with no live importer, because their
+value is the behaviour, not the `App` wiring. Phase 3 closed most of that:
 
-- `crates/titi-tui/src/selection.rs` — the drag-select model (anchor, drag,
-  release, cells → styled spans). `App` was its only consumer; the live chat
-  has no mouse code.
-- `crates/titi-tui/src/space_hold.rs` — the hold-space dictation gesture
-  state machine and `delete_before_cursor`. Same story: `App`-only today.
-  Its `tests/mouse_selection.rs` counterpart now drives `Selection`
-  directly (the SGR decode half went with `titi_tui::input`).
+- `crates/titi-tui/src/selection.rs` — **live again**. `chat.rs` anchors a
+  selection on mouse press, moves it on drag and holds it on release
+  (`Chat::mouse_press`/`mouse_drag`/`mouse_release`; the screen coordinates
+  are translated to the transcript's own rows in
+  `Chat::transcript_selection`), paints the region with
+  `Selection::apply_background` over the transcript's own rows and copies it
+  with `Selection::text`. Every part of the module has a caller, so it is
+  not dead and nothing in it is parked behind these lines.
+- `crates/titi-tui/src/space_hold.rs` — **half live, half dead on purpose**.
+  `delete_before_cursor` is live: `Chat::delete_word` is behind
+  alt+backspace / ctrl+w, the word-at-a-time delete the composer lacked.
+  `SpaceHold` itself — the push-to-talk detector — is still dead, and stays
+  dead while titi's STT is a stub: a hold-space key that opened a microphone
+  nothing listens to would be a key that does nothing, and the detector is
+  not a repeat machinery to be reused for something else (`delete_word`
+  counts the word's characters itself). It is kept rather than deleted
+  because it is the tested half of an STT wave; whoever lands STT either
+  wires it to the live composer in one commit or deletes it in one.
 
-Both are dead today. The next wave ports them into `chat.rs` (mouse
-selection and the space-hold gesture) and deletes the modules in that
-commit; if that wave decides against a port, the modules go in that commit
-instead. Neither is parked behind an `allow(dead_code)` — they are public
-API of a crate the chat still links, so they compile without one.
+Nothing else in the `App`-only list is dead *code* today: mouse selection,
+the appearance re-probe and history search are ported
+(`feat(cli): select and copy with the mouse`,
+`feat(cli): re-probe the terminal background on focus`,
+`feat(cli): search the prompt history`). Hub revive/stop, the details
+accordion and keybinding customization remain queue items, recoverable from
+git history at `65a2f8b`.

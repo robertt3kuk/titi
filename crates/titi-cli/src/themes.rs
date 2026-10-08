@@ -89,7 +89,19 @@ pub fn theme_named(name: &str) -> Result<Arc<Theme>, String> {
 /// The settings key a choice belongs in: the slot the terminal's own
 /// background selects, so a dark terminal's choice is the dark slot's.
 pub fn theme_slot(inputs: &AppearanceInputs) -> &'static str {
-    match titi_tui::theme::appearance::detect_terminal_background(inputs) {
+    slot_for(titi_tui::theme::appearance::detect_terminal_background(
+        inputs,
+    ))
+}
+
+/// The settings key one appearance's choice belongs in.
+///
+/// The two slots are what makes a live appearance change work: each appearance
+/// has its own choice, so a user who picked a palette for their dark terminal
+/// keeps it when the terminal turns light and their light choice is used
+/// instead.
+pub fn slot_for(appearance: titi_tui::theme::appearance::Appearance) -> &'static str {
+    match appearance {
         titi_tui::theme::appearance::Appearance::Light => titi_config::settings::THEME_LIGHT_KEY,
         titi_tui::theme::appearance::Appearance::Dark => titi_config::settings::THEME_DARK_KEY,
     }

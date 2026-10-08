@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::CellDiffOption;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use ratatui::crossterm::event::{DisableFocusChange, EnableFocusChange};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,9 +29,12 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
+use titi_tui::caps::MousePreset;
+use titi_tui::selection::Selection;
 use titi_tui::status_bar::{
     StatusLinePreset, StatusLineStyle, StatusSnapshot, live_snapshot, short_model,
 };
+use titi_tui::theme::appearance::{self, Appearance, AppearanceEvent, AppearanceInputs};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -39,6 +45,28 @@ use crate::session_log::SessionLog;
 
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
+
+/// How long after an OSC 11 query a reply's characters are recognized as one.
+///
+/// The query is answered in microseconds by a terminal that speaks OSC 11, so
+/// the window is the slack for a slow one — and it is also the window in which
+/// typing could be mistaken for a reply, which is why it is short.
+const PROBE_REPLY_WINDOW: Duration = Duration::from_millis(300);
+
+/// Longest byte string still treated as an appearance reply: `OSC 11 ; rgb:…`
+/// with four-digit components is well under this.
+const PROBE_REPLY_MAX: usize = 32;
+
+/// What a probed appearance did to the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// No payload, or an appearance the palette already matches.
+    Unchanged,
+    /// Mode 2031: the appearance moved, so a fresh OSC 11 query is owed.
+    NeedOsc11Query,
+    /// The palette for the reported appearance is now on screen.
+    ThemeChanged,
+}
 
 /// Which of the terminal's own channels this run may use.
 ///
@@ -315,6 +343,10 @@ pub enum Key {
     CtrlX,
     /// `app.model.select`: alt+m.
     AltM,
+    /// `app.history.search`: ctrl+r.
+    CtrlR,
+    /// Delete the word before the caret: alt+backspace or ctrl+w.
+    DeleteWord,
     Esc,
     Up,
     Down,
@@ -664,6 +696,39 @@ pub struct Chat {
     /// The generation-rate estimate the working row shows, fed from the
     /// character counts that row already keeps.
     token_rate: titi_tui::status::TokenRate,
+    /// The drag selection over the transcript, in screen coordinates; `None`
+    /// when nothing is selected. The model is `titi_tui::selection`.
+    selection: Option<Selection>,
+    /// The transcript's rows as the last frame drew them, as plain text: what
+    /// a copy of a selection carries, style and padding left behind.
+    last_rows: Vec<String>,
+    /// The screen row the transcript starts on. A mouse event arrives in
+    /// screen coordinates; this is what turns one into a row of
+    /// [`Chat::last_rows`].
+    transcript_top: u16,
+    /// The mouse preset this run has enabled. `/mouse` changes it, and the
+    /// way out disables mouse reporting whatever it is.
+    mouse_preset: MousePreset,
+    /// Sequences to write before the next frame, outside ratatui's diff: the
+    /// mouse preset switching over, an OSC 11 query, an OSC 52 copy.
+    output_flush: String,
+    /// The appearance the palette on screen was chosen for. A probe reply that
+    /// names the same one changes nothing, so a terminal that answers every
+    /// focus gain does not repaint the screen each time.
+    appearance: Option<Appearance>,
+    /// Whether the terminal's appearance may move the theme. `--theme` names
+    /// one palette for the run, and a probe must not undo a choice the user
+    /// made on the command line.
+    appearance_auto: bool,
+    /// When the last OSC 11 query went out. A reply arrives on the same stream
+    /// the keyboard does, so this is the window in which a reply's characters
+    /// are recognized as one and kept out of the composer.
+    probe_sent: Option<Instant>,
+    /// The reply being reassembled, byte for byte, from the events it arrived
+    /// as: `None` when no reply is part-way in.
+    probe_bytes: Option<Vec<u8>>,
+    /// The Ctrl+R / ↑ browser over this session's own prompts; `None` = closed.
+    history_picker: Option<HistoryPicker>,
 }
 
 impl Chat {
@@ -738,6 +803,16 @@ impl Chat {
             progress_on: false,
             pending_notify: None,
             token_rate: titi_tui::status::TokenRate::new(),
+            selection: None,
+            last_rows: Vec::new(),
+            transcript_top: 0,
+            mouse_preset: MousePreset::Buttons,
+            output_flush: String::new(),
+            appearance: None,
+            appearance_auto: true,
+            probe_sent: None,
+            probe_bytes: None,
+            history_picker: None,
         }
     }
 
@@ -747,8 +822,474 @@ impl Chat {
         self.intro = Some(now);
     }
 
-    fn take_kitty_flush(&mut self) -> String {
-        std::mem::take(&mut self.kitty_flush)
+    /// The sequences the next frame owes outside ratatui's diff: a kitty
+    /// graphic's setup, the mouse preset switching over, an OSC 52 copy. One
+    /// drain, so the run loop has one place to write them and no sequence can
+    /// sit in a field until the next frame that happens to draw.
+    fn take_output_flush(&mut self) -> String {
+        let kitty = std::mem::take(&mut self.kitty_flush);
+        let rest = std::mem::take(&mut self.output_flush);
+        if rest.is_empty() {
+            return kitty;
+        }
+        let mut out = kitty;
+        out.push_str(&rest);
+        out
+    }
+
+    // ---- Mouse selection -------------------------------------------------
+    //
+    // The transcript is the only surface with a selection: the composer has a
+    // caret, the pickers have a cursor. A press anchors, a drag moves the
+    // anchor's other corner, a release copies. Nothing here scrolls — a drag
+    // that scrolled would move the text out from under the selection.
+
+    /// Mouse press: anchor a drag-select at a screen cell.
+    pub fn mouse_press(&mut self, x: u16, y: u16) {
+        self.selection = Some(Selection::anchor(x, y));
+    }
+
+    /// Mouse drag: move the selection's far corner.
+    pub fn mouse_drag(&mut self, x: u16, y: u16) {
+        if let Some(selection) = &mut self.selection {
+            selection.drag(x, y);
+        }
+    }
+
+    /// Mouse release: the selection stands, and its text is what was copied.
+    ///
+    /// Returns `None` for a click (an empty selection) so nothing reaches the
+    /// clipboard on a press that selected nothing.
+    pub fn mouse_release(&mut self) -> Option<String> {
+        let selection = self.selection.as_mut()?;
+        selection.release();
+        let text = self.selection_text();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// The wheel: a panel's cursor when one is open — the wheel moves it the
+    /// way the arrows do — and the transcript's scroll otherwise. The wheel
+    /// never *opens* anything: ↑ at an empty composer is the history's, and a
+    /// wheel is not a key.
+    pub fn mouse_wheel(&mut self, delta: isize, now: Instant) {
+        if self.panel_open() {
+            let key = if delta > 0 { Key::Up } else { Key::Down };
+            self.on_key(key, now);
+            return;
+        }
+        if delta > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(delta as usize);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(delta.unsigned_abs());
+        }
+    }
+
+    /// Whether a panel holds the bottom of the screen: the same set
+    /// [`Chat::on_key`] routes to before the composer sees a key.
+    fn panel_open(&self) -> bool {
+        self.approval.is_some()
+            || self.login_for.is_some()
+            || self.theme_picker.is_some()
+            || self.session_picker.is_some()
+            || self.login_picker.is_some()
+            || self.model_picker.is_some()
+            || self.emoji_picker.is_visible()
+            || self.picking()
+    }
+
+    /// Forget the selection — a key or a new press takes it away.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// The committed selection, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// The selection as the transcript sees it: the screen rows translated to
+    /// the transcript's own rows, and `None` when the selection never reached
+    /// the transcript at all (`None` after a release is the same as a selection
+    /// that holds no text).
+    fn transcript_selection(&self) -> Option<Selection> {
+        let selection = self.selection?;
+        if !selection.is_non_empty() {
+            return None;
+        }
+        let (_, top, _, bottom) = selection.rect()?;
+        let origin = self.transcript_top;
+        let last = origin.saturating_add(self.last_rows.len() as u16);
+        if bottom < origin || top >= last {
+            return None;
+        }
+        let shift = |y: u16| y.saturating_sub(origin);
+        Some(Selection {
+            anchor: (selection.anchor.0, shift(selection.anchor.1)),
+            current: (selection.current.0, shift(selection.current.1)),
+            active: selection.active,
+        })
+    }
+
+    /// What a copy of the selection carries: the plain text of the selected
+    /// columns, with no styling and no padding.
+    pub fn selection_text(&self) -> String {
+        match self.transcript_selection() {
+            Some(selection) => selection.text(&self.last_rows),
+            None => String::new(),
+        }
+    }
+
+    // ---- Editing ----------------------------------------------------------
+
+    /// Delete the word before the caret: the run of spaces first, then the word
+    /// itself — omp's `deleteBeforeCursor`, which the space-hold gesture's
+    /// retract used and the live composer had no key for.
+    ///
+    /// The primitive is `titi_tui::space_hold`'s, character-counted, so a
+    /// multi-byte or wide character is one character and not one byte.
+    fn delete_word(&mut self) {
+        let trailing = self
+            .input
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+        let word = self
+            .input
+            .chars()
+            .rev()
+            .skip(trailing)
+            .take_while(|ch| !ch.is_whitespace())
+            .count();
+        if trailing + word == 0 {
+            return;
+        }
+        titi_tui::space_hold::delete_before_cursor(&mut self.input, trailing + word);
+    }
+
+    // ---- Prompt history ---------------------------------------------------
+    //
+    // What this session has been asked, from the session's own store — the same
+    // file the transcript writes and a resume replays. There is no second
+    // history file, and nothing here is remembered that the session did not
+    // already keep.
+
+    /// The prompts this session carried, newest first.
+    fn prompt_history(&self) -> Vec<String> {
+        let mut prompts: Vec<String> =
+            crate::session_fs::session_history(&self.agent_dir, &self.session_id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|message| message.role == titi_providers::Role::User)
+                .map(|message| message.content.to_string())
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+        prompts.reverse();
+        prompts
+    }
+
+    /// Ctrl+R, or ↑ at an empty composer: browse the prompts this session has
+    /// carried. An empty history says so instead of opening an empty panel.
+    fn open_history(&mut self) -> Applied {
+        let entries = self.prompt_history();
+        if entries.is_empty() {
+            self.push(
+                LineKind::Note,
+                "history: this session has no prompts yet".to_owned(),
+            );
+            return Applied::none();
+        }
+        self.history_picker = Some(HistoryPicker::open(entries));
+        Applied::none()
+    }
+
+    /// Typing while the history browser is up: the model browser's own idiom —
+    /// arrows move, a printable key narrows, Backspace takes a character back,
+    /// Esc closes.
+    fn history_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_history_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_history_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_history_picker(),
+            Key::Esc => {
+                self.history_picker = None;
+                self.disarm();
+                Applied::none()
+            }
+            Key::Backspace
+                if self
+                    .history_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.query.is_empty()) =>
+            {
+                if let Some(picker) = self.history_picker.as_mut() {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                if let Some(picker) = self.history_picker.as_mut() {
+                    picker.query.push(ch);
+                    picker.selected = 0;
+                }
+                Applied::none()
+            }
+            other => {
+                self.history_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_history_picker(&mut self, delta: isize) {
+        let Some(picker) = self.history_picker.as_mut() else {
+            return;
+        };
+        let len = picker.matched().len();
+        if len == 0 {
+            return;
+        }
+        let current = picker.selected % len;
+        picker.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter on a prompt: it lands in the composer, and the picker closes with
+    /// nothing sent — no engine command, no log line. A prompt that was sent
+    /// once is usually sent again only after being changed, so the composer is
+    /// where it belongs.
+    fn accept_history_picker(&mut self) -> Applied {
+        let Some(picker) = self.history_picker.take() else {
+            return Applied::none();
+        };
+        match picker.selected_text().map(str::to_owned) {
+            Some(text) => {
+                self.input = text;
+                Applied::none()
+            }
+            None => {
+                self.push(
+                    LineKind::Note,
+                    format!("history: nothing matches \"{}\"", picker.query),
+                );
+                Applied::none()
+            }
+        }
+    }
+
+    // ---- Terminal appearance --------------------------------------------
+    //
+    // A terminal can change its background while titi runs — a person flips
+    // their OS between light and dark, or switches a terminal profile — and the
+    // screen should follow. The reply to an OSC 11 query is the authority; the
+    // window's focus is the moment to ask, because that is when a person has
+    // just come back to it.
+
+    /// Focus came back: ask the terminal what its background is now.
+    pub fn on_focus_gained(&mut self, now: Instant) {
+        if self.appearance_auto {
+            self.query_appearance(now);
+        }
+    }
+
+    /// Ask for the background: write the query and open the window a reply is
+    /// recognized in.
+    fn query_appearance(&mut self, now: Instant) {
+        self.probe_sent = Some(now);
+        self.probe_bytes = None;
+        self.output_flush.push_str(titi_tui::caps::OSC11_QUERY);
+    }
+
+    /// Feed an OSC 11 / Mode 2031 probe reply into the theme on screen.
+    ///
+    /// Mode 2031 is a re-query trigger, not a luminance source: a terminal that
+    /// pushes it is telling us the appearance moved, so the reply to a fresh
+    /// OSC 11 is what decides the palette.
+    pub fn ingest_probe_reply(&mut self, bytes: &[u8]) -> ProbeOutcome {
+        match appearance::classify_appearance_bytes(bytes) {
+            None => ProbeOutcome::Unchanged,
+            Some(event) => self.apply_appearance(event),
+        }
+    }
+
+    /// Take a key event that is really part of an OSC 11 reply.
+    ///
+    /// There is one input stream, and the reply travels on it: the event layer
+    /// reads `ESC ]` as alt-`]` and the rest as a run of characters. A query
+    /// this run just sent arms the machine for [`PROBE_REPLY_WINDOW`]; while it
+    /// is armed, the reply's own shape is reassembled byte for byte and handed
+    /// to the classifier, and no part of it reaches the composer. Returns true
+    /// when the event was the reply's and the caller must not also handle it as
+    /// a key.
+    pub fn absorb_probe_key(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        let armed = self
+            .probe_sent
+            .is_some_and(|at| now.saturating_duration_since(at) <= PROBE_REPLY_WINDOW);
+        if !armed {
+            self.probe_bytes = None;
+            return false;
+        }
+        let KeyEvent {
+            code, modifiers, ..
+        } = *key;
+        let KeyCode::Char(ch) = code else {
+            // Anything that is not a character is not a probe reply.
+            self.probe_bytes = None;
+            return false;
+        };
+        let mut bytes = self.probe_bytes.take().unwrap_or_default();
+        if bytes.is_empty() && (ch != ']' || !modifiers.contains(KeyModifiers::ALT)) {
+            // Only a reply's first character is taken out of the keyboard's
+            // way: `ESC ]`, which the event layer reads as alt-`]`. A person
+            // typing in the window after coming back to the window keeps every
+            // key, because nothing else can begin a reply.
+            return false;
+        }
+        let Some(carried) = Self::probe_bytes_of(ch, modifiers) else {
+            // Not a byte a reply is spelled with.
+            self.probe_sent = None;
+            return false;
+        };
+        bytes.extend_from_slice(&carried);
+        if bytes.len() > PROBE_REPLY_MAX {
+            // Nothing this long is an OSC 11 reply: stop swallowing input.
+            self.probe_sent = None;
+            return true;
+        }
+        if let Some(event) = appearance::classify_appearance_bytes(&bytes) {
+            self.probe_sent = None;
+            if let ProbeOutcome::NeedOsc11Query = self.apply_appearance(event) {
+                self.query_appearance(now);
+            }
+            return true;
+        }
+        self.probe_bytes = Some(bytes);
+        true
+    }
+
+    /// The bytes one key event carried on the wire.
+    ///
+    /// The reply is read as if it were typed, so its bytes have to be spelled
+    /// back: a character the layer read as alt-modified had an ESC in front of
+    /// it, and the C0 bytes `0x00`–`0x1F` come back as the control chords they
+    /// are the key codes for — the reply's BEL terminator arrives as ctrl-`g`.
+    /// `None` when the event cannot be part of a reply.
+    fn probe_bytes_of(ch: char, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(2);
+        if modifiers.contains(KeyModifiers::ALT) {
+            bytes.push(0x1b);
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            let byte = match ch {
+                'a'..='z' => ch as u8 - b'a' + 0x01,
+                '4'..='7' => ch as u8 - b'4' + 0x1c,
+                ' ' => 0x00,
+                _ => return None,
+            };
+            bytes.push(byte);
+        } else {
+            let mut encoded = [0u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+        }
+        Some(bytes)
+    }
+
+    /// The classifier's verdict on one appearance report.
+    fn apply_appearance(&mut self, event: AppearanceEvent) -> ProbeOutcome {
+        match event {
+            AppearanceEvent::Mode2031Requery => ProbeOutcome::NeedOsc11Query,
+            AppearanceEvent::Osc11(mode) => {
+                if self.appearance == Some(mode) {
+                    return ProbeOutcome::Unchanged;
+                }
+                self.appearance = Some(mode);
+                if !self.appearance_auto {
+                    return ProbeOutcome::Unchanged;
+                }
+                match self.theme_for_appearance(mode) {
+                    Ok(theme) => {
+                        self.theme = theme;
+                        ProbeOutcome::ThemeChanged
+                    }
+                    Err(reason) => {
+                        self.push(LineKind::Error, format!("theme: {reason}"));
+                        ProbeOutcome::Unchanged
+                    }
+                }
+            }
+        }
+    }
+
+    /// The palette one appearance's slot holds: the user's choice for it when
+    /// they made one, the crate's own pick for it otherwise.
+    fn theme_for_appearance(&self, mode: Appearance) -> Result<Arc<Theme>, String> {
+        let workspace = crate::session_fs::current_workspace();
+        let settings = titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[])
+            .map_err(|reason| reason.to_string())?;
+        let chosen = settings
+            .get(crate::themes::slot_for(mode))
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let name = chosen.unwrap_or_else(|| match mode {
+            Appearance::Light => appearance::AUTO_LIGHT_THEME.to_owned(),
+            Appearance::Dark => appearance::AUTO_DARK_THEME.to_owned(),
+        });
+        crate::themes::theme_named(&name)
+    }
+
+    /// Assume the appearance the run started on: the palette in use was chosen
+    /// for it, so the first probe reply that names it changes nothing.
+    pub fn set_starting_appearance(&mut self, appearance: Appearance) {
+        self.appearance = Some(appearance);
+    }
+
+    /// Whether an explicit `--theme` took the appearance out of the loop.
+    pub fn set_appearance_auto(&mut self, auto: bool) {
+        self.appearance_auto = auto;
+    }
+
+    /// The mouse preset in force, and whether the terminal is reporting drags.
+    pub fn mouse_preset(&self) -> MousePreset {
+        self.mouse_preset
+    }
+
+    /// `/mouse`: the preset is persisted where the next run reads it and
+    /// switched over now.
+    fn mouse(&mut self, args: &str) -> Applied {
+        let Some(preset) = MousePreset::parse(args.trim()) else {
+            self.push(
+                LineKind::Note,
+                "mouse: off, wheel, buttons, all (or on/off)".to_owned(),
+            );
+            return Applied::none();
+        };
+        let saved = crate::session_fs::save_mouse_preset_to(&self.agent_dir, preset);
+        self.mouse_preset = preset;
+        // Off and then on: a preset that narrows must not leave the wider one's
+        // modes set. `Off`'s own enable sequence is the disable for all four.
+        self.output_flush.push_str(MousePreset::Off.enable());
+        self.output_flush.push_str(preset.enable());
+        match saved {
+            Ok(()) => self.push(
+                LineKind::Note,
+                format!(
+                    "mouse: {}{}",
+                    preset.name(),
+                    if preset == MousePreset::Off {
+                        " (the terminal's own selection is back)"
+                    } else {
+                        " (drag selects · release copies)"
+                    }
+                ),
+            ),
+            Err(reason) => self.push(LineKind::Error, format!("mouse: not saved ({reason})")),
+        }
+        Applied::none()
     }
 
     /// Load a local photo once and queue its kitty setup when the size changes.
@@ -807,6 +1348,9 @@ impl Chat {
     }
 
     pub fn on_key(&mut self, key: Key, now: Instant) -> Applied {
+        // The next key takes a standing selection away, the way every terminal
+        // does: the highlight is about the copy that just happened, not a mode.
+        self.clear_selection();
         if self.approval.is_some() {
             return self.approval_key(key);
         }
@@ -828,12 +1372,16 @@ impl Chat {
         if self.emoji_picker.is_visible() {
             return self.emoji_picker_key(key, now);
         }
+        if self.history_picker.is_some() {
+            return self.history_picker_key(key, now);
+        }
         match key {
             Key::CtrlC if self.turn_active => {
                 self.disarm();
                 Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
             }
             Key::CtrlC => self.arm_quit(now),
+            Key::CtrlR => self.open_history(),
             Key::CtrlX => self.open_session_picker(),
             Key::AltM => {
                 self.open_model_picker();
@@ -876,6 +1424,12 @@ impl Chat {
                 }
                 self.submit(now)
             }
+            Key::DeleteWord => {
+                self.disarm();
+                self.delete_word();
+                self.sync_emoji_picker();
+                Applied::none()
+            }
             Key::Backspace => {
                 self.disarm();
                 self.input.pop();
@@ -899,6 +1453,10 @@ impl Chat {
                 self.disarm();
                 Applied::none()
             }
+            // ↑ at an empty composer is the prompt history's (omp
+            // `app.history.search`); with text in the composer it scrolls the
+            // transcript, as it always has.
+            Key::Up if self.input.is_empty() => self.open_history(),
             Key::Up => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
                 Applied::none()
@@ -1632,6 +2190,7 @@ impl Chat {
             "keys" | "whoami" => self.keys(),
             "theme" => self.theme(args),
             "statusline" => self.statusline(args),
+            "mouse" => self.mouse(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
             _ => {
@@ -3613,6 +4172,11 @@ impl Chat {
         Applied::none()
     }
 
+    /// Say one thing above the composer until the next key.
+    fn set_hint(&mut self, text: String) {
+        self.hint = text;
+    }
+
     fn disarm(&mut self) {
         self.quit_armed = None;
         self.hint.clear();
@@ -3880,7 +4444,20 @@ pub fn run(
         reporter.report(AgentState::Idle, None);
     }
     let mut reported = AgentState::Idle;
-    let mut screen = Screen::open(chat.terminal.progress)?;
+    // The terminal's appearance decided the palette above, so the screen
+    // already matches it: the first probe reply that names the same appearance
+    // changes nothing. An explicit `--theme` is the user's own choice and is
+    // not the probe's to move.
+    chat.set_starting_appearance(appearance::detect_terminal_background(
+        &AppearanceInputs::from_env(),
+    ));
+    chat.set_appearance_auto(theme_name.is_none());
+    // The mouse preset the user persisted, or drag-select on a machine that
+    // has never chosen one: the transcript's selection needs button *and* drag
+    // reporting, which is `Buttons`.
+    chat.mouse_preset =
+        crate::session_fs::load_mouse_preset_from(&chat.agent_dir).unwrap_or(MousePreset::Buttons);
+    let mut screen = Screen::open(chat.terminal.progress, chat.mouse_preset)?;
     chat.start_intro(Instant::now());
     let result = loop {
         // The rate the working row shows is sampled from the character counts
@@ -3895,10 +4472,10 @@ pub fn run(
             reported = state;
         }
         screen.terminal.draw(|frame| draw(frame, &mut chat))?;
-        let kitty = chat.take_kitty_flush();
-        if !kitty.is_empty() {
+        let flush = chat.take_output_flush();
+        if !flush.is_empty() {
             let backend = screen.terminal.backend_mut();
-            backend.write_all(kitty.as_bytes())?;
+            backend.write_all(flush.as_bytes())?;
             backend.flush()?;
             screen.terminal.draw(|frame| draw(frame, &mut chat))?;
         }
@@ -3934,14 +4511,23 @@ struct Screen {
 }
 
 impl Screen {
-    fn open(progress: bool) -> io::Result<Self> {
+    /// Take the terminal over: raw mode, the alternate screen, the cursor's
+    /// hiding, and the mouse preset the run was given.
+    ///
+    /// Mouse reporting is asked for in the crate's own vocabulary
+    /// ([`MousePreset`]) rather than through crossterm's blanket capture, so
+    /// the preset a user persisted with `/mouse` is the one the terminal gets.
+    fn open(progress: bool, mouse: MousePreset) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(
             stdout,
             EnterAlternateScreen,
-            ratatui::crossterm::cursor::Hide
+            ratatui::crossterm::cursor::Hide,
+            EnableFocusChange
         )?;
+        stdout.write_all(mouse.enable().as_bytes())?;
+        stdout.flush()?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal, progress })
@@ -3954,13 +4540,17 @@ impl Drop for Screen {
         let _ = execute!(
             self.terminal.backend_mut(),
             ratatui::crossterm::cursor::Show,
-            LeaveAlternateScreen
+            LeaveAlternateScreen,
+            DisableFocusChange
         );
-        // The terminal's own channels go back with the screen: an empty OSC 2
-        // hands the title to the shell, and the OSC 9;4 clear takes the
-        // progress bar down, so a Ctrl+C mid-turn cannot leave a bar running
-        // in a tab whose agent is gone.
+        // The terminal's own channels go back with the screen: mouse reporting
+        // is turned off for every mode (`Off`'s sequence is the disable for all
+        // four, so an exit cannot leave the terminal reporting drags to a
+        // program that is gone), an empty OSC 2 hands the title to the shell,
+        // and the OSC 9;4 clear takes the progress bar down, so a Ctrl+C
+        // mid-turn cannot leave a bar running in a tab whose agent is gone.
         let backend = self.terminal.backend_mut();
+        let _ = backend.write_all(MousePreset::Off.enable().as_bytes());
         let _ = backend.write_all(crate::title::restore(self.progress).as_bytes());
         let _ = backend.flush();
     }
@@ -4123,6 +4713,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "statusline",
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
+    },
+    Command {
+        name: "mouse",
+        about: "mouse reporting: off, wheel, buttons, all (drag selects, release copies)",
     },
 ];
 
@@ -5029,6 +5623,9 @@ fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
     if chat.emoji_picker.is_visible() {
         return Some(emoji_panel(chat, total));
     }
+    if chat.history_picker.is_some() {
+        return Some(history_panel(chat, total));
+    }
     if picker_rows(chat).is_empty() {
         return None;
     }
@@ -5150,6 +5747,77 @@ impl ThemePicker {
         let at = *matched.get(self.selected % matched.len().max(1))?;
         self.names.get(at).map(String::as_str)
     }
+}
+
+/// The Ctrl+R / ↑ browser: the prompts this session has carried, newest first,
+/// filtered the way the model browser filters — a prompt can be typed down to
+/// one row without knowing where it is in the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryPicker {
+    entries: Vec<String>,
+    query: String,
+    selected: usize,
+}
+
+impl HistoryPicker {
+    fn open(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    /// The rows the query keeps, best score first and the list's own order
+    /// breaking ties, so a list that is re-filtered never jumps between frames.
+    fn matched(&self) -> Vec<usize> {
+        let mut scored: Vec<(i32, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(at, text)| fuzzy_score(&self.query, text).map(|score| (score, at)))
+            .collect();
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+        scored.into_iter().map(|(_, at)| at).collect()
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        let matched = self.matched();
+        let at = *matched.get(self.selected % matched.len().max(1))?;
+        self.entries.get(at).map(String::as_str)
+    }
+}
+
+/// The history browser's rows: one line per prompt, flattened so a prompt that
+/// was typed over several lines is still one row.
+fn history_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(picker) = chat.history_picker.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let matched = picker.matched();
+    let lines: Vec<PanelLine> = matched
+        .iter()
+        .map(|at| PanelLine::Row {
+            text: one_line(picker.entries[*at].trim(), 72),
+            accent: false,
+        })
+        .collect();
+    let title = if picker.query.is_empty() {
+        format!("history · {}", picker.entries.len())
+    } else {
+        format!(
+            "history · {} of {} · {}",
+            lines.len(),
+            picker.entries.len(),
+            picker.query
+        )
+    };
+    panel_view(
+        Some(title),
+        lines,
+        Some(picker.selected % matched.len().max(1)),
+        panel_body(total),
+    )
 }
 
 /// The bare-`/login` picker: a provider and a method per row. Nothing is
@@ -5445,7 +6113,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     } else {
         transcript(chat, cols[2].width, cols[2].height, &theme)
     };
+    chat.transcript_top = cols[2].y;
     frame.render_widget(body, cols[2]);
+    paint_selection(frame, chat, cols[2], &theme);
     paint_photos(frame, cols[2], &photos, &theme);
     paint_links(frame, cols[2], &links);
     if let Some(view) = &panel {
@@ -6650,7 +7320,60 @@ fn transcript(
             }
         }
     }
+    // What the frame draws, as characters. A copied selection reads this, not
+    // the buffer, so style can never ride along on the way to the clipboard.
+    chat.last_rows = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
     (Paragraph::new(lines).style(page(theme)), photos, paints)
+}
+
+/// Draws the drag selection: the rows it covers, re-drawn with the theme's
+/// `selectedBg` behind them.
+///
+/// The rows are re-rendered from the transcript's own text rather than by
+/// repainting buffer cells, so the highlight is exactly the text a copy
+/// carries: [`Selection::apply_background`] inserts the background into the
+/// row's own styling and [`sgr_row`] reads that styling back into spans. The
+/// highlight is not a mode — the next key takes it away — and the photos and
+/// hyperlinks are painted after it, so a selected row that holds an image or a
+/// link keeps both.
+fn paint_selection(
+    frame: &mut ratatui::Frame<'_>,
+    chat: &Chat,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
+    let Some(selection) = chat.transcript_selection() else {
+        return;
+    };
+    // The rows are padded to the pane's width before the background is laid
+    // on: a terminal paints the whole selection rectangle, and a row whose
+    // text stops before the rectangle's right edge would otherwise highlight
+    // only as far as its characters. The padding is spaces on the pane's own
+    // surface, which is what those cells already hold.
+    let width = area.width as usize;
+    let padded: Vec<String> = chat
+        .last_rows
+        .iter()
+        .map(|row| {
+            let room = width.saturating_sub(titi_tui::width::visible_width(row));
+            if room == 0 {
+                row.clone()
+            } else {
+                format!("{row}{}", " ".repeat(room))
+            }
+        })
+        .collect();
+    let rows = selection.apply_background(&padded, theme);
+    let lines: Vec<Line<'static>> = rows.iter().map(|row| Line::from(sgr_row(row))).collect();
+    frame.render_widget(Paragraph::new(lines).style(page(theme)), area);
 }
 
 fn paint_photos(
@@ -7586,6 +8309,12 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         // leaves both chords with nothing to reach.
         KeyCode::Char('x') if control => Some(Key::CtrlX),
         KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
+        KeyCode::Char('r') if control => Some(Key::CtrlR),
+        KeyCode::Char('w') if control => Some(Key::DeleteWord),
+        // The two ends of the keyboard's own word delete: the macOS chord and
+        // the readline one. Both are a word at a time, which the composer
+        // otherwise cannot do — backspace takes exactly one character.
+        KeyCode::Backspace if modifiers.contains(KeyModifiers::ALT) => Some(Key::DeleteWord),
         KeyCode::Char(ch) if !control && !modifiers.contains(KeyModifiers::ALT) => {
             Some(Key::Char(ch))
         }
@@ -7613,14 +8342,37 @@ fn pump(
     if event::poll(Duration::from_millis(50))? {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if let Some(mapped) = map_key(key.code, key.modifiers) {
+                // A reply to a query this run sent arrives on this same stream,
+                // read as if it were typed. It is taken first, so no character
+                // of it can land in the composer.
+                if !chat.absorb_probe_key(&key, Instant::now())
+                    && let Some(mapped) = map_key(key.code, key.modifiers)
+                {
                     let applied = chat.on_key(mapped, Instant::now());
                     if dispatch(engine, chat, session_log, cast, applied) {
                         return Ok(true);
                     }
                 }
             }
+            Event::FocusGained => chat.on_focus_gained(Instant::now()),
             Event::Paste(text) => chat.paste(&text),
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    chat.mouse_press(mouse.column, mouse.row)
+                }
+                // A drag moves the selection's corner and nothing else: the
+                // transcript must not scroll out from under the highlight.
+                MouseEventKind::Drag(MouseButton::Left) => chat.mouse_drag(mouse.column, mouse.row),
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(text) = chat.mouse_release() {
+                        let path = std::env::var("PATH").unwrap_or_default();
+                        copy_selection(chat, &text, &path);
+                    }
+                }
+                MouseEventKind::ScrollUp => chat.mouse_wheel(1, Instant::now()),
+                MouseEventKind::ScrollDown => chat.mouse_wheel(-1, Instant::now()),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -7645,6 +8397,90 @@ fn pump(
     chat.poll_hub();
     chat.poll_login();
     Ok(false)
+}
+
+/// The OS clipboard writers this build knows, in the order they are asked for.
+///
+/// The same three the old `App` read the clipboard with, so a copy lands in
+/// the one clipboard a terminal, a browser and an editor all share.
+const CLIPBOARD_WRITERS: &[(&str, &[&str])] = &[
+    ("pbcopy", &[]),
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+];
+
+/// The file `bin` would be run from, if one is on `path`.
+///
+/// The capability check for the OS clipboard: a build with no `pbcopy` and no
+/// selection tool falls back to OSC 52 rather than spawning a program that is
+/// not there. `path` is passed in (not read from the environment here) so the
+/// check is a pure function of what it is given.
+fn executable_path(bin: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join(bin))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The first OS clipboard writer on `path`, resolved to the file that will be
+/// run — never the bare name, so the check and the spawn cannot disagree about
+/// which `pbcopy` answered.
+fn clipboard_writer(path: &str) -> Option<(&'static str, &'static [&'static str], PathBuf)> {
+    CLIPBOARD_WRITERS
+        .iter()
+        .find_map(|(bin, args)| executable_path(bin, path).map(|program| (*bin, *args, program)))
+}
+
+/// Hand `text` to the OS clipboard writer at `program`.
+///
+/// The child's stdin is taken and dropped before the wait: leaving the pipe
+/// open would leave `pbcopy` waiting for an end of input that never comes.
+fn write_to_clipboard(program: &Path, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or_else(|| "no stdin".to_owned())?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
+    drop(stdin);
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{} exited with {status}", program.display()))
+    }
+}
+
+/// Put a copied selection where the user can paste it, and say where.
+///
+/// The OS writer when this machine has one; otherwise OSC 52, which the
+/// terminal itself puts on the clipboard the user is at — the route that works
+/// over SSH. A copy with no route at all still names itself, so a screen that
+/// copied nothing does not look like one that did. `path` is the search path
+/// the OS writer is looked for on.
+fn copy_selection(chat: &mut Chat, text: &str, path: &str) {
+    let chars = text.chars().count();
+    let route = match clipboard_writer(path) {
+        Some((bin, args, program)) => match write_to_clipboard(&program, args, text) {
+            Ok(()) => format!("copied {chars} chars · {bin}"),
+            Err(reason) => {
+                chat.output_flush
+                    .push_str(&titi_tui::caps::osc52_copy(text));
+                format!("copied {chars} chars · OSC 52 ({reason})")
+            }
+        },
+        None => {
+            chat.output_flush
+                .push_str(&titi_tui::caps::osc52_copy(text));
+            format!("copied {chars} chars · OSC 52")
+        }
+    };
+    chat.set_hint(route);
 }
 
 /// Writes one cast record, and stops recording if the file has gone bad.
@@ -13693,7 +14529,7 @@ mod tests {
             Err(error) => panic!("test backend: {error}"),
         };
         assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
-        let flush = chat.take_kitty_flush();
+        let flush = chat.take_output_flush();
         assert!(flush.contains("f=32"), "{flush}");
         assert!(flush.contains("a=p,U=1"), "{flush}");
         let symbols: String = terminal
@@ -13705,7 +14541,7 @@ mod tests {
             .collect();
         assert!(symbols.contains('\u{10EEEE}'), "{symbols}");
         assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
-        assert!(chat.take_kitty_flush().is_empty());
+        assert!(chat.take_output_flush().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -15579,5 +16415,526 @@ mod tests {
         chat.on_key(Key::Char('a'), Instant::now());
         let view_reset = frame_text(&mut chat);
         assert!(view_reset.contains("line 49"), "typing resets to bottom");
+    }
+
+    // ---- Mouse selection and copy ---------------------------------------
+
+    /// Draw one frame and hand the terminal back, so a test can read the
+    /// buffer (what a terminal would receive) and the chat's own rows (what a
+    /// copy would carry).
+    fn drawn(
+        chat: &mut Chat,
+        width: u16,
+        height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => panic!("test backend: {error}"),
+        };
+        assert!(terminal.draw(|frame| draw(frame, chat)).is_ok());
+        terminal
+    }
+
+    /// A chat whose reply wraps over several rows at 40 columns, drawn once.
+    ///
+    /// The reply is markdown-less, so it goes through the plain speech path:
+    /// the rows are the text, wrapping, and nothing else.
+    fn wrapped_reply_chat() -> (Chat, ratatui::Terminal<ratatui::backend::TestBackend>) {
+        let mut chat = chat();
+        chat.push(LineKind::User, "wrap it".to_owned());
+        chat.push(
+            LineKind::Assistant,
+            "the quick brown fox jumps over the lazy dog and keeps going".to_owned(),
+        );
+        let terminal = drawn(&mut chat, 40, 20);
+        (chat, terminal)
+    }
+    /// The transcript rows holding `needle`, and where the transcript starts.
+    fn selected_rows(chat: &Chat, needle: &str) -> usize {
+        chat.last_rows
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is on screen: {:?}", chat.last_rows))
+    }
+
+    /// A drag over a wrapped reply copies its text: the wrapping is the
+    /// screen's, so it is not in the copy; the gutter and the theme's colours
+    /// are the screen's too, so they are not either.
+    #[test]
+    fn a_drag_over_a_wrapped_reply_copies_the_text() {
+        let (mut chat, _terminal) = wrapped_reply_chat();
+        let first = selected_rows(&chat, "the quick brown fox");
+        let last = selected_rows(&chat, "going");
+        assert!(last > first, "the reply wrapped: {:?}", chat.last_rows);
+        let top = chat.transcript_top;
+
+        // The body column: the nine cells of `  titi │ ` are the gutter.
+        chat.mouse_press(9, top + first as u16);
+        chat.mouse_drag(39, top + last as u16);
+        let copied = chat.mouse_release().expect("a drag copies");
+
+        assert!(!copied.contains('\u{1b}'), "no styling: {copied:?}");
+        assert_eq!(copied.lines().count(), last - first + 1, "{copied:?}");
+        assert!(copied.starts_with("the quick brown fox"), "{copied:?}");
+        assert!(copied.ends_with("going"), "{copied:?}");
+        for line in copied.lines() {
+            assert_eq!(line, line.trim(), "no padding: {line:?}");
+        }
+        // The selection stands after the release, the way a terminal's does.
+        assert!(chat.selection().is_some_and(|sel| !sel.active));
+    }
+
+    /// The frame paints the theme's `selectedBg` behind the selected cells and
+    /// leaves the guttter and the rows outside the selection alone.
+    #[test]
+    fn the_selection_paints_the_selected_cells_with_selected_bg() {
+        let (mut chat, mut terminal) = wrapped_reply_chat();
+        let first = selected_rows(&chat, "the quick brown fox");
+        let last = selected_rows(&chat, "going");
+        let top = chat.transcript_top;
+
+        chat.mouse_press(9, top + first as u16);
+        chat.mouse_drag(39, top + last as u16);
+        assert!(terminal.draw(|frame| draw(frame, &mut chat)).is_ok());
+
+        let theme = Arc::clone(&chat.theme);
+        let selected = bg(&theme, ThemeBg::SelectedBg);
+        let page_bg = bg(&theme, ThemeBg::StatusLineBg);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(20u16, top + first as u16)].bg, selected);
+        assert_eq!(buffer[(20u16, top + last as u16)].bg, selected);
+        // The gutter is left of the selection's first column.
+        assert_eq!(buffer[(4u16, top + first as u16)].bg, page_bg);
+        // And the row below the selection is untouched.
+        assert_eq!(buffer[(20u16, top + last as u16 + 1)].bg, page_bg);
+    }
+
+    /// A click selects nothing, so nothing is copied; a drag never scrolls.
+    #[test]
+    fn a_click_copies_nothing_and_a_drag_does_not_scroll() {
+        let (mut chat, _terminal) = wrapped_reply_chat();
+        let first = selected_rows(&chat, "the quick brown fox");
+        let top = chat.transcript_top;
+        let before = chat.scroll_offset;
+
+        chat.mouse_press(12, top + first as u16);
+        assert!(chat.mouse_release().is_none(), "a click copies nothing");
+        assert_eq!(chat.selection_text(), "");
+
+        chat.mouse_press(12, top + first as u16);
+        chat.mouse_drag(20, top + first as u16 + 1);
+        assert!(chat.mouse_release().is_some());
+        assert_eq!(chat.scroll_offset, before, "a drag does not scroll");
+    }
+
+    /// A key takes a standing selection away, and the wheel scrolls the
+    /// transcript — but moves a panel's cursor while one is open.
+    #[test]
+    fn a_key_clears_the_selection_and_the_wheel_scrolls() {
+        let mut chat = chat();
+        for i in 0..50 {
+            chat.push(LineKind::Note, format!("line {i}"));
+        }
+        drawn(&mut chat, 80, 20);
+        chat.mouse_press(2, 3);
+        chat.mouse_drag(8, 5);
+        assert!(chat.selection().is_some());
+        chat.on_key(Key::Char('x'), Instant::now());
+        assert!(chat.selection().is_none(), "a key clears the selection");
+
+        let before = chat.scroll_offset;
+        chat.mouse_wheel(1, Instant::now());
+        assert_eq!(chat.scroll_offset, before + 1);
+        chat.mouse_wheel(-1, Instant::now());
+        assert_eq!(chat.scroll_offset, before);
+
+        // An open slash list takes the wheel as its cursor, not the transcript.
+        chat.input.clear();
+        chat.on_key(Key::Char('/'), Instant::now());
+        assert!(chat.picking(), "input {:?}", chat.input);
+        let scroll = chat.scroll_offset;
+        chat.mouse_wheel(1, Instant::now());
+        assert_eq!(chat.scroll_offset, scroll, "the wheel moved the list");
+    }
+
+    /// `/mouse off` persists the preset and queues the sequence that turns
+    /// reporting off; a preset is the one the next run reads back.
+    #[test]
+    fn slash_mouse_persists_the_preset_and_switches_reporting_over() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        type_text(&mut chat, "/mouse off");
+        chat.on_key(Key::Enter, Instant::now());
+
+        assert_eq!(chat.mouse_preset(), MousePreset::Off);
+        assert_eq!(
+            crate::session_fs::load_mouse_preset_from(dir.path()),
+            Some(MousePreset::Off)
+        );
+        let flush = chat.take_output_flush();
+        assert!(flush.contains("\x1b[?1002l"), "drags off: {flush:?}");
+        assert!(flush.contains("\x1b[?1003l"), "motion off: {flush:?}");
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("mouse: off")),
+            "the screen says so: {:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        // A preset that is not one says what there is and changes nothing.
+        let before = chat.mouse_preset();
+        type_text(&mut chat, "/mouse sideways");
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.mouse_preset(), before);
+        assert!(chat.take_output_flush().is_empty());
+    }
+
+    /// The clipboard writer is found on the search path it is given, and the
+    /// copy it makes is the one a paste would find.
+    #[test]
+    fn a_copy_with_an_os_writer_goes_to_it() {
+        let dir = tempfile::tempdir().expect("temp");
+        let out = dir.path().join("copied.txt");
+        let bin = dir.path().join("pbcopy");
+        std::fs::write(&bin, format!("#!/bin/sh\ncat > {}\n", out.display())).expect("write");
+        let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&bin, perms).expect("chmod");
+
+        let mut chat = chat();
+        copy_selection(
+            &mut chat,
+            "hello clipboard",
+            &dir.path().display().to_string(),
+        );
+        assert!(
+            chat.take_output_flush().is_empty(),
+            "a tool took it, so nothing goes out as OSC 52"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("the copy landed"),
+            "hello clipboard"
+        );
+        assert!(chat.hint.contains("pbcopy"), "{:?}", chat.hint);
+    }
+
+    /// With no writer on the path, the copy goes out as OSC 52 — the route a
+    /// terminal over SSH can still reach.
+    #[test]
+    fn a_copy_with_no_os_writer_goes_out_as_osc52() {
+        let mut chat = chat();
+        copy_selection(&mut chat, "over ssh", "/nonexistent");
+        assert_eq!(
+            chat.take_output_flush(),
+            titi_tui::caps::osc52_copy("over ssh")
+        );
+        assert!(chat.hint.contains("OSC 52"), "{:?}", chat.hint);
+    }
+
+    /// The capability check is a property of the path it is handed.
+    #[test]
+    fn the_clipboard_writer_is_the_first_one_on_the_path() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().display().to_string();
+        assert_eq!(clipboard_writer(&path), None);
+        std::fs::write(dir.path().join("wl-copy"), b"").expect("write");
+        assert_eq!(
+            executable_path("wl-copy", &path),
+            Some(dir.path().join("wl-copy"))
+        );
+        assert_eq!(executable_path("pbcopy", &path), None);
+        assert_eq!(
+            clipboard_writer(&path).map(|(bin, _, program)| (bin, program)),
+            Some(("wl-copy", dir.path().join("wl-copy")))
+        );
+    }
+
+    // ---- Terminal appearance --------------------------------------------
+
+    /// A white reply (light) and a black one (dark), as the wire carries them.
+    const LIGHT_REPLY: &[u8] = b"\x1b]11;rgb:ffff/ffff/ffff\x07";
+    const DARK_REPLY: &[u8] = b"\x1b]11;rgb:0000/0000/0000\x07";
+
+    fn surface_hex(theme: &Theme) -> String {
+        theme.get_bg_hex(ThemeBg::StatusLineBg)
+    }
+
+    /// An OSC 11 reply moves the screen to the palette that appearance's slot
+    /// holds; the same appearance twice is not a second repaint, and a payload
+    /// that is not a reply changes nothing.
+    #[test]
+    fn an_osc11_reply_moves_the_palette_to_that_slot() {
+        let _guard = theme_lock();
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.theme = test_theme();
+        chat.set_starting_appearance(Appearance::Dark);
+        let light = crate::themes::theme_named("light").expect("the crate carries light");
+        let dark = test_theme();
+        assert_ne!(surface_hex(&light), surface_hex(&dark));
+
+        assert_eq!(
+            chat.ingest_probe_reply(LIGHT_REPLY),
+            ProbeOutcome::ThemeChanged
+        );
+        assert_eq!(surface_hex(&chat.theme), surface_hex(&light));
+        assert_eq!(
+            chat.ingest_probe_reply(LIGHT_REPLY),
+            ProbeOutcome::Unchanged,
+            "the same appearance is already on screen"
+        );
+        assert_eq!(
+            chat.ingest_probe_reply(DARK_REPLY),
+            ProbeOutcome::ThemeChanged
+        );
+        assert_eq!(surface_hex(&chat.theme), surface_hex(&dark));
+        assert_eq!(
+            chat.ingest_probe_reply(b"11;rgb:nonsense"),
+            ProbeOutcome::Unchanged
+        );
+    }
+
+    /// The slot's own choice wins over the crate's pick for that appearance,
+    /// and an explicit `--theme` is not the probe's to move.
+    #[test]
+    fn the_slot_choice_wins_and_a_theme_flag_keeps_the_palette() {
+        let _guard = theme_lock();
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.theme = test_theme();
+        chat.set_starting_appearance(Appearance::Dark);
+        let workspace = crate::session_fs::current_workspace();
+        let mut settings =
+            titi_config::settings::Settings::load(dir.path(), &workspace, &[]).expect("settings");
+        settings
+            .set(
+                titi_config::settings::THEME_LIGHT_KEY,
+                serde_json::json!("amethyst"),
+            )
+            .expect("the light slot is written");
+        let chosen = crate::themes::theme_named("amethyst").expect("the crate carries amethyst");
+
+        assert_eq!(
+            chat.ingest_probe_reply(LIGHT_REPLY),
+            ProbeOutcome::ThemeChanged
+        );
+        assert_eq!(surface_hex(&chat.theme), surface_hex(&chosen));
+
+        // And with the loop off — `--theme` — nothing moves at all.
+        chat.set_appearance_auto(false);
+        assert_eq!(
+            chat.ingest_probe_reply(DARK_REPLY),
+            ProbeOutcome::Unchanged,
+            "the palette the run was started with stands"
+        );
+        assert_eq!(surface_hex(&chat.theme), surface_hex(&chosen));
+    }
+
+    /// The reply arrives on the keyboard's own stream: it is reassembled and
+    /// swallowed, and a key typed in the same window still reaches the
+    /// composer.
+    #[test]
+    fn a_probe_reply_arrives_as_keys_and_never_reaches_the_composer() {
+        let _guard = theme_lock();
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.theme = test_theme();
+        chat.set_starting_appearance(Appearance::Dark);
+        let light = crate::themes::theme_named("light").expect("the crate carries light");
+
+        let now = Instant::now();
+        chat.on_focus_gained(now);
+        assert!(
+            chat.take_output_flush()
+                .contains(titi_tui::caps::OSC11_QUERY),
+            "the focus gain asks the terminal"
+        );
+
+        // A key typed in the window is a key, not a reply.
+        let typed = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!chat.absorb_probe_key(&typed, now), "a plain key is a key");
+
+        // What the terminal answers with, as the event layer reads it: the
+        // ESC of `ESC ]` comes back as an alt-modified `]`.
+        // The BEL of `\x1b]11;rgb:…\x07` is a C0 byte the event layer reads as
+        // the control chord it is a key code for: ctrl-`g`.
+        let mut reply: Vec<(char, KeyModifiers)> = "]11;rgb:ffff/ffff/ffff"
+            .chars()
+            .enumerate()
+            .map(|(at, ch)| {
+                let modifiers = if at == 0 {
+                    KeyModifiers::ALT
+                } else {
+                    KeyModifiers::NONE
+                };
+                (ch, modifiers)
+            })
+            .collect();
+        reply.push(('g', KeyModifiers::CONTROL));
+        for (ch, modifiers) in reply {
+            let key = KeyEvent::new(KeyCode::Char(ch), modifiers);
+            assert!(
+                chat.absorb_probe_key(&key, now),
+                "the reply's {ch:?} is swallowed"
+            );
+        }
+        assert_eq!(chat.input, "", "no character of the reply was typed");
+        assert_eq!(surface_hex(&chat.theme), surface_hex(&light));
+
+        // The window closed with the reply: a later alt-`]` is not a reply.
+        let late = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT);
+        assert!(!chat.absorb_probe_key(&late, now));
+        // And neither is one after the window has run out.
+        chat.on_focus_gained(now);
+        let later = now + PROBE_REPLY_WINDOW + Duration::from_millis(1);
+        let late = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT);
+        assert!(!chat.absorb_probe_key(&late, later), "the window expired");
+    }
+
+    /// A mode-2031 notification is a re-query trigger: the reply to the fresh
+    /// query is what decides the palette.
+    #[test]
+    fn a_mode_2031_report_asks_for_a_fresh_query() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.set_starting_appearance(Appearance::Dark);
+        assert_eq!(
+            chat.ingest_probe_reply(b"\x1b[?997;1n"),
+            ProbeOutcome::NeedOsc11Query
+        );
+        assert_eq!(
+            chat.ingest_probe_reply(b"\x1b[?997;2n"),
+            ProbeOutcome::NeedOsc11Query
+        );
+    }
+
+    // ---- Prompt history -------------------------------------------------
+
+    /// A chat whose session exists in its own store, so the prompts it is asked
+    /// land where the history reads them from (the live run's own path: the
+    /// session is made before the screen opens).
+    fn history_chat() -> (tempfile::TempDir, Chat) {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let session_id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("a session");
+        let mut chat = Chat::new("openai/gpt-4.1", &session_id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+        (dir, chat)
+    }
+
+    /// Ask `chat` something the way the live run does: the key, then the store
+    /// write the run records (`record`), so the session's own history has the
+    /// prompt and nothing else does.
+    fn ask(chat: &mut Chat, log: &Option<SessionLog>, prompt: &str) {
+        type_text(chat, prompt);
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        record(chat, log, applied.log);
+    }
+
+    /// ↑ at an empty composer opens the browser over the session's own prompts,
+    /// newest first; a query narrows it; Enter puts the chosen prompt in the
+    /// composer and sends nothing; Esc leaves the text alone.
+    #[test]
+    fn the_history_browser_puts_a_past_prompt_in_the_composer_unsent() {
+        let (_dir, mut chat) = history_chat();
+        let log = SessionLog::open(&chat.agent_dir, &chat.session_id);
+        ask(&mut chat, &log, "first prompt");
+        ask(&mut chat, &log, "second prompt");
+        assert!(chat.input.is_empty(), "a submit clears the composer");
+
+        // ↑ at the empty composer: the browser, not the transcript's scroll.
+        let opened = chat.on_key(Key::Up, Instant::now());
+        assert!(opened.effect.is_none(), "opening sends nothing");
+        assert!(chat.history_picker.is_some(), "the browser is up");
+        let frame = frame_rows(&mut chat, 80, 20).join("\n");
+        assert!(frame.contains("history · 2"), "{frame}");
+        assert!(frame.contains("second prompt"), "{frame}");
+        assert!(frame.contains("first prompt"), "{frame}");
+        // Newest first *in the panel*: the transcript above it holds the same
+        // two strings in the order they were asked.
+        let panel = &frame[frame.find("history · 2").expect("the browser")..];
+        let newest = panel.find("second prompt").expect("newest listed");
+        let oldest = panel.find("first prompt").expect("oldest listed");
+        assert!(newest < oldest, "newest first: {panel}");
+
+        // Typing narrows it, the way the model browser does.
+        type_text(&mut chat, "first");
+        let narrowed = frame_rows(&mut chat, 80, 20).join("\n");
+        let panel = &narrowed[narrowed.find("history · ").expect("the browser")..];
+        assert!(panel.contains("history · 1 of 2 · first"), "{panel}");
+        assert!(!panel.contains("second prompt"), "{panel}");
+        assert!(panel.contains("first prompt"), "{panel}");
+
+        // Enter takes the row into the composer, and the turn is not started.
+        let taken = chat.on_key(Key::Enter, Instant::now());
+        assert!(taken.effect.is_none(), "a pick never sends");
+        assert!(taken.log.is_none(), "and never logs");
+        assert!(chat.history_picker.is_none(), "the browser closed");
+        assert_eq!(chat.input, "first prompt");
+
+        // Ctrl+R opens it again, and Esc closes without touching the draft.
+        chat.on_key(Key::CtrlR, Instant::now());
+        assert!(chat.history_picker.is_some());
+        type_text(&mut chat, "second");
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.history_picker.is_none());
+        assert_eq!(chat.input, "first prompt", "Esc left the draft alone");
+    }
+
+    /// The browser lists the session's prompts, not the screen's lines: a note
+    /// or an assistant reply is not a prompt, and a session that was never
+    /// asked anything says so rather than opening an empty panel.
+    #[test]
+    fn the_history_is_the_sessions_prompts_and_an_empty_one_says_so() {
+        let (_dir, mut chat) = history_chat();
+        chat.push(LineKind::Note, "/help".to_owned());
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "not a prompt".into(),
+        });
+        chat.on_key(Key::CtrlR, Instant::now());
+        assert!(chat.history_picker.is_none(), "nothing to browse");
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("history: this session has no prompts")),
+            "{:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        // A prompt the session did carry is listed once, whole.
+        let log = SessionLog::open(&chat.agent_dir, &chat.session_id);
+        ask(&mut chat, &log, "what did I ask earlier");
+        chat.input.clear();
+        chat.on_key(Key::CtrlR, Instant::now());
+        let frame = frame_rows(&mut chat, 80, 20).join("\n");
+        let panel = &frame[frame.find("history · 1").expect("the browser")..];
+        assert!(panel.contains("what did I ask earlier"), "{panel}");
+    }
+    /// Alt+Backspace and Ctrl+W delete a word at a time; an empty composer (or
+    /// one holding only spaces) costs nothing.
+    #[test]
+    fn delete_word_takes_the_word_before_the_caret() {
+        let mut chat = chat();
+        type_text(&mut chat, "fix the parser now");
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "fix the parser ");
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "fix the ");
+        type_text(&mut chat, "now   ");
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "fix the ", "the spaces go with the word");
+
+        // Nothing to delete is not an error and not a panic.
+        chat.input.clear();
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "");
+        chat.input = "   ".to_owned();
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "");
+
+        // A wide character is one character, not two cells' worth of bytes.
+        chat.input = "日本 語".to_owned();
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "日本 ");
     }
 }

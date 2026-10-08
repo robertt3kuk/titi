@@ -58,6 +58,38 @@ impl Selection {
         Some((left, top, right, bottom))
     }
 
+    /// The text a copy of this selection carries: the selected columns of
+    /// every selected row, joined by a newline.
+    ///
+    /// Styling is not text, so escape sequences are dropped on the way — the
+    /// clipboard gets the characters the screen shows, not the SGR that drew
+    /// them — and a row's trailing blanks are padding, not content, so each
+    /// row is trimmed. Rows outside the rows passed in (a selection that ran
+    /// past the end of the pane) contribute nothing, exactly as in
+    /// [`Selection::apply_background`].
+    pub fn text(&self, rows: &[String]) -> String {
+        let Some((left, top, right, bottom)) = self.rect() else {
+            return String::new();
+        };
+        let mut lines: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(y, row)| {
+                let y = y as u16;
+                (y >= top && y <= bottom).then(|| clip_columns(row, left, right))
+            })
+            .collect();
+        // Blank rows the selection merely crossed — above the first line of
+        // text and below the last — are not part of what was selected.
+        while lines.first().is_some_and(String::is_empty) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// Apply the selection background to viewport rows.
     ///
     /// For each row within the selection's vertical span, the columns
@@ -82,6 +114,35 @@ impl Selection {
             })
             .collect()
     }
+}
+
+/// The visible columns `[left, right]` (inclusive) of `row`, as plain text:
+/// escape sequences are dropped, wide characters are counted by their cells,
+/// and the result is trimmed of the padding the columns past the text carry.
+fn clip_columns(row: &str, left: u16, right: u16) -> String {
+    let mut out = String::new();
+    let mut col: u32 = 0;
+    for span in spans(row) {
+        match span {
+            Span::Escape(_) => {}
+            Span::Text(t) => {
+                for c in t.chars() {
+                    let cw = char_width(c) as u32;
+                    // A zero-width character rides on the cell before it, so
+                    // it is in the selection whenever that cell is.
+                    let within = col <= right as u32 && col + cw.max(1) > left as u32;
+                    if within {
+                        out.push(c);
+                    }
+                    col += cw;
+                    if col > right as u32 {
+                        return out.trim_end().to_owned();
+                    }
+                }
+            }
+        }
+    }
+    out.trim_end().to_owned()
 }
 
 /// Wrap the visible columns `[left, right]` (inclusive) of `row` in `bg`.
@@ -204,6 +265,58 @@ mod tests {
     fn selection_empty_rect() {
         let s = Selection::anchor(5, 10);
         assert_eq!(s.rect(), None);
+    }
+
+    #[test]
+    fn text_takes_only_the_selected_columns() {
+        let mut s = Selection::anchor(2, 0);
+        s.drag(4, 0);
+        let rows = vec!["abcdef".to_owned()];
+        assert_eq!(s.text(&rows), "cde");
+    }
+
+    #[test]
+    fn text_drops_styling_and_trailing_padding() {
+        let theme = test_theme();
+        // The row the renderer would draw: an fg-coloured run, then padding to
+        // the pane's edge.
+        let row = format!("{}!", theme.fg(crate::theme::ThemeColor::Error, "hi"));
+        let row = format!("{row}    ");
+        let mut s = Selection::anchor(0, 0);
+        s.drag(20, 0);
+        assert_eq!(s.text(&[row]), "hi!");
+    }
+
+    #[test]
+    fn text_joins_rows_and_keeps_inner_blanks() {
+        let mut s = Selection::anchor(0, 0);
+        s.drag(9, 2);
+        let rows = vec!["one".to_owned(), String::new(), "two".to_owned()];
+        assert_eq!(s.text(&rows), "one\n\ntwo");
+    }
+
+    #[test]
+    fn text_ignores_rows_outside_the_selection_and_a_click() {
+        let rows = vec!["one".to_owned(), "two".to_owned()];
+        // Rows 0..=0 only: the second row is not part of the selection.
+        let mut s = Selection::anchor(0, 0);
+        s.drag(9, 0);
+        assert_eq!(s.text(&rows), "one");
+        // A click (anchor == current) selects nothing.
+        let click = Selection::anchor(3, 1);
+        assert_eq!(click.text(&rows), "");
+        // A selection that ran past the rows it was given copies what exists.
+        let mut past = Selection::anchor(0, 0);
+        past.drag(9, 7);
+        assert_eq!(past.text(&rows), "one\ntwo");
+    }
+
+    #[test]
+    fn text_counts_wide_characters_by_their_cells() {
+        // "日本" is four cells wide; columns 2..=3 are the second character.
+        let mut s = Selection::anchor(2, 0);
+        s.drag(3, 0);
+        assert_eq!(s.text(&["日本語".to_owned()]), "本");
     }
 
     #[test]
