@@ -46,8 +46,8 @@ pub use orchestrator::{
 pub use protocol::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 pub use registry::{
     CredentialSource, EnvCredentialSource, HttpTransportFactory, LayeredCredentialSource,
-    ModelDescriptor, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig, RefreshOutcome,
-    RefreshState, RegistryError, ResolvedModel, TransportFactory,
+    ModelDescriptor, ModelPrice, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig,
+    RefreshOutcome, RefreshState, RegistryError, ResolvedModel, TransportFactory,
 };
 pub use review::{AgentReviewer, REVIEWER_BRIEF, Review, ReviewRequest, Reviewer, Verdict};
 pub use runtime::{Engine, EngineConfig, EngineError, EngineRuntime, TransportResolver};

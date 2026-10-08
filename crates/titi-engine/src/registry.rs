@@ -30,6 +30,56 @@ const fn default_true() -> bool {
     true
 }
 
+/// What a model costs to run, in micro-dollars (millionths of a US dollar)
+/// per million tokens.
+///
+/// Integers, so a hand-written price is exact: `$3/MTok` is `3_000_000`, and
+/// the arithmetic in [`ModelPrice::cost_micro_usd`] cannot drift the way a
+/// float table would. Dollars per million tokens is how every provider
+/// publishes a price, so the unit is the published one.
+///
+/// The cached-input rate is optional and separate, because the providers
+/// that publish one distinguish it: a cached read bills at a share of the
+/// input price (Anthropic: a tenth). A provider that does not bill cached
+/// reads separately leaves it `None`, and cached tokens then bill as input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// Input tokens the provider did not serve from its cache.
+    pub input: u64,
+    /// Output (completion) tokens.
+    pub output: u64,
+    /// Input tokens the provider served from its cache. `None` means this
+    /// provider does not bill them at a rate of their own.
+    #[serde(default)]
+    pub cached_input: Option<u64>,
+}
+
+impl ModelPrice {
+    /// What one turn's usage costs, in micro-dollars.
+    ///
+    /// Rounded up, never down: a turn that spent anything at all must not
+    /// display as `$0.00`, and the ceiling is below one millionth of a
+    /// dollar. A zero price still costs zero — a free model is free.
+    ///
+    /// `cached_tokens` is clamped to `prompt_tokens`: a report whose cached
+    /// share exceeds the prompt is a provider bug, and billing more prompt
+    /// tokens than were sent would be this code's.
+    pub fn cost_micro_usd(
+        &self,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+        completion_tokens: u32,
+    ) -> u64 {
+        let cached = u64::from(cached_tokens).min(u64::from(prompt_tokens));
+        let uncached = u64::from(prompt_tokens) - cached;
+        let cached_rate = self.cached_input.unwrap_or(self.input);
+        let micro = u128::from(uncached) * u128::from(self.input)
+            + u128::from(cached) * u128::from(cached_rate)
+            + u128::from(completion_tokens) * u128::from(self.output);
+        u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
     pub id: SmolStr,
@@ -39,6 +89,15 @@ pub struct ModelDescriptor {
     /// `None` leaves the engine's default in place.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// What the model costs, when that is known.
+    ///
+    /// `None` is *unpriced*, which is not the same as free: a model served
+    /// locally, a subscription backend, or a price nobody has written down.
+    /// Every surface omits the money for an unpriced model rather than
+    /// printing `$0.000`, and `/budget $2` is refused rather than guessed
+    /// from a rate nobody stated.
+    #[serde(default)]
+    pub price: Option<ModelPrice>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +175,10 @@ pub async fn discover_models(
             provider: provider.id.clone(),
             wire_model: wire.into(),
             context_window: None,
+            // A server's listing is a list of ids, not a price list: what a
+            // pulled tag costs this machine is not something the endpoint
+            // states.
+            price: None,
         })
         .collect())
 }
@@ -426,6 +489,17 @@ impl ProviderRegistry {
         let mut ids: Vec<_> = models.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// What the named model costs, when the catalog states a price.
+    ///
+    /// Read by the surfaces that print money — the turn footer, `/usage`,
+    /// `/budget`'s refusal. `None` is *unpriced*: a model the registry
+    /// discovered, a local server's tag, or a descriptor nobody priced. It
+    /// is never to be read as a price of zero.
+    pub fn price(&self, model_id: &str) -> Option<ModelPrice> {
+        let models = self.models.read().ok()?;
+        models.get(model_id).and_then(|model| model.price)
     }
 
     /// Discovery failures worth telling the user about, by provider.
@@ -783,7 +857,111 @@ mod tests {
             provider: provider.into(),
             wire_model: wire_model.into(),
             context_window: None,
+            price: None,
         }
+    }
+
+    fn priced(model: ModelDescriptor, price: ModelPrice) -> ModelDescriptor {
+        ModelDescriptor {
+            price: Some(price),
+            ..model
+        }
+    }
+
+    /// A price multiplies the tokens it names, at its own rate: input and
+    /// output are priced separately, and the figure is a count of
+    /// micro-dollars rather than a float that could drift.
+    #[test]
+    fn a_price_multiplies_tokens_at_its_own_rate() {
+        // $1/MTok in, $2/MTok out, no separate cached rate.
+        let price = ModelPrice {
+            input: 1_000_000,
+            output: 2_000_000,
+            cached_input: None,
+        };
+        // 600 uncached + 400 cached (both at the input rate) + 300 out:
+        // 600 + 400 micro-dollars in, 600 out.
+        assert_eq!(price.cost_micro_usd(1_000, 400, 300), 1_600);
+        assert_eq!(price.cost_micro_usd(0, 0, 1), 2);
+    }
+
+    /// A cached rate of its own is what the cached share bills at; without
+    /// one, cached tokens are input tokens and bill like them.
+    #[test]
+    fn a_cached_rate_of_its_own_bills_the_cached_share() {
+        let base = ModelPrice {
+            input: 1_000_000,
+            output: 2_000_000,
+            cached_input: None,
+        };
+        let cheaper_read = ModelPrice {
+            cached_input: Some(250_000),
+            ..base
+        };
+        // The same turn: 600 uncached + 400 cached + 300 out.
+        assert_eq!(base.cost_micro_usd(1_000, 400, 300), 1_600);
+        assert_eq!(cheaper_read.cost_micro_usd(1_000, 400, 300), 1_300);
+    }
+
+    /// A cost is never rounded down to nothing: the ceiling keeps a turn
+    /// that spent a fraction of a micro-dollar out of `$0.00`.
+    #[test]
+    fn a_fraction_of_a_micro_dollar_still_costs_one() {
+        let price = ModelPrice {
+            input: 1,
+            output: 1,
+            cached_input: None,
+        };
+        assert_eq!(price.cost_micro_usd(1, 0, 0), 1, "rounded up, not to zero");
+        let free = ModelPrice {
+            input: 0,
+            output: 0,
+            cached_input: None,
+        };
+        assert_eq!(free.cost_micro_usd(1_000_000, 0, 1_000_000), 0);
+    }
+
+    /// A report whose cached share exceeds the prompt cannot bill more
+    /// prompt tokens than were sent.
+    #[test]
+    fn a_cached_share_larger_than_the_prompt_is_clamped() {
+        let price = ModelPrice {
+            input: 1_000_000,
+            output: 0,
+            cached_input: Some(0),
+        };
+        assert_eq!(price.cost_micro_usd(100, 5_000, 0), 0);
+    }
+
+    /// Unpriced is not free: a descriptor with no price answers `None`
+    /// while a priced one answers its own, and the two are different
+    /// questions.
+    #[test]
+    fn an_unpriced_model_has_no_cost_and_a_priced_one_has_its_own() {
+        let factory = Arc::new(RecordingFactory::default());
+        let config = ProviderRegistryConfig {
+            providers: vec![gateway("local", "http://127.0.0.1:11434/v1", None)],
+            models: vec![
+                model("local/llama", "local", "llama3"),
+                priced(
+                    model("local/sonnet", "local", "sonnet"),
+                    ModelPrice {
+                        input: 3_000_000,
+                        output: 15_000_000,
+                        cached_input: Some(300_000),
+                    },
+                ),
+            ],
+        };
+        let registry = ProviderRegistry::new(config, Arc::new(NoCredentials), factory)
+            .expect("registry builds");
+
+        assert_eq!(registry.price("local/llama"), None, "no price is not zero");
+        assert_eq!(
+            registry.price("local/sonnet").map(|price| price.input),
+            Some(3_000_000)
+        );
+        assert_eq!(registry.price("nobody/knows"), None);
     }
 
     /// Two gateways of the same family differ only by URL, so a model must
