@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod chat;
 pub mod engine;
 pub mod first_frame;

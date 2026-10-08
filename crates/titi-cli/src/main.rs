@@ -2,6 +2,7 @@
 //!
 //! Headless JSONL and one full-screen chat share the engine. The screen is
 //! ratatui; it sends `EngineCommand` and paints `EngineEvent`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::io;
 
