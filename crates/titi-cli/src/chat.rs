@@ -3950,7 +3950,6 @@ fn parse_money(word: &str) -> Result<u64, BudgetArgError> {
     Ok(micro)
 }
 
-/// `part` as a whole percent of `whole`. An empty whole is 0%, not a panic.
 /// A money figure as the screen states it: `$0.38`, `$2.00`.
 ///
 /// Two decimals is the session's own precision (`SESSION_COST_DECIMALS`);
@@ -3960,6 +3959,7 @@ fn usd(micro_usd: u64) -> String {
     titi_tui::status::format_usd(micro_usd, titi_tui::status::SESSION_COST_DECIMALS)
 }
 
+/// `part` as a whole percent of `whole`. An empty whole is 0%, not a panic.
 fn share(part: u64, whole: u64) -> u64 {
     if whole == 0 {
         0
