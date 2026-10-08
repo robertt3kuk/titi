@@ -136,8 +136,35 @@ pub(crate) struct Lang {
     pub parse: fn(&str, &str, &HashSet<String>) -> ParsedFile,
 }
 
-/// Every language this crate understands, and everything the index knows about
-/// one. Rows sharing a [`Language`] share its level, name and note.
+/// The grammar that would turn a heuristic language into a parsed one, as
+/// researched on 2026-10-08. None of them is linked yet: a row whose grammar
+/// column would be filled in says `Heuristic` today rather than claiming a
+/// syntax tree it does not have.
+///
+/// `ABI` is the `LANGUAGE_VERSION` the grammar's own `parser.c` defines. The
+/// workspace's tree-sitter 0.24 accepts 14, so a row is only addable when its
+/// crate has an ABI-14 release; every language below has one, and the cost of
+/// each bump is the dependency, a walker module and its fixtures — no core
+/// bump, because the pinned release is not the newest one.
+///
+/// | language | crate | ABI 14 release | newest release | license | newest ABI |
+/// |----------|-------|----------------|----------------|---------|------------|
+/// | go       | tree-sitter-go            | 0.23.4   | 0.25.0 (2025-08-29) | MIT | 15 |
+/// | java     | tree-sitter-java          | 0.23.5   | 0.23.5 (2024-12-21) | MIT | 14 |
+/// | c#       | tree-sitter-c-sharp       | 0.23.1   | 0.23.5 (2026-04-14) | MIT | 15 |
+/// | c        | tree-sitter-c             | 0.23.4   | 0.24.2 (2026-04-22) | MIT | 15 |
+/// | c++      | tree-sitter-cpp           | 0.23.4   | 0.23.4 (2024-11-11) | MIT | 14 |
+/// | ruby     | tree-sitter-ruby          | 0.23.1   | 0.23.1 (2024-11-11) | MIT | 14 |
+/// | kotlin   | tree-sitter-kotlin-ng     | 1.1.0    | 1.1.0 (2025-01-09)  | MIT | 14 |
+/// | swift    | tree-sitter-swift         | 0.7.0    | 0.7.4 (2026-10-04)  | MIT | 15 |
+/// | php      | tree-sitter-php           | 0.23.11  | 0.25.1 (2026-10-06) | MIT | 15 |
+///
+/// TypeScript and JavaScript already parse: `.ts`/`.mts`/`.cts` through
+/// tree-sitter-typescript, `.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs` through its TSX
+/// grammar, which is why `JavaScript` has a row of its own instead of a
+/// second extension on the TypeScript one. tree-sitter-javascript 0.23.1 is
+/// ABI 14 too, but the TSX grammar already reads plain JS/JSX, so linking it
+/// would buy nothing.
 pub(crate) const LANGS: &[Lang] = &[
     Lang {
         language: Language::Rust,

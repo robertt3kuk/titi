@@ -264,3 +264,97 @@ fn serve_lsp_answers_initialize_and_document_symbol() {
         "unknown method must be method-not-found: {text}"
     );
 }
+
+/// The capability line is the only place a user can find out that the index
+/// did not really parse their language. One line per language present, on the
+/// first file of it, and `Info` so it never decides the exit code.
+#[test]
+fn a_capability_line_names_each_language_and_its_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn a() {}\n");
+    write(root, "src/b.rs", "pub fn b() {}\n");
+    write(
+        root,
+        "src/App.java",
+        "package com.acme;\npublic class App {}\n",
+    );
+    write(
+        root,
+        "src/Other.java",
+        "package com.acme;\npublic class Other {}\n",
+    );
+    write(root, "cmd/main.go", "package main\n\nfunc Main() {}\n");
+
+    let genome = Genome::index(root).unwrap();
+    let capabilities: Vec<_> = genome
+        .check()
+        .into_iter()
+        .filter(|item| item.code == "capability")
+        .collect();
+    // Three languages are present, so three lines — not five, one per file.
+    assert_eq!(capabilities.len(), 3, "{capabilities:?}");
+    for item in &capabilities {
+        assert_eq!(item.severity, Severity::Info, "{}", item.message);
+        assert_eq!(item.line, 1);
+    }
+    let line = |needle: &str| {
+        capabilities
+            .iter()
+            .find(|item| item.message.contains(needle))
+            .unwrap_or_else(|| panic!("no capability line for {needle}: {capabilities:?}"))
+            .clone()
+    };
+    // A parsed language says so, a pattern language says what it can miss, and
+    // the file it rides on is the first of that language.
+    let rust = line("rust");
+    assert_eq!(rust.path, "src/a.rs");
+    assert!(rust.message.contains("Full"), "{}", rust.message);
+    let java = line("java");
+    assert_eq!(java.path, "src/App.java");
+    assert!(java.message.contains("Heuristic"), "{}", java.message);
+    assert!(line("go").message.contains("Heuristic"));
+}
+
+/// The per-file LSP diagnostic channel answers "what is wrong with this file".
+/// A constant capability hint in every file is noise there; the level is in
+/// the handshake instead.
+#[test]
+fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub struct Widget;\n");
+    write(
+        root,
+        "src/App.java",
+        "package com.acme;\npublic class App {}\n",
+    );
+    let uri = format!("file://{}", root.join("src/App.java").display());
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let diagnostic = format!(
+        r#"{{"jsonrpc":"2.0","id":"diag","method":"textDocument/diagnostic","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    );
+    let mut input = frame(init);
+    input.extend(frame(&diagnostic));
+    input.extend(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let mut output = Vec::new();
+    serve_lsp(root, Cursor::new(input), &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains(r#""language":"java""#) && text.contains(r#""level":"Heuristic""#),
+        "the handshake must report the level: {text}"
+    );
+    assert!(
+        text.contains(r#""language":"rust""#) && text.contains(r#""level":"Full""#),
+        "the handshake must report the level: {text}"
+    );
+    assert!(
+        !text.contains(r#""code":"capability""#),
+        "a capability line must not reach the per-file diagnostic reply: {text}"
+    );
+    assert!(
+        text.contains(r#""kind":"full""#),
+        "the diagnostic reply itself must still be sent: {text}"
+    );
+}

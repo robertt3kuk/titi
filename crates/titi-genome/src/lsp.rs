@@ -34,7 +34,7 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
         }
         let id = id.ok_or_else(|| invalid("missing request id"))?;
         let result = match method {
-            "initialize" => initialize_result(),
+            "initialize" => initialize_result(&genome),
             "shutdown" => Value::Null,
             "textDocument/documentSymbol" => document_symbols(&genome, root, &message),
             "textDocument/definition" => definition(&genome, root, &message),
@@ -63,7 +63,21 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
     }
 }
 
-fn initialize_result() -> Value {
+/// The handshake, including what this index can actually do per language.
+///
+/// The level roster rides in `experimental`: a client that draws it can tell
+/// its user that a Java symbol is a guess before they trust it, and a client
+/// that ignores it loses nothing. The per-file `diagnostic` reply does not
+/// repeat it — that channel answers "what is wrong with this file", and a
+/// constant hint in every file is noise.
+fn initialize_result(genome: &Genome) -> Value {
+    let mut languages: Vec<(&str, &str)> = genome
+        .files
+        .values()
+        .map(|record| (record.language.name(), record.language.level().as_str()))
+        .collect();
+    languages.sort_unstable();
+    languages.dedup();
     json!({
         "capabilities": {
             "documentSymbolProvider": true,
@@ -71,7 +85,15 @@ fn initialize_result() -> Value {
             "referencesProvider": true,
             "diagnosticProvider": true
         },
-        "serverInfo": { "name": "titi-genome" }
+        "serverInfo": { "name": "titi-genome" },
+        "experimental": {
+            "titiGenome": {
+                "languages": languages
+                    .into_iter()
+                    .map(|(language, level)| json!({ "language": language, "level": level }))
+                    .collect::<Vec<Value>>()
+            }
+        }
     })
 }
 
@@ -124,7 +146,7 @@ fn diagnostic(genome: &Genome, root: &Path, message: &Value) -> Value {
     let items: Vec<Value> = genome
         .check()
         .into_iter()
-        .filter(|item| item.path == rel)
+        .filter(|item| item.path == rel && item.code != "capability")
         .map(|item| {
             json!({
                 "range": lsp_range(item.line, item.character, 0),

@@ -2,23 +2,49 @@ use std::collections::HashSet;
 use std::fs;
 
 use crate::refs;
-use crate::{Diagnostic, ExportSite, Genome, Location, MAX_DEFINERS, Severity};
+use crate::{Diagnostic, ExportSite, Genome, Language, Location, MAX_DEFINERS, Severity};
 
 const CHECK_LIMIT: usize = 32;
 
 impl Genome {
-    /// Index diagnostics, syntax first, then unresolved imports, then ambiguous
-    /// symbols. Capped so a noisy repo cannot flood a client.
+    /// Index diagnostics: syntax first, then unresolved imports, then
+    /// ambiguous symbols, then one line per language saying what its exports
+    /// and imports rest on. Capped so a noisy repo cannot flood a client, and
+    /// the capability lines come last so the cap never hides a real problem.
+    ///
+    /// The capability line is what lets a user tell that Java's exports are
+    /// guesses while Rust's were read off a syntax tree: it names the
+    /// language, its [`Level`](crate::Level) and one line on what that level
+    /// costs. It is `Info`, so it never decides the exit code.
     pub fn check(&self) -> Vec<Diagnostic> {
         let mut paths: Vec<&String> = self.files.keys().collect();
         paths.sort();
 
         let mut syntax = Vec::new();
         let mut imports = Vec::new();
+        let mut capabilities = Vec::new();
+        let mut described: HashSet<Language> = HashSet::new();
         for path in paths {
             let Some(record) = self.files.get(path) else {
                 continue;
             };
+            // Paths are sorted, so a language's line lands on the first file of
+            // it that the index holds. One line per language, not per file.
+            if described.insert(record.language) {
+                capabilities.push(Diagnostic {
+                    path: path.clone(),
+                    line: 1,
+                    character: 0,
+                    severity: Severity::Info,
+                    code: "capability".to_owned(),
+                    message: format!(
+                        "{}: {} — {}",
+                        record.language.name(),
+                        record.language.level().as_str(),
+                        record.language.note(),
+                    ),
+                });
+            }
             if record.syntax_errors > 0 {
                 let plural = if record.syntax_errors == 1 { "" } else { "s" };
                 syntax.push(Diagnostic {
@@ -75,6 +101,7 @@ impl Genome {
         let mut out = syntax;
         out.extend(imports);
         out.extend(ambiguous);
+        out.extend(capabilities);
         out.truncate(CHECK_LIMIT);
         out
     }
