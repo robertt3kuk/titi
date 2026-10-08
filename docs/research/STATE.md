@@ -354,7 +354,7 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `medium` the workspace lints now surface 1381 `unwrap`/`expect` warning
+- [ ] `medium` the workspace lints now surface 1392 `unwrap`/`expect` warning
   headers (`cargo clippy --workspace --all-targets`), nearly all of them inside
   test modules — the audit counted ≈36 sites outside them; turning that into a
   rule (per-module allow-lists, or a real fix pass) is its own task.
@@ -420,5 +420,6 @@ counts ÷ 4 over a rolling 4 s window, printed with a `~` because it is an
 estimate, `titi-tui/src/status.rs:182-235`). Honest limits: the C row claims
 `.h` and retries the C++ grammar when the C parse is broken (`titi genome
 capabilities` says so), `export_to_file` is still a plain `fs::write`, and the
-lints' 1381 `unwrap`/`expect` warnings stand.
+lints' 1392 `unwrap`/`expect` warnings stand (1381 before this wave's
+  grammar code).
 
