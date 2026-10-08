@@ -54,6 +54,11 @@ impl SessionMode {
 }
 
 /// Commands accepted by every engine surface.
+///
+/// `#[non_exhaustive]`: a surface matching exhaustively must handle an
+/// unknown variant instead of failing to compile when one is added. The
+/// wire vocabulary is pinned by `tests/protocol.rs`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EngineCommand {
     SubmitPrompt {
@@ -157,6 +162,11 @@ pub enum EngineCommand {
 }
 
 /// UI-independent events rendered by TUI, GPUI, or serialized by headless RPC.
+///
+/// `#[non_exhaustive]`: a surface matching exhaustively must handle an
+/// unknown variant instead of failing to compile when one is added. The
+/// wire vocabulary is pinned by `tests/protocol.rs`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EngineEvent {
     TurnStarted {
