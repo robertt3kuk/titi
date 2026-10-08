@@ -64,9 +64,9 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: medium (large but mechanical). `crates/titi-tui/src/markdown.rs` + a new `crates/titi-tui/src/latex.rs` (symbol map + a small 2-D box renderer for `\frac`/matrices).
 - beauty: inline math becomes Unicode (`$O(n log n)$` → italic `O(n log n)` with real super/subscripts); display math draws a centred block in `MdQuote` colours.
 
-## 9. Vim modal editing
+## 9. Vim modal editing — **prerequisite landed** (the caret: `feat(cli): move a caret through the draft`)
 - omp: `tui.vimMode` (`modes/settings.ts:774`) and `tui.vimModeDisplay` (`:788`, text/icon/none); state machine in `pi-tui/src/vim.ts:264` (`VimState`) — hjkl, counts, operators+motions, text objects, visual modes.
-- titi: absent — `grep -rli "vim" crates/ --include=*.rs` → none. titi's editor actions already wear omp's names (`crates/titi-tui/src/keybindings.rs:32+`, `tui.editor.cursorUp` …), so the vocabulary is in place.
+- titi: absent, and the thing it was blocked on is done. The live composer was append-only — no ←/→ inside the draft, no caret to move — so a modal layer would have had nothing to move; the caret now exists (`crates/titi-cli/src/chat.rs`: `caret`, `move_caret`/`move_caret_word`, `backspace`/`delete_forward`/`delete_to_start`, a clamped accessor, and the paste markers crossed as one unit), its keys are the crate's own `tui.editor.*` names (←/→, alt+←/→, home/end, ctrl+a/ctrl+e, delete, ctrl+u), and the `/` and emoji completions follow the caret rather than the end of the draft. What is still absent: `tui.vimMode` itself — the `VimState` machine (`hjkl`, counts, operators+motions, text objects, visual modes), the `tui.vimModeDisplay` chip, and the block-vs-bar cursor. titi's editor actions already wear omp's names (`crates/titi-tui/src/keybindings.rs:32+`), so the vocabulary is in place.
 - value: the vim-using slice of users, every session; the loudest complaint of a terminal-agent switcher.
 - cost: medium. New `crates/titi-tui/src/vim.rs` + composer entry point in `crates/titi-tui/src/composer.rs`, key routing in `crates/titi-cli/src/chat.rs`, mode chip in the composer's top border (`render_box_composer`, `composer.rs:243`).
 - beauty: a `NORMAL`/`VISUAL` chip in the box border's top rule; block cursor in Normal, bar in Insert; nothing else changes.

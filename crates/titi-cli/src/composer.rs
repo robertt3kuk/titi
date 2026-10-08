@@ -94,14 +94,15 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
             Span::styled(placeholder, fg(theme, ThemeColor::Dim)),
         ])
     } else {
+        // The caret's own row: the draft windowed so the caret is visible, and
+        // the caret drawn where it is rather than at the end.
         let room = inner.saturating_sub(4).max(1);
+        let row = caret_row(&chat.input, chat.caret(), room);
         Line::from(vec![
             Span::styled("› ", fg(theme, ThemeColor::Accent)),
-            Span::styled(
-                fit_tail(&composer_view(&chat.input), room),
-                fg(theme, ThemeColor::Text),
-            ),
+            Span::styled(row.before, fg(theme, ThemeColor::Text)),
             Span::styled("▍", fg(theme, ThemeColor::Accent)),
+            Span::styled(row.after, fg(theme, ThemeColor::Text)),
         ])
     };
     Paragraph::new(line).block(block)
@@ -197,6 +198,43 @@ pub(crate) fn wrap_plain(text: &str, width: usize) -> Vec<String> {
         rows.push(String::new());
     }
     rows
+}
+
+/// The draft's row around the caret: what is drawn before the caret and what
+/// is drawn after it, the pair the composer puts its caret glyph between.
+pub(crate) struct CaretRow {
+    pub(crate) before: String,
+    pub(crate) after: String,
+}
+
+/// Windows the draft to `room` cells around the caret.
+///
+/// The caret is what the row is for, so it is what the window keeps in view: a
+/// few cells of what follows it are held open when there is any (so the
+/// character being typed into is visible too), the window never runs past
+/// either end of the draft, and a draft that fits is drawn whole.
+fn caret_row(input: &str, caret: usize, room: usize) -> CaretRow {
+    let caret = caret.min(input.len());
+    let head = composer_view(&input[..caret]);
+    let tail = composer_view(&input[caret..]);
+    let caret_col = titi_tui::width::visible_width(&head);
+    let total = caret_col + titi_tui::width::visible_width(&tail);
+    if total <= room {
+        return CaretRow {
+            before: head,
+            after: tail,
+        };
+    }
+    // Keep a few cells of the tail visible, so the window shows where the
+    // caret is writing as well as what it is writing into.
+    let tail_room = 4.min(room / 2);
+    let start = caret_col
+        .saturating_sub(room.saturating_sub(tail_room))
+        .min(total.saturating_sub(room));
+    CaretRow {
+        before: titi_tui::width::slice_by_column(&head, start, caret_col),
+        after: titi_tui::width::slice_by_column(&tail, 0, start + room - caret_col),
+    }
 }
 
 /// The composer's one row: a pasted line break is shown as `↵` and a tab as

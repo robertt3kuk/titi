@@ -227,6 +227,31 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     },
     Hotkey {
         group: HotkeyGroup::Composer,
+        keys: "← · →",
+        what: "move the caret a character",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "alt+← · alt+→",
+        what: "move the caret a word",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "home · end · ctrl+a · ctrl+e",
+        what: "the start and the end of the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "delete",
+        what: "delete the character after the caret",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "ctrl+u",
+        what: "delete back to the start of the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
         keys: "esc",
         what: "clear the draft",
     },
@@ -304,11 +329,6 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
         group: HotkeyGroup::Transcript,
         keys: "page up · page down",
         what: "scroll the transcript a page",
-    },
-    Hotkey {
-        group: HotkeyGroup::Transcript,
-        keys: "ctrl+u",
-        what: "scroll half a page up",
     },
     Hotkey {
         group: HotkeyGroup::Transcript,
@@ -530,7 +550,8 @@ impl Chat {
                 // other terminator, so the line reaches the transcript as the
                 // glyph rather than the keystrokes.
                 self.expand_trailing_emoticon();
-                let token = slash_token(&self.input).map(|(start, name)| (start, name.to_owned()));
+                let token = slash_token(&self.input, self.caret())
+                    .map(|token| (token.start, token.name.to_owned()));
                 if let Some((start, name)) = token {
                     let at_line_start = self.input[..start].trim().is_empty();
                     if at_line_start && name.is_empty() {
@@ -565,9 +586,66 @@ impl Chat {
                 self.sync_emoji_picker();
                 Applied::none()
             }
+            // The caret's keys, in the free composer: a list or a picker
+            // takes them first (the arrows move its highlight), so what is
+            // left here is a person editing the draft.
+            Key::Left => {
+                self.disarm();
+                self.move_caret(-1);
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::Right => {
+                self.disarm();
+                self.move_caret(1);
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::WordLeft => {
+                self.disarm();
+                self.move_caret_word(-1);
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::WordRight => {
+                self.disarm();
+                self.move_caret_word(1);
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::Home => {
+                self.disarm();
+                self.caret_to_start();
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::End => {
+                self.disarm();
+                self.caret_to_end();
+                self.sync_emoji_picker();
+                Applied::none()
+            }
+            Key::Delete => {
+                self.disarm();
+                self.delete_forward();
+                self.sync_emoji_picker();
+                self.picker = 0;
+                self.picker_hidden = false;
+                self.scroll_offset = 0;
+                Applied::none()
+            }
+            Key::DeleteToStart => {
+                self.disarm();
+                self.delete_to_start();
+                self.sync_emoji_picker();
+                self.picker = 0;
+                self.picker_hidden = false;
+                self.scroll_offset = 0;
+                Applied::none()
+            }
             Key::Backspace => {
                 self.disarm();
-                self.input.pop();
+                self.backspace();
                 // The query may still stand after the pop (`:sm` from `:smi`),
                 // so the picker follows the text here too.
                 self.sync_emoji_picker();
@@ -661,11 +739,11 @@ impl Chat {
                     }
                 }
                 Key::Backspace => {
-                    self.input.pop();
+                    self.backspace();
                     Applied::none()
                 }
                 Key::Char(ch) if !ch.is_control() => {
-                    self.input.push(ch);
+                    self.insert_at_caret(&ch.to_string());
                     Applied::none()
                 }
                 Key::Esc => self.answer_ask(titi_tools::AskAnswer::Cancelled),
@@ -710,7 +788,7 @@ impl Chat {
                 if let Some(pending) = self.pending_ask.as_mut() {
                     pending.typing = true;
                 }
-                self.input.push(ch);
+                self.insert_at_caret(&ch.to_string());
                 Applied::none()
             }
             Key::CtrlC => self.cancel_ask(),
@@ -758,7 +836,7 @@ impl Chat {
         let Some(ask) = self.pending_ask.take() else {
             return Applied::none();
         };
-        self.input.clear();
+        self.clear_input();
         let said = match &answer {
             titi_tools::AskAnswer::Chosen(chosen) => format!("ask · chose {}", chosen.join(" · ")),
             titi_tools::AskAnswer::Text(text) => format!("ask · answered {text}"),
@@ -795,7 +873,7 @@ impl Chat {
                 ask.typing = true;
             }
             let body = paste_body(text);
-            self.input.push_str(&body);
+            self.insert_at_caret(&body);
             return;
         }
         self.disarm();
@@ -807,13 +885,13 @@ impl Chat {
         let body = paste_body(text);
         let lines = body.lines().count();
         if lines <= PASTE_INLINE_MAX_LINES {
-            self.input.push_str(&body);
+            self.insert_at_caret(&body);
             return;
         }
         self.next_paste += 1;
         let marker = paste_marker(self.next_paste, lines);
         self.pastes.insert(marker.clone(), body);
-        self.input.push_str(&marker);
+        self.insert_at_caret(&marker);
         // Long enough to be worth a choice, so offer one. The marker is already
         // staged above: whatever the menu does, or does not do, the paste is
         // where a short one would have left it.
@@ -861,7 +939,18 @@ impl Chat {
         };
         match crate::session_fs::write_paste(&self.workspace, menu.seq, &body) {
             Ok(path) => {
-                self.input = self.input.replace(&menu.marker, &path);
+                if let Some(at) = self.input.find(&menu.marker) {
+                    let end = at + menu.marker.len();
+                    let was = self.caret();
+                    self.input.replace_range(at..end, &path);
+                    // The menu was just up, so the caret is at or after the
+                    // marker: it follows what replaced it.
+                    self.set_caret(if was >= end {
+                        at + path.len()
+                    } else {
+                        was.min(at)
+                    });
+                }
                 self.pastes.remove(&menu.marker);
                 self.push(
                     LineKind::Note,
@@ -1039,6 +1128,7 @@ fn paste_marker(seq: u32, lines: usize) -> String {
 
 pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
     let control = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
     match code {
         KeyCode::Char('c') if control => Some(Key::CtrlC),
         KeyCode::Char('d') if control => Some(Key::CtrlD),
@@ -1064,7 +1154,21 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Tab => Some(Key::Tab),
         KeyCode::PageUp => Some(Key::PageUp),
         KeyCode::PageDown => Some(Key::PageDown),
-        KeyCode::Char('u') if control => Some(Key::PageUpHalf),
+        // The caret's own keys, as the crate's keybinding table names them
+        // (`tui.editor.cursor*`, `deleteCharForward`, `deleteToLineStart`):
+        // word motions on alt and ctrl (terminals disagree about which they
+        // send), the line's ends on home/end and ctrl+a/ctrl+e, and ctrl+u for
+        // everything before the caret.
+        KeyCode::Left if alt || control => Some(Key::WordLeft),
+        KeyCode::Right if alt || control => Some(Key::WordRight),
+        KeyCode::Left => Some(Key::Left),
+        KeyCode::Right => Some(Key::Right),
+        KeyCode::Home => Some(Key::Home),
+        KeyCode::End => Some(Key::End),
+        KeyCode::Delete => Some(Key::Delete),
+        KeyCode::Char('a') if control => Some(Key::Home),
+        KeyCode::Char('e') if control => Some(Key::End),
+        KeyCode::Char('u') if control => Some(Key::DeleteToStart),
         KeyCode::Char('d') if control => Some(Key::PageDownHalf),
         _ => None,
     }

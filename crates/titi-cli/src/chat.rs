@@ -228,6 +228,19 @@ pub enum Key {
     Up,
     Down,
     Tab,
+    /// The caret, in the draft: one character at a time.
+    Left,
+    Right,
+    /// The caret, one word at a time (`tui.editor.cursorWord*`).
+    WordLeft,
+    WordRight,
+    /// The ends of the line (`tui.editor.cursorLine*`).
+    Home,
+    End,
+    /// Delete the character after the caret (`tui.editor.deleteCharForward`).
+    Delete,
+    /// Delete everything before the caret (`tui.editor.deleteToLineStart`).
+    DeleteToStart,
     PageUp,
     PageDown,
     PageUpHalf,
@@ -422,6 +435,13 @@ pub(crate) struct OAuthLogin {
 pub struct Chat {
     pub(crate) lines: Vec<TranscriptLine>,
     pub(crate) input: String,
+    /// Where the caret is in `input`: a byte offset on a char boundary, and
+    /// never inside a `[Paste #N · …]` marker — a marker stands for a body the
+    /// person pasted, so the caret crosses it as one unit. Every write to
+    /// `input` goes through the helpers below, which is what keeps both true;
+    /// [`Chat::caret`] reads it clamped, so a draft replaced wholesale leaves
+    /// the caret at the end of it rather than panicking.
+    caret: usize,
     /// The bodies the collapsed markers in `input` stand for, by marker text.
     /// A paste too long to sit in the draft leaves a marker here instead, and
     /// [`Chat::submit`] swaps it for the body; taking the draft away takes
@@ -666,6 +686,7 @@ impl Chat {
         Self {
             lines: Vec::new(),
             input: String::new(),
+            caret: 0,
             pastes: HashMap::new(),
             next_paste: 0,
             turn_active: false,
@@ -785,21 +806,34 @@ impl Chat {
 
     // ---- Editing ----------------------------------------------------------
 
+    /// Where the caret is, clamped to the draft and to a char boundary.
+    ///
+    /// The stored offset is kept honest by the helpers below; this is what
+    /// reads it, so a draft assigned wholesale — a test, a replay — cannot
+    /// turn a stale offset into a panic.
+    pub(crate) fn caret(&self) -> usize {
+        let mut at = self.caret.min(self.input.len());
+        while at > 0 && !self.input.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
     /// Delete the word before the caret: the run of spaces first, then the word
     /// itself — omp's `deleteBeforeCursor`, which the space-hold gesture's
     /// retract used and the live composer had no key for.
     ///
-    /// The primitive is `titi_tui::space_hold`'s, character-counted, so a
-    /// multi-byte or wide character is one character and not one byte.
+    /// Counted in characters, so a multi-byte or wide character is one
+    /// character and not one byte, and taken from where the caret is rather
+    /// than from the end of the draft.
     pub(crate) fn delete_word(&mut self) {
-        let trailing = self
-            .input
+        let prefix = &self.input[..self.caret()];
+        let trailing = prefix
             .chars()
             .rev()
             .take_while(|ch| ch.is_whitespace())
             .count();
-        let word = self
-            .input
+        let word = prefix
             .chars()
             .rev()
             .skip(trailing)
@@ -808,7 +842,161 @@ impl Chat {
         if trailing + word == 0 {
             return;
         }
-        titi_tui::space_hold::delete_before_cursor(&mut self.input, trailing + word);
+        let start = byte_offset_back(&self.input, self.caret(), trailing + word);
+        self.input.replace_range(start..self.caret(), "");
+        self.caret = start;
+    }
+
+    /// Puts the caret at `at`, clamped to the draft by [`Chat::caret`].
+    ///
+    /// For the places outside this module that splice the draft themselves: a
+    /// path that replaces a paste marker, say, has to say where the caret
+    /// lands rather than reaching for the field.
+    pub(crate) fn set_caret(&mut self, at: usize) {
+        self.caret = at.min(self.input.len());
+    }
+
+    /// Puts the caret at the start of the draft.
+    pub(crate) fn caret_to_start(&mut self) {
+        self.caret = 0;
+    }
+
+    /// Puts the caret at the end of the draft: what a write that replaces the
+    /// whole buffer leaves behind.
+    pub(crate) fn caret_to_end(&mut self) {
+        self.caret = self.input.len();
+    }
+
+    /// Inserts `text` at the caret and leaves the caret after it.
+    pub(crate) fn insert_at_caret(&mut self, text: &str) {
+        let at = self.caret().min(self.input.len());
+        self.input.insert_str(at, text);
+        self.caret = at + text.len();
+    }
+
+    /// The spans of the paste markers this draft holds, left to right.
+    ///
+    /// A marker is one unit to the caret: it stands for a body the person
+    /// pasted, so a caret inside one, or a backspace through one, would leave
+    /// text that no longer stands for anything.
+    fn marker_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = self
+            .pastes
+            .keys()
+            .filter_map(|marker| {
+                self.input
+                    .find(marker.as_str())
+                    .map(|at| (at, at + marker.len()))
+            })
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    /// The nearest offset outside every marker, travelling `forward`: an offset
+    /// that would land inside one is pushed to the end it was heading for.
+    fn skip_markers(&self, at: usize, forward: bool) -> usize {
+        for (start, end) in self.marker_spans() {
+            if at > start && at < end {
+                return if forward { end } else { start };
+            }
+        }
+        at
+    }
+
+    /// Moves the caret one character, skipping a paste marker whole: entering
+    /// one from either side lands on its far end.
+    pub(crate) fn move_caret(&mut self, delta: isize) {
+        let at = if delta < 0 {
+            self.input[..self.caret()]
+                .char_indices()
+                .next_back()
+                .map(|(at, _)| at)
+                .unwrap_or(0)
+        } else {
+            self.input[self.caret()..]
+                .chars()
+                .next()
+                .map(|ch| self.caret() + ch.len_utf8())
+                .unwrap_or(self.input.len())
+        };
+        self.caret = self.skip_markers(at, delta >= 0);
+    }
+
+    /// Moves the caret one word: the run of spaces and then the run of
+    /// non-spaces, the same shape [`Chat::delete_word`] takes out.
+    pub(crate) fn move_caret_word(&mut self, delta: isize) {
+        let at = if delta < 0 {
+            let prefix = &self.input[..self.caret()];
+            let spaces = prefix
+                .chars()
+                .rev()
+                .take_while(|ch| ch.is_whitespace())
+                .count();
+            let word = prefix
+                .chars()
+                .rev()
+                .skip(spaces)
+                .take_while(|ch| !ch.is_whitespace())
+                .count();
+            byte_offset_back(&self.input, self.caret(), spaces + word)
+        } else {
+            let rest = &self.input[self.caret()..];
+            let spaces = rest.chars().take_while(|ch| ch.is_whitespace()).count();
+            let word = rest
+                .chars()
+                .skip(spaces)
+                .take_while(|ch| !ch.is_whitespace())
+                .count();
+            byte_offset_forward(&self.input, self.caret(), spaces + word)
+        };
+        self.caret = self.skip_markers(at, delta >= 0);
+    }
+
+    /// Removes the character before the caret — or the whole paste marker the
+    /// caret sits after, because a marker is one unit.
+    pub(crate) fn backspace(&mut self) {
+        if let Some((start, end)) = self
+            .marker_spans()
+            .into_iter()
+            .find(|(_, end)| *end == self.caret())
+        {
+            self.input.replace_range(start..end, "");
+            self.caret = start;
+            return;
+        }
+        if let Some(at) = self.input[..self.caret()]
+            .char_indices()
+            .next_back()
+            .map(|(at, _)| at)
+        {
+            self.input.replace_range(at..self.caret(), "");
+            self.caret = at;
+        }
+    }
+
+    /// Removes the character after the caret — or the whole marker the caret
+    /// sits before.
+    pub(crate) fn delete_forward(&mut self) {
+        if let Some((start, end)) = self
+            .marker_spans()
+            .into_iter()
+            .find(|(start, _)| *start == self.caret())
+        {
+            self.input.replace_range(start..end, "");
+            return;
+        }
+        if let Some(ch) = self.input[self.caret()..].chars().next() {
+            self.input
+                .replace_range(self.caret()..self.caret() + ch.len_utf8(), "");
+        }
+    }
+
+    /// Removes everything before the caret: ctrl+u, `deleteToLineStart` in the
+    /// crate's own keybinding table.
+    pub(crate) fn delete_to_start(&mut self) {
+        self.input.replace_range(..self.caret(), "");
+        self.caret = 0;
     }
 
     // ---- Prompt history ---------------------------------------------------
@@ -1303,6 +1491,7 @@ impl Chat {
                 if self.input.is_empty() && self.approval.is_none() {
                     self.pastes.clear();
                     self.input = text.to_string();
+                    self.caret_to_end();
                     self.picker = 0;
                     self.push(
                         LineKind::Note,
@@ -1485,7 +1674,7 @@ impl Chat {
     pub(crate) fn clear_input(&mut self) {
         self.input.clear();
         self.pastes.clear();
-        self.picker_hidden = false;
+        self.caret = 0;
     }
 
     pub(crate) fn submit(&mut self, now: Instant) -> Applied {
@@ -2296,38 +2485,42 @@ impl Chat {
     /// guards are `titi_tui::emoji`'s; this is the live composer's own buffer,
     /// so the expansion runs over it here.
     ///
-    /// The caret is the end of the buffer, so an expansion lands it directly
-    /// after the glyph and nothing else has to move.
+    /// The token before the caret is the one that can expand — a shortcode
+    /// written mid-sentence expands where the person is typing, not at the end
+    /// of the draft.
     pub(crate) fn type_char(&mut self, ch: char) {
         let terminator = matches!(ch, ' ' | '\n' | '\r');
         let expansion = if terminator {
-            titi_tui::emoji::try_expand_emoticon(&self.input)
+            titi_tui::emoji::try_expand_emoticon(&self.input[..self.caret()])
         } else if ch == ':' {
-            titi_tui::emoji::try_expand_shortcode(&self.input)
+            titi_tui::emoji::try_expand_shortcode(&self.input[..self.caret()])
         } else {
             None
         };
-        self.input.push(ch);
+        self.insert_at_caret(&ch.to_string());
         if let Some((start, glyph)) = expansion {
-            self.input.truncate(start);
-            self.input.push_str(glyph);
-            // The closing colon of a shortcode *is* the trigger: the
-            // expansion consumed it. An emoticon's terminator is kept after
-            // the glyph, the way it was typed.
+            // The token and the trigger just typed become the glyph. The
+            // closing colon of a shortcode *is* the trigger, so it goes with
+            // it; an emoticon's terminator is kept after the glyph, the way it
+            // was typed.
+            self.input.replace_range(start..self.caret(), glyph);
+            self.caret = start + glyph.len();
             if terminator {
-                self.input.push(ch);
+                self.insert_at_caret(&ch.to_string());
             }
         }
         self.sync_emoji_picker();
     }
 
-    /// Expand an emoticon sitting at the end of the composer, for the Enter
+    /// Expand an emoticon sitting just before the caret, for the Enter
     /// terminator: the space case is handled as the space is typed, and Enter
     /// does the same before the line is sent.
     pub(crate) fn expand_trailing_emoticon(&mut self) {
-        if let Some((start, glyph)) = titi_tui::emoji::try_expand_emoticon(&self.input) {
-            self.input.truncate(start);
-            self.input.push_str(glyph);
+        if let Some((start, glyph)) =
+            titi_tui::emoji::try_expand_emoticon(&self.input[..self.caret()])
+        {
+            self.input.replace_range(start..self.caret(), glyph);
+            self.caret = start + glyph.len();
         }
     }
 
@@ -2522,11 +2715,11 @@ impl Chat {
             Key::Esc | Key::CtrlC => self.cancel_login(),
             _ if device => Applied::none(),
             Key::Char(ch) if !ch.is_control() => {
-                self.input.push(ch);
+                self.insert_at_caret(&ch.to_string());
                 Applied::none()
             }
             Key::Backspace => {
-                self.input.pop();
+                self.backspace();
                 Applied::none()
             }
             Key::Enter => self.store_login_secret(),
@@ -2546,6 +2739,7 @@ impl Chat {
 
     fn store_login_secret(&mut self) -> Applied {
         let secret = std::mem::take(&mut self.input);
+        self.caret = 0;
         self.pastes.clear();
         let secret = secret.trim().to_owned();
         if self.oauth.is_some() {
@@ -3864,22 +4058,76 @@ impl Credential {
     }
 }
 
-/// The `/token` under the cursor: the trailing word, when it opens with a
-/// slash at the start of the line or after whitespace and holds nothing but
-/// name characters. That is what keeps `/tmp/photo.png` and `a/b` out.
-pub(crate) fn slash_token(input: &str) -> Option<(usize, &str)> {
-    let start = input.rfind('/')?;
+/// The `/token` the caret is in, when it opens with a slash at the start of
+/// the line or after whitespace and holds nothing but name characters. That is
+/// what keeps `/tmp/photo.png` and `a/b` out.
+pub(crate) struct SlashToken<'a> {
+    /// Where the token opens: the slash.
+    pub(crate) start: usize,
+    /// Where it ends: the next whitespace, or the end of the draft.
+    pub(crate) end: usize,
+    /// The whole word after the slash — what accepting the token replaces.
+    pub(crate) name: &'a str,
+    /// What the person has typed of it: between the slash and the caret, which
+    /// is what a list filters by.
+    pub(crate) prefix: &'a str,
+}
+
+pub(crate) fn slash_token(input: &str, caret: usize) -> Option<SlashToken<'_>> {
+    let caret = caret.min(input.len());
+    let start = input[..caret].rfind('/')?;
     if start > 0 && !input[..start].ends_with(char::is_whitespace) {
         return None;
     }
-    let name = &input[start + 1..];
+    let end = input[caret..]
+        .find(char::is_whitespace)
+        .map(|at| caret + at)
+        .unwrap_or(input.len());
+    let name = &input[start + 1..end];
     if !name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
     {
         return None;
     }
-    Some((start, name))
+    Some(SlashToken {
+        start,
+        end,
+        name,
+        prefix: &input[start + 1..caret],
+    })
+}
+
+/// The byte offset `count` characters back from `at`, clamped to the start.
+fn byte_offset_back(text: &str, at: usize, count: usize) -> usize {
+    let mut offset = at;
+    let mut left = count;
+    while left > 0 {
+        match text[..offset].char_indices().next_back() {
+            Some((at, _)) => {
+                offset = at;
+                left -= 1;
+            }
+            None => return 0,
+        }
+    }
+    offset
+}
+
+/// The byte offset `count` characters forward from `at`, clamped to the end.
+fn byte_offset_forward(text: &str, at: usize, count: usize) -> usize {
+    let mut offset = at;
+    let mut left = count;
+    while left > 0 {
+        match text[offset..].chars().next() {
+            Some(ch) => {
+                offset += ch.len_utf8();
+                left -= 1;
+            }
+            None => return text.len(),
+        }
+    }
+    offset
 }
 
 /// Why `/loop` could not be read.
@@ -10547,11 +10795,13 @@ mod tests {
     fn probe_chats() -> Vec<(&'static str, Chat)> {
         let mut draft = chat();
         draft.input = "two words".to_owned();
+        draft.caret_to_end();
         draft.scroll_offset = 3;
         draft.last_transcript_height = 10;
 
         let mut list = chat();
         list.input = "/hel".to_owned();
+        list.caret_to_end();
 
         let mut turn = chat();
         turn.turn_active = true;
@@ -10633,8 +10883,9 @@ mod tests {
     /// a new `Key` variant does not compile until it is spelled here, so the
     /// guard below cannot quietly skip one.
     ///
-    /// `PageDownHalf` has no spelling because no terminal can press it:
-    /// `map_key` maps ctrl+d to quit before its later half-page arm is reached.
+    /// `PageUpHalf` and `PageDownHalf` have no spelling because no terminal
+    /// can press them: `map_key` takes ctrl+u for the caret's own delete and
+    /// ctrl+d for quit before the half-page arms are reached.
     fn hotkey_spelling(key: Key) -> Option<&'static str> {
         Some(match key {
             // A space is its own row: the one listing where it does something
@@ -10649,13 +10900,24 @@ mod tests {
             Key::Down => "↓",
             Key::PageUp => "page up",
             Key::PageDown => "page down",
-            Key::PageUpHalf => "ctrl+u",
+            Key::Left => "←",
+            Key::Right => "→",
+            Key::WordLeft => "alt+←",
+            Key::WordRight => "alt+→",
+            Key::Home => "home",
+            Key::End => "end",
+            Key::Delete => "delete",
+            Key::DeleteToStart => "ctrl+u",
             Key::DeleteWord => "alt+backspace",
             Key::CtrlC => "ctrl+c",
             Key::CtrlD => "ctrl+d",
             Key::CtrlX => "ctrl+x",
             Key::CtrlR => "ctrl+r",
             Key::AltM => "alt+m",
+            // Neither half-page key can be pressed any more: the crate's table
+            // gives ctrl+u to the caret's own delete and ctrl+d to quit, and
+            // `map_key` reaches the half-page arms after both.
+            Key::PageUpHalf => return None,
             Key::PageDownHalf => return None,
         })
     }
@@ -12017,7 +12279,7 @@ mod tests {
     #[test]
     fn a_collapsed_paste_expands_when_it_is_sent() {
         let mut chat = chat();
-        chat.input.push_str("what is this trace? ");
+        chat.insert_at_caret("what is this trace? ");
         chat.paste(&stack_trace());
         let applied = chat.on_key(Key::Enter, Instant::now());
 
@@ -14849,6 +15111,225 @@ mod tests {
         assert_eq!(chat.input, "first prompt", "Esc left the draft alone");
     }
 
+    /// The caret's own keys, one family at a time: a character, a word, and the
+    /// two ends of the draft.
+    #[test]
+    fn the_caret_moves_by_a_character_a_word_and_to_the_ends() {
+        let mut chat = chat();
+        type_text(&mut chat, "fix the parser now");
+        assert_eq!(
+            chat.caret(),
+            chat.input.len(),
+            "typing leaves it at the end"
+        );
+
+        chat.on_key(Key::Left, Instant::now());
+        assert_eq!(chat.caret(), chat.input.len() - 1);
+        chat.on_key(Key::Home, Instant::now());
+        assert_eq!(chat.caret(), 0);
+        chat.on_key(Key::Right, Instant::now());
+        assert_eq!(chat.caret(), 1);
+        chat.on_key(Key::End, Instant::now());
+        assert_eq!(chat.caret(), chat.input.len());
+
+        // ctrl+a and ctrl+e are the same two ends: the crate's own table binds
+        // them (`tui.editor.cursorLineStart`/`cursorLineEnd`).
+        assert_eq!(
+            map_key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            Some(Key::Home)
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Some(Key::End)
+        );
+
+        // A word at a time, from the end: `now`, then the spaces, then `parser`.
+        chat.on_key(Key::WordLeft, Instant::now());
+        assert_eq!(&chat.input[chat.caret()..], "now");
+        chat.on_key(Key::WordLeft, Instant::now());
+        assert_eq!(&chat.input[chat.caret()..], "parser now");
+        chat.on_key(Key::WordRight, Instant::now());
+        assert_eq!(&chat.input[chat.caret()..], " now");
+
+        // A wide character is one character to the caret, not three bytes.
+        let mut wide = chat_with_theme(test_theme());
+        type_text(&mut wide, "日本語");
+        wide.on_key(Key::Left, Instant::now());
+        assert_eq!(&wide.input[wide.caret()..], "語");
+        wide.on_key(Key::WordLeft, Instant::now());
+        assert_eq!(wide.caret(), 0);
+    }
+
+    /// Typing, backspace and delete happen where the caret is, not at the end
+    /// of the draft.
+    #[test]
+    fn typing_and_deleting_happen_at_the_caret() {
+        let mut chat = chat();
+        type_text(&mut chat, "fix the parser");
+        chat.on_key(Key::Home, Instant::now());
+        type_text(&mut chat, "please ");
+        assert_eq!(chat.input, "please fix the parser");
+        assert_eq!(chat.caret(), "please ".len());
+
+        // Backspace takes what is behind it; delete takes what is ahead.
+        chat.on_key(Key::Backspace, Instant::now());
+        assert_eq!(chat.input, "pleasefix the parser");
+        chat.on_key(Key::Delete, Instant::now());
+        assert_eq!(chat.input, "pleaseix the parser");
+
+        // ctrl+u is the crate's `deleteToLineStart`: everything before the
+        // caret, wherever the caret is.
+        chat.on_key(Key::End, Instant::now());
+        chat.on_key(Key::DeleteToStart, Instant::now());
+        assert_eq!(chat.input, "");
+        assert_eq!(chat.caret(), 0);
+        assert_eq!(
+            map_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Some(Key::DeleteToStart)
+        );
+
+        // alt+backspace and ctrl+w take the word before the caret too.
+        let mut words = chat_with_theme(test_theme());
+        type_text(&mut words, "fix the parser now");
+        words.on_key(Key::WordLeft, Instant::now());
+        words.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(words.input, "fix the now");
+    }
+
+    /// A completion completes the token the caret is in, and the sentence
+    /// around it stays where it was.
+    #[test]
+    fn the_slash_list_completes_the_token_the_caret_is_in() {
+        let mut chat = chat();
+        type_text(&mut chat, "/help now");
+        // Five lefts put the caret inside `/help`: after `/hel`.
+        for _ in 0..5 {
+            chat.on_key(Key::Left, Instant::now());
+        }
+        assert!(chat.picking(), "the list is up for the token at the caret");
+        chat.on_key(Key::Tab, Instant::now());
+        assert_eq!(
+            chat.input, "/help now",
+            "the token became `/help` and the sentence kept its own space"
+        );
+        assert_eq!(&chat.input[chat.caret()..], " now", "the caret follows it");
+
+        // Mid-sentence a command is not a command — the rule that keeps a
+        // path out of the list — but a skill still completes where the caret
+        // is.
+        let mut skills = chat_with_skills();
+        type_text(&mut skills, "please use /");
+        assert!(skills.picking(), "the skill list is up at the caret");
+        let wanted = skills.row_name(&picker_rows(&skills)[0]).to_owned();
+        skills.on_key(Key::Tab, Instant::now());
+        assert_eq!(
+            skills.input,
+            format!("please use /{wanted} "),
+            "the skill completed where the caret was"
+        );
+    }
+
+    /// An emoji expands where the caret is, and the picker follows the caret
+    /// rather than the end of the draft.
+    #[test]
+    fn an_emoji_expands_where_the_caret_is() {
+        let mut chat = chat();
+        type_text(&mut chat, "say :tada");
+        assert!(
+            chat.emoji_picker.is_visible(),
+            "the picker follows the caret"
+        );
+        chat.on_key(Key::Home, Instant::now());
+        assert!(
+            !chat.emoji_picker.is_visible(),
+            "the caret left the query, so the picker went"
+        );
+
+        // Typed before existing text, the expansion leaves that text alone.
+        let mut early = chat_with_theme(test_theme());
+        type_text(&mut early, "now");
+        early.on_key(Key::Home, Instant::now());
+        type_text(&mut early, ":tada:");
+        assert_eq!(early.input, "🎉now");
+        assert_eq!(
+            &early.input[early.caret()..],
+            "now",
+            "the caret follows the glyph"
+        );
+    }
+
+    /// A paste lands where the caret is.
+    #[test]
+    fn a_paste_lands_at_the_caret() {
+        let mut chat = chat();
+        type_text(&mut chat, "fix the parser");
+        chat.on_key(Key::Home, Instant::now());
+        chat.paste("README");
+        assert_eq!(chat.input, "READMEfix the parser");
+        assert_eq!(chat.caret(), "README".len());
+    }
+
+    /// A paste marker is one unit to the caret: it cannot be landed inside, a
+    /// backspace through it takes the whole thing (its body goes with it), and
+    /// so does a delete in front of it.
+    #[test]
+    fn the_caret_crosses_a_paste_marker_as_one_unit() {
+        let mut chat = chat();
+        chat.paste(&stack_trace());
+        assert_eq!(chat.input, "[Paste #1 · 8 lines]");
+        let whole = chat.input.len();
+
+        chat.on_key(Key::Home, Instant::now());
+        chat.on_key(Key::Right, Instant::now());
+        assert_eq!(chat.caret(), whole, "the marker moved as one unit");
+        chat.on_key(Key::Left, Instant::now());
+        assert_eq!(chat.caret(), 0, "and back as one unit");
+        chat.on_key(Key::End, Instant::now());
+        chat.on_key(Key::WordLeft, Instant::now());
+        assert_eq!(chat.caret(), 0, "a word motion crosses it too");
+
+        chat.on_key(Key::End, Instant::now());
+        chat.on_key(Key::Backspace, Instant::now());
+        assert_eq!(chat.input, "", "the marker went whole, body and all");
+        assert_eq!(chat.caret(), 0);
+
+        let mut front = chat_with_theme(test_theme());
+        front.paste(&stack_trace());
+        front.on_key(Key::Home, Instant::now());
+        front.on_key(Key::Delete, Instant::now());
+        assert_eq!(front.input, "", "delete in front of it takes it whole");
+    }
+
+    /// A draft longer than the row keeps the caret in view: the head when the
+    /// caret is at the start, the tail when it is at the end.
+    #[test]
+    fn a_long_draft_keeps_the_caret_visible() {
+        let mut chat = chat();
+        chat.input = format!("{}the end", "x".repeat(200));
+        chat.caret_to_end();
+        let frame = frame_rows(&mut chat, 40, 12).join("\n");
+        assert!(
+            frame.contains("the end▍"),
+            "the caret is at the end: {frame}"
+        );
+
+        chat.on_key(Key::Home, Instant::now());
+        let frame = frame_rows(&mut chat, 40, 12).join("\n");
+        assert!(
+            frame.contains("› ▍xxxx"),
+            "the caret is at the start: {frame}"
+        );
+        assert!(!frame.contains("the end"), "{frame}");
+
+        // A caret in the middle keeps a few cells of what follows it visible.
+        chat.set_caret(120);
+        let frame = frame_rows(&mut chat, 40, 12).join("\n");
+        assert!(
+            frame.contains("▍xxx"),
+            "the caret is in the middle: {frame}"
+        );
+    }
+
     /// The browser lists the session's prompts, not the screen's lines: a note
     /// or an assistant reply is not a prompt, and a session that was never
     /// asked anything says so rather than opening an empty panel.
@@ -14873,7 +15354,7 @@ mod tests {
         // A prompt the session did carry is listed once, whole.
         let log = SessionLog::open(&chat.agent_dir, &chat.session_id);
         ask(&mut chat, &log, "what did I ask earlier");
-        chat.input.clear();
+        chat.clear_input();
         chat.on_key(Key::CtrlR, Instant::now());
         let frame = frame_rows(&mut chat, 80, 20).join("\n");
         let panel = &frame[frame.find("history · 1").expect("the browser")..];
@@ -14894,15 +15375,17 @@ mod tests {
         assert_eq!(chat.input, "fix the ", "the spaces go with the word");
 
         // Nothing to delete is not an error and not a panic.
-        chat.input.clear();
+        chat.clear_input();
         chat.on_key(Key::DeleteWord, Instant::now());
         assert_eq!(chat.input, "");
         chat.input = "   ".to_owned();
+        chat.caret_to_end();
         chat.on_key(Key::DeleteWord, Instant::now());
         assert_eq!(chat.input, "");
 
         // A wide character is one character, not two cells' worth of bytes.
         chat.input = "日本 語".to_owned();
+        chat.caret_to_end();
         chat.on_key(Key::DeleteWord, Instant::now());
         assert_eq!(chat.input, "日本 ");
     }

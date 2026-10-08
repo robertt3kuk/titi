@@ -542,15 +542,17 @@ pub(crate) fn picker_rows(chat: &Chat) -> Vec<PickRow> {
     if chat.login_for.is_some() || chat.picker_hidden {
         return Vec::new();
     }
-    let Some((start, prefix)) = slash_token(&chat.input) else {
+    let Some(token) = slash_token(&chat.input, chat.caret()) else {
         return Vec::new();
     };
+    // The prefix is what the person has typed of the token *so far* — up to the
+    // caret — so a completion mid-word lists what the word can still become.
     let mut rows = Vec::new();
-    if chat.input[..start].trim().is_empty() {
+    if chat.input[..token.start].trim().is_empty() {
         rows.extend(
             COMMANDS
                 .iter()
-                .filter(|command| command.name.starts_with(prefix))
+                .filter(|command| command.name.starts_with(token.prefix))
                 .map(PickRow::Command),
         );
     }
@@ -558,7 +560,7 @@ pub(crate) fn picker_rows(chat: &Chat) -> Vec<PickRow> {
         chat.skills
             .iter()
             .enumerate()
-            .filter(|(_, skill)| skill.name.starts_with(prefix))
+            .filter(|(_, skill)| skill.name.starts_with(token.prefix))
             .map(|(index, _)| PickRow::Skill(index)),
     );
     rows
@@ -1778,6 +1780,7 @@ impl Chat {
             Some(text) => {
                 self.pastes.clear();
                 self.input = text;
+                self.caret_to_end();
                 Applied::none()
             }
             None => {
@@ -1822,13 +1825,23 @@ impl Chat {
             return;
         };
         let name = self.row_name(row).to_owned();
-        let Some((start, _)) = slash_token(&self.input) else {
+        let Some(token) = slash_token(&self.input, self.caret()) else {
             return;
         };
-        self.input.truncate(start);
-        self.input.push('/');
-        self.input.push_str(&name);
-        self.input.push(' ');
+        let (start, end) = (token.start, token.end);
+        // The token the caret is in is replaced, and the caret lands after it:
+        // a completion mid-sentence keeps the sentence around it. The space the
+        // completion would add is left out when the sentence already has one
+        // there, so `/he` in `run /he now` completes to one space, not two.
+        let follow = self.input[end..].starts_with(' ');
+        let insert = if follow {
+            format!("/{name}")
+        } else {
+            format!("/{name} ")
+        };
+        let after = insert.len();
+        self.input.replace_range(start..end, &insert);
+        self.set_caret(start + after);
         self.picker = 0;
     }
 
@@ -1836,7 +1849,9 @@ impl Chat {
     /// caret. It opens on 2+ name characters with at least one match, and a
     /// slash list already up keeps it shut, so the two never show at once.
     pub(crate) fn sync_emoji_picker(&mut self) {
-        let query = titi_tui::emoji::trailing_query(&self.input)
+        // The query is the `:word` just before the caret, not at the end of
+        // the draft: an emoji can be named mid-sentence.
+        let query = titi_tui::emoji::trailing_query(&self.input[..self.caret()])
             .filter(|query| query.chars().count() >= 2)
             .filter(|_| !self.picking())
             .map(str::to_owned);
@@ -1886,10 +1901,12 @@ impl Chat {
         let Some(glyph) = glyph else {
             return Applied::none();
         };
-        if let Some(colon) = self.input.rfind(':') {
-            self.input.truncate(colon);
+        // The `:query` before the caret is what the glyph replaces; whatever
+        // follows the caret stays where it is.
+        if let Some(colon) = self.input[..self.caret()].rfind(':') {
+            self.input.replace_range(colon..self.caret(), glyph);
+            self.set_caret(colon + glyph.len());
         }
-        self.input.push_str(glyph);
         self.picker = 0;
         Applied::none()
     }
