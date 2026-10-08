@@ -1,14 +1,19 @@
-//! Integration test for mouse drag-select — emulated SGR-mouse events.
+//! Integration test for mouse drag-select — the `Selection` model itself.
 //!
 //! Contract: `docs/research/agent-ux/README.md` (DoD mouse item):
-//! drag-select draws selection background instead of SGR inverse; the SGR
-//! 1006 events are decoded by [`titi_tui::input::InputBuffer`] into
-//! [`titi_tui::input::InputEvent::Mouse`] and drive the selection model.
+//! drag-select draws selection background instead of SGR inverse.
+//!
+//! The SGR-1006 decoding half of this test went with `titi_tui::input`,
+//! which only the deleted `App` loop consumed; the pointer still has to
+//! decode SGR mouse events on the day `Selection` is wired into the chat,
+//! and that decoder will be written against the chat's own input path.
+//! What stays asserted here is the model: an anchor plus a drag paints the
+//! selected rows, releases into a rectangle, and never invents one from a
+//! bare default.
 
 use serde_json::json;
 use std::collections::HashMap;
 
-use titi_tui::input::{InputBuffer, InputEvent, MouseKind};
 use titi_tui::selection::Selection;
 use titi_tui::theme::{ColorMode, SymbolPreset, Theme, ThemeBg};
 
@@ -30,47 +35,11 @@ fn test_theme() -> Theme {
     .expect("test theme builds")
 }
 
-/// Feed SGR sequences and collect the decoded Mouse events.
-fn mouse_events(sequences: &[&str]) -> Vec<(MouseKind, u16, u16)> {
-    let mut buf = InputBuffer::new();
-    let mut out = Vec::new();
-    for seq in sequences {
-        for ev in buf.feed(seq.as_bytes()) {
-            if let InputEvent::Mouse { kind, x, y } = ev {
-                out.push((kind, x, y));
-            }
-        }
-    }
-    out
-}
-
-#[test]
-fn sgr_events_decode_press_drag_release() {
-    let events = mouse_events(&[
-        "\x1b[<0;10;20M",
-        "\x1b[<32;15;22M",
-        "\x1b[<32;18;24M",
-        "\x1b[<0;18;24m",
-    ]);
-    assert_eq!(
-        events,
-        vec![
-            (MouseKind::Press, 10, 20),
-            (MouseKind::Drag, 15, 22),
-            (MouseKind::Drag, 18, 24),
-            (MouseKind::Release, 18, 24),
-        ]
-    );
-}
-
 #[test]
 fn drag_select_paints_background_over_selected_rows() {
-    // Emulate: press at (2, 1), drag to (6, 3), release.
-    let events = mouse_events(&["\x1b[<0;2;1M", "\x1b[<32;6;3M", "\x1b[<0;6;3m"]);
-    let (press, drag, _release) = (events[0], events[1], events[2]);
-
-    let mut selection = Selection::anchor(press.1, press.2);
-    selection.drag(drag.1, drag.2);
+    // A press at (2, 1) dragged to (6, 3) and released.
+    let mut selection = Selection::anchor(2, 1);
+    selection.drag(6, 3);
     selection.release();
 
     assert_eq!(selection.rect(), Some((2, 1, 6, 3)));
@@ -120,10 +89,11 @@ fn drag_select_paints_background_over_selected_rows() {
 }
 
 #[test]
-fn scroll_events_do_not_create_selection() {
-    let events = mouse_events(&["\x1b[<64;5;5M", "\x1b[<128;5;5M"]);
-    assert_eq!(events[0].0, MouseKind::ScrollUp);
-    assert_eq!(events[1].0, MouseKind::ScrollDown);
-    // No press → no selection anchor.
+fn no_drag_means_no_selection() {
+    // Nothing pressed → no anchor, so nothing is painted.
     assert!(Selection::default().rect().is_none());
+    // A press that never moved is an empty selection, not a rectangle.
+    let mut selection = Selection::anchor(5, 5);
+    selection.release();
+    assert!(selection.rect().is_none());
 }

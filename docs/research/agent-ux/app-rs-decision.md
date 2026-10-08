@@ -99,3 +99,22 @@ App-dispatch against chat's loop.
   real terminal (its absence would strengthen (a)).
 - Whether `hub.rs` HubRevive/HubStop has a live herdr twin in the chat loop (`crate::herdr` exists
   on both sides; steering semantics untested because App never runs).
+
+## Kept on purpose (2026-10-09)
+
+Two `titi-tui` modules survive phase 2 with no live importer, because their
+value is the behaviour, not the `App` wiring:
+
+- `crates/titi-tui/src/selection.rs` — the drag-select model (anchor, drag,
+  release, cells → styled spans). `App` was its only consumer; the live chat
+  has no mouse code.
+- `crates/titi-tui/src/space_hold.rs` — the hold-space dictation gesture
+  state machine and `delete_before_cursor`. Same story: `App`-only today.
+  Its `tests/mouse_selection.rs` counterpart now drives `Selection`
+  directly (the SGR decode half went with `titi_tui::input`).
+
+Both are dead today. The next wave ports them into `chat.rs` (mouse
+selection and the space-hold gesture) and deletes the modules in that
+commit; if that wave decides against a port, the modules go in that commit
+instead. Neither is parked behind an `allow(dead_code)` — they are public
+API of a crate the chat still links, so they compile without one.

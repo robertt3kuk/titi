@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 /// Terminal component: renders rows and consumes input.
 ///
 /// `render` returns the component's full frame at `width`; rows may carry
-/// ANSI escapes and a [`crate::cursor::CURSOR_MARKER`]. `handle_input`
+/// ANSI escapes. `handle_input`
 /// receives raw decoded input (key text or paste chunk).
 pub trait Component {
     /// Render this component's rows for the given terminal width.
