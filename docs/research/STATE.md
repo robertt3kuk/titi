@@ -549,9 +549,16 @@ next, and the two worker notes it could not see yet.
   `titi_tools::background_after_with`, which keeps the environment check first,
   so a value already exported for a machine or a test is never overridden by a
   config layer.
-- [ ] `low` no `/tree` view of a tree that is already stored: `parent_id`,
-  `fork` and `walk` are in `titi-core` and `/fork` exists, but the picker is
-  flat. A `/tree` over `store.load` is file-only work, no schema change.
+- [x] `low` ~~no `/tree` view of a tree that is already stored~~ landed
+  2026-10-09 in `141700f`: `/tree` draws the store's entries as the tree they
+  are — one row per entry, indented by depth, the path to the leaf marked `•`
+  and the leaf named `✓ current`, the title counting what is off the path — and
+  Enter moves the leaf to the row under the cursor and replays that path
+  (`session_fs::branch_at` forks the store's leaf, walks the new path, and the
+  `RestoreHistory` a rewind already sends replaces the engine's history). The
+  entries left behind stay in the store, which is what makes it a branch and
+  not a rewind. Deliberately not done: omp's `/tree` also filters entries and
+  summarises the branch you leave.
 - [x] `low` ~~no `/hotkeys`: the screen answers 16 keys and advertises 3, and
   `/help` lists 41 commands one line each. Generate the list from the same table
   the keys are read from, so the two cannot drift.~~ fixed 2026-10-09 in
@@ -596,13 +603,26 @@ next, and the two worker notes it could not see yet.
   `sent`/`applied` pending, `4f455ec` the retried window, `ef304a9` the bounded
   turn wait) and phase 5 (`0a5a8ea`, the LSP's buffer overlay) — and phase 3 now
   has a worker to feed rather than a design to invent.
-- [ ] `low` a `micro_usd` on `SetBudget` plus a cost accumulated from
-  `TurnUsage` in `Runtime::over_budget`: the money this wave shipped states what
-  a turn and a session cost, but the *cap* is still token-only
-  (`runtime.rs:1309` reads `self.budget` tokens; `protocol.rs:157`'s
-  `SetBudget` carries a token count). The review's "so `/budget $2` becomes
-  possible" is **not** delivered — the mechanism is. `/budget`'s refusal now
-  says exactly that, and names the model's own rate when it has one.
+- [x] `low` ~~a `micro_usd` on `SetBudget` plus a cost accumulated from
+  `TurnUsage` in `Runtime::over_budget`~~ landed 2026-10-09, and it is the
+  review's "so `/budget $2` becomes possible" actually delivered:
+  `36d3aef` added `SetMoneyBudget { micro_usd }` as a **sibling** of
+  `SetBudget` rather than a field beside its tokens — a wire-compatibility
+  choice (a struct variant cannot gain a field without breaking every
+  construction site) that also says the truth that the two bounds are
+  independent — with `MoneyBudgetUpdated`, `MoneyBudgetExceeded` and
+  `MoneyBudgetUnpriced { model }` (an unpriced model is not a free one);
+  `89d8ec0` keeps the ledger from the same per-turn figure a footer shows
+  (`ModelPrice::cost_micro_usd` over the turn's own counts, one arithmetic in
+  one place), takes the price from the resolver (`TransportResolver::price`,
+  implemented by `ProviderRegistry` from the descriptors a surface already
+  reads, defaulted to `None` so a resolver that only maps ids is honestly
+  unpriced), and enforces it in `over_budget` beside the token cap — either
+  one reached stops the next turn and hands back what was queued behind it,
+  each reporting its own event once; `be0211f` reads `/budget $2` as digits
+  into micro-dollars (`$0.50` is 500 000, never a float) and refuses a figure
+  finer than a millionth, a sign, or a typo in either unit by naming which,
+  with `/budget off` lifting both bounds in one intent.
 - [x] `low` ~~subagents have no genome handle: `tool_agent.rs:199-202` passes
   `None` where the tool loop passes its `SharedGenome`~~ landed 2026-10-09 in
   `6cdb2af`: `ToolAgentRunner` carries the session's handle (`with_genome`) and
@@ -624,6 +644,15 @@ next, and the two worker notes it could not see yet.
   surface: `chat.rs` contributes none of the 11 headers the measurement now
   finds, so whatever became of them, nothing in that file is behind an
   unscoped allow any more.
+- [ ] `medium` wire `AskRequested` into the chat, so the held `ask` commits can
+  land: `d52f1cf` (the tool and the engine's `SessionAsk`), `ebf8fc6` (the
+  headless answer path) and `015f8ed` (its test file's mode bit) are committed
+  on the local `master` and **held out of the pushed branch**, because the
+  engine parks a turn on an `AskRequested` that the interactive surface does not
+  answer — a model calling `ask` on the screen would wait for a reply that never
+  comes. The path to add is the one the headless surface already uses
+  (`EngineCommand::AnswerAsk`), answered from a panel of the kind the model,
+  theme and history browsers already share.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -996,3 +1025,115 @@ expects and `1cf904a` the language table's behind item-level allowances that say
 why. All three gates ran in a **clean detached worktree** of this commit with its
 own target directory (`git worktree add --detach`), so nothing in the dirty tree
 was staged, formatted, or built against the shared `target/`.
+
+The money-budget, tree and paste wave (2026-10-09) closed the last of the
+review's ranked gaps. Money now has a cap end to end. The wire gained
+`SetMoneyBudget { micro_usd }` as a **sibling** of `SetBudget` rather than a
+field beside its tokens (`36d3aef`) — a wire-compatibility choice, since a
+struct variant cannot gain a field without breaking every construction site, and
+two commands also state the truth that the two bounds are independent: setting
+one does not restate the other, and clearing one leaves the other standing.
+Three events answer it: `MoneyBudgetUpdated` (what the engine has measured
+against what cap), `MoneyBudgetExceeded` (the same stop as the token cap's
+event, its own variant because the token event's shape is pinned by a surface
+this change does not own) and `MoneyBudgetUnpriced { model }` — an unpriced model
+is not a free one, so a cap the engine cannot measure is named rather than
+accepted. The ledger (`89d8ec0`) is the same per-turn figure a footer shows:
+`ModelPrice::cost_micro_usd` over the counts the turn itself reports, computed
+where it reports them, so there is one arithmetic and one place it happens; the
+price comes from the resolver (`TransportResolver::price`, implemented by
+`ProviderRegistry` from the descriptors a surface already reads, defaulted to
+`None`, so a resolver that only maps ids is honestly unpriced). The bound is
+enforced in `over_budget` **beside** the token cap — either one reached stops
+the next turn starting and hands back what was queued behind it, each reporting
+its own event once. `/budget $2` (`be0211f`) reads digits into micro-dollars
+(`$0.50` is 500 000, never a float) and refuses a figure finer than a
+millionth, a sign, or a typo in either unit by naming which; `/budget off`
+lifts both bounds in one intent, as two commands sent in order. The limit that
+remains is the one recorded before: **no built-in model carries a price**, so
+the ledger is exact where a user has written a rate and `MoneyBudgetUnpriced`
+says so where it has not.
+
+`/tree` (`141700f`) draws the append-only store as the tree it is — one row per
+entry indented by depth, the path to the leaf marked `•`, the leaf `✓ current`,
+the title counting what is off the path — and Enter moves the leaf to the row
+under the cursor and replays that path (`session_fs::branch_at` forks the
+store's leaf, walks the new path, and the `RestoreHistory` a rewind already
+sends replaces the engine's history). What is left behind stays in the store,
+which is what makes this a branch and not a rewind. Deliberately not taken from
+omp: `/tree`'s entry filtering and the summary of the branch you leave.
+
+The large-paste menu (`b8995eb`) is omp's `paste.largeMenuThreshold` at 100
+lines: a longer paste stages its marker **first** — exactly as a short paste's
+does — and only then opens the panel (`pasted 150 lines · esc keeps the marker`),
+so the offer can only sharpen what already happened and a paste is never lost to
+the menu. Two of its options are load-bearing: "attach as a block" keeps the
+marker and turns what it stands for into the fenced body at send, and "attach as
+a file" writes the body to `.titi/pastes/paste-<n>.txt` and puts that path in
+the draft. That path is inside the user's repository, so `18ebf77` makes the
+directory write its own `.gitignore` holding `*` before the paste and only when
+there is none — the repository's own `.gitignore` is never touched, and a
+directory that will not take the ignore file **fails the attach** instead (the
+marker stays, nothing is written, the note says why). The test inits a real
+repository in a temp dir and asserts `git status --porcelain` is empty after an
+attach.
+
+`ec6df82` moved the reference patterns' compile site: `refs.rs` held three more
+literal-regex `expect`s than the language modules, and the helper the previous
+commit introduced lived in `lang/support`, the wrong side of a crate whose
+collector is language-agnostic on purpose. One private module at the crate root
+— `patterns` — is the honest home, `crate::patterns::literal_regex` is
+`pub(crate)` inside it, and the single item-level allow with its why stays on
+that one item. The three reference patterns (`CALL`, `PATH`, `TYPE` in
+`collect_refs`) now compile through it, and the test asserts each separately,
+because a pattern that still compiled but stopped matching would otherwise go
+unnoticed. `c8c8dbf` restores a doc comment on `share` that a refactor had
+dropped.
+
+Two commits landed **while this round was running**, after the eight above, so
+the range grew after the inventory: `e5b72ff` drops a stray doc block and
+`#[test]` that `be0211f` left behind when it removed a test — the next test
+carried two attributes and every test build warned
+`duplicate_macro_attributes` — and **that commit is where this push stops**.
+
+**Held out of `master` on purpose, on the owner's word:** `d52f1cf` adds the
+`ask` tool (the model's way to put a question to the user), `ebf8fc6` wires its
+answer path through `headless.rs`, and `015f8ed` fixes the mode bit on its test
+file. They stay off `master` because the **interactive surface is not wired
+yet**: the engine parks the turn on an `AskRequested` the chat does not answer
+yet, so a model that calls `ask` on the screen would wait for a reply that never
+comes. Their design is recorded here for whoever lands that surface, because it
+was decided deliberately: the tool owns no surface of its own — it hands an
+`AskRequest` to an `AskSink` the session installs (`ToolHandler::set_ask`,
+mirroring `bash`'s background door), and the engine's `SessionAsk` turns one ask
+into one `EngineEvent::AskRequested` plus a wait on a oneshot that
+`EngineCommand::AnswerAsk` resolves; it is **read-tier**, so a question is never
+itself a prompt to approve (plan mode keeps it with `read`, duck mode withholds
+it with the other read-tier tools); a subagent **cannot** ask (its registry is
+built without the door, so its `ask` answers "no user to ask" and the subagent
+carries on, where omp aborts the whole turn, because forwarding to the parent's
+surface would attribute a question to a worker the user never started); the
+answer path is interruption, not a deadline (a cancel raises the session's
+`Interrupt`, the wait selects on it, and the tool answers `Cancelled` — "the
+user did not answer … the turn was cancelled. Do not assume an answer."); and
+there is **no timeout**, where omp's auto-selects the recommended option,
+because a deadline would have to answer a question only the user can. Until the
+chat answers an `AskRequested`, the tool is a *branch's* work and not `master`'s
+behaviour.
+
+The main checkout holds nothing uncommitted but the two files this commit
+writes; the `ask` line above sits on the local `master` and is not pushed.
+
+The suite went 1907 → **1925 passed** (77 targets, 0 failed) **at the commit this
+pushes** (`e5b72ff`): engine `tests/budget.rs` +3 (the money cap and its ledger),
+`titi-cli` unit +14 (`/tree`, the paste menu, the decimal parse and the
+self-ignoring directory, less the budget test `be0211f` removed) and
+`titi-genome` unit +1. The held `ask` line is not in that count — it would add
+another target and eight tests, and it is not on `master`. The `unwrap`/`expect`
+headers went 9 → **6** of **95** `warning:` lines: `titi-genome/src/shared.rs` 5
+(the deliberate poisoned-lock panics) and `titi-tui/src/theme/mod.rs` 1 —
+`refs.rs`'s three left the count because `ec6df82` compiled them through
+`patterns::literal_regex`, the single item-level allow whose comment says a
+literal pattern cannot fail for any input. All three gates ran in a clean
+detached worktree of that exact sha with its own target directory, so the shared
+`target/` in the main checkout was never built against.
