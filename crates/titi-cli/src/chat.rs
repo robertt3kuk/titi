@@ -297,6 +297,10 @@ pub enum LineKind {
     Diff,
     Error,
     Note,
+    /// A finished turn's usage footer: the dim row under the answer
+    /// (`titi_tui::status::TurnFooter`). Not a line of the conversation, so it
+    /// is never written to the session file.
+    Usage,
 }
 
 impl LineKind {
@@ -309,6 +313,7 @@ impl LineKind {
             LineKind::Diff => "diff",
             LineKind::Error => "error",
             LineKind::Note => "note",
+            LineKind::Usage => "usage",
         }
     }
 }
@@ -518,6 +523,15 @@ pub struct Chat {
     /// frame reaches a terminal; a chat that never starts it — every test's —
     /// draws the resting frame.
     intro: Option<Instant>,
+    /// The running turn's usage as the engine reported it, `(prompt, cached,
+    /// completion)`. `Some` only from the turn's `TurnUsage` to its end: the
+    /// footer under the answer is built from it, and a cancelled turn that
+    /// never reached a round leaves it `None` — which is what keeps the screen
+    /// from showing zeros as if they were data.
+    turn_usage: Option<(u32, u32, u32)>,
+    /// Whether the running turn's request carried a non-empty history. Read
+    /// once at the turn's start (see [`Chat::begin_usage_ledger`]).
+    turn_history: bool,
 }
 
 impl Chat {
@@ -581,6 +595,8 @@ impl Chat {
             theme,
             reply_render: None,
             intro: None,
+            turn_usage: None,
+            turn_history: false,
         }
     }
 
@@ -778,6 +794,7 @@ impl Chat {
                 // Whatever a previous turn left in the phase, this turn
                 // starts before its first token: only a delta moves it on.
                 self.phase = WorkPhase::Waiting;
+                self.begin_usage_ledger();
                 self.active_turn_id = Some(turn_id);
                 self.model = model.to_string();
                 self.reply.clear();
@@ -990,6 +1007,9 @@ impl Chat {
                 self.last_prompt_tokens = prompt_tokens;
                 self.last_completion_tokens = completion_tokens;
                 self.last_cached_tokens = cached_tokens;
+                // The running turn's own ledger, for the footer under its
+                // answer; the totals below outlive it.
+                self.turn_usage = Some((prompt_tokens, cached_tokens, completion_tokens));
                 self.session_prompt_tokens += prompt_tokens;
                 self.session_completion_tokens += completion_tokens;
                 self.session_cached_tokens += cached_tokens;
@@ -1170,8 +1190,28 @@ impl Chat {
         } else {
             self.turn_active = true;
             self.turn_started = Some(now);
+            self.begin_usage_ledger();
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
+    }
+
+    /// Opens the running turn's usage ledger: nothing reported yet, and
+    /// whether the request this turn is about to make carries history.
+    ///
+    /// The engine reports a turn's prompt, completion and cached tokens and
+    /// nothing about the messages behind them, so "non-empty history" is read
+    /// from what it has reported so far: a session that has already paid for a
+    /// request (`session_prompt_tokens`, which every earlier `TurnUsage`
+    /// added to) or a resumed session whose answers are already on screen. The
+    /// first request of a fresh session has no history to re-read, so a cold
+    /// cache there is a provider's norm and not a miss worth naming.
+    fn begin_usage_ledger(&mut self) {
+        self.turn_usage = None;
+        self.turn_history = self.session_prompt_tokens > 0
+            || self
+                .lines
+                .iter()
+                .any(|line| line.kind == LineKind::Assistant);
     }
 
     fn switch_model(&mut self, text: &str) -> Option<Applied> {
@@ -3104,6 +3144,9 @@ impl Chat {
 
     fn finish_turn(&mut self) -> Applied {
         let reply = self.unrecorded_reply();
+        // The turn's clock is read before it is dropped: the footer says how
+        // long the turn took, and nothing else keeps that time.
+        let elapsed = self.turn_started.map(|started| started.elapsed());
         self.reply.clear();
         self.recorded_reply = 0;
         self.shown_from = 0;
@@ -3116,6 +3159,24 @@ impl Chat {
         self.approval = None;
         self.assistant_at = None;
         self.drop_thinking();
+        // The turn's usage footer, under the last line of the turn. Only a
+        // turn that reported usage has one: a turn cancelled before its first
+        // round has nothing to say, and a row of zeros would say it wrong.
+        if let (Some(elapsed), Some((prompt_tokens, cached_tokens, completion_tokens))) =
+            (elapsed, self.turn_usage.take())
+        {
+            let footer = titi_tui::status::TurnFooter {
+                elapsed,
+                prompt_tokens,
+                cached_tokens,
+                completion_tokens,
+                // The engine reports no message count, so "the request carried
+                // history" was read at the turn's start from what it had
+                // already reported (`begin_usage_ledger`).
+                cache_miss: cached_tokens == 0 && self.turn_history,
+            };
+            self.push(LineKind::Usage, footer.row());
+        }
         if reply.trim().is_empty() {
             Applied::none()
         } else {
@@ -6389,8 +6450,29 @@ fn message_rows(
             theme,
             width,
         ),
+        LineKind::Usage => usage_row(&line.text, theme, width),
     };
     (rows, Vec::new())
+}
+
+/// A finished turn's usage footer: one dim row indented to the text column,
+/// with no mark of its own — it is metadata about the turn, not a line of it.
+///
+/// The row is only ever pushed for a turn that reported usage, so a screen
+/// without one is a screen with nothing to report, and no zero is drawn as if
+/// it were a fact.
+fn usage_row(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let room = body_width(width, MARK_INDENT).max(4);
+    let gutter = " ".repeat(MARK_INDENT);
+    wrap_plain(text, room)
+        .into_iter()
+        .map(|piece| {
+            Line::from(vec![
+                Span::styled(gutter.clone(), page(theme)),
+                Span::styled(piece, fg(theme, ThemeColor::Dim)),
+            ])
+        })
+        .collect()
 }
 
 /// The sign-in note as its three parts: the head line, the authorize URL and
@@ -9700,6 +9782,134 @@ mod tests {
         assert!(chat.turn_elapsed().is_none());
         assert!(!chat.turn_active);
         assert!(!frame_text(&mut chat).contains("working"));
+    }
+
+    /// The last usage footer the transcript holds, as its text.
+    fn last_footer(chat: &Chat) -> Option<String> {
+        chat.lines
+            .iter()
+            .rev()
+            .find(|line| line.kind == LineKind::Usage)
+            .map(|line| line.text.clone())
+    }
+
+    /// A finished turn shows its own time, the prompt it paid for, the share
+    /// the provider cached and what it answered, on one dim row under the
+    /// answer.
+    #[test]
+    fn a_finished_turn_shows_its_usage_under_the_answer() {
+        let mut chat = chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now() - Duration::from_millis(1_400));
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "answer".into(),
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 3_400,
+            completion_tokens: 250,
+            cached_tokens: 2_900,
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+
+        let footer = last_footer(&chat).unwrap_or_default();
+        assert!(
+            footer.ends_with("3.4k prompt (2.9k cached) · 250 out"),
+            "{footer}"
+        );
+        let seconds = shown_seconds(&footer).unwrap_or_default();
+        assert!((1.4..1.5).contains(&seconds), "{footer}");
+
+        // The row is drawn, not only held: the frame is where a user sees it,
+        // and it is the last row of the turn's own block.
+        let rows = frame_rows(&mut chat, 80, 24);
+        let frame = rows.join("");
+        assert!(
+            frame.contains("3.4k prompt (2.9k cached) · 250 out"),
+            "{frame}"
+        );
+
+        // …and it is dim, like every other metadata row: the theme's `Dim`
+        // token is what every row of its kind carries.
+        let at = rows.iter().position(|row| row.contains("3.4k prompt"));
+        assert!(at.is_some(), "no footer row: {rows:?}");
+        let colors = frame_colors(&mut chat, 80, 24);
+        let (footer_fg, _) = colors[at.unwrap_or_default() * 80 + MARK_INDENT];
+        assert_eq!(footer_fg, rgb(&chat.theme.get_color_hex(ThemeColor::Dim)));
+
+        // The totals `/usage` reads are untouched by the footer.
+        assert_eq!(chat.last_prompt_tokens, 3_400);
+        assert_eq!(chat.session_completion_tokens, 250);
+    }
+
+    /// A turn whose request carried history and read nothing back from the
+    /// cache says so. The first request of a fresh session has no history to
+    /// re-read, so a cold cache there is a provider's norm, not a miss.
+    #[test]
+    fn a_cold_cache_over_history_is_named() {
+        let mut chat = chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now());
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 40,
+            cached_tokens: 0,
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let first = last_footer(&chat).unwrap_or_default();
+        assert!(!first.contains("cache miss"), "no history yet: {first}");
+        assert!(first.ends_with("1k prompt · 40 out"), "{first}");
+        assert!(!first.contains("(0 cached)"), "no zero as data: {first}");
+
+        // The second turn carries the first: a cold cache is a miss now.
+        type_text(&mut chat, "again");
+        chat.on_key(Key::Enter, Instant::now());
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(2),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(2),
+            prompt_tokens: 2_000,
+            completion_tokens: 40,
+            cached_tokens: 0,
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(2),
+            reason: StopReason::Stop,
+        });
+        let second = last_footer(&chat).unwrap_or_default();
+        assert!(second.ends_with("cache miss"), "{second}");
+    }
+
+    /// A turn that reported no usage has no footer: a cancelled turn before
+    /// its first round has nothing to show, and the screen says nothing rather
+    /// than a row of zeros.
+    #[test]
+    fn a_turn_without_usage_shows_no_footer() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "answer".into(),
+        });
+        chat.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) });
+        assert!(last_footer(&chat).is_none());
+        let frame = frame_text(&mut chat);
+        assert!(!frame.contains("prompt"), "{frame}");
+        assert!(!frame.contains("cached"), "{frame}");
+        assert!(!frame.contains("cache miss"), "{frame}");
     }
 
     /// The key hints are not what the status row replaces: whatever the row

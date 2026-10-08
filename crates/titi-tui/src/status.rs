@@ -80,6 +80,105 @@ pub fn format_timer(dur: Duration) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Turn footer
+// ---------------------------------------------------------------------------
+
+/// One finished turn's accounting, as the dim row under the answer shows it.
+///
+/// omp prints the same row under the answer of every turn
+/// (`display.showTokenUsage`, `display.showTurnTime`,
+/// `pi-tui/src/overlays/usage-row.ts:117`): the turn's wall time, the prompt it
+/// paid for, the share of it the provider read from its cache, and what it
+/// answered. The row is only built for a turn that reported usage — a turn
+/// cancelled before its first round has nothing to show, and a row of zeros
+/// would be a fact dressed up as data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnFooter {
+    /// The turn's wall time, from the prompt to the turn's last event.
+    pub elapsed: Duration,
+    /// Prompt tokens the turn's requests carried.
+    pub prompt_tokens: u32,
+    /// The part of `prompt_tokens` the provider served from its cache.
+    pub cached_tokens: u32,
+    /// Tokens the turn's answer cost.
+    pub completion_tokens: u32,
+    /// The turn's request carried history and the provider served none of it
+    /// from cache, so the prefix was paid for again.
+    pub cache_miss: bool,
+}
+
+impl TurnFooter {
+    /// The row: `1.4s · 3.4k prompt (2.9k cached) · 250 out`, with a trailing
+    /// `· cache miss` when the request re-paid for its own history.
+    ///
+    /// The cached share is named only when there is one: `(0 cached)` would be
+    /// a zero dressed as data, and the miss marker already says the honest
+    /// thing about a cold request.
+    pub fn row(&self) -> String {
+        let prompt = if self.cached_tokens > 0 {
+            format!(
+                "{} prompt ({} cached)",
+                compact_tokens(self.prompt_tokens),
+                compact_tokens(self.cached_tokens)
+            )
+        } else {
+            format!("{} prompt", compact_tokens(self.prompt_tokens))
+        };
+        let mut parts = vec![
+            format_turn_time(self.elapsed),
+            prompt,
+            format!("{} out", compact_tokens(self.completion_tokens)),
+        ];
+        if self.cache_miss {
+            parts.push("cache miss".to_owned());
+        }
+        parts.join(" · ")
+    }
+}
+
+/// A turn's wall time: one decimal deep below a minute (`1.4s`), the status
+/// line's own timer from there (`3m 05s`, `1h 23m`).
+///
+/// The tenths are worth their cells here, unlike on the live status row: a turn
+/// is short, and a footer that reads `1s` for a turn that took 1.4 of them says
+/// less than the row it replaces.
+fn format_turn_time(elapsed: Duration) -> String {
+    if elapsed.as_secs() < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format_timer(elapsed)
+    }
+}
+
+/// A token count as the screen prints it: exact below a thousand, one decimal
+/// up to ten thousand, whole thousands and millions from there — `250`, `3.4k`,
+/// `128k`, `1.2M`.
+///
+/// omp's `formatNumber` (`pi-utils/src/format.ts:34`), in the lowercase `k`/`M`
+/// this crate's context labels already use.
+pub fn compact_tokens(tokens: u32) -> String {
+    let n = u64::from(tokens);
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 10_000 {
+        one_decimal(n as f64 / 1_000.0, "k")
+    } else if n < 1_000_000 {
+        format!("{}k", (n + 500) / 1_000)
+    } else if n < 10_000_000 {
+        one_decimal(n as f64 / 1_000_000.0, "M")
+    } else {
+        format!("{}M", (n + 500_000) / 1_000_000)
+    }
+}
+
+/// `value` to one decimal, a trailing `.0` dropped, with `unit` appended.
+fn one_decimal(value: f64, unit: &str) -> String {
+    let text = format!("{value:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{text}{unit}")
+}
+
+// ---------------------------------------------------------------------------
 // Busy indicator
 // ---------------------------------------------------------------------------
 
@@ -462,6 +561,73 @@ mod tests {
         let s = pad_to_width("x", 3);
         assert_eq!(s, "x  ");
         assert_eq!(visible_width(&s), 3);
+    }
+
+    // ---- Turn footer ------------------------------------------------------
+
+    #[test]
+    fn turn_footer_names_every_part_it_has() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(1_400),
+            prompt_tokens: 3_400,
+            cached_tokens: 2_900,
+            completion_tokens: 250,
+            cache_miss: false,
+        };
+        assert_eq!(footer.row(), "1.4s · 3.4k prompt (2.9k cached) · 250 out");
+    }
+
+    #[test]
+    fn turn_footer_drops_the_cached_share_when_there_is_none() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(900),
+            prompt_tokens: 900,
+            cached_tokens: 0,
+            completion_tokens: 40,
+            cache_miss: false,
+        };
+        assert_eq!(footer.row(), "0.9s · 900 prompt · 40 out");
+    }
+
+    #[test]
+    fn turn_footer_keeps_the_small_numbers_exact() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_secs(75),
+            prompt_tokens: 999,
+            cached_tokens: 12,
+            completion_tokens: 7,
+            cache_miss: false,
+        };
+        assert_eq!(footer.row(), "1m 15s · 999 prompt (12 cached) · 7 out");
+    }
+
+    #[test]
+    fn a_cold_cache_over_history_is_marked() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(1_200),
+            prompt_tokens: 12_000,
+            cached_tokens: 0,
+            completion_tokens: 80,
+            cache_miss: true,
+        };
+        assert_eq!(
+            footer.row(),
+            "1.2s · 12k prompt · 80 out · cache miss",
+            "the miss is named, and no zero is dressed as data"
+        );
+    }
+
+    #[test]
+    fn compact_tokens_shortens_like_the_rest_of_the_ui() {
+        assert_eq!(compact_tokens(0), "0");
+        assert_eq!(compact_tokens(999), "999");
+        assert_eq!(compact_tokens(1_000), "1k");
+        assert_eq!(compact_tokens(3_400), "3.4k");
+        assert_eq!(compact_tokens(9_400), "9.4k");
+        assert_eq!(compact_tokens(10_000), "10k");
+        assert_eq!(compact_tokens(128_000), "128k");
+        assert_eq!(compact_tokens(1_200_000), "1.2M");
+        assert_eq!(compact_tokens(128_000_000), "128M");
     }
 
     // ---- Render -----------------------------------------------------------
