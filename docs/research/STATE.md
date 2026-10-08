@@ -356,7 +356,10 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `crates/titi-tools/src/pipe.rs:306`, `pty.rs:423`. The fourth file the
   audit named, `crates/titi-engine/tests/tools.rs:953`, is gate-driven since
   2cce9f3: the cancel test waits on the trap the turn actually sets instead
-  of on a sleep, so a slow machine cannot fail it.
+  of on a sleep, so a slow machine cannot fail it. A fifth instance flaked on
+  CI and is fixed: `chat.rs`'s `the_frame_paints_each_state_with_its_own_token`
+  rendered twice with a needle carrying the clock and the spinner — `59ceebf`
+  (2026-10-09), which strengthens the assertion rather than relaxing it.
 - [x] `medium` ~~the headless JSONL protocol is serde-tested on one sample —
   `crates/titi-cli/tests/headless.rs:8-20`~~ fixed 2026-10-09 in 6e97627:
   `EngineCommand` and `EngineEvent` are `#[non_exhaustive]` now, and
