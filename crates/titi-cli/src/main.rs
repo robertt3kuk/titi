@@ -42,7 +42,9 @@ genome.enabled in the agent config.yml or project .titi/config.yml
 TITI_NO_GENOME=1 forces off for one run without touching this setting.
 
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
-the turn; press it twice to leave. y / n answers a write or a shell prompt.
+the turn; press it twice to leave. A bare exit (or quit, or q) leaves too:
+straight away before the first turn, and on a second Enter once the session
+has one. y / n answers a write or a shell prompt.
 Bare /model (or alt+m) opens a picker of the models by provider, and typing
 filters it; /model <name> switches straight to one. Ctrl+X switches
 sessions. Bare /login opens a picker of the subscriptions you can sign in

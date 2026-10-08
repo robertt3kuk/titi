@@ -46,6 +46,11 @@ use crate::session_log::SessionLog;
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
 
+/// The line above the composer while a second press is owed, one per key: a
+/// two-press exit names the key that confirms *it*.
+const CTRL_C_HINT: &str = "ctrl-c again to quit";
+const EXIT_HINT: &str = "press Enter again to quit";
+
 /// How long after an OSC 11 query a reply's characters are recognized as one.
 ///
 /// The query is answered in microseconds by a terminal that speaks OSC 11, so
@@ -1380,7 +1385,7 @@ impl Chat {
                 self.disarm();
                 Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
             }
-            Key::CtrlC => self.arm_quit(now),
+            Key::CtrlC => self.arm_quit(now, CTRL_C_HINT),
             Key::CtrlR => self.open_history(),
             Key::CtrlX => self.open_session_picker(),
             Key::AltM => {
@@ -1901,6 +1906,12 @@ impl Chat {
         if text.is_empty() {
             return Applied::none();
         }
+        // A bare word that means "leave" is the one prompt the composer
+        // answers itself. It is matched whole: a prompt that merely starts
+        // with those letters (`exit code`) goes to the model like any other.
+        if matches!(text.as_str(), "exit" | "quit" | "q") {
+            return self.exit_word(now);
+        }
         if let Some(applied) = self.slash(&text) {
             self.input.clear();
             self.disarm();
@@ -2159,6 +2170,7 @@ impl Chat {
                 &self.session_id,
             )),
             "rewind" => self.rewind(args),
+            "exit" | "quit" => self.exit_word(Instant::now()),
             "recap" => self.recap(),
             "pause" => self.toggle_pause(),
             "fork" => self.fork(),
@@ -4161,15 +4173,40 @@ impl Chat {
         );
     }
 
-    fn arm_quit(&mut self, now: Instant) -> Applied {
+    fn arm_quit(&mut self, now: Instant, hint: &str) -> Applied {
         if let Some(armed) = self.quit_armed
             && now.saturating_duration_since(armed) <= QUIT_WINDOW
         {
             return Applied::effect(ChatEffect::Quit);
         }
         self.quit_armed = Some(now);
-        self.hint = "ctrl-c again to quit".to_owned();
+        self.hint = hint.to_owned();
         Applied::none()
+    }
+
+    /// Leaving from the composer: the bare word `exit`/`quit`/`q`, or
+    /// `/exit`/`/quit` (omp `input.bareExitOnEmptySession`).
+    ///
+    /// A session with nothing in it has nothing to keep, so the first word
+    /// leaves; once a turn is on the screen — finished or in flight — the
+    /// same word only arms the exit, and a second press inside
+    /// [`QUIT_WINDOW`] leaves. The window is the one Ctrl+C uses: one shape
+    /// for "press it twice to be sure", so both keys confirm the same intent.
+    fn exit_word(&mut self, now: Instant) -> Applied {
+        if !self.has_conversation() {
+            return Applied::effect(ChatEffect::Quit);
+        }
+        self.arm_quit(now, EXIT_HINT)
+    }
+
+    /// Whether the screen holds something a leave would give up: a finished
+    /// turn's lines, or one still in flight.
+    fn has_conversation(&self) -> bool {
+        self.turn_active
+            || self
+                .lines
+                .iter()
+                .any(|line| matches!(line.kind, LineKind::User | LineKind::Assistant))
     }
 
     /// Say one thing above the composer until the next key.
@@ -4717,6 +4754,14 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "mouse",
         about: "mouse reporting: off, wheel, buttons, all (drag selects, release copies)",
+    },
+    Command {
+        name: "exit",
+        about: "leave titi (bare exit, quit or q leave too)",
+    },
+    Command {
+        name: "quit",
+        about: "leave titi, the same as /exit",
     },
 ];
 
@@ -9038,6 +9083,81 @@ mod tests {
         );
     }
 
+    /// A bare `exit` is the composer's own word for leaving (omp
+    /// `input.bareExitOnEmptySession`): it never becomes a prompt, and once
+    /// the session has something to lose the screen asks for a second Enter.
+    #[test]
+    fn a_bare_exit_asks_once_and_then_leaves() {
+        // Nothing on the screen yet, so there is nothing to keep: the first
+        // word leaves.
+        let mut fresh = chat();
+        type_text(&mut fresh, "exit");
+        assert_eq!(
+            fresh.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Quit)
+        );
+
+        // A turn in the session is worth asking about.
+        let mut chat = chat();
+        type_text(&mut chat, "hello");
+        chat.on_key(Key::Enter, Instant::now());
+        let before = chat.lines.len();
+        type_text(&mut chat, "exit");
+        let at = Instant::now();
+        let first = chat.on_key(Key::Enter, at);
+        assert!(
+            first.effect.is_none(),
+            "the first Enter only asks: {first:?}"
+        );
+        assert!(first.log.is_none(), "and writes nothing to the session");
+        assert_eq!(chat.lines.len(), before, "no prompt reached the transcript");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("press Enter again to quit"), "{frame}");
+        let second = chat.on_key(Key::Enter, at + Duration::from_millis(200));
+        assert_eq!(second.effect, Some(ChatEffect::Quit));
+    }
+
+    /// One word, three spellings. Short words that *start* with one of them
+    /// are prompts.
+    #[test]
+    fn only_the_whole_exit_word_leaves() {
+        for word in ["exit", "quit", "q"] {
+            let mut chat = chat();
+            type_text(&mut chat, word);
+            assert_eq!(
+                chat.on_key(Key::Enter, Instant::now()).effect,
+                Some(ChatEffect::Quit),
+                "{word:?} leaves an empty session"
+            );
+        }
+
+        let mut chat = chat();
+        type_text(&mut chat, "exit code");
+        match chat.on_key(Key::Enter, Instant::now()).effect {
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt { text })) => {
+                assert_eq!(text.as_str(), "exit code");
+            }
+            other => panic!("expected a prompt, got {other:?}"),
+        }
+    }
+
+    /// `/exit` and `/quit` are the same word with a slash, and both are
+    /// listed so they can be discovered.
+    #[test]
+    fn slash_exit_leaves_like_the_bare_word() {
+        for command in ["/exit", "/quit"] {
+            let mut chat = chat();
+            type_text(&mut chat, command);
+            assert_eq!(
+                chat.on_key(Key::Enter, Instant::now()).effect,
+                Some(ChatEffect::Quit),
+                "{command} leaves"
+            );
+        }
+        assert!(COMMANDS.iter().any(|command| command.name == "exit"));
+        assert!(COMMANDS.iter().any(|command| command.name == "quit"));
+    }
+
     /// Bare `/model` is the browser, not a cycle: Enter takes the row the
     /// cursor is on, which starts as the model in use.
     #[test]
@@ -13354,6 +13474,8 @@ mod tests {
             "graph",
             "git",
             "diagnose",
+            "exit",
+            "quit",
         ];
 
         for name in dispatched {
