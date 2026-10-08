@@ -35,29 +35,41 @@ pub const KEEP_EACH_END: usize = 64 * 1024;
 /// How long a command may hold the turn before it is handed to the
 /// background, where its output reaches the session when it ends instead of
 /// dying at the deadline with the output lost. Overridden per process by
-/// [`BACKGROUND_ENV`]; the settings key that would make it a setting is still
-/// to come.
+/// [`BACKGROUND_ENV`], then by the `bash.autoBackground.thresholdMs` setting
+/// (read by the surface and passed through [`background_after_with`]).
 pub const BACKGROUND_AFTER: Duration = Duration::from_secs(60);
 
 /// Environment variable holding that threshold in milliseconds, as in
 /// `TITI_BASH_BACKGROUND_MS=200`. For tests, and for a machine that wants a
-/// different bound without a settings key.
+/// different bound without a settings key; it wins over the setting.
 pub const BACKGROUND_ENV: &str = "TITI_BASH_BACKGROUND_MS";
 
 /// The threshold this process runs with: [`BACKGROUND_ENV`] in milliseconds
-/// when it parses, else [`BACKGROUND_AFTER`]. A value that does not parse is
-/// the default, not an error: a typo in the environment must not stop `bash`.
-pub fn background_after() -> Duration {
-    background_after_of(|key| std::env::var(key).ok())
+/// when it parses, else the setting, else [`BACKGROUND_AFTER`]. A value that
+/// does not parse is skipped, not an error: a typo in the environment must not
+/// stop `bash`.
+pub fn background_after_with(setting: Option<Duration>) -> Duration {
+    background_after_with_of(|key| std::env::var(key).ok(), setting)
 }
 
-/// [`background_after`] over an injected lookup, so the parse is testable
-/// without touching the process environment.
-fn background_after_of(lookup: impl Fn(&str) -> Option<String>) -> Duration {
+/// [`background_after_with`] over an injected lookup, so the parse and the
+/// env-over-setting precedence are testable without touching the process
+/// environment.
+fn background_after_with_of(
+    lookup: impl Fn(&str) -> Option<String>,
+    setting: Option<Duration>,
+) -> Duration {
     lookup(BACKGROUND_ENV)
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_millis)
+        .or(setting)
         .unwrap_or(BACKGROUND_AFTER)
+}
+
+/// The threshold from the environment alone, ignoring any setting: the
+/// engine's fallback when no surface passed one.
+pub fn background_after() -> Duration {
+    background_after_with(None)
 }
 
 /// How often the run loop looks at the child, the deadline, and the interrupt.
@@ -550,18 +562,42 @@ mod tests {
     }
 
     /// The threshold is milliseconds in the environment, and a value it cannot
-    /// read is the default rather than an error.
+    /// read is the next layer rather than an error.
     #[test]
     fn the_background_threshold_comes_from_the_environment() {
-        assert_eq!(background_after_of(|_| None), BACKGROUND_AFTER);
+        assert_eq!(background_after_with_of(|_| None, None), BACKGROUND_AFTER);
         assert_eq!(
-            background_after_of(|_| Some(" 250 ".into())),
+            background_after_with_of(|_| Some(" 250 ".into()), None),
             Duration::from_millis(250)
         );
         assert_eq!(
-            background_after_of(|_| Some("soon".into())),
+            background_after_with_of(|_| Some("soon".into()), None),
             BACKGROUND_AFTER
         );
+    }
+
+    /// `bash.autoBackground.thresholdMs` sets the threshold when no env value
+    /// is readable, and the env variable still wins when it is: that is the
+    /// precedence the engine relies on, so a stale environment cannot be
+    /// overridden by a config layer.
+    #[test]
+    fn the_setting_sets_the_threshold_and_the_environment_still_wins() {
+        let setting = Some(Duration::from_millis(250));
+        assert_eq!(
+            background_after_with_of(|_| None, setting),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            background_after_with_of(|_| Some("400".into()), setting),
+            Duration::from_millis(400)
+        );
+        // An environment value that does not parse falls through to the
+        // setting instead of pinning the default.
+        assert_eq!(
+            background_after_with_of(|_| Some("soon".into()), setting),
+            Duration::from_millis(250)
+        );
+        assert_eq!(background_after_with_of(|_| None, None), BACKGROUND_AFTER);
     }
 
     /// A command under the threshold is a [`Run`], byte for byte the one the

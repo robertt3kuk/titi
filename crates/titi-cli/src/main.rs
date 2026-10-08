@@ -50,6 +50,13 @@ genome.enabled in the agent config.yml or project .titi/config.yml
 (project wins) turns the prompt map on or off; unset means on,
 TITI_NO_GENOME=1 forces off for one run without touching this setting.
 
+bash.autoBackground.thresholdMs in the agent config.yml or project
+.titi/config.yml (project wins) sets, in milliseconds, how long a bash
+call may hold a turn before it is handed to the background; unset keeps
+60 000. It must be an integer from 1 to 3 600 000 — 0 or anything
+larger is refused at startup. TITI_BASH_BACKGROUND_MS overrides it
+when set.
+
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. A bare exit (or quit, or q) leaves too:
 straight away before the first turn, and on a second Enter once the session

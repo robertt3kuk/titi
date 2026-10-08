@@ -9,7 +9,7 @@ All notable user-facing changes to titi, newest first.
 - `--continue` / `-c` reopens the newest session in the agent directory instead of starting blank; with nothing to resume, it starts fresh and says so. `session.autoResume`, set in a config layer, does the same at every launch and is off unless set.
 - A bare `exit`, `quit`, `q` (or `/exit`, `/quit`) in the composer leaves the chat instead of being sent to the model — straight away before the first turn, and on a second Enter once the session has one.
 - A second `Escape` on an empty composer opens the rewind cut, the same as `/rewind`.
-- A `bash` command that outlives its background threshold — `TITI_BASH_BACKGROUND_MS`, in milliseconds, 60 000 by default — is handed over as a background job instead of holding the turn; `/jobs cancel` stops it.
+- A `bash` command that outlives its background threshold — `TITI_BASH_BACKGROUND_MS`, in milliseconds, 60 000 by default — is handed over as a background job instead of holding the turn; `/jobs cancel` stops it. The threshold is also a setting, `bash.autoBackground.thresholdMs` (1 to 3 600 000; 0 or anything larger is refused at startup), which the environment variable overrides when set.
 - A `todo` checklist tool: the agent writes a multi-step list, moves one item at a time through statuses, and a `todo N/M · name` chip tracks it in the transcript.
 - A splash screen at startup: a `TITI` wordmark, a tagline, facts, chords and one of twenty `Tip: …` hints, picked by the session id.
 - `read` takes `offset` and `limit`; `glob` matches real glob patterns (`**/`, `[a-z]`, `{rs,toml}`); `grep` takes a regular expression with `ignore_case` and a `glob` file filter, and a `path` may name one file.

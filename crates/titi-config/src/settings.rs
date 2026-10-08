@@ -14,7 +14,7 @@ use crate::config_file::with_file_lock;
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -145,6 +145,21 @@ pub const STATUS_LINE_CONTEXT_LINE_KEY: &str = "statusLine.contextLine";
 /// screen does. This crate owns the name only; the listing the resume picks
 /// from is `titi_cli::session_fs`.
 pub const SESSION_AUTO_RESUME_KEY: &str = "session.autoResume";
+
+/// How long a `bash` call may hold a turn before it is handed to the
+/// background, in milliseconds: `bash.autoBackground.thresholdMs`.
+///
+/// Unset means the engine default; this crate owns the name only, as with
+/// [`GENOME_LIMIT_KEY`], so it carries no number. A value must be an integer
+/// from 1 to [`MAX_AUTO_BACKGROUND_MS`]; 0 or anything larger is refused by
+/// [`Settings::auto_background_threshold`] rather than silently guessed.
+/// `TITI_BASH_BACKGROUND_MS` overrides this key when set.
+pub const BASH_AUTO_BACKGROUND_KEY: &str = "bash.autoBackground.thresholdMs";
+
+/// Largest `bash.autoBackground.thresholdMs` this build accepts: one hour.
+/// Past that the foreground wait is not a bound at all, so a longer number is
+/// a typo (a seconds value in a milliseconds slot) and is refused.
+pub const MAX_AUTO_BACKGROUND_MS: u64 = 3_600_000;
 
 impl Settings {
     /// Discover and load all layers.
@@ -284,6 +299,35 @@ impl Settings {
             .chain(self.overlays.iter().rev())
             .chain(std::iter::once(&self.global))
             .find_map(|layer| lookup(layer, key))
+    }
+
+    /// The `bash.autoBackground.thresholdMs` key as a duration.
+    ///
+    /// `Ok(None)` when the key is unset (the engine default, then, not zero).
+    /// `Ok(Some(d))` when it holds an integer from 1 to
+    /// [`MAX_AUTO_BACKGROUND_MS`]; anything else — a string, a float, 0, a
+    /// number past the cap — is a [`SettingsError::Key`], so a typo is named
+    /// rather than turned into a threshold nobody meant.
+    pub fn auto_background_threshold(&self) -> Result<Option<Duration>, SettingsError> {
+        let refuse = |reason: &str| SettingsError::Key {
+            key: BASH_AUTO_BACKGROUND_KEY.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let Some(value) = self.get(BASH_AUTO_BACKGROUND_KEY) else {
+            return Ok(None);
+        };
+        let millis = value.as_u64().ok_or_else(|| {
+            refuse("expected an integer number of milliseconds from 1 to 3600000")
+        })?;
+        if millis == 0 {
+            return Err(refuse("must be at least 1 ms; zero is not a threshold"));
+        }
+        if millis > MAX_AUTO_BACKGROUND_MS {
+            return Err(refuse(
+                "must be at most 3600000 ms (one hour); a larger value is refused",
+            ));
+        }
+        Ok(Some(Duration::from_millis(millis)))
     }
 
     /// The key's value in every layer that sets it, lowest first (global,
@@ -652,6 +696,39 @@ mod tests {
             settings.get_user("privacy.maskIps"),
             Some(Value::Bool(true))
         );
+    }
+
+    /// `bash.autoBackground.thresholdMs` reads as milliseconds, is refused
+    /// when it is zero, past the cap, or not an integer, and is absent — not
+    /// zero — when the key is unset.
+    #[test]
+    fn the_auto_background_threshold_is_read_and_refused_out_of_range() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let mut settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert_eq!(settings.auto_background_threshold().unwrap(), None);
+        settings
+            .set_runtime(BASH_AUTO_BACKGROUND_KEY, Value::from(250u64))
+            .unwrap();
+        assert_eq!(
+            settings.auto_background_threshold().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        for bad in [
+            Value::from(0u64),
+            Value::from(MAX_AUTO_BACKGROUND_MS + 1),
+            Value::from(1.5f64),
+            Value::String("soon".into()),
+        ] {
+            settings
+                .set_runtime(BASH_AUTO_BACKGROUND_KEY, bad.clone())
+                .unwrap();
+            let error = settings.auto_background_threshold().unwrap_err();
+            assert!(
+                matches!(error, SettingsError::Key { .. }),
+                "{bad}: {error:?}"
+            );
+        }
     }
 
     #[test]

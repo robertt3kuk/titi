@@ -289,6 +289,13 @@ input, so three things are read from the user's layers only (`get_user`):
 `privacy.allow`, `privacy.maskIps`, and the provider catalog (`providers`,
 `models`), whose entries name the URL a key is sent to.
 
+One settings key changes a tool bound: `bash.autoBackground.thresholdMs`
+(integer milliseconds, 1 to 3 600 000, default 60 000) is how long a `bash`
+call holds a turn before the runtime hands it to the background. It is read
+through the effective view into `EngineConfig::background_after`; a value of 0
+or past an hour refuses startup by name, and `TITI_BASH_BACKGROUND_MS` overrides
+the key when set.
+
 **Why it matters:** `git status` after a session shows nothing new, keys
 cannot end up in a commit, profiles are isolated from each other, and a
 clone carries no one's chat history or credentials.

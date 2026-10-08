@@ -864,6 +864,15 @@ pub fn start_engine_with(
     engine_config.mask_ips = mask_ips;
     if let Some(settings) = &settings {
         engine_config.genome_limit = genome_limit_from(settings);
+        // The setting names how long a `bash` call may hold the turn before
+        // it is handed to the background. A value that is zero or absurd is
+        // refused here, by name, instead of starting with a bound nobody
+        // meant; a readable `TITI_BASH_BACKGROUND_MS` still wins inside
+        // `background_after_with`.
+        let threshold = settings
+            .auto_background_threshold()
+            .map_err(|error| error.to_string())?;
+        engine_config.background_after = Some(titi_tools::background_after_with(threshold));
     }
     let mut tools = ToolRegistry::new();
     // One cache for the main turn and every subagent it spawns.
