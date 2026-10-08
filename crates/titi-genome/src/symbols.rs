@@ -29,6 +29,8 @@ pub enum Grammar {
     Python,
     Go,
     Java,
+    C,
+    Cpp,
 }
 
 impl Grammar {
@@ -40,6 +42,8 @@ impl Grammar {
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 }
@@ -52,6 +56,8 @@ struct Parsers {
     python: Option<Parser>,
     go: Option<Parser>,
     java: Option<Parser>,
+    c: Option<Parser>,
+    cpp: Option<Parser>,
 }
 
 impl Parsers {
@@ -63,6 +69,8 @@ impl Parsers {
             Grammar::Python => &mut self.python,
             Grammar::Go => &mut self.go,
             Grammar::Java => &mut self.java,
+            Grammar::C => &mut self.c,
+            Grammar::Cpp => &mut self.cpp,
         }
     }
 }
@@ -156,6 +164,8 @@ mod tests {
             Grammar::Python,
             Grammar::Go,
             Grammar::Java,
+            Grammar::C,
+            Grammar::Cpp,
         ] {
             assert!(grammar_available(grammar), "{grammar:?} failed to load");
         }

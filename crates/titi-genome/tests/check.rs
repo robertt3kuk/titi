@@ -336,7 +336,16 @@ fn the_roster_needs_no_workspace() {
         .collect();
     assert_eq!(
         full,
-        vec!["go", "java", "javascript", "python", "rust", "typescript"]
+        vec![
+            "c",
+            "c++",
+            "go",
+            "java",
+            "javascript",
+            "python",
+            "rust",
+            "typescript"
+        ]
     );
     let heuristic = roster
         .iter()

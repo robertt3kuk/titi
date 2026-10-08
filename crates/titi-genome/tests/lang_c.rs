@@ -31,6 +31,7 @@ fn c_repo() -> tempfile::TempDir {
 
 int hash(const char *key);
 int* compact(void);
+int first(void), second(void);
 
 struct Hash {
     int size;
@@ -93,6 +94,10 @@ public:
         "src/engine.cpp",
         r#"#include "util/hash.h"
 
+const char *doc = R"(
+int quoted(void);
+)";
+
 void Engine::start() {
 }
 
@@ -126,6 +131,15 @@ fn c_declarations_survive_pointers_and_qualifiers() {
         "a pointer-decorated return type must be read: {:?}",
         header.exports
     );
+    // `int first(void), second(void);` is one declaration with two
+    // declarators; the line patterns only ever saw the first of them.
+    for name in ["first", "second"] {
+        assert!(
+            header.exports.contains(&name.to_owned()),
+            "`{name}` is declared on the same line as another function: {:?}",
+            header.exports
+        );
+    }
     // `static` is file-private in C, so it is not an export.
     assert!(
         !header.exports.contains(&"helper".to_owned()),
@@ -166,6 +180,14 @@ fn c_declarations_survive_pointers_and_qualifiers() {
     assert!(
         cpp.exports.contains(&"slots".to_owned()),
         "{:?}",
+        cpp.exports
+    );
+    // A declaration written inside a raw string literal is string content: the
+    // line patterns read `int quoted(void);` as a declaration, the grammar
+    // does not.
+    assert!(
+        !cpp.exports.contains(&"quoted".to_owned()),
+        "a raw string's content is not a declaration: {:?}",
         cpp.exports
     );
 
@@ -233,14 +255,17 @@ fn c_quoted_includes_resolve_and_system_ones_stay_quiet() {
         "a system header must not be reported: {unresolved:?}"
     );
 
-    // Both rows this module serves are patterns, and the roster a user asks
-    // for says so rather than claiming a syntax tree.
+    // Both rows this module serves read their names off a syntax tree.
     for name in ["c", "c++"] {
         let capability = Genome::capabilities()
             .into_iter()
             .find(|capability| capability.language == name)
             .unwrap_or_else(|| panic!("no `{name}` capability"));
-        assert_eq!(capability.level, Level::Heuristic, "{name}");
-        assert!(capability.note.contains("pattern"), "{}", capability.note);
+        assert_eq!(capability.level, Level::Full, "{name}");
+        assert!(
+            capability.note.contains("syntax tree"),
+            "{}",
+            capability.note
+        );
     }
 }
