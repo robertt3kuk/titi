@@ -6,7 +6,7 @@ A terminal coding agent in Rust. It follows the product model of its reference p
 
 | Version | License | Phase | As of | Tests |
 | --- | --- | --- | --- | --- |
-| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-10-08 | 1774 passed (CI run 37780191533) |
+| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-10-08 | 1907 passed (CI run 37840563719) |
 
 ---
 
