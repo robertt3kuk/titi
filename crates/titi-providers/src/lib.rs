@@ -1,8 +1,7 @@
 //! LLM provider layer for titi: wire transports dispatched by endpoint family,
 //! a single SSE engine, per-family stream decoders normalizing into
 //! [`StreamEvent`], a repairing partial-JSON parser for streamed tool
-//! arguments, stop-reason tables, compat policies, the credential ladder and a
-//! one-shot fallback chain (see `docs/research/providers-streaming`).
+//! arguments, stop-reason tables, compat policies and the credential ladder.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -10,7 +9,6 @@ pub mod anthropic;
 pub mod compat;
 pub mod creds;
 pub mod discovery;
-pub mod fallback;
 pub mod gemini;
 pub mod http;
 pub mod mock;
@@ -30,7 +28,6 @@ pub use compat::{
 };
 pub use creds::{CredKind, Credential, LadderCtx, LadderLevel, parse_env_file, resolve_credential};
 pub use discovery::{DiscoveryError, MAX_DISCOVERY_BODY, list_models};
-pub use fallback::{FallbackChain, ModelRef};
 pub use gemini::GeminiStreamState;
 pub use http::{HttpFetch, HttpRequest, HttpResponse, ReqwestFetch};
 pub use mock::{MockBody, MockFetch, MockFetchResponse, MockTransport};

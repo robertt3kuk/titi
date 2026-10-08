@@ -489,9 +489,6 @@ pub struct EngineConfig {
     /// Session the turns are recorded under, so a finished turn can name it.
     /// `None` (headless one-shots, tests) simply never names anything.
     pub session_id: Option<String>,
-    pub fallback_cooldown: std::time::Duration,
-    pub fallback_chain:
-        std::sync::Arc<tokio::sync::Mutex<titi_providers::FallbackChain<smol_str::SmolStr>>>,
     pub judgment_provider: Option<crate::judgment::JudgmentProvider>,
     /// Mode the session starts in (`--mode plan|duck`). `SetMode` changes it
     /// afterwards.
@@ -504,9 +501,8 @@ pub struct EngineConfig {
 
 impl EngineConfig {
     pub fn new(primary_model: impl Into<SmolStr>) -> Self {
-        let primary = primary_model.into();
         Self {
-            primary_model: primary.clone(),
+            primary_model: primary_model.into(),
             fallback_models: Vec::new(),
             max_transient_retries: 2,
             retry_backoff: std::time::Duration::from_millis(500),
@@ -530,10 +526,6 @@ impl EngineConfig {
             mask_ips: true,
             goal_gates: Vec::new(),
             session_id: None,
-            fallback_cooldown: std::time::Duration::from_secs(60),
-            fallback_chain: std::sync::Arc::new(tokio::sync::Mutex::new(
-                titi_providers::FallbackChain::new(primary, Vec::new()),
-            )),
             judgment_provider: None,
             mode: crate::protocol::SessionMode::Agent,
             interrupt: titi_tools::Interrupt::new(),
