@@ -41,7 +41,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -49,8 +49,9 @@ use std::time::Duration;
 
 use crate::{Genome, RefreshStats, SharedGenome};
 
-/// How the worker coalesces, and how much it will hold.
-#[derive(Debug, Clone, Copy)]
+/// How the worker coalesces, how much it will hold, and how a test can hold
+/// it.
+#[derive(Clone)]
 pub struct Options {
     /// How long the worker keeps collecting after the last request before it
     /// applies the window. Long enough to swallow a save burst, short enough
@@ -59,6 +60,26 @@ pub struct Options {
     /// The most paths one window accumulates before it becomes a tree walk,
     /// and the most urgent paths it keeps in the caller's order.
     pub batch_cap: usize,
+    /// Called by the worker once a window is over — applied or failed — and
+    /// before it waits for the next request. `None` everywhere but a test.
+    ///
+    /// It exists for one state, the only one a reader must never mistake for
+    /// "nothing outstanding" and the only one that cannot be observed without
+    /// it: a request the handle has *sent* and the worker has not yet
+    /// *received*. That state lasts microseconds, so a test that raced it
+    /// would prove nothing; held open here it is exact. A hook inside a window
+    /// would not do, because the state under test is the gap after one.
+    pub hold: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("debounce", &self.debounce)
+            .field("batch_cap", &self.batch_cap)
+            .field("hold", &self.hold.is_some())
+            .finish()
+    }
 }
 
 impl Default for Options {
@@ -66,6 +87,7 @@ impl Default for Options {
         Self {
             debounce: Duration::from_millis(120),
             batch_cap: 1024,
+            hold: None,
         }
     }
 }
@@ -100,8 +122,31 @@ pub enum Request {
 pub struct GenomeHandle {
     genome: SharedGenome,
     tx: Sender<Request>,
-    pending: Arc<AtomicUsize>,
+    progress: Arc<Progress>,
     worker: Arc<Worker>,
+}
+
+/// How far the worker is behind what the handle has been asked to do.
+///
+/// The item count of the window the worker happens to be holding cannot answer
+/// `pending` on its own, and the gap it leaves is not theoretical: a request
+/// the caller has sent and the worker has not yet *received* is invisible to
+/// it, so a turn that gives up waiting on its own resync — sent while the
+/// worker was finishing a previous batch — can read "nothing outstanding" and
+/// render a graph that does not contain the changes it just handed over. That
+/// is the silent stale map the contract forbids.
+///
+/// Two monotonic counters close it. `sent` is bumped by the handle *before*
+/// the send, so a request in the channel is counted from the instant it
+/// exists; `applied` is set by the worker from its own receive count after a
+/// window it folded in; `sent > applied` is exactly "there is work in the
+/// channel or on the worker's hands". `items` is the window's path count, for
+/// the number the header shows.
+#[derive(Default)]
+struct Progress {
+    sent: AtomicU64,
+    applied: AtomicU64,
+    items: AtomicUsize,
 }
 
 /// The worker's end of the handle, so that only the last clone stops it.
@@ -128,7 +173,7 @@ impl Clone for GenomeHandle {
         Self {
             genome: self.genome.clone(),
             tx: self.tx.clone(),
-            pending: Arc::clone(&self.pending),
+            progress: Arc::clone(&self.progress),
             worker: Arc::clone(&self.worker),
         }
     }
@@ -147,16 +192,16 @@ impl GenomeHandle {
         let root = root.as_ref().to_path_buf();
         let genome = SharedGenome::index(&root)?;
         let (tx, rx) = mpsc::channel();
-        let pending = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(Progress::default());
         let worker_genome = genome.clone();
-        let worker_pending = Arc::clone(&pending);
+        let worker_progress = Arc::clone(&progress);
         let join = thread::Builder::new()
             .name("titi-genome-index".to_owned())
-            .spawn(move || run(rx, root, worker_genome, worker_pending, options))?;
+            .spawn(move || run(rx, root, worker_genome, worker_progress, options))?;
         Ok(Self {
             genome,
             tx: tx.clone(),
-            pending,
+            progress,
             worker: Arc::new(Worker {
                 tx,
                 join: Mutex::new(Some(join)),
@@ -178,17 +223,31 @@ impl GenomeHandle {
         self.genome.read(f)
     }
 
-    /// Path-level work items the worker has accepted and not yet folded in.
+    /// Path-level work items that have been asked for and not yet folded in.
     ///
     /// Named paths count once each, and so does a queued tree walk, whose
     /// dirty set is not known until it runs. It is a count of *work*, not of
     /// changed files: a batch of one path that turns out to be unchanged still
-    /// reads `1` until it lands. Zero means the graph a reader is handed is
-    /// the one every accepted batch has reached, with one deliberate
-    /// exception: a batch that **failed** to apply keeps its count standing,
-    /// so a frozen graph is named rather than passed off as current.
+    /// reads `1` until it lands.
+    ///
+    /// Zero means the graph a reader is handed contains everything this handle
+    /// has been asked for — including the requests still in the channel, which
+    /// is the state a turn's own resync is in when it gives up waiting. Two
+    /// deliberate exceptions, both in the safe direction: a window whose apply
+    /// **failed** advances nothing, so the graph stays named as behind until a
+    /// later window folds or finds nothing to fold; and the count can lag a
+    /// publish by the instruction it takes the worker to store it, which
+    /// over-reports and never hides.
     pub fn pending(&self) -> usize {
-        self.pending.load(Ordering::Acquire)
+        if self.progress.sent.load(Ordering::Acquire)
+            == self.progress.applied.load(Ordering::Acquire)
+        {
+            return 0;
+        }
+        // `max(1)`: work that is outstanding is worth naming even when the
+        // window it belongs to has no paths yet — a walk not yet run, or a
+        // window the worker has not opened.
+        self.progress.items.load(Ordering::Acquire).max(1)
     }
 
     /// How many times the graph has been published. Compare two of these to
@@ -205,7 +264,16 @@ impl GenomeHandle {
     /// Send a request. `false` when the worker is gone, which only happens
     /// once every clone of this handle has been dropped.
     pub fn request(&self, request: Request) -> bool {
-        self.tx.send(request).is_ok()
+        // Counted *before* the send, because a request that is in the channel
+        // and not yet received is precisely what the count has to cover.
+        self.progress.sent.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(request).is_ok() {
+            return true;
+        }
+        // Nobody will ever take it, so leaving the deficit standing would
+        // report a backlog for the rest of the process's life.
+        self.progress.sent.fetch_sub(1, Ordering::AcqRel);
+        false
     }
 
     /// Wait until the worker has folded in everything sent before this call,
@@ -218,7 +286,10 @@ impl GenomeHandle {
     /// so rather than read [`Self::snapshot`] and hope.
     pub fn quiesce(&self, timeout: Duration) -> bool {
         let (tx, rx) = mpsc::channel();
-        if self.tx.send(Request::Quiesce(tx)).is_err() {
+        // Through `request`, so the wait itself is counted: while this request
+        // is unread the count says work is outstanding, which is exactly what
+        // a caller that timed out must not be told otherwise about.
+        if !self.request(Request::Quiesce(tx)) {
             // No worker: every update it will ever make has been made.
             return true;
         }
@@ -286,8 +357,8 @@ fn accumulate(
     queue: &mut Queue,
     waiters: &mut Vec<Sender<u64>>,
     stop: &mut bool,
-    options: Options,
-    pending: &AtomicUsize,
+    options: &Options,
+    progress: &Progress,
 ) {
     match request {
         Request::Changed(paths) => queue.paths.extend(paths),
@@ -317,7 +388,7 @@ fn accumulate(
     if queue.urgent.len() > options.batch_cap {
         queue.urgent.truncate(options.batch_cap);
     }
-    pending.store(queue.items(), Ordering::Release);
+    progress.items.store(queue.items(), Ordering::Release);
 }
 
 /// The worker loop: window, apply, answer, repeat.
@@ -325,14 +396,19 @@ fn run(
     rx: Receiver<Request>,
     root: PathBuf,
     genome: SharedGenome,
-    pending: Arc<AtomicUsize>,
+    progress: Arc<Progress>,
     options: Options,
 ) {
     let mut queue = Queue::default();
+    // Requests this worker has taken out of the channel. It is the worker's
+    // own count, so it is exact at the moment it is read: nothing else bumps
+    // it, and the worker is single-threaded.
+    let mut received: u64 = 0;
     loop {
         let Ok(first) = rx.recv() else {
             return;
         };
+        received += 1;
         let mut waiters = Vec::new();
         let mut stop = false;
         accumulate(
@@ -340,19 +416,22 @@ fn run(
             &mut queue,
             &mut waiters,
             &mut stop,
-            options,
-            &pending,
+            &options,
+            &progress,
         );
         while !queue.hurry {
             match rx.recv_timeout(options.debounce) {
-                Ok(request) => accumulate(
-                    request,
-                    &mut queue,
-                    &mut waiters,
-                    &mut stop,
-                    options,
-                    &pending,
-                ),
+                Ok(request) => {
+                    received += 1;
+                    accumulate(
+                        request,
+                        &mut queue,
+                        &mut waiters,
+                        &mut stop,
+                        &options,
+                        &progress,
+                    );
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => {
                     stop = true;
@@ -360,15 +439,18 @@ fn run(
                 }
             }
         }
-        // A batch that could not be folded in leaves its count standing: the
-        // graph a reader gets is the last one that worked, and the count is
-        // the only thing that says so — an error here publishes nothing, and
-        // the generation still names the graph the reader is looking at. A
-        // root that has gone away is the ordinary case. The next batch
-        // replaces the count, and a successful one clears it.
-        let applied = queue.is_empty() || apply(&genome, &root, &queue).is_ok();
-        if applied {
-            pending.store(0, Ordering::Release);
+        // A window folds nothing for one of two reasons: there was nothing in
+        // it (a bare `Quiesce`), or its apply failed. Only the second leaves
+        // work unfilled, and only the second advances nothing — so a root that
+        // is gone names the backlog for as long as it lasts, while a window
+        // that had nothing to do still says so. A window that did fold marks
+        // everything received so far as applied: the next successful window is
+        // a walk over the same tree in the engine's shape, so it covers what a
+        // single failed one dropped.
+        let folded = queue.is_empty() || apply(&genome, &root, &queue).is_ok();
+        if folded {
+            progress.applied.store(received, Ordering::Release);
+            progress.items.store(0, Ordering::Release);
         }
         let generation = genome.generation();
         for waiter in waiters {
@@ -377,6 +459,9 @@ fn run(
         queue = Queue::default();
         if stop {
             return;
+        }
+        if let Some(hold) = &options.hold {
+            hold();
         }
     }
 }
@@ -395,6 +480,8 @@ fn apply(genome: &SharedGenome, root: &Path, queue: &Queue) -> io::Result<Refres
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{GenomeHandle, Options, Request};
@@ -403,6 +490,45 @@ mod tests {
         let path = root.join(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
+    }
+
+    /// A gate the worker blocks on at the end of every window.
+    ///
+    /// It is the only way to observe the state the `sent`/`applied` pair
+    /// exists for — a request in the channel the worker has not received —
+    /// without racing a window that closes in microseconds. A spin, not a
+    /// condvar: it is held for a few assertions in one test, and a lock here
+    /// would be state with nothing to protect.
+    #[derive(Clone, Default)]
+    struct Gate {
+        open: Arc<AtomicBool>,
+    }
+
+    impl Gate {
+        /// Blocks until [`Self::release`] is called; returns immediately after.
+        fn hold(&self) {
+            while !self.open.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+
+        fn release(&self) {
+            self.open.store(true, Ordering::Release);
+        }
+    }
+
+    /// Releases the gate when the test ends, assertion or panic.
+    ///
+    /// Without it a failed assertion unwinds past the release and the handle's
+    /// `Drop` joins a worker that is still spinning in [`Gate::hold`] — the
+    /// test would hang instead of failing, which is the one way a test can be
+    /// worse than useless. Declared *after* the handle, so it drops first.
+    struct ReleaseOnDrop(Gate);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     /// A debounce no test will ever wait out, so only an explicit `Quiesce`
@@ -487,16 +613,86 @@ mod tests {
 
         write(root, "src/late.rs", "pub fn late() {}\n");
         assert!(live.request(Request::Changed(vec!["src/late.rs".to_owned()])));
-        // Wait for the *publish*, not for `pending`: between the send and the
-        // worker's first `recv` the count is still zero, so polling it can
-        // read "idle" before the request was ever picked up.
+        // Wait for the *publish* rather than for `pending` to move: the count
+        // is bumped before the send, so it is non-zero from the instant the
+        // request exists — what is waited for here is the window closing with
+        // no `Quiesce`, which is the property under test.
         let deadline = Instant::now() + Duration::from_secs(5);
         while live.generation() == published && Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert_eq!(live.generation(), published + 1, "one window, one publish");
         assert!(live.snapshot().0.files.contains_key("src/late.rs"));
+        // The count can lag the publish by the instruction it takes to store
+        // it, so it is polled rather than asserted outright.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live.pending() > 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
         assert_eq!(live.pending(), 0, "and it is idle again");
+    }
+
+    /// A request the handle has *sent* counts as pending until the worker has
+    /// taken it, even when the window before it has already landed.
+    ///
+    /// This is the state the count used to miss, and it is the state a turn's
+    /// own resync is in when it gives up waiting: the worker is busy on a
+    /// previous batch, the turn's requests sit in the channel, the deadline
+    /// expires, and the count has to say so. Racing that gap would prove
+    /// nothing — it is microseconds wide — so the worker is held at the end of
+    /// its first window by [`Options::hold`] and the second request is sent
+    /// into a worker that provably cannot receive it.
+    #[test]
+    fn a_sent_request_is_pending_until_the_worker_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/seed.rs", "pub fn seed() {}\n");
+
+        let gate = Gate::default();
+        let held = gate.clone();
+        let live = GenomeHandle::spawn(
+            root,
+            Options {
+                debounce: Duration::from_secs(600),
+                hold: Some(Arc::new(move || held.hold())),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        // After the handle, so it drops before it: see `ReleaseOnDrop`.
+        let _release = ReleaseOnDrop(gate.clone());
+
+        // First window: one path, applied, and then the worker blocks at the
+        // end of the window instead of waiting for the next request.
+        write(root, "src/first.rs", "pub fn first() {}\n");
+        assert!(live.request(Request::Changed(vec!["src/first.rs".to_owned()])));
+        assert!(
+            live.quiesce(Duration::from_secs(30)),
+            "the first window landed"
+        );
+        assert_eq!(live.pending(), 0, "nothing outstanding once it landed");
+        let published = live.generation();
+
+        // Second request, sent while the worker is held: it is in the channel
+        // and no window owns it, so the count is the only thing that can say
+        // there is work.
+        write(root, "src/second.rs", "pub fn second() {}\n");
+        assert!(live.request(Request::Changed(vec!["src/second.rs".to_owned()])));
+        assert!(
+            live.pending() > 0,
+            "a sent request is work before the worker sees it"
+        );
+        assert_eq!(
+            live.generation(),
+            published,
+            "and it is genuinely not applied yet"
+        );
+
+        // Released, the second window lands and the count follows.
+        gate.release();
+        assert!(live.quiesce(Duration::from_secs(30)));
+        assert_eq!(live.pending(), 0);
+        assert!(live.snapshot().0.files.contains_key("src/second.rs"));
     }
 
     /// `quiesce` answers once the window it was sent in has landed, and is
@@ -659,6 +855,7 @@ mod tests {
             Options {
                 debounce: Duration::from_secs(600),
                 batch_cap: 4,
+                hold: None,
             },
         )
         .unwrap();
