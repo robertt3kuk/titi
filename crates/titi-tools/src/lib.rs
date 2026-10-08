@@ -2,6 +2,8 @@
 //!
 //! Spec: `docs/research/tools-core/README.md` and `docs/research/reference-product-port/README.md` (E1).
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod ansi;
 pub mod cache;
 pub mod fs;
