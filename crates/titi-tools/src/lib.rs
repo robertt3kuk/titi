@@ -36,6 +36,10 @@ pub use fs::{
     workspace_tools_with_cache, workspace_tools_with_interrupt, workspace_tools_with_policy,
 };
 pub use git::{DiagnoseTool, GIT_TIMEOUT, GitCommitTool, GitError, GitTool, git_tools};
+pub use pipe::{
+    BACKGROUND_AFTER, BACKGROUND_ENV, Background, BackgroundCancel, BackgroundSink,
+    background_after,
+};
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
@@ -141,6 +145,14 @@ pub trait ToolHandler: Send + Sync + 'static {
         let _ = args;
         None
     }
+
+    /// Installs the session's door for a command that outlives the turn's
+    /// threshold — see [`pipe::BackgroundSink`]. Only a tool that can leave a
+    /// process running has anywhere to put one; the default, for every other
+    /// tool, does nothing.
+    fn set_background(&self, sink: Arc<dyn pipe::BackgroundSink>) {
+        let _ = sink;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -220,6 +232,16 @@ impl ToolRegistry {
                 offered.join(" and ")
             )
         })
+    }
+
+    /// Hands every registered tool the session's door for a command that
+    /// outlives the turn's threshold, so a `bash` call can be handed over to
+    /// the job registry instead of dying at its deadline. The engine installs
+    /// one as it starts, on the registry the surface built.
+    pub fn install_background(&self, sink: Arc<dyn pipe::BackgroundSink>) {
+        for handler in self.tools.values() {
+            handler.set_background(Arc::clone(&sink));
+        }
     }
 
     /// Names of the registered tools, sorted.

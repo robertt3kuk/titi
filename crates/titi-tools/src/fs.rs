@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -8,7 +9,7 @@ use titi_providers::ToolSpec;
 
 use crate::cache::ReadCache;
 use crate::hashline::HashlineEditTool;
-use crate::pipe;
+use crate::pipe::{self, BackgroundSink};
 use crate::pty::{self, Interrupt, Options as PtyOptions};
 use crate::sensitive::SensitivePolicy;
 use crate::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
@@ -1051,11 +1052,48 @@ struct Hits {
     more: usize,
 }
 
+/// How a finished piped run reads to the model: the output for a success, and
+/// an exit line ahead of it for anything else, so an empty output still tells
+/// the model something.
+fn pipe_result(run: pipe::Run) -> ToolResult {
+    if run.success {
+        return ok(run.output);
+    }
+    let status = run.exit_code.map_or_else(
+        || "killed by a signal".to_owned(),
+        |code| format!("exit {code}"),
+    );
+    err(format!("{status}\n{}", run.output))
+}
+
 pub struct BashTool {
     pub root: PathBuf,
     /// Raised to stop the command a run is waiting on, on either path. Held
     /// by whoever owns the cancel key.
     pub interrupt: Interrupt,
+    /// Where a command that outlives the turn's threshold goes, once the
+    /// engine that runs the tools has installed one.
+    pub background: BashBackground,
+}
+
+/// The session's door for a `bash` command that outlives the turn's
+/// threshold, installed by the engine as it starts. Until it is installed the
+/// tool is bounded by its deadline exactly as every earlier titi was: nothing
+/// is ever handed to a session that could not report it back.
+#[derive(Default)]
+pub struct BashBackground(std::sync::OnceLock<Arc<dyn BackgroundSink>>);
+
+impl BashBackground {
+    /// The installed door, if the engine has started.
+    fn get(&self) -> Option<&Arc<dyn BackgroundSink>> {
+        self.0.get()
+    }
+
+    /// Installs the door. Only the engine's registry does this, once, on the
+    /// tools it is about to run.
+    fn install(&self, sink: Arc<dyn BackgroundSink>) {
+        let _ = self.0.set(sink);
+    }
 }
 
 #[async_trait]
@@ -1100,6 +1138,10 @@ impl ToolHandler for BashTool {
         crate::intercept::refusal(&arg_str(args, "command")?)
     }
 
+    fn set_background(&self, sink: Arc<dyn BackgroundSink>) {
+        self.background.install(sink);
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         let Some(command) = arg_str(&args, "command") else {
             return err("missing command");
@@ -1134,22 +1176,39 @@ impl BashTool {
         Self {
             root: root.into(),
             interrupt: Interrupt::new(),
+            background: BashBackground::default(),
         }
     }
 
-    /// The default path, bounded as [`pipe::run`] describes. A failure says
-    /// how the command exited, so an empty output still tells the model
-    /// something.
+    /// The default path, bounded as [`pipe::run_with_background`] describes:
+    /// by its deadline, and — once the engine installed a door — by a
+    /// threshold past which the command is handed over to the job registry
+    /// and its output arrives when it ends. A failure says how the command
+    /// exited, so an empty output still tells the model something.
     fn run_on_pipe(&self, command: &str, timeout: std::time::Duration) -> ToolResult {
-        match pipe::run(command, &self.root, timeout, &self.interrupt) {
-            Ok(run) if run.success => ok(run.output),
-            Ok(run) => {
-                let status = run.exit_code.map_or_else(
-                    || "killed by a signal".to_owned(),
-                    |code| format!("exit {code}"),
-                );
-                err(format!("{status}\n{}", run.output))
-            }
+        let sink = self.background.get();
+        let outcome = pipe::run_with_background(
+            command,
+            &self.root,
+            timeout,
+            sink.map(|sink| sink.after()),
+            &self.interrupt,
+        );
+        match outcome {
+            Ok(pipe::Outcome::Done(run)) => pipe_result(run),
+            Ok(pipe::Outcome::Backgrounded(background)) => match sink {
+                Some(sink) => {
+                    let job = sink.hand_over(command, background);
+                    ok(format!(
+                        "moved to the background as {job} · the output will arrive when it \
+                         finishes"
+                    ))
+                }
+                // No door means no threshold was asked for, so this is only
+                // reachable if one was installed mid-flight: waiting it out
+                // beats dropping a live command on the floor.
+                None => pipe_result(background.wait()),
+            },
             Err(error) => err(error.to_string()),
         }
     }
@@ -1346,6 +1405,7 @@ pub fn workspace_tools_with_interrupt(
         Box::new(BashTool {
             root: root.clone(),
             interrupt,
+            background: BashBackground::default(),
         }),
     ];
     tools.extend(crate::git::git_tools(root, policy));
@@ -1602,6 +1662,7 @@ mod tests {
         let bash = BashTool {
             root: root.clone(),
             interrupt: Interrupt::new(),
+            background: BashBackground::default(),
         };
         assert_eq!(
             bash.describe(&serde_json::json!({"command": "cargo test -p titi-core"}))
@@ -2754,6 +2815,7 @@ mod tests {
         let tool = BashTool {
             root,
             interrupt: interrupt.clone(),
+            background: BashBackground::default(),
         };
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));

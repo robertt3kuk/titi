@@ -999,6 +999,7 @@ async fn a_cancel_stops_the_shell_command_the_turn_waits_on() {
     tools.register(Arc::new(titi_tools::BashTool {
         root: dir.path().to_path_buf(),
         interrupt: config.interrupt.clone(),
+        background: Default::default(),
     }));
     let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), tools);
     engine
