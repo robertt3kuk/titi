@@ -793,6 +793,77 @@ async fn falls_back_after_transient_budget() {
     assert!(events.iter().any(|event| matches!(event, EngineEvent::ModelSwitched { from, to, .. } if from == "primary" && to == "backup")));
 }
 
+/// A retry must not replay the previous attempt's reasoning.
+///
+/// The first attempt streams thinking and then dies with no terminal event,
+/// which is retryable. The surface has already painted that reasoning, and a
+/// retry streams a second attempt's reasoning into the same thinking block,
+/// so the transcript shows the first attempt's reasoning twice over.
+#[tokio::test]
+async fn a_retry_does_not_replay_the_first_attempt_thinking() {
+    let primary = Arc::new(MockTransport::new(vec![
+        // Thinking arrives, then the stream ends with no terminal event.
+        MockBody::Events(vec![
+            StreamEvent::ThinkingStart {
+                id: BlockId::new("thinking"),
+            },
+            StreamEvent::ThinkingDelta {
+                id: BlockId::new("thinking"),
+                text: "weighing the options".into(),
+            },
+            StreamEvent::ThinkingEnd {
+                id: BlockId::new("thinking"),
+            },
+        ]),
+        // A retry would emit the same reasoning again, then answer.
+        MockBody::Events(vec![
+            StreamEvent::ThinkingDelta {
+                id: BlockId::new("thinking"),
+                text: "weighing the options".into(),
+            },
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: "the answer".into(),
+            },
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ]),
+    ]));
+    let mut config = EngineConfig::new("primary");
+    config.max_transient_retries = 2;
+    let mut engine = EngineRuntime::start(
+        config,
+        resolver(vec![("primary", Arc::clone(&primary) as _)]),
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    // One request only: reasoning was already on screen, so the attempt
+    // stands even though the error was retryable.
+    assert_eq!(primary.call_count(), 1, "the retry replayed the reasoning");
+    let reasoning: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasoning,
+        vec!["weighing the options"],
+        "the surface saw one attempt's reasoning more than once"
+    );
+    assert!(
+        matches!(events.last(), Some(EngineEvent::Failed { .. })),
+        "the turn ends where it got to, it does not retry: {events:?}"
+    );
+}
+
 /// When every model gives up, the failure still says why: the last model
 /// tried and what its provider answered, not only that none were available.
 #[tokio::test]

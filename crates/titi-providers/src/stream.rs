@@ -135,12 +135,17 @@ pub enum StreamEvent {
 }
 
 impl StreamEvent {
-    /// True once user-visible content (text or tool arguments) has been
-    /// emitted; after this point retry/fallback is forbidden for the turn.
-    pub fn is_content(&self) -> bool {
+    /// True once output the user can already see has been emitted — answer
+    /// text, tool arguments, or reasoning. After this point retry and
+    /// fallback are forbidden for the turn: the surface has painted it, and a
+    /// second attempt would stream its own reasoning into the same block, so
+    /// the transcript reads the previous attempt's thinking twice.
+    pub fn is_visible_output(&self) -> bool {
         matches!(
             self,
-            StreamEvent::TextDelta { .. } | StreamEvent::ToolcallDelta { .. }
+            StreamEvent::TextDelta { .. }
+                | StreamEvent::ToolcallDelta { .. }
+                | StreamEvent::ThinkingDelta { .. }
         )
     }
 
@@ -155,7 +160,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_flag_covers_only_deltas() {
+    fn visible_output_covers_text_tools_and_reasoning() {
         let text = StreamEvent::TextDelta {
             id: BlockId::new("b1"),
             text: "hi".into(),
@@ -169,10 +174,17 @@ mod tests {
             text: "hmm".into(),
         };
         let start = StreamEvent::Start;
-        assert!(text.is_content());
-        assert!(tool.is_content());
-        assert!(!thinking.is_content());
-        assert!(!start.is_content());
+        assert!(text.is_visible_output());
+        assert!(tool.is_visible_output());
+        // Reasoning is on screen, so a retry would replay it: it counts too.
+        assert!(thinking.is_visible_output());
+        assert!(!start.is_visible_output());
+        assert!(
+            !StreamEvent::ThinkingStart {
+                id: BlockId::new("b4")
+            }
+            .is_visible_output()
+        );
     }
 
     #[test]

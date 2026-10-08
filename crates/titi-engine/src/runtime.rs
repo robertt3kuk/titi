@@ -1998,11 +1998,11 @@ async fn run_turn(
                             last_error = None;
                             break;
                         }
-                        Err((error, visible_content)) => {
+                        Err((error, visible_output)) => {
                             if aborted.load(Ordering::SeqCst) {
                                 return None;
                             }
-                            if visible_content || !error.is_retryable() {
+                            if visible_output || !error.is_retryable() {
                                 meter.settle(&events, turn_id).await;
                                 emit_transport_failure(&events, turn_id, error).await;
                                 return None;
@@ -2178,7 +2178,7 @@ async fn stream_attempt(
         .stream(request, context)
         .await
         .map_err(|error| (error, false))?;
-    let mut visible_content = false;
+    let mut visible_output = false;
     let mut collector = ToolCallCollector::default();
     let mut answer = String::new();
     let mut reported: Option<TokenUsage> = None;
@@ -2187,7 +2187,7 @@ async fn stream_attempt(
         if aborted.load(Ordering::SeqCst) {
             return Ok((SmolStr::default(), Vec::new()));
         }
-        visible_content |= event.is_content();
+        visible_output |= event.is_visible_output();
         collector.observe(&event);
         match event {
             StreamEvent::TextDelta { text, .. } => {
@@ -2229,7 +2229,7 @@ async fn stream_attempt(
                 return Ok((answer.into(), calls));
             }
             StreamEvent::Error { reason, message } => {
-                let error = if reason == ErrorReason::Connection && !visible_content {
+                let error = if reason == ErrorReason::Connection && !visible_output {
                     TransportError::Retryable {
                         status: None,
                         message,
@@ -2240,7 +2240,7 @@ async fn stream_attempt(
                         message,
                     }
                 };
-                return Err((error, visible_content));
+                return Err((error, visible_output));
             }
             _ => {}
         }
@@ -2251,7 +2251,7 @@ async fn stream_attempt(
             status: None,
             message: "stream ended without terminal event".into(),
         },
-        visible_content,
+        visible_output,
     ))
 }
 
