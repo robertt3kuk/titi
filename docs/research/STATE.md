@@ -354,8 +354,9 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `medium` the workspace lints now surface 1392 `unwrap`/`expect` warning
-  headers (`cargo clippy --workspace --all-targets`), nearly all of them inside
+- [ ] `medium` the workspace lints surface 1304 `unwrap`/`expect` warning
+  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`, down from
+  1392 before the `App` deletion), nearly all of them inside
   test modules — the audit counted ≈36 sites outside them; turning that into a
   rule (per-module allow-lists, or a real fix pass) is its own task.
 - [ ] `medium` `selection.rs` and `space_hold.rs` are kept while nothing calls
@@ -427,8 +428,9 @@ counts ÷ 4 over a rolling 4 s window, printed with a `~` because it is an
 estimate, `titi-tui/src/status.rs:182-235`). Honest limits: the C row claims
 `.h` and retries the C++ grammar when the C parse is broken (`titi genome
 capabilities` says so), `export_to_file` is still a plain `fs::write`, and the
-lints' 1392 `unwrap`/`expect` warnings stand (1381 before this wave's
-  grammar code).
+lints' `unwrap`/`expect` warning headers stood at 1304 when this was written
+  2026-10-09 (1392 before the `App` deletion), a count that follows the tests
+  rather than a fact to trust.
 
 The `App` deletion wave (2026-10-09) closed the audit's last structural item.
 Phase 1 had moved the live helpers out; phase 2 deleted the stack — `app.rs`
