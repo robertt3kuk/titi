@@ -152,7 +152,21 @@ pub(crate) fn strip_jsonc_comments(text: &str) -> String {
 }
 
 /// Acquire an exclusive advisory lock on `<path>.lock` while holding the guard.
-pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+///
+/// The closure runs only while the lock is held. On Unix/POSIX, the lock
+/// blocks until acquired; if it fails (e.g. due to signal interrupt), the
+/// error is returned and the closure does not run. The lock file is
+/// intentionally NOT unlinked after the guard is dropped: it is a rendezvous
+/// point, and unlinking it while another process is waiting on its own open
+/// descriptor would create a race where a lock holder believes it holds the
+/// lock while a waiter acquires "the" lock on a different inode.
+pub fn with_file_lock<T, E>(
+    path: &Path,
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<std::io::Error>,
+{
     let lock_path = path.with_extension({
         let mut s = path
             .extension()
@@ -163,23 +177,111 @@ pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
         s
     });
     if let Some(parent) = lock_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|e| E::from(e))?;
     }
-    let opened = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&lock_path);
-    let result = match opened {
-        Ok(file) => {
-            let mut guard = fd_lock::RwLock::new(file);
-            match guard.write() {
-                Ok(_w) => f(),
-                Err(_) => f(),
-            }
+        .open(&lock_path)
+        .map_err(|e| E::from(e))?;
+    let mut guard = fd_lock::RwLock::new(file);
+    match guard.write() {
+        Ok(_w) => f(),
+        Err(e) => Err(E::from(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    fn counter_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.yml");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    fn bump(path: &std::path::Path) -> Result<(), io::Error> {
+        with_file_lock(path, || -> Result<(), io::Error> {
+            let n: u32 = std::fs::read_to_string(path)?.trim().parse().map_err(|e| io::Error::other(e))?;
+            // Keep the critical section slow and wobbly so interleaving would
+            // be near-certain without a real lock.
+            thread::sleep(Duration::from_millis(1));
+            std::fs::write(path, (n + 1).to_string())
+        })
+    }
+
+    /// Two racing writers read-modify-write a counter under the lock; the
+    /// final value must be exactly 2N. Fails on the old helper, which ran the
+    /// body whether or not the lock was held.
+    #[test]
+    fn concurrent_writers_do_not_interleave() {
+        let (_dir, path) = counter_file("0");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    bump(&path).unwrap();
+                }
+            }));
         }
-        Err(_) => f(),
-    };
-    let _ = fs::remove_file(&lock_path);
-    result
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "50");
+    }
+
+    /// Pin the failure path: when the lock file itself cannot be opened (here
+    /// because a directory occupies `<path>.lock`), the body must not run and
+    /// the error must reach the caller.
+    #[test]
+    fn refused_lock_does_not_run_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("counter.yml");
+        std::fs::write(&target, "41").unwrap();
+        std::fs::create_dir(dir.path().join("counter.yml.lock")).unwrap();
+
+        let err: io::Error = with_file_lock(&target, || -> Result<(), io::Error> {
+            let n: u32 = std::fs::read_to_string(&target)?.trim().parse().map_err(|e| io::Error::other(e))?;
+            std::fs::write(&target, (n + 1).to_string())?;
+            Ok(())
+        })
+        .unwrap_err();
+        // open(2) on a directory yields EISDIR: the lock was never acquired.
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "41");
+    }
+
+    /// A closure returning Err<T>/Err<E> propagates to the caller unchanged.
+    #[test]
+    fn failing_closure_propagates_error() {
+        let (_dir, path) = counter_file("7");
+        let result: Result<(), io::Error> =
+            with_file_lock(&path, || Err(io::Error::other("boom")));
+        assert_eq!(result.unwrap_err().to_string(), "boom");
+    }
+
+    /// Corrupt YAML still loads to `Error(ConfigError::Invalid)`, so a
+    /// quarantined settings file never wedges writes behind it.
+    #[test]
+    fn corrupt_yaml_file_is_reported_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yml");
+        std::fs::write(&path, "invalid: [unclosed\n").unwrap();
+        let outcome: LoadOutcome<serde_json::Value> = try_load(&path);
+        match outcome {
+            LoadOutcome::Error(ConfigError::Invalid { .. }) => {}
+            _ => panic!("expected ConfigError::Invalid for corrupt YAML"),
+        }
+    }
 }
