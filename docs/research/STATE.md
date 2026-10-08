@@ -383,21 +383,24 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `medium` the workspace lints surface 441 `unwrap`/`expect` warning
-  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`; 555
-  `warning:` lines in all; the per-file split below is counted from clippy's
-  JSON messages, not from a log window). The scoping wave took them from
-  1304/1477 by turning the two lints on for **production** code in nine crates
-  with a crate-level
+- [ ] `low` the workspace lints surface **15** `unwrap`/`expect` warning headers
+  as of 2026-10-09, of 111 `warning:` lines in all (`cargo clippy --workspace
+  --all-targets`, measured on this tree). The rule the item asked for is in
+  place: all eleven crates carry a crate-level
   `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`
-  (b7396f9 config, 23ea652 core, 0e71d27 providers, 00908d8 tools, 483806c
-  soul, a8b7cc2 secrets, ebaaf15 memory, 22614cf genome, ad76f7c engine), which
-  removed the test-only noise; this wave then added six of them with the new
-  code. `titi-cli` (322) and `titi-tui` (108) are not scoped yet and hold all
-  but eleven: 189 headers in `titi-cli/src/chat.rs`, 33 in `git_checkpoint.rs`,
-  27 in `tests/genome.rs`, 25 in `titi-tui/src/theme/schema.rs`. The audit's
-  ≈36 production sites — ~19 of them behind the module-wide allow at
-  `titi-genome/src/parse.rs:3` — still need either a rule or a fix pass.
+  (`b7396f9` config, `23ea652` core, `0e71d27` providers, `00908d8` tools,
+  `483806c` soul, `a8b7cc2` secrets, `ebaaf15` memory, `22614cf` genome,
+  `ad76f7c` engine, then `b63140a`, `3315395` and `e0be096` for cli and tui),
+  which took the count from 1304/1477 by silencing the test-only noise. What
+  remains is what a fix pass would take: `titi-genome/src/refs.rs`'s three kept
+  regex `.expect`s (the invariant-impossible case `22614cf` argued for, at
+  `src/refs.rs:260-264`), `titi-genome/src/shared.rs` (new Taimyr code),
+  `titi-memory/src/redact.rs` and `titi-tui/src/theme/mod.rs`, plus four in
+  `crates/titi-engine/tests/protocol.rs`. Two test files missed the sweep and
+  should be named when it is redone: `protocol.rs` (no header at all, which is
+  where those four come from) and `crates/titi-cli/tests/continue.rs`, which
+  still carries the old blanket `#![allow(clippy::unwrap_used)]` because the
+  sweep left the file to the worker who owned it.
 - [x] `medium` ~~`selection.rs` and `space_hold.rs` are kept while nothing
   calls them~~ ported into `chat.rs` 2026-10-09 in 92c08c8, with the status
   `app-rs-decision.md` keeps: `selection.rs` is live again (a press anchors,
@@ -468,32 +471,64 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
 wave above, with its own ranked cost table; these are the items it recommends
 next, and the two worker notes it could not see yet.
 
-- [ ] `medium` the paste collapse and the transcript's section model are gone —
-  **a regression from our own `App` deletion, not a feature never built.**
-  `composer.rs`'s 6-line paste collapse went with the module, so a pasted stack
-  trace is inserted whole and the composer shows one row of its tail;
-  `transcript.rs`'s `/details`, the per-section visibility and the fold divider
-  went with it too, leaving one `folded N earlier messages` note on compaction.
-  Both are `chat.rs` work (`Chat::paste`, `composer_view`/`fit_tail`, the
-  `EngineEvent::Compacted` arm) and both are felt by a user after the first
-  compaction or the first long paste.
-- [ ] `medium` `/sessions <query>`: the FTS5 index and `SessionStore::search`
-  exist, are populated on every append, and have **no caller** — the switcher
-  is Ctrl+X only, and the source's own comments name the command `/sessions`
-  while typing it answers `unknown command`. `chat.rs` over the read-only API;
-  a bare `/sessions` should list what Ctrl+X lists, which also makes the
-  comments true.
+- [x] `medium` ~~the paste collapse and the transcript's section model are
+  gone — **a regression from our own `App` deletion, not a feature never
+  built**~~ both restored 2026-10-09 in `chat.rs`: `3f86696` brings the
+  collapse back with the lost module's own threshold (`6` lines, restored
+  rather than chosen — the old `App` passed six) and a one-line
+  `[Paste #1 · 8 lines]` marker whose body is swapped in at submit, so the
+  model reads the wall while the transcript echoes the marker; `21bc0fb`
+  brings the section model back as `/details <section> <mode>` over the
+  module's four names, with its DoD defaults (thinking, tools and subagents)
+  and one departure — activity stays expanded, because on this surface those
+  lines are the answers `/usage`, `/context`, `/jobs` and `/recap` give — plus
+  a `▸ folded 14 turns · 22k tokens` divider, collapsed by default.
+  Honest notes: the marker's form is new on purpose (one line, no `/` in it,
+  so command completion still works on the draft, and a substituted body is
+  never scanned again), and `Screen::open` now asks for **bracketed paste** —
+  it never did, so no terminal marked a paste and the collapse could not have
+  fired even before the deletion. That part was a live bug, not a regression.
+- [x] `medium` ~~`/sessions <query>`: the FTS5 index and `SessionStore::search`
+  exist, are populated on every append, and have **no caller**~~ the caller
+  landed 2026-10-09 in `6d7a89e` (`chat.rs`): a bare `/sessions` opens the same
+  rows, title and switch Ctrl+X opens, and `/sessions <query>` offers one row
+  per matching entry — the session's title (or its id) and the line that
+  matched — narrowing as it is typed (a character re-runs, a backspace takes
+  one back, the first Esc clears to the whole list, the second closes) on the
+  picker chrome the model, theme and history browsers already use.
+  Honest limits: it reaches only what the index holds; both the list and the
+  search are **capped at `SESSION_HITS_MAX` = 40** rows; the row's time is the
+  session's last write (read from its file, so a hit row and a list row cannot
+  disagree), not the hit's own time — `SearchHit` carries only
+  `session_id`/`entry_id`/`text`, which is why `SearchHit.ts` is queued below;
+  and the search is deliberately unscoped (no bot, no workspace filter), the
+  only way a session written before sessions recorded a workspace is findable.
 - [ ] `medium` no money anywhere: `/budget $2` is refused with "no price
   table", and neither the turn footer nor `/usage` states a cost. A static
   price on `ModelDescriptor` (`titi-engine/src/registry.rs`), the `$` figure in
   `titi-tui/src/status.rs`'s `TurnFooter` and in `/usage`, and the part omitted
   when a descriptor has no price — a keyless local model must not print
   `$0.000`.
-- [ ] `medium` sessions record no workspace: `SessionMeta` carries title, bot
+- [x] `medium` ~~sessions record no workspace: `SessionMeta` carries title, bot
   and source but no cwd, so `--continue` and the switcher are agent-directory
-  wide (the new flag says so in prose). Add `cwd` to the index with a migration,
-  then scope listing, resume and search by it; omp's `autoResume` is cwd-scoped
-  for the same reason.
+  wide~~ landed 2026-10-09 in three commits: `ca61791` adds
+  `SessionMeta::cwd`, persisted as `sessions.cwd` and read back by
+  `session_meta`; `1fe4bc0` adds `sessions_in(Some(root))` and the same filter
+  beside `search`'s bot one, both inside the query's own statement so the
+  index narrows; `a77d12f` makes the resume rule `newest_session_in(agent_dir,
+  workspace)` and passes the directory titi runs in, so `--continue` resumes
+  the row Ctrl+X would have offered rather than the session created last.
+  The three details that make it honest: `cwd` is `Option<String>` because
+  every older session has none, and `None` means **unknown, never "not
+  yours"** — nothing may treat it as a filter result; the v1→v2 migration
+  probes `PRAGMA table_info(sessions)` before `ALTER TABLE … ADD COLUMN cwd`
+  and stamps `user_version = 2`; and the resume falls back in three branches —
+  the scoped pick when the index has one, the newest session anywhere when
+  this workspace has nothing recorded, and the newest anywhere when the index
+  cannot be read at all — so an old session is never hidden by a filter it
+  predates. The store also records the process working directory when its
+  caller names no workspace, which is what makes the field live in production
+  rather than a value only callers could fill.
 - [ ] `low` `bash.autoBackground.thresholdMs` is not a setting yet: the
   threshold is `titi_tools::BACKGROUND_AFTER` (60 s) or
   `TITI_BASH_BACKGROUND_MS`, with `EngineConfig::background_after` as the
@@ -511,10 +546,34 @@ next, and the two worker notes it could not see yet.
   parallelized, and the review calls the split a finding of its own. A plan for
   it (sections, views and pickers as modules behind a thin `Chat`) is worth more
   than any single item in this list.
-- [ ] `low` the README's first paragraph links the placeholder
+- [x] `low` ~~the README's first paragraph links the placeholder
   `https://reference-product.com` (`README.md:3` and the verify block), which
   404s for the first stranger who reads it, and there is no `CHANGELOG.md` at
-  all.
+  all~~ fixed 2026-10-09 in `240db13`: the placeholder link is gone from the
+  README and `CHANGELOG.md` exists — newest-first, user-facing, in prose about
+  what a user sees.
+
+**Follow-ups named by this wave (2026-10-09).**
+
+- [ ] `low` the engine's one-line adoption of `SharedGenome`: phase 0 built the
+  snapshot type (`580de37`) and today its only caller is
+  `examples/refresh.rs`, while `crates/titi-engine/src/runtime.rs` still keeps
+  `Arc<Mutex<Option<Genome>>>`. Replacing that is what gives the incremental
+  machinery a production reader.
+- [ ] `medium` Taimyr phases 1–5, per `docs/research/genome-incremental.md` §6,
+  each with the acceptance test its table names. Phase 3 is the only one that
+  wants `notify`: that decision is written in §4 as phase 3's, it needs the
+  owner's word, and adding the dependency goes through the
+  `dependency-update` procedure — its health is **unverified offline**, so
+  nothing was added.
+- [ ] `low` `SearchHit.ts` for exact session-hit times: `SearchHit` carries
+  `session_id`/`entry_id`/`text` and no timestamp, so a hit row shows the
+  session's last write — which is what keeps a hit row and a list row from
+  disagreeing. A timestamp on the hit would let the row say when the matching
+  line was written instead.
+- [ ] `low` the five production `unwrap`/`expect` sites in `chat.rs` the lints
+  worker listed — `2113`, `2164`, `5338`, `8665`, `8726` — i.e. the ones the
+  scoping now surfaces precisely because they sit outside a test module.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -661,3 +720,73 @@ recommends next. The test suite went 1784 → 1812 passed, and the
 `unwrap`/`expect` warning headers 435 → 441 (`cargo clippy --workspace
 --all-targets`; 535 → 555 `warning:` lines): the new code adds production sites,
 while the two unscoped crates still hold most of the number.
+
+The workspace-and-Taimyr wave (2026-10-09) finished the review's first list and
+started Taimyr. Restorations, all in `chat.rs`: the paste collapse is back with
+the lost module's own threshold — six lines, restored rather than chosen, since
+the old `App` passed six — as a one-line `[Paste #1 · 8 lines]` marker whose
+body is swapped in at submit while the transcript echoes the marker, and
+`Screen::open` now asks for **bracketed paste**, which no earlier titi did, so
+no terminal ever marked a paste and the collapse could not have fired at all:
+that half was a live bug, not a regression (`3f86696`). The section model is
+back as `/details <section> <mode>` over thinking, tools, subagents and
+activity, with the deleted module's DoD defaults and one departure — activity
+stays expanded, or `/usage`, `/context`, `/jobs` and `/recap` would print
+nothing — plus a `▸ folded 14 turns · 22k tokens` divider that is collapsed by
+default (`21bc0fb`). `/sessions` finally has the caller the FTS5 index never
+had (`6d7a89e`): a bare one opens exactly what Ctrl+X opens, and a query offers
+a row per matching entry and narrows as it is typed. Honest limits there: it
+reaches only what the index holds, both lists cap at forty rows, and the row's
+time is the session's last write rather than the hit's own — which is why
+`SearchHit.ts` is queued.
+
+Sessions now know the workspace they were started in (`ca61791`, `1fe4bc0`,
+`a77d12f`): `SessionMeta::cwd` is persisted as `sessions.cwd` and `None` means
+*unknown, never "not yours"*, so nothing may treat it as a filter result; the
+v1→v2 migration probes `PRAGMA table_info(sessions)` before adding the column
+and stamps `user_version = 2`; and resume is `newest_session_in(agent_dir,
+workspace)` with three branches — the scoped pick when the index has one, the
+newest session anywhere when this workspace has nothing recorded, and the
+newest anywhere when the index cannot be read — so a session written before the
+column existed is never hidden by a filter it predates. The store also records
+the process working directory when its caller names no workspace, which is what
+makes the field live in production rather than a value only callers could fill.
+
+The lints sweep finished: `titi-cli` and `titi-tui` are scoped now (`b63140a`,
+`3315395`, `e0be096`), which took the `unwrap`/`expect` headers from 441 to
+**15** of 111 `warning:` lines (`cargo clippy --workspace --all-targets`,
+measured on this tree). What is left is production code — `titi-genome/src/
+refs.rs`'s three kept regex `.expect`s, `src/shared.rs`, `titi-memory/src/
+redact.rs`, `titi-tui/src/theme/mod.rs` — plus four in
+`titi-engine/tests/protocol.rs`, a test file that missed the sweep. Two files
+did: that one, and `titi-cli/tests/continue.rs`, which still carries the old
+blanket `#![allow(clippy::unwrap_used)]` because the sweep deliberately left it
+to the worker who owned it. One commit's scope is half wrong rather than its
+content: `e0be096` says `chore(cli)` and carries three `titi-tui/tests/*` files
+beside the thirteen cli ones — one concern, two crates. The docs surface landed
+with it: a `CHANGELOG.md` exists, newest-first and user-facing, and the README's
+placeholder link is gone (`240db13`).
+
+Taimyr phase 0 landed in `crates/titi-genome` only, one concern per commit:
+`91f17d8` (a file's content hash in `FileRecord`, so a same-size rewrite inside
+one mtime tick is not re-parsed), `d8f3deb` (the graph is recomputed only when
+a file's `(exports, imports, used_symbols)` tuple moved — the condition phase 1
+formalises), `d0eb4ed` (`Genome::apply_changes` for a path set the caller
+already knows, with no walk) and `580de37` (`SharedGenome`: the index behind
+`Arc<RwLock<Arc<Genome>>>`, published as one consistent snapshot), then
+`dca1460` wrapping the new code to rustfmt and `92b97ff` moving the example's
+assertions onto the file it touched. What phase 0 provably skips is those three
+things exactly: the parse when size and hash match, the rank pass when the
+tuple did not move, and the walk when the paths are named. Its own check is
+`cargo run -p titi-genome --example refresh -- .`, which asserted whole-tree
+counters until `92b97ff` made them the touched file's, because several agents
+edit this tree at once. The snapshot type has no production reader yet: the
+engine still keeps `Arc<Mutex<Option<Genome>>>` (queued). The design is
+`docs/research/genome-incremental.md` — dated, with its pipeline, its
+update-strategy table, its consistency contract, phases 0–5 each with the test
+that fails without it, and the `notify` decision confined to phase 3.
+
+The suite went 1812 → 1855 passed (77 targets, 0 failed): `titi-cli` unit +21,
+`titi-core` unit +7, `titi-genome` unit +3, genome `tests/index.rs` +7 and
+`titi-cli/tests/continue.rs` +5. The restored code in `chat.rs` was hand-wrapped
+and needed its own `style:` commit (`a3b63c5`) before the fmt job would pass.
