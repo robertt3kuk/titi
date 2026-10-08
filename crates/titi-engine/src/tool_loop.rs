@@ -164,10 +164,14 @@ pub(crate) async fn execute_tools(
             let _ = TOUCHING_TOOLS;
         }
         if let Some(recorder) = trajectory.lock().await.as_mut() {
+            // The trajectory writes the arguments to disk and keeps them for
+            // review, so they are masked here: this is the one place a
+            // `ToolCall` is recorded, and `titi-core`, which owns the writer,
+            // sits below `titi-memory` and cannot reach the redactor itself.
             let _ = recorder.record(titi_core::trajectory::EventKind::ToolCall {
                 id: call.call_id.to_string(),
                 name: call.name.to_string(),
-                args: args.clone(),
+                args: mask_args(&args, mask_ips),
             });
         }
         // A write-tier call takes an exclusive claim on its file, so a
@@ -282,6 +286,31 @@ fn mask(output: &str, mask_ips: bool) -> String {
         titi_memory::redact::redact_for_model(output).text
     } else {
         titi_memory::redact::redact(output).text
+    }
+}
+
+/// Masks every string inside a tool call's arguments, keys and non-strings
+/// left alone, so a credential a call carries is not written to the
+/// trajectory — the same redactor the answer and the diff go through.
+///
+/// This is the one place a `ToolCall` is recorded: the engine is the only
+/// producer, and `TrajectorySink` is handed down from the surface, so every
+/// turn — main, subagent, goal, council — funnels through here.
+fn mask_args(args: &serde_json::Value, mask_ips: bool) -> serde_json::Value {
+    use serde_json::Value;
+
+    match args {
+        Value::String(text) => Value::String(mask(text, mask_ips)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| mask_args(item, mask_ips)).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), mask_args(value, mask_ips)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

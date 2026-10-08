@@ -758,6 +758,67 @@ async fn tool_output_is_masked_before_the_trajectory_records_it() {
     assert!(recorded, "the trajectory recorded this call's result");
 }
 
+/// A tool call's arguments are persisted in the trajectory, so a credential
+/// they carry is masked before the call is recorded. The engine is the only
+/// producer of that event and masks at its single recording site, so every
+/// turn — main, subagent, goal — inherits it. Field names and the clean values
+/// around the key survive, so the record is still readable.
+#[tokio::test]
+async fn tool_arguments_are_masked_before_the_trajectory_records_them() {
+    use titi_core::trajectory::{EventKind, TrajectoryRecorder};
+    use titi_engine::TrajectorySink;
+    use tokio::sync::Mutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = TrajectoryRecorder::open(dir.path(), "sess").unwrap();
+    let trajectory: TrajectorySink = Arc::new(Mutex::new(Some(recorder)));
+    let secret = "sk-proj-abc1234567890xyz";
+    let args = serde_json::json!({
+        "text": format!("deployed with {secret}"),
+        "note": "/tmp/keep-me",
+    })
+    .to_string();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call_events("echo", &args)),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut engine = EngineRuntime::start_with_session(
+        EngineConfig::new("primary"),
+        resolver(transport),
+        None,
+        echo_registry(),
+        trajectory,
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let replay = TrajectoryRecorder::open(dir.path(), "sess").unwrap();
+    let recorded = replay
+        .tail(16)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::ToolCall { name, args, .. } if name == "echo" => Some(args),
+            _ => None,
+        })
+        .expect("the trajectory recorded the call");
+    let shown = recorded.to_string();
+    assert!(
+        !shown.contains(secret),
+        "the key is in the trajectory: {shown}"
+    );
+    assert!(shown.contains("[redacted]"), "the key is masked: {shown}");
+    assert!(
+        shown.contains("/tmp/keep-me"),
+        "a clean argument survives: {shown}"
+    );
+    assert!(shown.contains("note"), "the field names survive: {shown}");
+}
+
 /// The workspace tools, so the loop is driven by the real `write`.
 fn workspace_registry(root: &std::path::Path) -> ToolRegistry {
     let mut tools = ToolRegistry::new();

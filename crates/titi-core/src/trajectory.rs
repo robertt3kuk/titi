@@ -118,11 +118,25 @@ impl TrajectoryRecorder {
             Vec::new()
         };
         let next_seq = events.last().map_or(1, |e| e.seq + 1);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(TrajectoryError::Io)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // A trajectory repeats the session's tool calls and arguments, so it
+        // is as private as the session file. The umask can only clear bits a
+        // `0o600` request does not carry, so this is 0600 on create.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(TrajectoryError::Io)?;
+        // `mode` is only consulted at creation: a file an earlier build made
+        // 0644 keeps those bits until someone says otherwise.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(TrajectoryError::Io)?;
+        }
         Ok(Self {
             path,
             file: BufWriter::new(file),
@@ -133,6 +147,15 @@ impl TrajectoryRecorder {
 
     /// Appends an event with the current timestamp and the next sequence
     /// number, flushing to disk when the event closes a turn.
+    ///
+    /// The payload is written to the file exactly as it is passed, so a caller
+    /// recording a [`ToolCall`](EventKind::ToolCall) **must** mask its
+    /// arguments first — its `args` are a tool's own input, and a tool is
+    /// routinely handed a credential. The engine does, at its single
+    /// `ToolCall` recording site, and the event it hands back is the masked
+    /// one. Masking here would be better and is not possible: the workspace's
+    /// secret pattern set lives in `titi-memory`, which is layered above this
+    /// crate, so a dependency on it would point the graph backwards.
     pub fn record(&mut self, kind: EventKind) -> Result<TrajectoryEvent, TrajectoryError> {
         let e = TrajectoryEvent {
             ts: crate::session::entry::now_ms(),
@@ -463,5 +486,39 @@ mod tests {
             tool_call_digest("bash", &json!({"a": 1})),
             tool_call_digest("bash", &json!({"a": 2}))
         );
+    }
+
+    /// A trajectory repeats the session's tool calls, so it is as private as
+    /// the session file — on creation and, for a file an earlier build left
+    /// group- or world-readable, on the next open.
+    #[cfg(unix)]
+    #[test]
+    fn the_trajectory_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let mode = |path: &Path| {
+            fs::metadata(path)
+                .unwrap_or_else(|e| panic!("metadata: {e}"))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let mut r = open(dir.path());
+        r.record(EventKind::TurnEnd)
+            .unwrap_or_else(|e| panic!("record: {e}"));
+        assert_eq!(mode(r.path()), 0o600);
+        drop(r);
+
+        // A file an earlier build created with the default mode.
+        let loose = dir.path().join("trajectories").join("s2.jsonl");
+        fs::write(&loose, "").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|e| panic!("chmod: {e}"));
+        assert_eq!(mode(&loose), 0o644);
+
+        let r = TrajectoryRecorder::open(dir.path(), "s2").unwrap_or_else(|e| panic!("open: {e}"));
+        assert_eq!(mode(r.path()), 0o600, "a loose trajectory is tightened");
     }
 }
