@@ -17,15 +17,16 @@ use std::time::SystemTime;
 pub mod ast_edit;
 
 mod graph;
+mod lang;
 mod lsp;
-mod parse;
 mod project;
 mod query;
+mod refs;
 mod scan;
 mod symbols;
 
+pub use lang::{Language, Level};
 pub use lsp::serve_lsp;
-pub use parse::Language;
 pub use project::render;
 pub use scan::list_files;
 
@@ -290,7 +291,7 @@ fn parse_batch(stale: &[&scan::ListedFile], known: &HashSet<String>) -> Vec<File
 
 fn parse_one(file: &scan::ListedFile, known: &HashSet<String>) -> FileRecord {
     let source = fs::read_to_string(&file.abs).unwrap_or_default();
-    let result = parse::parse(&file.path, &source, known);
+    let result = lang::parse(&file.path, &source, known);
     FileRecord {
         language: Language::from_path(&file.path),
         path: file.path.clone(),

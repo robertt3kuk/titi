@@ -420,7 +420,14 @@ fn language_detection_covers_the_indexed_extensions() {
     use titi_genome::Language;
     for (path, expected) in [
         ("a.rs", Language::Rust),
+        ("a.ts", Language::TypeScript),
         ("a.tsx", Language::TypeScript),
+        ("a.mts", Language::TypeScript),
+        ("a.js", Language::JavaScript),
+        ("a.jsx", Language::JavaScript),
+        ("a.mjs", Language::JavaScript),
+        ("a.cjs", Language::JavaScript),
+        ("a.pyi", Language::Python),
         ("a.py", Language::Python),
         ("a.go", Language::Go),
         ("A.java", Language::Java),
@@ -433,7 +440,7 @@ fn language_detection_covers_the_indexed_extensions() {
         ("a.kt", Language::Kotlin),
         ("a.swift", Language::Swift),
         ("a.php", Language::Php),
-        ("a.txt", Language::Other),
+        ("a.txt", Language::Unsupported),
     ] {
         assert_eq!(Language::from_path(path), expected, "{path}");
     }

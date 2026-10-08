@@ -150,8 +150,8 @@ fn should_prune_dir(name: &str) -> bool {
 }
 
 fn is_source(name: &str) -> bool {
-    // One source of truth: the language table in `parse` owns the extensions.
-    crate::parse::is_source_file(name)
+    // One source of truth: the language table in `lang` owns the extensions.
+    crate::lang::is_source_file(name)
 }
 
 fn is_ignored(rel: &str, is_dir: bool, rules: &[Rule]) -> bool {

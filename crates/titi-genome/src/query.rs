@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 
-use crate::parse;
+use crate::refs;
 use crate::{Diagnostic, ExportSite, Genome, Location, MAX_DEFINERS, Severity};
 
 const CHECK_LIMIT: usize = 32;
@@ -92,7 +92,7 @@ impl Genome {
         if let Some(site) = self.site_covering(path, &name, line, character) {
             return Some(location(path, site));
         }
-        if !parse::is_resolvable_mention(&source, name_start) {
+        if !refs::is_resolvable_mention(&source, name_start) {
             return None;
         }
         let symbol = self.symbols.get(&name)?;
@@ -202,7 +202,7 @@ fn is_ambiguous_report(name: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|first| first.is_ascii_uppercase())
-        && !parse::is_noise_name(name)
+        && !refs::is_noise_name(name)
         && name != "new"
         && name != "get"
         && name != "join"

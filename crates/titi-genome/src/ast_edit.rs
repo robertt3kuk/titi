@@ -17,6 +17,7 @@
 
 use tree_sitter::Node;
 
+use crate::lang::grammar_for;
 use crate::symbols::{Grammar, parse};
 
 /// Which family of declaration a target names.
@@ -175,7 +176,7 @@ impl AstEditError {
 ///
 /// Errors exactly as [`apply`] does, minus [`AstEditError::BrokenResult`].
 pub fn find(path: &str, source: &str, target: &Target) -> Result<Span, AstEditError> {
-    let grammar = Grammar::from_path(path).ok_or_else(|| AstEditError::UnsupportedLanguage {
+    let grammar = grammar_for(path).ok_or_else(|| AstEditError::UnsupportedLanguage {
         path: path.to_owned(),
     })?;
     let tree = parse(grammar, source).ok_or_else(|| AstEditError::Unparsable {
@@ -246,7 +247,7 @@ pub fn apply(
     edited.push_str(replacement);
     edited.push_str(after);
 
-    let grammar = Grammar::from_path(path).ok_or_else(|| AstEditError::UnsupportedLanguage {
+    let grammar = grammar_for(path).ok_or_else(|| AstEditError::UnsupportedLanguage {
         path: path.to_owned(),
     })?;
     let reparsed = parse(grammar, &edited).ok_or_else(|| AstEditError::BrokenResult {
