@@ -2667,7 +2667,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "titi-providers",
- "titi-tools",
 ]
 
 [[package]]
@@ -2767,7 +2766,6 @@ dependencies = [
  "smol_str",
  "tempfile",
  "thiserror 2.0.20",
- "titi-config",
  "titi-providers",
  "tokio",
 ]
@@ -2777,12 +2775,10 @@ name = "titi-tui"
 version = "0.1.0"
 dependencies = [
  "base64",
- "crossterm",
  "image",
  "serde",
  "serde_json",
  "serde_yaml",
- "titi-core",
  "unicode-width",
 ]
 
