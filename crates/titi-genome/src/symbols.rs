@@ -124,6 +124,27 @@ pub(crate) struct Extract {
     pub parsed: bool,
     pub sites: Vec<crate::ExportSite>,
     pub syntax_errors: u32,
+    /// Rust `use`/`mod` items, from the syntax tree rather than a line regex.
+    /// Empty for every other language and for a file whose grammar refused the
+    /// input. The caller must not fall back to pattern matching: an unparsed
+    /// file has no established imports, and guessing them from text is what
+    /// made comment and string-literal `use` lines into phantom imports.
+    pub rust_imports: Vec<RustImport>,
+}
+
+/// One Rust import site, flattened to the path it names.
+///
+/// `use a::{b, c as d}` yields two: `["a", "b"]` and `["a", "c"]`. A bare
+/// `mod x;` is one with `is_mod`, whose resolution is relative to the module
+/// that declares it and whose spec to report is just `x`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RustImport {
+    pub segments: Vec<String>,
+    /// Inline `mod` names enclosing the declaration, outermost first. This is
+    /// what makes `super::*` inside `#[cfg(test)] mod tests` resolve to the
+    /// file's own module instead of a directory one level too high.
+    pub mods: Vec<String>,
+    pub is_mod: bool,
 }
 
 pub(crate) fn extract(path: &str, source: &str) -> Extract {
@@ -132,6 +153,7 @@ pub(crate) fn extract(path: &str, source: &str) -> Extract {
             parsed: false,
             sites: Vec::new(),
             syntax_errors: 0,
+            rust_imports: Vec::new(),
         };
     };
     let Some(tree) = parse(grammar, source) else {
@@ -139,12 +161,18 @@ pub(crate) fn extract(path: &str, source: &str) -> Extract {
             parsed: false,
             sites: Vec::new(),
             syntax_errors: 1,
+            rust_imports: Vec::new(),
         };
     };
     let bytes = source.as_bytes();
     let mut sites = Vec::new();
+    let mut rust_imports = Vec::new();
     match grammar {
-        Grammar::Rust => rust_items(tree.root_node(), bytes, false, &mut sites),
+        Grammar::Rust => {
+            rust_items(tree.root_node(), bytes, false, &mut sites);
+            let mut cursor = Vec::new();
+            collect_rust_imports(tree.root_node(), bytes, &mut cursor, &mut rust_imports);
+        }
         Grammar::TypeScript | Grammar::Tsx => ts_module(tree.root_node(), bytes, &mut sites),
         Grammar::Python => python_module(tree.root_node(), bytes, &mut sites),
     }
@@ -152,6 +180,7 @@ pub(crate) fn extract(path: &str, source: &str) -> Extract {
         parsed: true,
         sites,
         syntax_errors: count_errors(tree.root_node(), source, grammar),
+        rust_imports,
     }
 }
 
@@ -256,6 +285,126 @@ fn text(node: Node, source: &[u8]) -> Option<String> {
 fn has_child_kind(node: Node, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|child| child.kind() == kind)
+}
+
+/// Collects every `use_declaration` and body-less `mod_item`, remembering the
+/// inline `mod`s each one sits inside. Walking the tree is what makes a `use`
+/// inside a comment, a string, or a raw-string fixture invisible: it never
+/// becomes a node. `mods` is the inline-module stack, outermost first.
+fn collect_rust_imports(
+    node: Node,
+    source: &[u8],
+    mods: &mut Vec<String>,
+    out: &mut Vec<RustImport>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "use_declaration" => {
+                if let Some(argument) = child.child_by_field_name("argument") {
+                    let mut prefix = Vec::new();
+                    flatten_use(argument, source, &mut prefix, mods, out);
+                }
+            }
+            "mod_item" => {
+                let name = child
+                    .child_by_field_name("name")
+                    .and_then(|name| text(name, source));
+                if child.child_by_field_name("body").is_some() {
+                    if let Some(name) = name {
+                        mods.push(name);
+                        collect_rust_imports(child, source, mods, out);
+                        mods.pop();
+                    }
+                } else if let Some(name) = name {
+                    out.push(RustImport {
+                        segments: vec![name],
+                        mods: mods.clone(),
+                        is_mod: true,
+                    });
+                }
+            }
+            _ => collect_rust_imports(child, source, mods, out),
+        }
+    }
+}
+
+/// Flattens one `use` argument into the full paths it names: `a::{b, c as d}`
+/// becomes `a::b` and `a::c`, a glob keeps its `*` tail.
+fn flatten_use(
+    node: Node,
+    source: &[u8],
+    prefix: &mut Vec<String>,
+    mods: &[String],
+    out: &mut Vec<RustImport>,
+) {
+    match node.kind() {
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                flatten_use(child, source, prefix, mods, out);
+            }
+        }
+        "scoped_use_list" => {
+            let saved = prefix.len();
+            if let Some(path) = node.child_by_field_name("path") {
+                push_path(path, source, prefix);
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                flatten_use(list, source, prefix, mods, out);
+            }
+            prefix.truncate(saved);
+        }
+        "use_as_clause" => {
+            // The alias renames the path for the caller; it does not change
+            // which file the path names.
+            if let Some(path) = node.child_by_field_name("path") {
+                flatten_use(path, source, prefix, mods, out);
+            }
+        }
+        "use_wildcard" => {
+            let saved = prefix.len();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                push_path(child, source, prefix);
+            }
+            prefix.push("*".to_owned());
+            out.push(RustImport {
+                segments: prefix.clone(),
+                mods: mods.to_vec(),
+                is_mod: false,
+            });
+            prefix.truncate(saved);
+        }
+        _ => {
+            let saved = prefix.len();
+            push_path(node, source, prefix);
+            out.push(RustImport {
+                segments: prefix.clone(),
+                mods: mods.to_vec(),
+                is_mod: false,
+            });
+            prefix.truncate(saved);
+        }
+    }
+}
+
+/// Appends the segments of one path node (`crate`, `super`, `self`, `a::b`).
+fn push_path(node: Node, source: &[u8], prefix: &mut Vec<String>) {
+    if node.kind() == "scoped_identifier" {
+        if let Some(path) = node.child_by_field_name("path") {
+            push_path(path, source, prefix);
+        }
+        if let Some(name) = node.child_by_field_name("name")
+            && let Some(segment) = text(name, source)
+        {
+            prefix.push(segment);
+        }
+        return;
+    }
+    if let Some(segment) = text(node, source) {
+        prefix.push(segment);
+    }
 }
 
 /// Rust: everything reachable from outside the module, so `pub` items at any

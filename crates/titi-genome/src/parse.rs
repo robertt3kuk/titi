@@ -770,44 +770,160 @@ fn resolve_suffix(spec: &str, exts: &[&str], files: &HashSet<String>) -> Option<
     None
 }
 
-/// Imports stay pattern-based: a `use` path is a module specifier, not a
-/// declaration, and resolving it needs the repo's file set rather than a
-/// syntax tree. Only the symbols moved to the grammar.
+/// Rust imports come from the syntax tree ([`symbols::extract`]), not from a
+/// line regex. A `use` in a comment, in a string literal, or in the raw-string
+/// fixture an integration test writes is not an import; a braced
+/// `use crate::{a, b}` is two paths, not the truncated `crate::` a `[^;{]+`
+/// capture leaves behind. Resolution stays here: it needs the repo's file set,
+/// which is a module index, not a syntax tree.
 fn parse_rust(path: &str, source: &str, files: &std::collections::HashSet<String>) -> ParsedFile {
-    static USES: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([^;{]+)").expect("use regex"));
-    static MODS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^\s*(?:pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").expect("mod regex")
-    });
-    let (uses_re, mods_re) = (&*USES, &*MODS);
-
     let extracted = symbols::extract(path, source);
     let syntax_errors = grammar_errors(path, &extracted);
     let mut imports = Vec::new();
     let mut unresolved = Vec::new();
-    for cap in uses_re.captures_iter(source) {
-        let raw = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        // `std` and external crates are not workspace lookups. Only a
-        // crate/super/self path can fail to resolve to a known file.
-        if raw.starts_with("crate::") || raw.starts_with("super::") || raw.starts_with("self::") {
-            note_resolved(
-                resolve_rust_use(path, raw, files),
-                raw,
-                &mut imports,
-                &mut unresolved,
-            );
+    for item in &extracted.rust_imports {
+        // A bare path is an external crate or a std path — `serde_json::json`,
+        // `std::collections::HashMap` — not a workspace lookup. Only the three
+        // crate/super/self prefixes name a file in this repo, exactly as
+        // before; a `mod x;` names a child of the module that declares it.
+        if !item.is_mod
+            && !matches!(
+                item.segments.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        {
+            continue;
         }
-    }
-    for cap in mods_re.captures_iter(source) {
-        let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let resolved = resolve_rust_import(path, item, files);
+        if resolved.as_deref() == Some(path) {
+            // `use super::*` inside an inline `mod` names the file's own
+            // module. That is a self-edge, not a dependency, and reporting it
+            // unresolved would claim a problem with a file that has none.
+            continue;
+        }
         note_resolved(
-            resolve_child_module(path, name, files),
-            name,
+            resolved,
+            &item.segments.join("::"),
             &mut imports,
             &mut unresolved,
         );
     }
     finish(source, extracted.sites, imports, unresolved, syntax_errors)
+}
+
+/// Where one import lands, at file granularity.
+///
+/// `crate::` starts at the crate root's module directory, `self::` at the
+/// module the declaration sits in (its file plus every enclosing inline `mod`),
+/// `super::` at that module's parent. A bare path (`use regex::Regex`) is an
+/// external crate or a std path, exactly as before: only those three prefixes
+/// are workspace lookups. A `mod x;` is a child of the module that declares it.
+fn resolve_rust_import(
+    from: &str,
+    item: &symbols::RustImport,
+    files: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let mut dir = module_children_dir(from);
+    for name in &item.mods {
+        dir = join(&dir, name);
+    }
+    if item.is_mod {
+        let name = item.segments.first()?;
+        return resolve_module_path(&dir, &[name], files);
+    }
+    let mut rest = &item.segments[1..];
+    match item.segments.first().map(String::as_str)? {
+        "crate" => dir = crate_root(from, files),
+        "self" => {}
+        "super" => {
+            // The `super` consumed by the slice above is the first step up.
+            let mut depth = 1;
+            while rest.first().map(String::as_str) == Some("super") {
+                depth += 1;
+                rest = &rest[1..];
+            }
+            for _ in 0..depth {
+                dir = parent(&dir)?.to_owned();
+            }
+        }
+        _ => return None,
+    }
+    let segments: Vec<&str> = rest.iter().map(String::as_str).collect();
+    resolve_use_path(&dir, &segments, files)
+}
+
+/// The directory a Rust module's child modules live in. `foo/mod.rs` and a
+/// crate root keep their own directory; `foo.rs` defines the module `foo`,
+/// whose children live in `foo/`.
+fn module_children_dir(path: &str) -> String {
+    let name = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
+    if matches!(name, "lib.rs" | "main.rs" | "mod.rs") {
+        return parent(path).unwrap_or("").to_owned();
+    }
+    match path.strip_suffix(".rs") {
+        Some(stem) => stem.to_owned(),
+        None => parent(path).unwrap_or("").to_owned(),
+    }
+}
+
+/// The file that defines the module whose children live in `dir`.
+fn module_file(dir: &str, files: &std::collections::HashSet<String>) -> Option<String> {
+    for name in ["mod.rs", "lib.rs", "main.rs"] {
+        let candidate = join(dir, name);
+        if files.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    let sibling = format!("{dir}.rs");
+    files.contains(&sibling).then_some(sibling)
+}
+
+/// Resolves a path whose every segment must name a module. The empty path is
+/// the module that lives in `dir` itself.
+fn resolve_module_path(
+    dir: &str,
+    segments: &[&str],
+    files: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if segments.is_empty() {
+        return module_file(dir, files);
+    }
+    let joined = segments.join("/");
+    let rel = if dir.is_empty() {
+        joined
+    } else {
+        format!("{dir}/{joined}")
+    };
+    [format!("{rel}.rs"), format!("{rel}/mod.rs")]
+        .into_iter()
+        .find(|candidate| files.contains(candidate))
+}
+
+/// Resolves a `use` path: the longest prefix that names a module decides the
+/// file, so only the trailing segments may be items. A one-segment path may be
+/// an item of `dir`'s own module (`use crate::Genome` at the crate root), which
+/// no prefix can name as a file; a longer path whose module prefix is missing
+/// (`use crate::missing::Thing`) stays unresolved.
+fn resolve_use_path(
+    dir: &str,
+    segments: &[&str],
+    files: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if segments.is_empty() {
+        return module_file(dir, files);
+    }
+    if segments.last() == Some(&"*") {
+        return resolve_module_path(dir, &segments[..segments.len() - 1], files);
+    }
+    for take in (1..=segments.len()).rev() {
+        if let Some(file) = resolve_module_path(dir, &segments[..take], files) {
+            return Some(file);
+        }
+    }
+    if segments.len() == 1 {
+        return module_file(dir, files);
+    }
+    None
 }
 
 fn parse_typescript(
@@ -866,56 +982,6 @@ fn grammar_errors(path: &str, extracted: &symbols::Extract) -> u32 {
     } else {
         0
     }
-}
-
-fn resolve_rust_use(
-    from: &str,
-    raw: &str,
-    files: &std::collections::HashSet<String>,
-) -> Option<String> {
-    let raw = raw.trim();
-    if raw.starts_with("crate::") {
-        let segs: Vec<&str> = raw.trim_start_matches("crate::").split("::").collect();
-        return resolve_from_dir(&crate_root(from, files), &segs, files);
-    }
-    if raw.starts_with("super::") {
-        let mut depth = 0;
-        let mut rest = raw;
-        while let Some(stripped) = rest.strip_prefix("super::") {
-            depth += 1;
-            rest = stripped;
-        }
-        let mut dir = parent(from)?;
-        for _ in 0..depth {
-            dir = parent(dir)?;
-        }
-        let segs: Vec<&str> = rest.split("::").collect();
-        return resolve_from_dir(dir, &segs, files);
-    }
-    if let Some(rest) = raw.strip_prefix("self::") {
-        let segs: Vec<&str> = rest.split("::").collect();
-        return resolve_from_dir(parent(from).unwrap_or(""), &segs, files);
-    }
-    None
-}
-
-fn resolve_child_module(
-    from: &str,
-    name: &str,
-    files: &std::collections::HashSet<String>,
-) -> Option<String> {
-    let dir = if from.ends_with("/lib.rs")
-        || from.ends_with("/main.rs")
-        || from.ends_with("lib.rs")
-        || from.ends_with("main.rs")
-    {
-        parent(from).unwrap_or("")
-    } else if let Some(stem) = from.strip_suffix(".rs") {
-        stem
-    } else {
-        parent(from).unwrap_or("")
-    };
-    resolve_from_dir(dir, &[name], files)
 }
 
 fn crate_root(from: &str, files: &std::collections::HashSet<String>) -> String {
