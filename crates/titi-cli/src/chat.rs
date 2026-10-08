@@ -32,6 +32,7 @@ use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
 use titi_tui::caps::MousePreset;
+use titi_tui::markdown::{Section, SectionMode, SectionVisibility};
 use titi_tui::selection::Selection;
 use titi_tui::status_bar::{
     StatusLinePreset, StatusLineStyle, StatusSnapshot, live_snapshot, short_model,
@@ -451,6 +452,17 @@ pub enum LineKind {
     /// (`titi_tui::status::TurnFooter`). Not a line of the conversation, so it
     /// is never written to the session file.
     Usage,
+    /// The reasoning row while it is the newest thing on screen. Its own kind
+    /// because reasoning is a section of its own (`/details thinking …`).
+    Thinking,
+    /// What a subagent did, as the engine reported it. A section of its own
+    /// (`/details subagents …`), because subagent chatter is what the default
+    /// transcript folds away.
+    Agent,
+    /// A compaction's fold divider. Not a line of the conversation: it stands
+    /// for the history above it, which is drawn only while the folded section
+    /// is expanded.
+    Fold,
 }
 
 impl LineKind {
@@ -464,6 +476,26 @@ impl LineKind {
             LineKind::Error => "error",
             LineKind::Note => "note",
             LineKind::Usage => "usage",
+            LineKind::Thinking => "thinking",
+            LineKind::Agent => "agent",
+            LineKind::Fold => "fold",
+        }
+    }
+
+    /// The named section this line belongs to, for `/details`.
+    ///
+    /// `None` is the conversation itself — the user's own questions and the
+    /// assistant's answers — which no visibility switch touches: a section
+    /// hides a class of the turn's furniture, never what was said. The fold
+    /// divider is `None` here too; it has a switch of its own
+    /// ([`Details::folded`]).
+    fn section(self) -> Option<Section> {
+        match self {
+            LineKind::User | LineKind::Assistant | LineKind::Fold => None,
+            LineKind::Thinking => Some(Section::Thinking),
+            LineKind::Tool | LineKind::Diff => Some(Section::Tools),
+            LineKind::Agent => Some(Section::Subagents),
+            LineKind::Error | LineKind::Note | LineKind::Usage => Some(Section::Activity),
         }
     }
 }
@@ -472,6 +504,182 @@ impl LineKind {
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+}
+
+/// What `/details` reaches: the transcript's four named sections
+/// (`titi_tui::markdown`'s own types, the module the deleted `transcript.rs`
+/// drove) and the compaction fold's divider.
+///
+/// A section's lines are visible while it is expanded, stand as one counted
+/// header while it is collapsed, and are not drawn at all while it is hidden.
+/// The conversation itself is not a section and is never hidden.
+#[derive(Debug, Clone)]
+struct Details {
+    sections: SectionVisibility,
+    /// The fold's own switch. The divider is not an entry of the four — it
+    /// stands for the history above it — so it has a mode of its own, but
+    /// `/details` reaches it by name like any other.
+    folded: SectionMode,
+}
+
+impl Details {
+    /// The defaults the old transcript module documented, with one departure.
+    ///
+    /// `SectionVisibility::default()` is that DoD exactly — thinking and tools
+    /// expanded, subagents collapsed, activity hidden — and this surface keeps
+    /// three of the four. Activity is the one it cannot keep: here those lines
+    /// are the answers `/usage`, `/context`, `/jobs`, `/recap` and a switch to
+    /// another session give, so a hidden default would be a command that
+    /// prints nothing at all. The mode is still reachable, so `/details
+    /// activity hidden` does what the DoD asked — on purpose, not by default.
+    ///
+    /// The fold starts collapsed: that is the point of the divider, and what
+    /// keeps a compacted transcript a line instead of the wall it replaced.
+    /// Before the first compaction there is no divider to show.
+    fn new() -> Self {
+        let mut sections = SectionVisibility::default();
+        sections.set(Section::Activity, SectionMode::Expanded);
+        Self {
+            sections,
+            folded: SectionMode::Collapsed,
+        }
+    }
+
+    /// Apply one `/details` directive: `"<section> <mode>"`, `"<section>"`
+    /// (which reports the mode it is on), or a whole-word `"<mode>"` over
+    /// every section and the fold.
+    ///
+    /// `None` when the directive names nothing this screen knows, `Some("")`
+    /// when it moved something the transcript itself now shows, and
+    /// `Some(line)` when there is something to say back.
+    fn apply(&mut self, directive: &str) -> Option<String> {
+        let mut parts = directive.split_whitespace();
+        let first = parts.next()?;
+        let second = parts.next();
+        // A third word is not a directive: nothing is guessed out of it.
+        if parts.next().is_some() {
+            return None;
+        }
+        match second {
+            Some(mode) => {
+                if !self.set(first, mode) {
+                    return None;
+                }
+                // The mode is read back off the section, so what is confirmed
+                // is what the next frame will do.
+                Some(format!("details: {first} {}", self.mode_label(first)?))
+            }
+            None => {
+                if let Some(mode) = self.mode_label(first) {
+                    return Some(format!("details: {first} {mode}"));
+                }
+                if !is_mode_word(first) {
+                    return None;
+                }
+                for section in
+                    [Section::Thinking, Section::Tools, Section::Subagents, Section::Activity]
+                {
+                    self.apply_to(section, first);
+                }
+                apply_mode(&mut self.folded, first);
+                // The sections move together, but a cycle sends each from
+                // wherever it was, so there is no single mode to report.
+                Some(String::new())
+            }
+        }
+    }
+
+    /// The listing a bare `/details` answers with: every section and the mode
+    /// it is on, which is the only way to see the state without guessing.
+    fn list(&self) -> String {
+        let parts: Vec<String> = ["thinking", "tools", "subagents", "activity", FOLDED_SECTION]
+            .iter()
+            .filter_map(|name| {
+                self.mode_label(name)
+                    .map(|mode| format!("{name} {mode}"))
+            })
+            .collect();
+        format!("details: {}", parts.join(" · "))
+    }
+
+    /// `<name> <mode>` for one named section or the fold. `false` when either
+    /// half is unknown, in which case nothing moved.
+    fn set(&mut self, name: &str, mode: &str) -> bool {
+        if name.eq_ignore_ascii_case(FOLDED_SECTION) {
+            return apply_mode(&mut self.folded, mode);
+        }
+        match Section::parse(name) {
+            Some(section) => self.apply_to(section, mode),
+            None => false,
+        }
+    }
+
+    fn apply_to(&mut self, section: Section, mode: &str) -> bool {
+        let mut current = self.sections.get(section);
+        if !apply_mode(&mut current, mode) {
+            return false;
+        }
+        let changed = self.sections.get(section) != current;
+        self.sections.set(section, current);
+        changed
+    }
+
+    /// The mode a named section or the fold is on, or `None` for a name
+    /// neither of them has.
+    fn mode(&self, name: &str) -> Option<SectionMode> {
+        if name.eq_ignore_ascii_case(FOLDED_SECTION) {
+            return Some(self.folded);
+        }
+        Some(self.sections.get(Section::parse(name)?))
+    }
+
+    /// The name a mode is spelled with, for the line `/details` answers with.
+    fn mode_label(&self, name: &str) -> Option<&'static str> {
+        Some(match self.mode(name)? {
+            SectionMode::Hidden => "hidden",
+            SectionMode::Collapsed => "collapsed",
+            SectionMode::Expanded => "expanded",
+        })
+    }
+}
+
+/// The fold's name in `/details`, beside the four the old module had.
+const FOLDED_SECTION: &str = "folded";
+
+/// The three mode words, as `/details` spells them.
+fn parse_mode(word: &str) -> Option<SectionMode> {
+    match word.to_lowercase().as_str() {
+        "hidden" => Some(SectionMode::Hidden),
+        "collapsed" => Some(SectionMode::Collapsed),
+        "expanded" => Some(SectionMode::Expanded),
+        _ => None,
+    }
+}
+
+/// Whether a word is a `/details` mode at all — the three names or `cycle`.
+fn is_mode_word(word: &str) -> bool {
+    parse_mode(word).is_some() || word.eq_ignore_ascii_case("cycle")
+}
+
+/// One section's or the fold's mode moved by a `/details` word: one of the
+/// three names, or `cycle` (hidden → collapsed → expanded → hidden, the order
+/// the old `SectionVisibility::apply` walked). `false` for anything else.
+fn apply_mode(current: &mut SectionMode, word: &str) -> bool {
+    let next = if word.eq_ignore_ascii_case("cycle") {
+        match current {
+            SectionMode::Hidden => SectionMode::Collapsed,
+            SectionMode::Collapsed => SectionMode::Expanded,
+            SectionMode::Expanded => SectionMode::Hidden,
+        }
+    } else {
+        match parse_mode(word) {
+            Some(mode) => mode,
+            None => return false,
+        }
+    };
+    let changed = *current != next;
+    *current = next;
+    changed
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,6 +968,8 @@ pub struct Chat {
     probe_bytes: Option<Vec<u8>>,
     /// The Ctrl+R / ↑ browser over this session's own prompts; `None` = closed.
     history_picker: Option<HistoryPicker>,
+    /// Which transcript sections are drawn, and how: the `/details` state.
+    details: Details,
 }
 
 impl Chat {
@@ -847,6 +1057,7 @@ impl Chat {
             probe_sent: None,
             probe_bytes: None,
             history_picker: None,
+            details: Details::new(),
         }
     }
 
@@ -1688,8 +1899,20 @@ impl Chat {
                 self.push(LineKind::Note, line);
                 Applied::none()
             }
-            EngineEvent::Compacted { folded, .. } => {
-                self.push(LineKind::Note, format!("folded {folded} earlier messages"));
+            EngineEvent::Compacted {
+                folded,
+                tokens_before,
+                ..
+            } => {
+                // A divider, not a note: it stands for the history above it,
+                // which the fold keeps off the screen until `/details folded
+                // expanded`. Both numbers come from this payload — the count
+                // and the tokens the engine held when it folded — because the
+                // transcript cannot know either by looking at itself.
+                self.push(
+                    LineKind::Fold,
+                    fold_divider_label(folded, tokens_before),
+                );
                 Applied::none()
             }
             EngineEvent::ContextBreakdown { parts, window } => {
@@ -1845,7 +2068,7 @@ impl Chat {
                 Applied::none()
             }
             EngineEvent::AgentStarted { name, .. } => {
-                self.push(LineKind::Tool, format!("tool agent {name}: started"));
+                self.push(LineKind::Agent, format!("tool agent {name}: started"));
                 Applied::none()
             }
             EngineEvent::AgentFinished {
@@ -1856,12 +2079,12 @@ impl Chat {
             } => {
                 if success {
                     self.push(
-                        LineKind::Tool,
+                        LineKind::Agent,
                         format!("tool done  agent {agent_id}: {summary}"),
                     );
                 } else {
                     self.push(
-                        LineKind::Tool,
+                        LineKind::Agent,
                         format!("tool error agent {agent_id}: {summary}"),
                     );
                 }
@@ -2291,6 +2514,7 @@ impl Chat {
             "usage" => self.usage(),
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
+            "details" => self.details(args),
             "help" => self.help(),
             "login" => self.login(args),
             "logout" => self.logout(args),
@@ -4231,6 +4455,38 @@ impl Chat {
         }))
     }
 
+    /// `/details`: bare lists every section and the mode it is on; a section
+    /// alone reports it; `"<section> <mode>"` moves one; a whole-word mode or
+    /// `cycle` moves every section and the fold.
+    ///
+    /// The render reads the same state the next frame is drawn from, so the
+    /// line answers with what the screen does rather than with what was asked.
+    fn details(&mut self, args: &str) -> Applied {
+        let directive = args.trim();
+        if directive.is_empty() {
+            self.push(LineKind::Note, self.details.list());
+            return Applied::none();
+        }
+        match self.details.apply(directive) {
+            Some(line) if line.is_empty() => Applied::none(),
+            Some(line) => {
+                self.push(LineKind::Note, line);
+                Applied::none()
+            }
+            None => {
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "details: no such section or mode ({directive}) · \
+                         try /details thinking|tools|subagents|activity|folded \
+                         hidden|collapsed|expanded|cycle"
+                    ),
+                );
+                Applied::none()
+            }
+        }
+    }
+
     /// The context breakdown, part by part. The share is of what is in the
     /// window now, so the parts add up to the total on the last line, and
     /// that total is what is reported against the window.
@@ -4400,7 +4656,7 @@ impl Chat {
             return;
         }
         self.lines.push(TranscriptLine {
-            kind: LineKind::Note,
+            kind: LineKind::Thinking,
             text,
         });
         self.thinking_at = Some(self.lines.len() - 1);
@@ -4719,6 +4975,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "compact",
         about: "fold the history now, optionally around a focus",
+    },
+    Command {
+        name: "details",
+        about: "show or set a transcript section (thinking, tools, subagents, activity, folded)",
     },
     Command {
         name: "context",
@@ -7394,21 +7654,71 @@ fn transcript(
         .rposition(|line| line.kind == LineKind::Assistant);
     let mut rows: Vec<TranscriptRow> = Vec::new();
     let mut links: Vec<(usize, LinkRow)> = Vec::new();
+    // The section modes, read once: rendering wants `&mut chat` for the
+    // newest answer's rows, so the state has to be out of the borrow before
+    // the loop.
+    let modes = SECTIONS.map(|section| chat.details.sections.get(section));
+    let folded = chat.details.folded;
+    // The newest compaction's divider. The lines before it are the history the
+    // fold stands for: they are drawn while the folded section is expanded, so
+    // a compacted transcript is short by default and whole on request.
+    let fold_at = owned.iter().rposition(|line| line.kind == LineKind::Fold);
+    let mut headers_drawn: HashSet<Section> = HashSet::new();
+    let mut last_role: Option<BlockRole> = None;
     for (index, line) in owned.iter().enumerate() {
+        if let Some(at) = fold_at {
+            if index < at && folded != SectionMode::Expanded {
+                continue;
+            }
+            if index == at && folded == SectionMode::Hidden {
+                continue;
+            }
+        }
+        // A section's own visibility, before anything is drawn: hidden lines
+        // are not rows, and a collapsed section's lines become one counted
+        // header where its first line would have been.
+        if let Some(section) = line.kind.section() {
+            let mode = modes[section_index(section)];
+            match mode {
+                SectionMode::Expanded => {}
+                SectionMode::Hidden => continue,
+                SectionMode::Collapsed => {
+                    if headers_drawn.insert(section) {
+                        let count = owned
+                            .iter()
+                            .filter(|line| line.kind.section() == Some(section))
+                            .count();
+                        if !rows.is_empty() {
+                            rows.push(TranscriptRow::Text(Line::from("")));
+                        }
+                        rows.push(TranscriptRow::Text(section_header(
+                            section, count, theme, inner,
+                        )));
+                        last_role = Some(BlockRole::Turn);
+                    }
+                    continue;
+                }
+            }
+        }
         // Air where the writer changes, and nowhere else: one turn's own
         // blocks — its text, its tool chips, the diffs under them, its notes —
         // stay one body, and a wrapped row is not a block of its own.
         let changes_writer =
-            index > 0 && owned[index - 1].kind.block_role() != line.kind.block_role();
+            last_role.is_some_and(|role| role != line.kind.block_role());
         if changes_writer && !rows.is_empty() {
             rows.push(TranscriptRow::Text(Line::from("")));
         }
         let base = rows.len();
+        last_role = Some(line.kind.block_role());
         let (texts, line_links) = if line.kind == LineKind::Assistant {
             (
                 chat.assistant_rows(newest_reply == Some(index), &line.text, inner, theme),
                 Vec::new(),
             )
+        } else if line.kind == LineKind::Fold {
+            // The divider carries the fold's own chevron, which the state
+            // above — not the line — decides.
+            (vec![fold_divider(&line.text, folded, theme, inner)], Vec::new())
         } else {
             message_rows(line, inner, theme)
         };
@@ -7657,6 +7967,84 @@ fn consider_image(found: &mut Vec<String>, raw: &str) {
     }
 }
 
+/// The fold divider's own words, from the `Compacted` payload: how many
+/// messages went into the digest and how many tokens the request held when it
+/// happened. The mark and whether the history under it is drawn come from
+/// [`Details::folded`], so the same line reads `▸` collapsed and `▾` expanded.
+fn fold_divider_label(folded: u32, tokens_before: u64) -> String {
+    let tokens = u32::try_from(tokens_before).unwrap_or(u32::MAX);
+    format!(
+        "folded {folded} turns · {} tokens",
+        titi_tui::status::compact_tokens(tokens)
+    )
+}
+
+/// The fold divider as a row: the fold's mark, then the payload's own words.
+fn fold_divider(text: &str, mode: SectionMode, theme: &Theme, width: usize) -> Line<'static> {
+    let mark = match mode {
+        SectionMode::Expanded => "▾",
+        // The caller drops a hidden divider before it gets here, so a mark is
+        // only ever the collapsed one; a collapsed means the history under it
+        // is not drawn.
+        SectionMode::Hidden | SectionMode::Collapsed => "▸",
+    };
+    chip(
+        (mark, ThemeColor::Dim, text.to_owned(), ThemeColor::Dim),
+        theme,
+        width,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default()
+}
+
+/// The four named sections, in the order `/details` lists them and the mode
+/// snapshot below is indexed by.
+const SECTIONS: [Section; 4] = [
+    Section::Thinking,
+    Section::Tools,
+    Section::Subagents,
+    Section::Activity,
+];
+
+fn section_index(section: Section) -> usize {
+    match section {
+        Section::Thinking => 0,
+        Section::Tools => 1,
+        Section::Subagents => 2,
+        Section::Activity => 3,
+    }
+}
+
+/// The name a section answers to, in `/details` and in the row a collapsed
+/// section stands as.
+fn section_name(section: Section) -> &'static str {
+    match section {
+        Section::Thinking => "thinking",
+        Section::Tools => "tools",
+        Section::Subagents => "subagents",
+        Section::Activity => "activity",
+    }
+}
+
+/// The one row a collapsed section takes the place of: `▸ tools (7)`, so the
+/// count says how much is behind it rather than leaving the fold silent.
+fn section_header(section: Section, count: usize, theme: &Theme, width: usize) -> Line<'static> {
+    let label = if count == 0 {
+        section_name(section).to_owned()
+    } else {
+        format!("{} ({count})", section_name(section))
+    };
+    chip(
+        ("▸", ThemeColor::Dim, label, ThemeColor::Dim),
+        theme,
+        width,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default()
+}
+
 /// The rows of one transcript line, plus every row that carries a URL.
 fn message_rows(
     line: &TranscriptLine,
@@ -7695,6 +8083,20 @@ fn message_rows(
             width,
         ),
         LineKind::Usage => usage_row(&line.text, theme, width),
+        // Reasoning reads exactly as a note does — the section it belongs to
+        // is a `/details` axis, not a look.
+        LineKind::Thinking => chip(
+            ("·", ThemeColor::Dim, line.text.clone(), ThemeColor::Dim),
+            theme,
+            width,
+        ),
+        // A subagent's report is a tool-shaped chip like any other; that it
+        // folds under `subagents` is the section's business.
+        LineKind::Agent => chip(tool_chip(&line.text), theme, width),
+        // The mode-less reading of a divider, for a caller that has no
+        // `Details` at hand: the live frame asks [`fold_divider`] directly with
+        // the fold's own mode.
+        LineKind::Fold => vec![fold_divider(&line.text, SectionMode::Collapsed, theme, width)],
     };
     (rows, Vec::new())
 }
@@ -15740,6 +16142,251 @@ mod tests {
         assert_eq!(chat.session_label, "blue-otter");
     }
 
+    /// Types a line and presses Enter: the shape every command test uses.
+    fn command(chat: &mut Chat, line: &str) -> Applied {
+        type_text(chat, line);
+        chat.on_key(Key::Enter, Instant::now())
+    }
+
+    /// `/details` reaches the four named sections the deleted `transcript.rs`
+    /// carried: expanded draws a section's lines, collapsed stands them up as
+    /// one counted row, hidden draws neither.
+    #[test]
+    fn details_sets_a_sections_visibility() {
+        let mut chat = chat();
+        chat.push(LineKind::Tool, "tool done  read src/main.rs".to_owned());
+        chat.push(LineKind::Tool, "tool done  write src/lib.rs".to_owned());
+        assert!(
+            frame_text(&mut chat).contains("read src/main.rs"),
+            "tools start expanded, as the old module's DoD had them"
+        );
+
+        command(&mut chat, "/details tools collapsed");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▸ tools (2)"), "one counted row: {frame}");
+        assert!(
+            !frame.contains("read src/main.rs"),
+            "and the lines are behind it: {frame}"
+        );
+        assert!(
+            frame.contains("details: tools collapsed"),
+            "the command answers with the mode the next frame draws: {frame}"
+        );
+
+        command(&mut chat, "/details tools hidden");
+        let frame = frame_text(&mut chat);
+        assert!(
+            !frame.contains("tools (2)") && !frame.contains("read src/main.rs"),
+            "neither the header nor the lines: {frame}"
+        );
+
+        command(&mut chat, "/details tools expanded");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("read src/main.rs"), "{frame}");
+        assert!(!frame.contains("tools (2)"), "no header when expanded: {frame}");
+    }
+
+    /// The conversation is not a section: no `/details` word takes the user's
+    /// own question or the answer off the screen.
+    #[test]
+    fn details_never_hides_the_conversation() {
+        let mut chat = chat();
+        chat.push(LineKind::User, "a question that stays".to_owned());
+        chat.push(LineKind::Assistant, "an answer that stays".to_owned());
+        for word in ["hidden", "collapsed", "cycle"] {
+            command(&mut chat, &format!("/details {word}"));
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains("a question that stays"), "{word}: {frame}");
+            assert!(frame.contains("an answer that stays"), "{word}: {frame}");
+        }
+    }
+
+    /// Bare `/details` is the only way to read the state back, so it lists
+    /// every section and the mode it is on.
+    #[test]
+    fn details_lists_every_section_when_bare() {
+        let mut chat = chat();
+        command(&mut chat, "/details");
+        let frame = frame_text(&mut chat);
+        for needle in [
+            "thinking expanded",
+            "tools expanded",
+            "subagents collapsed",
+            "activity expanded",
+            "folded collapsed",
+        ] {
+            assert!(frame.contains(needle), "{needle} is missing: {frame}");
+        }
+    }
+
+    /// The defaults are the old module's (`SectionVisibility::default`) with
+    /// one departure — activity — because on this surface those lines are the
+    /// answers `/usage`, `/context` and `/jobs` give.
+    #[test]
+    fn the_default_visibility_follows_the_old_module() {
+        let chat = chat();
+        assert_eq!(chat.details.mode("thinking"), Some(SectionMode::Expanded));
+        assert_eq!(chat.details.mode("tools"), Some(SectionMode::Expanded));
+        assert_eq!(chat.details.mode("subagents"), Some(SectionMode::Collapsed));
+        assert_eq!(chat.details.mode("activity"), Some(SectionMode::Expanded));
+        assert_eq!(chat.details.mode("folded"), Some(SectionMode::Collapsed));
+        assert_eq!(chat.details.mode("bogus"), None);
+    }
+
+    /// `cycle` walks the three modes the old `SectionVisibility::apply` walked
+    /// (hidden → collapsed → expanded), and a word that is not a mode leaves
+    /// the state where it was.
+    #[test]
+    fn details_cycles_and_refuses_what_it_cannot_read() {
+        let mut chat = chat();
+        command(&mut chat, "/details tools cycle");
+        assert_eq!(chat.details.mode("tools"), Some(SectionMode::Hidden));
+        command(&mut chat, "/details tools cycle");
+        assert_eq!(chat.details.mode("tools"), Some(SectionMode::Collapsed));
+        command(&mut chat, "/details tools cycle");
+        assert_eq!(chat.details.mode("tools"), Some(SectionMode::Expanded));
+
+        command(&mut chat, "/details bogus expanded");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("no such section or mode"), "{frame}");
+        assert_eq!(chat.details.mode("tools"), Some(SectionMode::Expanded));
+    }
+
+    /// Subagent chatter is the section the default folds, and the header says
+    /// how much is behind it.
+    #[test]
+    fn subagents_collapse_behind_their_header_by_default() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::AgentStarted {
+            agent_id: "agent-1".into(),
+            name: "worker".into(),
+            parent_id: None,
+            kind: titi_engine::protocol::AgentKind::Subagent,
+        });
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▸ subagents (1)"), "{frame}");
+        assert!(!frame.contains("agent worker: started"), "{frame}");
+
+        command(&mut chat, "/details subagents expanded");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("agent worker: started"), "{frame}");
+    }
+
+    /// Reasoning is a section like any other: the live row is drawn while
+    /// thinking is expanded and gone when it is hidden.
+    #[test]
+    fn the_reasoning_row_is_the_thinking_section() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::ThinkingDelta {
+            turn_id: titi_engine::TurnId(1),
+            text: "weighing the options".into(),
+        });
+        assert!(
+            frame_text(&mut chat).contains("weighing the options"),
+            "reasoning is on screen while it is the newest thing"
+        );
+        command(&mut chat, "/details thinking hidden");
+        let frame = frame_text(&mut chat);
+        assert!(!frame.contains("weighing the options"), "{frame}");
+    }
+
+    /// A compaction leaves a divider and takes the history it folded off the
+    /// screen: the point of the fold is a short transcript, not a note.
+    #[test]
+    fn a_compaction_folds_the_history_behind_a_divider() {
+        let mut chat = chat();
+        chat.push(LineKind::User, "the question that was folded".to_owned());
+        chat.push(LineKind::Assistant, "the answer that was folded".to_owned());
+        chat.on_event(EngineEvent::Compacted {
+            turn_id: titi_engine::TurnId(1),
+            folded: 14,
+            tokens_before: 22_000,
+            strategy: "digest".into(),
+        });
+
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▸ folded 14 turns · 22k tokens"), "{frame}");
+        assert!(
+            !frame.contains("the question that was folded"),
+            "the folded history is not on screen: {frame}"
+        );
+
+        command(&mut chat, "/details folded expanded");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▾ folded 14 turns · 22k tokens"), "{frame}");
+        assert!(
+            frame.contains("the question that was folded"),
+            "expanding the fold brings the history back: {frame}"
+        );
+
+        command(&mut chat, "/details folded hidden");
+        let frame = frame_text(&mut chat);
+        assert!(!frame.contains("folded 14 turns"), "{frame}");
+        assert!(!frame.contains("the question that was folded"), "{frame}");
+    }
+
+    /// The divider is furniture: the dim chip the theme gives a note's mark,
+    /// with the chevron the fold's mode decides.
+    #[test]
+    fn the_fold_divider_is_drawn_from_the_payload() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::Compacted {
+            turn_id: titi_engine::TurnId(3),
+            folded: 2,
+            tokens_before: 900,
+            strategy: "digest".into(),
+        });
+        assert_eq!(fold_divider_label(2, 900), "folded 2 turns · 900 tokens");
+
+        let rows = frame_rows(&mut chat, 80, 24);
+        let (x, y) = cell_of(&rows, "▸ folded 2 turns").expect("the divider is on screen");
+        let buffer = frame_buffer(&mut chat, 80, 24);
+        assert_eq!(
+            buffer[(x, y)].fg,
+            fg(&test_theme(), ThemeColor::Dim).fg.unwrap_or(Color::Reset),
+            "the divider is drawn as the furniture it is"
+        );
+
+        command(&mut chat, "/details folded expanded");
+        let rows = frame_rows(&mut chat, 80, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("▾ folded 2 turns")),
+            "an expanded fold opens its chevron: {rows:?}"
+        );
+    }
+
+    /// Two compactions keep their own numbers: each divider is the payload of
+    /// its own event, and only the newest one stands for history that is still
+    /// on the transcript.
+    #[test]
+    fn each_fold_divider_carries_its_own_event() {
+        let mut chat = chat();
+        chat.push(LineKind::User, "the oldest question".to_owned());
+        chat.on_event(EngineEvent::Compacted {
+            turn_id: titi_engine::TurnId(1),
+            folded: 3,
+            tokens_before: 1_500,
+            strategy: "digest".into(),
+        });
+        chat.push(LineKind::Assistant, "an answer between folds".to_owned());
+        chat.on_event(EngineEvent::Compacted {
+            turn_id: titi_engine::TurnId(2),
+            folded: 40,
+            tokens_before: 120_000,
+            strategy: "digest".into(),
+        });
+
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("▸ folded 40 turns · 120k tokens"), "{frame}");
+        assert!(!frame.contains("folded 3 turns"), "{frame}");
+
+        command(&mut chat, "/details folded expanded");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("folded 3 turns · 1.5k tokens"), "{frame}");
+        assert!(frame.contains("folded 40 turns · 120k tokens"), "{frame}");
+        assert!(frame.contains("the oldest question"), "{frame}");
+    }
+
     #[test]
     fn agent_events_produce_transcript_lines() {
         let mut chat = chat();
@@ -15769,7 +16416,9 @@ mod tests {
                 .text
                 .contains("agent agent-1: all done")
         );
-        assert_eq!(chat.lines.last().unwrap().kind, LineKind::Tool);
+        // Its own kind, not `Tool`: subagent chatter is a section `/details`
+        // can fold away, and a section needs lines it can tell apart.
+        assert_eq!(chat.lines.last().unwrap().kind, LineKind::Agent);
     }
 
     #[test]
