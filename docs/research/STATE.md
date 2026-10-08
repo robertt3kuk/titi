@@ -383,24 +383,30 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `low` the workspace lints surface **15** `unwrap`/`expect` warning headers
-  as of 2026-10-09, of 111 `warning:` lines in all (`cargo clippy --workspace
-  --all-targets`, measured on this tree). The rule the item asked for is in
-  place: all eleven crates carry a crate-level
-  `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`
+- [ ] `low` the workspace lints surface **13** `unwrap`/`expect` warning headers
+  as of 2026-10-09 (`cargo clippy --workspace --all-targets`, measured on this
+  tree). The rule the item asked for is in place: all eleven crates carry a
+  crate-level `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`
   (`b7396f9` config, `23ea652` core, `0e71d27` providers, `00908d8` tools,
   `483806c` soul, `a8b7cc2` secrets, `ebaaf15` memory, `22614cf` genome,
   `ad76f7c` engine, then `b63140a`, `3315395` and `e0be096` for cli and tui),
-  which took the count from 1304/1477 by silencing the test-only noise. What
-  remains is what a fix pass would take: `titi-genome/src/refs.rs`'s three kept
-  regex `.expect`s (the invariant-impossible case `22614cf` argued for, at
-  `src/refs.rs:260-264`), `titi-genome/src/shared.rs` (new Taimyr code),
-  `titi-memory/src/redact.rs` and `titi-tui/src/theme/mod.rs`, plus four in
-  `crates/titi-engine/tests/protocol.rs`. Two test files missed the sweep and
-  should be named when it is redone: `protocol.rs` (no header at all, which is
-  where those four come from) and `crates/titi-cli/tests/continue.rs`, which
-  still carries the old blanket `#![allow(clippy::unwrap_used)]` because the
-  sweep left the file to the worker who owned it.
+  which took the count from 1304/1477 by silencing the test-only noise. The two
+  test files that sweep had missed are fixed too, in `3118e96`
+  (`crates/titi-cli/tests/continue.rs`, whose old blanket
+  `#![allow(clippy::unwrap_used)]` stood at line 11, and
+  `crates/titi-engine/tests/protocol.rs`, which had **no header line at all** —
+  cite it as "no header", there is no line to name; its four headers are gone
+  with it. What remains, by file, is what a fix pass would take:
+  `titi-genome/src/shared.rs` 5, `titi-memory/src/redact.rs` 4,
+  `titi-genome/src/refs.rs` 3 (the kept regex `.expect`s at
+  `src/refs.rs:260-264`, the invariant-impossible case `22614cf` argued for)
+  and `titi-tui/src/theme/mod.rs` 1.
+  **All five in `shared.rs` are deliberate**: they are the poisoned-lock panics
+  documented at `shared.rs:59-65` ("a parser panic is a bug in this crate, not a
+  condition to paper over with a possibly torn graph") — the `"genome lock
+  poisoned"` expects at `:88`, `:102` and `:136` and the `"genome stats lock
+  poisoned"` pair at `:120`/`:124` that arrived with `last_stats` in phase 1/2 —
+  so do not "fix" them into a silent empty graph.
 - [x] `medium` ~~`selection.rs` and `space_hold.rs` are kept while nothing
   calls them~~ ported into `chat.rs` 2026-10-09 in 92c08c8, with the status
   `app-rs-decision.md` keeps: `selection.rs` is live again (a press anchors,
@@ -419,7 +425,9 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
 - [ ] `low` a module-wide `#![allow(clippy::expect_used)]` hides a
-  caller-supplied pattern — `crates/titi-genome/src/parse.rs:3,553`.
+  caller-supplied pattern — `crates/titi-genome/src/lang/mod.rs:17` (the file
+  the audit named, `src/parse.rs:3,553`, became `lang/` in `714824d`); scope it
+  to the items whose pattern is a compile-time literal.
 - [x] `low` ~~the lenient JSONL reader launders mid-file corruption into
   missing entries — `crates/titi-core/src/session/store.rs:434-438`~~ fixed
   2026-10-08 in ffb447d (a corrupt middle line is surfaced, not dropped).
@@ -555,25 +563,46 @@ next, and the two worker notes it could not see yet.
 
 **Follow-ups named by this wave (2026-10-09).**
 
-- [ ] `low` the engine's one-line adoption of `SharedGenome`: phase 0 built the
-  snapshot type (`580de37`) and today its only caller is
-  `examples/refresh.rs`, while `crates/titi-engine/src/runtime.rs` still keeps
-  `Arc<Mutex<Option<Genome>>>`. Replacing that is what gives the incremental
-  machinery a production reader.
-- [ ] `medium` Taimyr phases 1–5, per `docs/research/genome-incremental.md` §6,
-  each with the acceptance test its table names. Phase 3 is the only one that
-  wants `notify`: that decision is written in §4 as phase 3's, it needs the
-  owner's word, and adding the dependency goes through the
-  `dependency-update` procedure — its health is **unverified offline**, so
-  nothing was added.
+- [x] `low` ~~the engine's one-line adoption of `SharedGenome`~~ landed
+  2026-10-09 in `a4716a6`: `crates/titi-engine/src/runtime.rs` holds
+  `genome: SharedGenome` at `:780` (the doc on the field says the tool loop
+  writes it and the turn-start walk re-reads it), so the snapshot type phase 0
+  built has a production reader. `runtime.rs:117`'s
+  `type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>` is gone.
+- [ ] `medium` Taimyr phases 3–5, per `docs/research/genome-incremental.md` §6
+  (phases 1 and 2 landed 2026-10-09: `eac8a9c`, `3a7aafa`, `b4b1401`). **Phase
+  3 — the watcher and its debounce — is blocked on the owner's word about
+  `notify`**: the decision is written as phase 3's in §4, and adding the
+  dependency goes through the `dependency-update` procedure; its health is
+  **unverified offline**, which is why nothing was added. Phases 4 (background
+  worker, `pending`/`quiesce`) and 5 (LSP `didOpen`/`didChange`) need no
+  dependency and can be taken first — 4 first also gives the watcher a worker
+  that already coalesces.
+- [ ] `low` a `micro_usd` on `SetBudget` plus a cost accumulated from
+  `TurnUsage` in `Runtime::over_budget`: the money this wave shipped states what
+  a turn and a session cost, but the *cap* is still token-only
+  (`runtime.rs:1309` reads `self.budget` tokens; `protocol.rs:157`'s
+  `SetBudget` carries a token count). The review's "so `/budget $2` becomes
+  possible" is **not** delivered — the mechanism is. `/budget`'s refusal now
+  says exactly that, and names the model's own rate when it has one.
+- [ ] `low` subagents have no genome handle: `tool_agent.rs:199-202` passes
+  `None` where the tool loop passes its `SharedGenome` (documented there: a
+  subagent runs under the CLI's runner, which is built before the session's
+  index exists), so a subagent's writes reach the index at the session's next
+  turn walk instead of inline.
+- [ ] `low` a deleted import target does not re-parse its importers: removing a
+  file drops its symbols and edges, and an importer that named it keeps the
+  import it had. The next turn's walk fixes it, not the change itself.
 - [ ] `low` `SearchHit.ts` for exact session-hit times: `SearchHit` carries
   `session_id`/`entry_id`/`text` and no timestamp, so a hit row shows the
   session's last write — which is what keeps a hit row and a list row from
   disagreeing. A timestamp on the hit would let the row say when the matching
   line was written instead.
-- [ ] `low` the five production `unwrap`/`expect` sites in `chat.rs` the lints
-  worker listed — `2113`, `2164`, `5338`, `8665`, `8726` — i.e. the ones the
-  scoping now surfaces precisely because they sit outside a test module.
+- [x] `low` ~~the five production `unwrap`/`expect` sites in `chat.rs` the lints
+  worker listed (`2113`, `2164`, `5338`, `8665`, `8726`)~~ they no longer
+  surface: `chat.rs` contributes none of the 11 headers the measurement now
+  finds, so whatever became of them, nothing in that file is behind an
+  unscoped allow any more.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -790,3 +819,84 @@ The suite went 1812 → 1855 passed (77 targets, 0 failed): `titi-cli` unit +21,
 `titi-core` unit +7, `titi-genome` unit +3, genome `tests/index.rs` +7 and
 `titi-cli/tests/continue.rs` +5. The restored code in `chat.rs` was hand-wrapped
 and needed its own `style:` commit (`a3b63c5`) before the fmt job would pass.
+
+The lints-residue, money and Taimyr-1/2 wave (2026-10-09). The sweep's last two
+files are scoped (`3118e96`): `titi-cli/tests/continue.rs` gave up its blanket
+`#![allow(clippy::unwrap_used)]` for the crate-level form, and
+`titi-engine/tests/protocol.rs` — which had no header at all — took the
+scoping's four headers out of the count.
+
+Money landed as a mechanism with an honest empty table. `ModelPrice`
+(`titi-engine/src/registry.rs:46`) carries `input`, `output` and an optional
+`cached_input` (a provider that does not bill cache at its own rate says so with
+`None`), all in micro-dollars, and `cost_micro_usd` rounds **up** — a turn that
+spent anything must not print `$0.00`, and a zero price is still zero — with
+`cached_tokens` clamped to `prompt_tokens` because a provider reporting more
+cached than prompted is the provider's bug. The built-in table ships
+**empty-but-typed**: `NO_PRICE_MODELS` (`titi-cli/src/engine.rs:246`) names all
+26 built-in ids with the reason each is there — the metered backends this tree
+cannot price and the subscription/gateway backends whose flat plans have no
+per-token rate — and
+`every_builtin_model_is_priced_or_on_the_no_price_list`
+(`titi-cli/tests/engine.rs:226`) walks `default_registry_config()` and refuses an
+id that is neither priced nor listed, so a new model forces the decision instead
+of shipping a silent gap. Nothing was invented for the table and nothing was
+fetched: the tree holds one price note (`docs/research/prompt-cache.md` —
+Sonnet 4.5 at $3/MTok in, $3.75 cache write, $0.30 cache read) and **no output
+price**, and a figure built from input and cache reads alone would understate
+every coding turn. The surfaces are what the review asked for: the turn footer
+carries `cost_micro_usd` and prints `· $0.004` when the model has a price and
+nothing when it does not (`$0.000` would read as free, and unpriced is not
+free), `/usage` adds `· session total $0.38`, or
+`· session total $0.38+ (unpriced turns excluded)` when any turn was unpriced.
+`/budget` still refuses a cap in money, but the refusal is now specific: with a
+price it names the model's own rate and says the missing piece is the engine's
+cost ledger; without one it says the model is unpriced here; it never guesses a
+rate into a token cap. The mechanism that would make `/budget $2` real is
+queued — a `micro_usd` on `SetBudget` and a cost accumulated from `TurnUsage` in
+`Runtime::over_budget`, which today reads token counts (`runtime.rs:1309`).
+
+Taimyr phases 1 and 2 landed, both in `crates/titi-genome` plus the engine's
+two files. Phase 1 (`eac8a9c`, `3a7aafa`, `b4b1401`): raw mentions are kept and
+inverted into a name index, imports resolve from candidates rather than from a
+filtered answer (every language row's `resolve_*` now returns candidates), and a
+targeted update parses the caller's files first. What it provably skips is
+measured, not asserted in prose: the test
+`an_export_change_reresolves_only_the_files_that_mention_the_name` changes an
+export in a four-file tree and asserts `stats.reresolved == 2` — "the edited file
+and the file that mentions the new name" — with `reresolved < files.len()`;
+`a_specifier_that_now_resolves_is_found_without_reparsing_the_importer` calls
+`apply_changes(&["src/missing.ts"])` and gets `parsed == 1`, `!walked` ("a
+targeted update trusts the path it was handed") and a fixed importer that was
+never re-parsed. Phase 2 (`a4716a6`, `aede977`): the engine holds
+`genome: SharedGenome` at `runtime.rs:780` (`runtime.rs:117`'s
+`Arc<tokio::sync::Mutex<Option<Genome>>>` is gone), and the tool loop folds a
+write in **before the tool returns** — `genome.apply_changes(&[path])` at
+`tool_loop.rs:227`, skipped when the result is an error or no path was written —
+so a turn's prompt is current by construction, because the writer is synchronous
+inside the tool call; an out-of-process writer is still caught by the turn-start
+walk. `RefreshStats.walked` and `SharedGenome::last_stats` are new public
+surface, added on purpose to make that observable. The honest edges: the
+no-walk claim rests on a unit test, because the engine keeps its handle private;
+`tool_agent.rs:199-202` passes `None` for subagents (their writes arrive at the
+next turn's walk) and that is queued; a deleted import target does not re-parse
+its importers, also queued; and candidates are frozen at parse time, so a
+resolution is only as fresh as the last parse of the file that asked.
+
+The suite went 1855 → 1879 passed (77 targets, 0 failed): `titi-cli/tests/
+engine.rs` +3, genome `tests/index.rs` +2, engine `tests/loop.rs` +1, `titi-cli`
+unit +5, `titi-engine` unit +6, `titi-genome` unit +3, `titi-tui` unit +4. The
+`unwrap`/`expect` headers are **13** of 102 `warning:` lines now (`shared.rs` 5 —
+the deliberate poisoned-lock panics — `redact.rs` 4, `refs.rs` 3,
+`theme/mod.rs` 1).
+
+One operational lesson worth keeping: `cargo test --workspace` failed twice in
+`crates/titi-tui/tests/dependency_rule.rs` with `NotFound` for
+`titi-tui/Cargo.toml`, a file that exists. The cause was a **foreign stale
+artifact** in `target/debug/deps/` — that one `dependency_rule` binary carried
+no `/Users/workie/proj/titi` path at all, while every rebuilt one does — so the
+harness ran a binary built from a checkout that no longer exists, whose baked
+`CARGO_MANIFEST_DIR` points nowhere. `cargo clean -p titi-tui` fixed it (and
+freed 6.2 GiB of artifacts from the `/tmp/titi-baseline` and `/tmp/titi-head`
+checkouts that share this target directory). A `NotFound` on a file that is
+present means the *binary* is not yours.
