@@ -314,3 +314,40 @@ pub fn rewind_session(
         target.entries
     ))
 }
+
+/// Moves the session's leaf to `entry_id` — the branch point `/tree` picks —
+/// and returns the history the path through it now holds, with the line the
+/// screen says about it.
+///
+/// The store is append-only: the entries the old branch held are still there,
+/// and moving the leaf back only changes which path the next turn continues.
+/// The history is the same walk [`session_history`] does after the move, so a
+/// branch and a resume cannot disagree about what the model is shown.
+pub fn branch_at(
+    agent_dir: &std::path::Path,
+    session_id: &str,
+    entry_id: &str,
+) -> Result<(Vec<titi_providers::ChatMessage>, String), String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let entries = store.open(session_id).map_err(|e| e.to_string())?;
+    let at = entries
+        .iter()
+        .position(|entry| entry.id == entry_id)
+        .ok_or_else(|| format!("{entry_id} is not an entry of this session"))?;
+    store
+        .fork(session_id, entry_id)
+        .map_err(|e| e.to_string())?;
+    let path = store.walk(session_id, None).map_err(|e| e.to_string())?;
+    let messages = crate::engine::restore_window(
+        titi_core::session::entries_to_messages(&path),
+        crate::engine::MAX_RESTORED_MESSAGES,
+    );
+    // Everything the path no longer holds: the branch left behind, counted so
+    // the line says what the move cost rather than only where it went.
+    let off = match entries.len().saturating_sub(path.len()) {
+        1 => "1 entry is off the path now".to_owned(),
+        other => format!("{other} entries are off the path now"),
+    };
+    let where_ = at + 1;
+    Ok((messages, format!("branched at entry {where_} · {off}")))
+}

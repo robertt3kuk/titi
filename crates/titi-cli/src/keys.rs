@@ -467,6 +467,9 @@ impl Chat {
         if self.session_search.is_some() {
             return self.session_search_key(key, now);
         }
+        if self.tree_picker.is_some() {
+            return self.tree_picker_key(key, now);
+        }
         if self.login_picker.is_some() {
             return self.login_picker_key(key, now);
         }

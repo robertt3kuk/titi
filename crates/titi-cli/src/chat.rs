@@ -324,7 +324,7 @@ impl PendingApproval {
 /// the slow state word, the mode and the model; the composer keeps the key
 /// hints.
 #[derive(Debug, Clone)]
-enum WorkPhase {
+pub(crate) enum WorkPhase {
     /// Asked for; the model has not answered with anything yet.
     Waiting,
     /// Assistant text is arriving. The count is read from the reply the
@@ -384,10 +384,10 @@ pub struct Chat {
     /// `turn_active`: the status row above the composer reads it for the
     /// spinner and the elapsed seconds, so a request in flight is visible
     /// before the first token.
-    turn_started: Option<Instant>,
+    pub(crate) turn_started: Option<Instant>,
     /// Which phase the status row is in. Kept current on every turn so the
     /// row never shows a stale one; only read while `turn_active`.
-    phase: WorkPhase,
+    pub(crate) phase: WorkPhase,
     active_turn_id: Option<titi_engine::TurnId>,
     pub(crate) model: String,
     /// Live: a local server that answers after the first frame adds models,
@@ -452,6 +452,9 @@ pub struct Chat {
     pub(crate) login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
     pub(crate) session_picker: Option<usize>,
+    /// `/tree`: the session's own entries as a tree, the leaf marked; `None` =
+    /// closed.
+    pub(crate) tree_picker: Option<TreePicker>,
     /// `/sessions <query>`: the hits over stored sessions, filtered as the
     /// query is typed; `None` = closed.
     pub(crate) session_search: Option<SessionSearch>,
@@ -632,6 +635,7 @@ impl Chat {
             picker_hidden: false,
             login_picker: None,
             session_picker: None,
+            tree_picker: None,
             session_search: None,
             theme_picker: None,
             model_picker: None,
@@ -1607,6 +1611,7 @@ impl Chat {
             "exit" | "quit" => self.exit_word(Instant::now()),
             "recap" => self.recap(),
             "sessions" => self.sessions(args),
+            "tree" => self.open_tree(),
             "pause" => self.toggle_pause(),
             "fork" => self.fork(),
             "export" => self.export(args),
@@ -2051,7 +2056,7 @@ impl Chat {
         }
     }
 
-    fn show_history(&mut self, messages: &[titi_providers::ChatMessage]) {
+    pub(crate) fn show_history(&mut self, messages: &[titi_providers::ChatMessage]) {
         self.lines.clear();
         self.assistant_at = None;
         self.thinking_at = None;
@@ -10428,6 +10433,7 @@ mod tests {
             "advisor",
             "loop",
             "jobs",
+            "tree",
             "recap",
             "rewind",
             "fork",
@@ -14821,6 +14827,125 @@ mod tests {
             .set_title(&id, title)
             .expect("title");
         id
+    }
+
+    /// The tree shows what the store holds: every branch, indented by depth,
+    /// the path to the leaf marked and the leaf named. A session that branched
+    /// has entries off the path, and the title says how many.
+    #[test]
+    fn the_tree_shows_every_branch_with_the_leaf_marked() {
+        let (dir, id, store) = branched_session();
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        let picker = chat.tree_picker.as_ref().expect("the tree is open");
+        let rows: Vec<&str> = picker.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(
+            rows,
+            [
+                "• you   one",
+                "  • titi  two",
+                "      you   three",
+                "    • titi  other  ✓ current",
+            ],
+            "the branch left behind is a row of its own"
+        );
+        assert_eq!(picker.off_path, 1, "`three` is off the path now");
+        assert_eq!(picker.selected, 3, "the cursor starts on the leaf");
+
+        // The panel draws it, and the title counts what a move would leave.
+        let view = panel_view_for(&chat, 30, 100).expect("a panel");
+        let title = view.title.clone().unwrap_or_default();
+        assert!(title.contains("4 entries · 1 off this path"), "{title:?}");
+        // Esc closes it and leaves the store alone.
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.tree_picker.is_none());
+        assert_eq!(store.open(&id).expect("entries").len(), 4);
+    }
+
+    /// Enter on a row moves the leaf there: the path through it is what the
+    /// screen and the engine get, and the branch that is left stays in the
+    /// store — a branch, not a rewind.
+    #[test]
+    fn enter_on_a_tree_row_branches_there_and_replays_the_path() {
+        let (dir, id, store) = branched_session();
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        // Up twice: from the leaf (`other`) back to `two`, the branch point.
+        chat.on_key(Key::Up, Instant::now());
+        chat.on_key(Key::Up, Instant::now());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.tree_picker.is_none(), "the panel closes on Enter");
+
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::RestoreHistory { messages })) => {
+                let shown: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+                assert_eq!(shown, ["one", "two"], "the path through the row");
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
+        let shown: Vec<&str> = chat.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            shown,
+            [
+                "one",
+                "two",
+                "branched at entry 2 · 2 entries are off the path now",
+            ]
+        );
+
+        // The abandoned branch is still stored: branching never rewrites it.
+        let entries = store.open(&id).expect("entries");
+        assert_eq!(entries.len(), 4);
+        assert!(
+            entries.iter().any(|entry| entry.content == "three"),
+            "the entry left behind is still there"
+        );
+    }
+
+    /// A session with nothing in it answers rather than opening an empty panel.
+    #[test]
+    fn the_tree_of_an_empty_session_says_so() {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("session");
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.tree_picker.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "tree: this session has no entries yet"),
+            "{:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// One session that took a second branch: `one` → `two` → `three`, then the
+    /// leaf moves back to `two` and the conversation continues as `other`. The
+    /// store holds all four entries; the path holds `one`, `two`, `other`.
+    fn branched_session() -> (tempfile::TempDir, String, titi_core::session::SessionStore) {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("session");
+        store.append(&id, Role::User, "one").expect("one");
+        let two = store.append(&id, Role::Assistant, "two").expect("two");
+        store.append(&id, Role::User, "three").expect("three");
+        store.fork(&id, &two.id).expect("fork");
+        store.append(&id, Role::Assistant, "other").expect("other");
+        (dir, id, store)
     }
 
     /// `/sessions` bare is the list Ctrl+X opens: the same rows, the same

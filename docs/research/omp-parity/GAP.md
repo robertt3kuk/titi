@@ -162,9 +162,9 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: medium. `crates/titi-soul/src/builder.rs` (invite it) + `crates/titi-tui/src/transcript.rs` (badge row) + engine parse of the marker.
 - beauty: `👍` on the right edge of your prompt bubble; no layout shift, one theme colour.
 
-## 23. Session tree with filters + branch summaries
+## 23. Session tree with filters + branch summaries — **partly ported** (`/tree`: the tree view and the branch switch)
 - omp: `treeFilterMode` (`modes/settings.ts:908`), `branchSummary.enabled` (`session/context-settings.ts:528`), `doubleEscapeAction: "tree"` (`:867`); commands `/branch`, `/tree`, `/move`.
-- titi: partly — `/fork` exists (`crates/titi-cli/src/chat.rs:3378` commands table) but there is no tree view, no per-branch summary, and `/sessions` is a flat list.
+- titi: partly — `/tree` draws one session's stored entries as the tree they are (`SessionStore::open` for every branch, `walk` for the path to the leaf) in the panel above the composer: indented by depth, the path to the leaf marked `•`, the leaf named `✓ current`, the title counting the entries off the path. Enter moves the leaf to the row under the cursor and replays that path to the engine (`crates/titi-cli/src/session_fs.rs:branch_at` → `EngineCommand::RestoreHistory`), so the entry left behind stays in the store: a branch, not a rewind. `/fork` and `/sessions` are as they were. Still missing: the filter modes (`treeFilterMode`), a generated one-line summary per branch (`branchSummary.enabled`), `/branch` and `/move`, and `doubleEscapeAction: "tree"` — titi's Esc-Esc is the rewind (entry 14).
 - value: users exploring multiple approaches in one repo.
 - cost: medium–large. `crates/titi-core/src/session/` (parent links) + `crates/titi-tui/src/panels.rs` (tree overlay) + `crates/titi-cli/src/chat.rs`.
 - beauty: an indented tree with filter chips (`all / tools / files`), each branch showing a one-line summary it generated.

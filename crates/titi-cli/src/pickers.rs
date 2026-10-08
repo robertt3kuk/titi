@@ -123,6 +123,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "list stored sessions, or search them (usage: /sessions <query>)",
     },
     Command {
+        name: "tree",
+        about: "navigate the session tree, switching branches",
+    },
+    Command {
         name: "recap",
         about: "what this session did",
     },
@@ -694,6 +698,147 @@ fn panel_view(
     }
 }
 
+/// One entry of the session tree, as `/tree` offers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeRow {
+    /// The entry this row stands for: what Enter moves the leaf to.
+    pub(crate) entry_id: String,
+    /// The row as the panel draws it: indented by depth, the path to the leaf
+    /// marked, the leaf named.
+    pub(crate) text: String,
+}
+
+/// The `/tree` picker: one session's stored entries as the tree they are.
+///
+/// The store is append-only, so every branch ever taken is still in it — this
+/// is the screen that shows them. The rows are built once, when `/tree` runs:
+/// the picker cannot see an append while it is open, because nothing appends
+/// while a panel holds the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreePicker {
+    pub(crate) rows: Vec<TreeRow>,
+    /// The row the cursor is on, an index into [`TreePicker::rows`].
+    pub(crate) selected: usize,
+    /// Entries the path to the leaf does not hold, for the title: what a move
+    /// away from where the screen is would put behind it.
+    pub(crate) off_path: usize,
+}
+
+impl TreePicker {
+    /// Reads one session's entries and lays them out as a tree, the leaf's own
+    /// path marked and the cursor on the leaf.
+    pub(crate) fn open(agent_dir: &std::path::Path, session_id: &str) -> Result<Self, String> {
+        let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+        let entries = store.open(session_id).map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            return Err("this session has no entries yet".to_owned());
+        }
+        let path = store.walk(session_id, None).map_err(|e| e.to_string())?;
+        let leaf = path.last().map(|entry| entry.id.clone());
+        let on_path: std::collections::HashSet<&str> =
+            path.iter().map(|entry| entry.id.as_str()).collect();
+
+        // parent → its children, in the order they were appended; an entry
+        // whose parent is not in the log is a root (a torn write, or a branch
+        // whose head was pruned).
+        let mut children: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        let index: std::collections::HashMap<&str, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| (entry.id.as_str(), at))
+            .collect();
+        let mut roots: Vec<usize> = Vec::new();
+        for (at, entry) in entries.iter().enumerate() {
+            match entry.parent_id.as_deref().and_then(|id| index.get(id)) {
+                Some(parent) => children
+                    .entry(entries[*parent].id.as_str())
+                    .or_default()
+                    .push(at),
+                None => roots.push(at),
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|at| (*at, 0)).collect();
+        while let Some((at, depth)) = stack.pop() {
+            let entry = &entries[at];
+            let mark = if on_path.contains(entry.id.as_str()) {
+                "• "
+            } else {
+                "  "
+            };
+            let current = if leaf.as_deref() == Some(entry.id.as_str()) {
+                "  ✓ current"
+            } else {
+                ""
+            };
+            rows.push(TreeRow {
+                entry_id: entry.id.clone(),
+                text: format!(
+                    "{indent}{mark}{role}  {label}{current}",
+                    indent = "  ".repeat(depth),
+                    role = tree_role(entry.role),
+                    label = one_line(entry.content.trim(), 60),
+                ),
+            });
+            if let Some(kids) = children.get(entry.id.as_str()) {
+                for kid in kids.iter().rev() {
+                    stack.push((*kid, depth + 1));
+                }
+            }
+        }
+        let selected = rows
+            .iter()
+            .position(|row| leaf.as_deref() == Some(row.entry_id.as_str()))
+            .unwrap_or(rows.len() - 1);
+        let off_path = entries.len().saturating_sub(on_path.len());
+        Ok(Self {
+            rows,
+            selected,
+            off_path,
+        })
+    }
+
+    /// The entry the cursor is on.
+    pub(crate) fn selected_id(&self) -> Option<&str> {
+        self.rows
+            .get(self.selected)
+            .map(|row| row.entry_id.as_str())
+    }
+}
+
+/// How a tree row names the writer of an entry, in the transcript's own words.
+fn tree_role(role: titi_core::session::Role) -> &'static str {
+    match role {
+        titi_core::session::Role::User => "you ",
+        titi_core::session::Role::Assistant => "titi",
+        titi_core::session::Role::Tool => "tool",
+        titi_core::session::Role::System => "sys ",
+    }
+}
+
+/// The `/tree` panel: the session's entries, one row each, the leaf marked.
+fn tree_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(picker) = chat.tree_picker.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let lines: Vec<PanelLine> = picker
+        .rows
+        .iter()
+        .map(|row| PanelLine::Row {
+            text: row.text.clone(),
+            accent: false,
+        })
+        .collect();
+    let title = format!(
+        "tree · {} entries · {} off this path",
+        picker.rows.len(),
+        picker.off_path
+    );
+    panel_view(Some(title), lines, Some(picker.selected), panel_body(total))
+}
+
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
@@ -702,6 +847,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     }
     if chat.session_picker.is_some() {
         return Some(session_panel(chat, total));
+    }
+    if chat.tree_picker.is_some() {
+        return Some(tree_panel(chat, total));
     }
     if chat.session_search.is_some() {
         return Some(session_search_panel(chat, total));
@@ -1428,6 +1576,7 @@ impl Chat {
             || self.login_for.is_some()
             || self.theme_picker.is_some()
             || self.session_picker.is_some()
+            || self.tree_picker.is_some()
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.emoji_picker.is_visible()
@@ -1742,6 +1891,87 @@ impl Chat {
             return Applied::none();
         };
         self.switch_to_session(id)
+    }
+
+    /// `/tree`: the session's entries as the tree they are, the leaf marked.
+    /// A session with nothing in it says so rather than opening an empty panel,
+    /// the way the prompt history does.
+    pub(crate) fn open_tree(&mut self) -> Applied {
+        match TreePicker::open(&self.agent_dir, &self.session_id) {
+            Ok(picker) => {
+                self.tree_picker = Some(picker);
+                Applied::none()
+            }
+            Err(reason) => {
+                self.push(LineKind::Note, format!("tree: {reason}"));
+                Applied::none()
+            }
+        }
+    }
+
+    /// Typing while the tree is up: the session switcher's own idiom — arrows
+    /// move, Enter branches there, Esc closes; anything else closes the panel
+    /// and is handled as composer input.
+    pub(crate) fn tree_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_tree_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_tree_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_tree_picker(),
+            Key::Esc => {
+                self.tree_picker = None;
+                Applied::none()
+            }
+            other => {
+                self.tree_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_tree_picker(&mut self, delta: isize) {
+        let Some(picker) = self.tree_picker.as_mut() else {
+            return;
+        };
+        let len = picker.rows.len();
+        if len == 0 {
+            return;
+        }
+        let current = picker.selected % len;
+        picker.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter on a row: the leaf moves there, and the path through it replaces
+    /// the screen and the engine's history — the replay `/rewind` and a session
+    /// switch already use. The branch left behind stays in the store, which is
+    /// what makes this a branch and not a rewind.
+    pub(crate) fn accept_tree_picker(&mut self) -> Applied {
+        let Some(picker) = self.tree_picker.take() else {
+            return Applied::none();
+        };
+        let Some(entry_id) = picker.selected_id().map(str::to_owned) else {
+            return Applied::none();
+        };
+        match crate::session_fs::branch_at(&self.agent_dir, &self.session_id, &entry_id) {
+            Ok((messages, note)) => {
+                self.show_history(&messages);
+                self.turn_active = false;
+                self.turn_started = None;
+                self.phase = WorkPhase::Waiting;
+                self.approval = None;
+                self.push(LineKind::Note, note);
+                Applied::send(EngineCommand::RestoreHistory { messages }, None)
+            }
+            Err(reason) => {
+                self.push(LineKind::Error, format!("tree: {reason}"));
+                Applied::none()
+            }
+        }
     }
 
     /// Typing while the `/sessions <query>` browser is up. Like the model
