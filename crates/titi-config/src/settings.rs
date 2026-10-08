@@ -183,6 +183,18 @@ pub const BASH_AUTO_BACKGROUND_KEY: &str = "bash.autoBackground.thresholdMs";
 /// a typo (a seconds value in a milliseconds slot) and is refused.
 pub const MAX_AUTO_BACKGROUND_MS: u64 = 3_600_000;
 
+/// How many lines a paste must reach before the screen offers a menu of ways
+/// to attach it: `paste.menuThreshold`.
+///
+/// omp's key for the same menu is `paste.largeMenuThreshold`, 100 lines by
+/// default, and this one means the same thing. `0` turns the menu off — a
+/// long paste then collapses to its marker with no offer, which is what every
+/// paste does below the count. Unset, or anything that is not a whole number
+/// of lines, is [`Settings::paste_menu_threshold`]'s `None`: the screen then
+/// uses its own default, the way a typo in any cosmetic key leaves the screen
+/// as it was (see [`switch_off`]).
+pub const PASTE_MENU_THRESHOLD_KEY: &str = "paste.menuThreshold";
+
 impl Settings {
     /// Discover and load all layers.
     ///
@@ -298,6 +310,19 @@ impl Settings {
             current = index(current, seg)?;
         }
         Some(current.clone())
+    }
+
+    /// [`PASTE_MENU_THRESHOLD_KEY`] as a line count, `Some(0)` meaning the menu
+    /// is off.
+    ///
+    /// Unset is `None`, so the screen applies its own default. So is a value
+    /// that is not a whole number of lines — a negative, a float, a string —
+    /// because a typo in a cosmetic key leaves the screen as it was rather than
+    /// refusing to start (contrast [`Settings::auto_background_threshold`],
+    /// whose key bounds a wait).
+    pub fn paste_menu_threshold(&self) -> Option<u32> {
+        let lines = self.get(PASTE_MENU_THRESHOLD_KEY)?.as_u64()?;
+        Some(lines.min(u64::from(u32::MAX)) as u32)
     }
 
     /// Deep-merged effective view: defaults <- global <- project <- overlays <- runtime.

@@ -698,6 +698,58 @@ fn panel_view(
     }
 }
 
+/// The large-paste menu: a paste long enough to be worth choosing how it
+/// reaches the model, held while the panel is up.
+///
+/// The paste is *already* staged as its marker when this opens, so the menu can
+/// only sharpen what happened — Esc, or any stray key, leaves the marker exactly
+/// as a short paste would have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PasteMenu {
+    /// The marker registered in the draft, and the line count it stands for.
+    pub(crate) marker: String,
+    /// The number the marker (and so the file it may become) carries.
+    pub(crate) seq: u32,
+    pub(crate) lines: usize,
+    /// The row the cursor is on, an index into [`PasteMenu::ROWS`].
+    pub(crate) selected: usize,
+}
+
+impl PasteMenu {
+    /// The ways this paste can be attached, in the order `/hotkeys`-style
+    /// panels show them. Each row's index is what Enter acts on; the third
+    /// option omp offers — paste inline — is this screen's Esc, which leaves
+    /// the marker a short paste would have left.
+    pub(crate) const ROWS: [(&'static str, &'static str); 2] = [
+        ("attach as a block", "fence it in ``` and send it whole"),
+        (
+            "attach as a file",
+            "write it to .titi/pastes and send the path",
+        ),
+    ];
+
+    /// The row for attaching a paste as a fenced block.
+    pub(crate) const BLOCK: usize = 0;
+    /// The row for attaching a paste as a file.
+    pub(crate) const FILE: usize = 1;
+}
+
+/// The large-paste panel: what was pasted, and the ways to attach it.
+fn paste_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(menu) = chat.paste_menu.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let lines: Vec<PanelLine> = PasteMenu::ROWS
+        .iter()
+        .map(|(name, about)| PanelLine::Row {
+            text: format!("{name}   {about}"),
+            accent: false,
+        })
+        .collect();
+    let title = format!("pasted {} lines · esc keeps the marker", menu.lines);
+    panel_view(Some(title), lines, Some(menu.selected), panel_body(total))
+}
+
 /// One entry of the session tree, as `/tree` offers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeRow {
@@ -842,6 +894,9 @@ fn tree_panel(chat: &Chat, total: u16) -> PanelView {
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.paste_menu.is_some() {
+        return Some(paste_panel(chat, total));
+    }
     if chat.theme_picker.is_some() {
         return Some(theme_panel(chat, total));
     }
@@ -1577,6 +1632,7 @@ impl Chat {
             || self.theme_picker.is_some()
             || self.session_picker.is_some()
             || self.tree_picker.is_some()
+            || self.paste_menu.is_some()
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.emoji_picker.is_visible()
@@ -1906,6 +1962,57 @@ impl Chat {
                 self.push(LineKind::Note, format!("tree: {reason}"));
                 Applied::none()
             }
+        }
+    }
+
+    /// Typing while the large-paste menu is up: arrows move, Enter attaches the
+    /// paste the way the row says, Esc keeps the marker a short paste would
+    /// have left, and anything else keeps it too — the paste is never lost to a
+    /// keystroke aimed at the composer.
+    pub(crate) fn paste_menu_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_paste_menu(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_paste_menu(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_paste_menu(),
+            Key::Esc => {
+                self.paste_menu = None;
+                Applied::none()
+            }
+            other => {
+                self.paste_menu = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_paste_menu(&mut self, delta: isize) {
+        let Some(menu) = self.paste_menu.as_mut() else {
+            return;
+        };
+        let len = PasteMenu::ROWS.len();
+        let current = menu.selected % len;
+        menu.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter on a row: attach the staged paste the way it says. The marker is
+    /// already in the draft, so both arms rewrite it rather than adding to it.
+    pub(crate) fn accept_paste_menu(&mut self) -> Applied {
+        let Some(menu) = self.paste_menu.take() else {
+            return Applied::none();
+        };
+        match menu.selected % PasteMenu::ROWS.len() {
+            PasteMenu::BLOCK => self.attach_paste_as_block(&menu),
+            PasteMenu::FILE => self.attach_paste_as_file(&menu),
+            // A row this build does not know leaves the paste where it is: the
+            // marker, exactly as Esc leaves it. `rows_attach_what_they_say`
+            // fails if the list grows without this match.
+            _ => Applied::none(),
         }
     }
 

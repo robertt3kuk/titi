@@ -132,6 +132,13 @@ const PASTE_INLINE_MAX_LINES: usize = 6;
 /// expanded, and only from this prefix, so a literal in prose is never one.
 const PASTE_MARKER_HEAD: &str = "[Paste #";
 
+/// How many lines a paste must reach before the screen offers the large-paste
+/// menu (`paste.menuThreshold`): what a person pastes on purpose — a log, a
+/// stack trace, a file — rather than a line or two of prose. omp's
+/// `paste.largeMenuThreshold` is 100 too, and its 0 turns the menu off, which
+/// is what this number's 0 does.
+pub(crate) const PASTE_MENU_AFTER: u32 = 100;
+
 /// The line above the composer while a second press is owed, one per key: a
 /// two-press exit names the key that confirms *it*.
 const CTRL_C_HINT: &str = "ctrl-c again to quit";
@@ -467,6 +474,9 @@ impl Chat {
         if self.session_search.is_some() {
             return self.session_search_key(key, now);
         }
+        if self.paste_menu.is_some() {
+            return self.paste_menu_key(key, now);
+        }
         if self.tree_picker.is_some() {
             return self.tree_picker_key(key, now);
         }
@@ -644,6 +654,69 @@ impl Chat {
         let marker = paste_marker(self.next_paste, lines);
         self.pastes.insert(marker.clone(), body);
         self.input.push_str(&marker);
+        // Long enough to be worth a choice, so offer one. The marker is already
+        // staged above: whatever the menu does, or does not do, the paste is
+        // where a short one would have left it.
+        if self.paste_menu_after > 0
+            && lines as u32 >= self.paste_menu_after
+            // A panel already on screen has the keys, so an offer here could
+            // not be answered: the paste keeps its marker, which is what a
+            // paste does while any picker is up.
+            && !self.panel_open()
+        {
+            self.paste_menu = Some(PasteMenu {
+                marker,
+                seq: self.next_paste,
+                lines,
+                selected: 0,
+            });
+        }
+    }
+
+    /// Attach the staged paste as a fenced block: the marker stays in the draft
+    /// and what it stands for at send becomes the fenced body, so the model
+    /// reads a log as a block of text rather than as prose around it.
+    pub(crate) fn attach_paste_as_block(&mut self, menu: &PasteMenu) -> Applied {
+        let Some(body) = self.pastes.get(&menu.marker) else {
+            return Applied::none();
+        };
+        // One newline before the closing fence, wherever the paste ended: a
+        // fence that does not start a line is not one.
+        let fenced = format!("```\n{}\n```", body.trim_end_matches('\n'));
+        self.pastes.insert(menu.marker.clone(), fenced);
+        self.push(
+            LineKind::Note,
+            format!("paste: {} lines will be sent as a fenced block", menu.lines),
+        );
+        Applied::none()
+    }
+
+    /// Attach the staged paste as a file under the workspace, and leave its
+    /// path where the marker was: the model reads it when it needs it — in
+    /// ranges, if it is long — instead of carrying the whole body in every
+    /// request. Nothing is written unless the row was taken.
+    pub(crate) fn attach_paste_as_file(&mut self, menu: &PasteMenu) -> Applied {
+        let Some(body) = self.pastes.get(&menu.marker).cloned() else {
+            return Applied::none();
+        };
+        match crate::session_fs::write_paste(&self.workspace, menu.seq, &body) {
+            Ok(path) => {
+                self.input = self.input.replace(&menu.marker, &path);
+                self.pastes.remove(&menu.marker);
+                self.push(
+                    LineKind::Note,
+                    format!("paste: wrote {path} ({} lines)", menu.lines),
+                );
+                Applied::none()
+            }
+            Err(reason) => {
+                // The marker is still in the draft and still registered: a
+                // workspace that cannot be written leaves the paste exactly
+                // where a short one would be.
+                self.push(LineKind::Error, format!("paste: not written ({reason})"));
+                Applied::none()
+            }
+        }
     }
 
     /// The draft as it will be sent: every marker this draft holds replaced by

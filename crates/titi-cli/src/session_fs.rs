@@ -351,3 +351,20 @@ pub fn branch_at(
     let where_ = at + 1;
     Ok((messages, format!("branched at entry {where_} · {off}")))
 }
+
+/// Writes a pasted body under the workspace's `.titi/pastes/` and returns the
+/// path as the draft — and so the model — should read it: relative to the
+/// workspace, because that is the form `read` resolves and the form the person
+/// sees.
+///
+/// A paste attached this way is a file the workspace holds like any other: the
+/// point is that the model can read it in ranges instead of paying for it in
+/// every request. The directory is titi's own (the one the project layer
+/// already uses), so a project that ignores `.titi/` ignores these too.
+pub fn write_paste(workspace: &std::path::Path, seq: u32, body: &str) -> Result<String, String> {
+    let name = format!("paste-{seq}.txt");
+    let dir = workspace.join(".titi").join("pastes");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(&name), body).map_err(|e| e.to_string())?;
+    Ok(format!(".titi/pastes/{name}"))
+}

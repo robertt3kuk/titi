@@ -452,9 +452,20 @@ pub struct Chat {
     pub(crate) login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
     pub(crate) session_picker: Option<usize>,
+    /// The workspace this screen's session belongs to: where a paste attached
+    /// as a file lands, and the root the tools read it back from. Resolved once
+    /// (`session_fs::current_workspace`), so a caller that is not the live run —
+    /// a test, a cast — can point it somewhere harmless.
+    pub(crate) workspace: PathBuf,
     /// `/tree`: the session's own entries as a tree, the leaf marked; `None` =
     /// closed.
     pub(crate) tree_picker: Option<TreePicker>,
+    /// The large-paste menu: a paste long enough for `paste.menuThreshold`,
+    /// held while the panel offers the ways to attach it; `None` = closed.
+    pub(crate) paste_menu: Option<PasteMenu>,
+    /// How many lines a paste must reach for that menu: the settings' own
+    /// count, or [`PASTE_MENU_AFTER`]. `0` never opens it.
+    pub(crate) paste_menu_after: u32,
     /// `/sessions <query>`: the hits over stored sessions, filtered as the
     /// query is typed; `None` = closed.
     pub(crate) session_search: Option<SessionSearch>,
@@ -636,6 +647,9 @@ impl Chat {
             login_picker: None,
             session_picker: None,
             tree_picker: None,
+            workspace: crate::session_fs::current_workspace(),
+            paste_menu: None,
+            paste_menu_after: PASTE_MENU_AFTER,
             session_search: None,
             theme_picker: None,
             model_picker: None,
@@ -3469,6 +3483,10 @@ pub fn run(
     let term_env = titi_tui::caps::TermEnv::from_env();
     chat.terminal = TerminalFeatures::resolve(settings.as_ref(), &term_env);
     chat.turn_footer = footer_switches(settings.as_ref());
+    chat.paste_menu_after = settings
+        .as_ref()
+        .and_then(|settings| settings.paste_menu_threshold())
+        .unwrap_or(PASTE_MENU_AFTER);
     // The status line's preset and gauge come from the same settings, resolved
     // before the first frame: an unknown or unset name is `default`/`off`, so a
     // typo in a cosmetic key changes nothing and never refuses to start.
@@ -8145,6 +8163,8 @@ mod tests {
                 prompt_tokens: 3_400,
                 completion_tokens: 250,
                 cached_tokens: 2_900,
+                // An unpriced model: the footer states no money.
+                cost_micro_usd: None,
             });
             chat.on_event(EngineEvent::TurnFinished {
                 turn_id: TurnId(1),
@@ -8231,6 +8251,8 @@ mod tests {
             prompt_tokens: 3_400,
             completion_tokens: 250,
             cached_tokens: 2_900,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(1),
@@ -8280,6 +8302,8 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 40,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(1),
@@ -8302,6 +8326,8 @@ mod tests {
             prompt_tokens: 2_000,
             completion_tokens: 40,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(2),
@@ -8328,6 +8354,8 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 250,
             cached_tokens: 800,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(1),
@@ -8362,6 +8390,8 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 250,
             cached_tokens: 800,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(1),
@@ -10628,6 +10658,16 @@ mod tests {
         let mut sessions = chat();
         sessions.session_picker = Some(0);
 
+        // The states added with the paste menu and the tree: a paste long
+        // enough to be offered a way to attach it.
+        let mut pasted = chat();
+        pasted.paste(
+            &(1..=120)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
         vec![
             ("bare", chat()),
             ("draft", draft),
@@ -10637,6 +10677,7 @@ mod tests {
             ("model picker", model),
             ("history", history),
             ("session picker", sessions),
+            ("paste menu", pasted),
         ]
     }
 
@@ -12124,12 +12165,16 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 50,
             cached_tokens: 800,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnUsage {
             turn_id: TurnId(2),
             prompt_tokens: 1_200,
             completion_tokens: 40,
             cached_tokens: 1_000,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());
@@ -12150,6 +12195,8 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());
@@ -12172,12 +12219,16 @@ mod tests {
             prompt_tokens: 100_000,
             completion_tokens: 5_000,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         chat.on_event(EngineEvent::TurnUsage {
             turn_id: TurnId(2),
             prompt_tokens: 1_200,
             completion_tokens: 40,
             cached_tokens: 1_000,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());
@@ -12202,6 +12253,8 @@ mod tests {
             prompt_tokens: 100_000,
             completion_tokens: 5_000,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         // The switch a `/model ollama/qwen3` makes: the next turn has no
         // price to read.
@@ -12211,6 +12264,8 @@ mod tests {
             prompt_tokens: 500,
             completion_tokens: 20,
             cached_tokens: 0,
+            // An unpriced model: the footer states no money.
+            cost_micro_usd: None,
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());
@@ -14929,6 +14984,202 @@ mod tests {
             "{:?}",
             chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
+    }
+
+    /// The body of the paste the tests stage: long enough to cross the menu's
+    /// own threshold (`PASTE_MENU_AFTER`), which is what a log looks like.
+    fn long_paste(lines: usize) -> String {
+        (1..=lines)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A paste past the threshold offers the menu, and nothing is lost while it
+    /// is up: the draft already stands for the whole body, the way a short
+    /// paste's marker does.
+    #[test]
+    fn a_large_paste_offers_the_menu_and_keeps_the_marker() {
+        let body = long_paste(150);
+        let mut chat = chat();
+        chat.paste(&body);
+
+        let menu = chat.paste_menu.as_ref().expect("the menu is offered");
+        assert_eq!(menu.lines, 150);
+        assert_eq!(menu.selected, 0, "the first row is the cursor");
+        assert_eq!(chat.input, "[Paste #1 · 150 lines]");
+        assert_eq!(chat.expand_pastes(&chat.input), body, "nothing is lost");
+
+        let view = panel_view_for(&chat, 30, 100).expect("a panel");
+        let title = view.title.clone().unwrap_or_default();
+        assert!(title.contains("pasted 150 lines"), "{title}");
+        assert!(title.contains("esc keeps the marker"), "{title}");
+        assert_eq!(view.lines.len(), PasteMenu::ROWS.len());
+    }
+
+    /// Below the threshold there is no menu, and a paste that only reaches the
+    /// collapse threshold still becomes its marker: the menu is an offer, not a
+    /// change to what a paste does.
+    #[test]
+    fn a_paste_below_the_threshold_never_offers_the_menu() {
+        let mut chat = chat();
+        chat.paste(&long_paste(8));
+        assert!(chat.paste_menu.is_none());
+        assert_eq!(chat.input, "[Paste #1 · 8 lines]");
+
+        // …and a threshold of 0 turns the offer off for a paste of any size.
+        let mut off = chat_with_theme(test_theme());
+        off.paste_menu_after = 0;
+        off.paste(&long_paste(400));
+        assert!(off.paste_menu.is_none());
+        assert_eq!(off.input, "[Paste #1 · 400 lines]");
+    }
+
+    /// Taking the block row fences what the marker stands for: the draft is
+    /// untouched, and what would be sent is the body between fences.
+    #[test]
+    fn attaching_a_paste_as_a_block_fences_it_at_send() {
+        let mut chat = chat();
+        chat.paste(&long_paste(150));
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.paste_menu.is_none(), "the menu closes on Enter");
+        assert_eq!(
+            chat.input, "[Paste #1 · 150 lines]",
+            "the draft is untouched"
+        );
+
+        let sent = chat.expand_pastes(&chat.input);
+        assert!(sent.starts_with("```\nline 1\n"), "{sent:.40}");
+        assert!(
+            sent.ends_with("line 150\n```"),
+            "{}",
+            &sent[sent.len() - 20..]
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "paste: 150 lines will be sent as a fenced block"),
+            "{:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Taking the file row writes the body under the workspace and leaves its
+    /// path where the marker was, so the model can `read` it instead of paying
+    /// for it in every request — and the marker stops standing for anything.
+    #[test]
+    fn attaching_a_paste_as_a_file_names_its_path() {
+        let dir = tempfile::tempdir().expect("temp");
+        let body = long_paste(150);
+        let mut chat = chat();
+        chat.workspace = dir.path().to_path_buf();
+        chat.paste(&body);
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Enter, Instant::now());
+
+        assert!(chat.paste_menu.is_none());
+        assert_eq!(chat.input, ".titi/pastes/paste-1.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".titi/pastes/paste-1.txt")).expect("the file"),
+            body
+        );
+        assert_eq!(
+            chat.expand_pastes(&chat.input),
+            ".titi/pastes/paste-1.txt",
+            "a path is sent as written, not expanded"
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "paste: wrote .titi/pastes/paste-1.txt (150 lines)"),
+            "{:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Esc keeps what a short paste would have left: the marker, expanding to
+    /// the body as it was pasted. A workspace that cannot be written does the
+    /// same, and says so.
+    #[test]
+    fn esc_or_a_failed_write_keeps_the_verbatim_marker() {
+        let body = long_paste(150);
+        let mut chat = chat();
+        chat.paste(&body);
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.paste_menu.is_none());
+        assert_eq!(chat.input, "[Paste #1 · 150 lines]");
+        assert_eq!(chat.expand_pastes(&chat.input), body);
+
+        // A workspace that does not exist cannot hold the file: the marker
+        // stays registered and the error is said, rather than a path to
+        // nothing being left in the draft.
+        let mut broken = chat_with_theme(test_theme());
+        broken.workspace = std::path::PathBuf::from("/nonexistent-titi-workspace");
+        broken.paste(&body);
+        broken.on_key(Key::Down, Instant::now());
+        broken.on_key(Key::Enter, Instant::now());
+        assert_eq!(broken.input, "[Paste #1 · 150 lines]");
+        assert_eq!(broken.expand_pastes(&broken.input), body);
+        assert!(
+            broken
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("paste: not written")),
+            "{:?}",
+            broken.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// Every row attaches what it says it does. Adding a row to `PasteMenu::ROWS`
+    /// without teaching `accept_paste_menu` about it fails here.
+    #[test]
+    fn every_paste_menu_row_attaches_something() {
+        let dir = tempfile::tempdir().expect("temp");
+        let body = long_paste(120);
+        for row in 0..PasteMenu::ROWS.len() {
+            let mut chat = chat();
+            chat.workspace = dir.path().to_path_buf();
+            chat.paste(&body);
+            chat.paste_menu.as_mut().expect("open").selected = row;
+            chat.on_key(Key::Enter, Instant::now());
+            match row {
+                PasteMenu::BLOCK => assert!(
+                    chat.expand_pastes(&chat.input).contains("```"),
+                    "the block row fences the body"
+                ),
+                _ => assert_eq!(
+                    chat.input, ".titi/pastes/paste-1.txt",
+                    "the file row leaves the path"
+                ),
+            }
+        }
+    }
+
+    /// The key is read once, from the same settings as everything else: unset
+    /// leaves the screen's own default, a number is the number, and a typo
+    /// leaves the default rather than refusing to start.
+    #[test]
+    fn the_paste_menu_threshold_reads_the_config() {
+        let dir = tempfile::tempdir().expect("temp");
+        let read = |yml: &str| {
+            std::fs::write(dir.path().join("config.yml"), yml).expect("config");
+            titi_config::settings::Settings::load(dir.path(), dir.path(), &[])
+                .expect("load")
+                .paste_menu_threshold()
+        };
+        assert_eq!(read("paste:\n  menuThreshold: 12\n"), Some(12));
+        assert_eq!(read("paste:\n  menuThreshold: 0\n"), Some(0), "0 is off");
+        assert_eq!(
+            read("paste: {}\n"),
+            None,
+            "unset leaves the screen's default"
+        );
+        assert_eq!(
+            read("paste:\n  menuThreshold: often\n"),
+            None,
+            "a typo is no number"
+        );
+        assert_eq!(read("paste:\n  menuThreshold: -3\n"), None);
     }
 
     /// One session that took a second branch: `one` → `two` → `three`, then the

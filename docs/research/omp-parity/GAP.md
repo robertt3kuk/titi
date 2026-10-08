@@ -43,12 +43,12 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: small. `crates/titi-tui/src/caps.rs` + one pair of writes around a turn in `crates/titi-cli/src/chat.rs`.
 - beauty: no rows change; the tab spinner runs while the agent works and clears on yield.
 
-## 6. Large-paste menu
-- omp: `paste.largeMenuThreshold` (`modes/settings.ts:1012`, default 100 lines); the menu re-inserts as code block / XML tags / file via `pi-tui/src/components/editor.ts:755,3226`.
-- titi: partly — long pastes already collapse to a preview (`crates/titi-tui/src/composer.rs:68,132-159`, `PasteResult::Collapsed`), but there is no menu: `grep -rn "menu\|Menu" crates/titi-tui/src/composer.rs` → none.
+## 6. Large-paste menu — **ported** (marker + fenced block + file)
+- omp: `paste.largeMenuThreshold` (`modes/settings.ts:1012`, default 100 lines); the menu re-inserts as code block / XML tags / file via `pi-tui/src/components/editor.ts:755,3226` (`handleLargePaste` / `presentLargePasteMenu`, `modes/controllers/input-controller.ts:2497,2520`).
+- titi: **ported** — a paste of `paste.menuThreshold` lines (`crates/titi-config/src/settings.rs:186`, default 100, `0` turns the menu off) stages its marker exactly as before and then opens a two-row panel above the composer (`paste_panel`, `crates/titi-cli/src/pickers.rs`): **attach as a block** keeps the marker and makes what it stands for at send the fenced body; **attach as a file** writes the body to `.titi/pastes/paste-<n>.txt` in the workspace (`session_fs::write_paste`) and leaves that workspace-relative path in the draft, where `read` — whose root is the workspace — walks it in ranges instead of the model paying for the body in every request. Esc, or any key aimed at the composer, keeps the marker verbatim: omp's third row ("paste inline") is this screen's Esc, and a paste is never lost to the menu. A write that fails keeps the marker too, and says why. One deliberate difference: omp's other wrapper is `<attachment>` XML tags, and titi has no tag vocabulary for them — a code fence is titi's own way of saying "this is a block of text", and the transcript already draws one as a box.
 - value: anyone pasting logs/stacktraces — chooses how it enters the prompt instead of a `[Paste]` marker.
-- cost: small. `crates/titi-tui/src/composer.rs` (a small select overlay) + key routing in `crates/titi-cli/src/chat.rs`.
-- beauty: a 3-row picker above the composer after a ≥100-line paste; the input then shows a fenced block or `<paste>` wrapper.
+- cost: small. `crates/titi-cli/src/keys.rs` (the paste path and the two attachments), `crates/titi-cli/src/pickers.rs` (the panel), `crates/titi-cli/src/session_fs.rs` (`write_paste`), `crates/titi-config/src/settings.rs` (the key).
+- beauty: a two-row picker above the composer after a ≥100-line paste, titled `pasted 150 lines · esc keeps the marker`; the input then holds a fenced block or `.titi/pastes/paste-1.txt`.
 
 ## 7. Emoji autocomplete — **ported** (`faa2de9 feat(tui): expand emoji shortcodes and emoticons in the composer`, `effcf3e feat(cli): expand emoji and open the picker in the live composer`)
 - omp: `emojiAutocomplete` (`modes/settings.ts:999`); shortcode + emoticon expansion in `pi-tui/src/prompt/emoji-autocomplete.ts:2,12` against `pi-tui/src/prompt/data/emojis.json` (33 KB, sorted longest-first).
