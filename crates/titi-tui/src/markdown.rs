@@ -1691,4 +1691,36 @@ Done in `AGENTS.md`.";
             ]
         );
     }
+
+    /// A runaway answer cannot grow one table without bound: the body stops at
+    /// the row cap and the rest is literal text, and a row wider than the
+    /// column cap is prose from the start.
+    #[test]
+    fn table_input_is_capped() {
+        let theme = colored_theme();
+        let mut md = String::from("| a |\n|---|\n");
+        for i in 0..MAX_TABLE_ROWS + 3 {
+            md.push_str(&format!("| {i} |\n"));
+        }
+        let rows = plain(&render_markdown(&md, &theme, 40));
+        assert_eq!(
+            rows.iter().filter(|r| r.starts_with("│ ")).count(),
+            1 + MAX_TABLE_ROWS,
+            "header plus exactly the capped body rows"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.starts_with('└')).count(),
+            1,
+            "one frame: {rows:?}"
+        );
+        assert!(
+            rows.contains(&format!("| {} |", MAX_TABLE_ROWS + 2)),
+            "the rows past the cap are still on screen"
+        );
+
+        let header = format!("|{}", " c |".repeat(MAX_TABLE_COLS + 1));
+        let delim = format!("|{}", "---|".repeat(MAX_TABLE_COLS + 1));
+        let rows = plain(&render_markdown(&format!("{header}\n{delim}"), &theme, 200));
+        assert_eq!(rows, vec![header, delim], "a row that wide is prose");
+    }
 }
