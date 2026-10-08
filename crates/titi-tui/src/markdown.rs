@@ -27,6 +27,12 @@
 //!   one space of padding per side, column widths from the widest cell's
 //!   display width, and per-column alignment; a ragged or malformed block
 //!   stays literal text rather than losing a cell
+//! - Inline math (`$…$`, `\(…\)`) — converted by `latex::to_unicode` inside
+//!   the inline pipeline, so it inherits the surrounding style and wraps like
+//!   the words around it. A lone `$`, a price (`$5 and $6`), a `$` inside
+//!   inline code or a fence, a `$` with a backslash in front of it, and any
+//!   span without a matching closer all stay literal: money is never eaten.
+//!   A `$$…$$` in the middle of a sentence renders in this inline form too.
 //! - Paragraphs — wrapped to `width`
 //!
 //! # Section visibility
@@ -36,6 +42,7 @@
 //! and tools expanded, subagents collapsed, activity hidden).
 //! `SectionVisibility::apply` implements `/details <section> <mode>`.
 
+use crate::latex;
 use crate::theme::{Theme, ThemeColor};
 use crate::width::{replace_tabs, truncate_to_width, visible_width, wrap_text_with_ansi};
 
@@ -348,6 +355,96 @@ fn render_code_block(code: &[&str], lang: &str, theme: &Theme, w: usize) -> Vec<
         &format!("╰{}╯", "─".repeat(w.saturating_sub(2))),
     ));
     out
+}
+
+// ---------------------------------------------------------------------------
+// Math
+// ---------------------------------------------------------------------------
+
+/// An inline math span at the head of `text`: `$…$`, `$$…$$` or `\(…\)`.
+///
+/// The guards are the whole point — a `$` that could be money, an escaped `$`,
+/// or a span with no closer is not math, and the caller then leaves the
+/// characters alone:
+///
+/// - the opener must be followed by a non-space, non-digit, non-`$` character
+///   (so `$5 and $6` and a bare `$` are money and symbols, not maths);
+/// - neither the opener nor the closer may be preceded by a backslash, so
+///   `\$` is left exactly as written;
+/// - the closer may not be preceded by a space or followed by a digit;
+/// - the body must be non-empty and on one line (`style_inline` is per-line,
+///   and the `\n` test keeps it that way if that ever changes).
+///
+/// Returns the converted text and how many bytes the span used.
+fn take_inline_math(text: &str) -> Option<(String, usize)> {
+    if let Some(rest) = text.strip_prefix("\\(") {
+        let end = rest.find("\\)")?;
+        let body = &rest[..end];
+        if body.is_empty() || body.contains('\n') {
+            return None;
+        }
+        let rendered = latex::to_unicode(body.trim());
+        if rendered.is_empty() {
+            return None;
+        }
+        return Some((rendered, 2 + end + 2));
+    }
+    let rest = text.strip_prefix('$')?;
+    if let Some(rest) = rest.strip_prefix('$') {
+        let end = rest.find("$$")?;
+        let body = &rest[..end];
+        if body.is_empty() || body.contains('\n') {
+            return None;
+        }
+        let rendered = latex::to_unicode(body.trim());
+        if rendered.is_empty() {
+            return None;
+        }
+        return Some((rendered, 2 + end + 2));
+    }
+    let first = rest.chars().next()?;
+    if first.is_whitespace() || first.is_ascii_digit() {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(offset) = rest[from..].find('$') {
+        let close = from + offset;
+        let opened = rest[..close].chars().next_back();
+        let after = rest[close + 1..].chars().next();
+        let preceded_by_space = opened.is_some_and(char::is_whitespace);
+        let followed_by_digit = after.is_some_and(|c| c.is_ascii_digit());
+        if !preceded_by_space && !followed_by_digit && opened != Some('\\') {
+            let body = &rest[..close];
+            let rendered = latex::to_unicode(body.trim());
+            if rendered.is_empty() {
+                return None;
+            }
+            return Some((rendered, 1 + close + 1));
+        }
+        from = close + 1;
+    }
+    None
+}
+
+/// Byte offset of the first inline math span in `text`, or `None`.
+///
+/// A `$` with a backslash in front of it is skipped, so `\$` never opens a
+/// span (and both characters stay).
+fn inline_math_open(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while from < text.len() {
+        let dollar = text[from..].find('$').map(|o| from + o);
+        let paren = text[from..].find("\\(").map(|o| from + o);
+        let at = match (dollar, paren) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        if !text[..at].ends_with('\\') && take_inline_math(&text[at..]).is_some() {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -874,9 +971,10 @@ fn parse_list_item(raw: &str) -> Option<(usize, String, &str)> {
 
 /// Style inline markdown in a single line of text.
 ///
-/// Handles `` `code` ``, `[text](url)`, `**bold**`, `*italic*` and
-/// `_italic_`.  Processes the earliest marker first and recurses into prefixes
-/// so nested/staged markers (e.g. bold before an inline code span) all render.
+/// Handles `` `code` ``, `[text](url)`, `**bold**`, `*italic*`, `_italic_`
+/// and math (`$…$`, `\(…\)`).  Processes the earliest marker first and recurses
+/// into prefixes so nested/staged markers (e.g. bold before an inline code
+/// span) all render.
 fn style_inline(text: &str, theme: &Theme) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -886,8 +984,9 @@ fn style_inline(text: &str, theme: &Theme) -> String {
         let bold_at = rest.find("**");
         let italic_at = rest.find('*');
         let underscore_at = underscore_italic_at(rest);
+        let math_at = inline_math_open(rest);
 
-        // Earliest marker wins; on ties code > link > bold > italic.
+        // Earliest marker wins; on ties code > link > bold > italic > math.
         let mut best: Option<(usize, &str)> = None;
         for (i, kind) in [
             (code_at, "code"),
@@ -895,6 +994,7 @@ fn style_inline(text: &str, theme: &Theme) -> String {
             (bold_at, "bold"),
             (italic_at, "italic"),
             (underscore_at, "underscore"),
+            (math_at, "math"),
         ] {
             let Some(i) = i else { continue };
             if kind == "italic" && bold_at == Some(i) {
@@ -976,6 +1076,21 @@ fn style_inline(text: &str, theme: &Theme) -> String {
                     rest = &rest[end + 1..];
                 } else {
                     out.push('_');
+                }
+            }
+            "math" => {
+                // The maths is plain Unicode text here, so an enclosing bold
+                // or italic span still styles it like the words around it.
+                match take_inline_math(rest) {
+                    Some((rendered, used)) => {
+                        out.push_str(&rendered);
+                        rest = &rest[used.min(rest.len())..];
+                    }
+                    None => {
+                        let skip = if rest.starts_with("\\(") { 2 } else { 1 };
+                        out.push_str(&rest[..skip]);
+                        rest = &rest[skip..];
+                    }
                 }
             }
             _ => unreachable!(),
@@ -1826,5 +1941,67 @@ Done in `AGENTS.md`.";
             !style_is_open(content.trim_end()),
             "the style is closed before the padding: {cut:?}"
         );
+    }
+
+    // ---- LaTeX math -------------------------------------------------------
+
+    /// Inline maths reaches a heading, a bullet and a quote as Unicode: the
+    /// `$` never survives, and the surrounding style still applies.
+    #[test]
+    fn math_renders_inside_every_inline_construct() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown("## Growth $O(n\\log n)$", &theme, 40)),
+            vec!["Growth O(n log n)"]
+        );
+        assert_eq!(
+            plain(&render_markdown("- step $x^2$", &theme, 40)),
+            vec!["• step x²"]
+        );
+        assert_eq!(
+            plain(&render_markdown("> limit $\\to \\infty$", &theme, 40)),
+            vec!["▎ limit → ∞"]
+        );
+    }
+
+    /// A cell goes through the same pipeline, so a formula in a table renders
+    /// like prose and the column still measures the glyphs, not the TeX.
+    #[test]
+    fn math_renders_in_a_table_cell() {
+        let theme = colored_theme();
+        let rows = plain(&render_markdown(
+            "| Cost |\n|------|\n| $O(n^2)$ |",
+            &theme,
+            40,
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                "┌───────┐",
+                "│ Cost  │",
+                "├───────┤",
+                "│ O(n²) │",
+                "└───────┘",
+            ]
+        );
+    }
+
+    /// Guards, at the unit level: money, an escaped dollar, a lone dollar and a
+    /// span with no closer all stay exactly as written.
+    #[test]
+    fn math_guards_keep_the_dollar_signs() {
+        let theme = colored_theme();
+        for line in [
+            "It costs $5 and $6 here.",
+            "A lone $ and another $",
+            "Costs \\$5 today.",
+            "An open $x with no closer.",
+        ] {
+            assert_eq!(
+                plain(&render_markdown(line, &theme, 60)),
+                vec![line],
+                "left literal: {line:?}"
+            );
+        }
     }
 }
