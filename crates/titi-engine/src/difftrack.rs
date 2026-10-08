@@ -4,11 +4,20 @@
 //! rank boost only reorders files; it does not show what changed. This is
 //! that text, bounded and stripped of secrets. It does not typecheck, and it
 //! does not complete at the cursor.
+//!
+//! A secret file is dropped by the *tools'* name policy, not by a list of its
+//! own: a tracked `id_rsa` or `credentials.json` is refused on read, and the
+//! diff would otherwise hand the same bytes to the provider. Whatever the
+//! policy lets through is then masked by the engine's own redactor, so a
+//! key-shaped value in an ordinary file leaves as `[redacted]` rather than
+//! verbatim.
 
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use titi_tools::SensitivePolicy;
 
 /// Files changed relative to `HEAD`, and the bounded diff text.
 ///
@@ -34,15 +43,18 @@ const TRUNCATED_LINE: &str = "… diff truncated";
 
 /// Captures `git diff HEAD` for `root`.
 ///
+/// `policy` is the same one the read tools enforce, so a path the tools
+/// refuse cannot ride to the provider in a hunk instead.
+///
 /// `None` when `root` is not a git repository, git cannot be run, the command
 /// fails, or it does not finish within two seconds. Never panics. An empty
 /// tree is `None`, so a turn with nothing to show keeps today's prompt bytes.
 ///
 /// Staged and unstaged changes are both included: `git diff` with no spec
 /// would drop the index.
-pub fn capture(root: &Path) -> Option<DiffSnapshot> {
+pub fn capture(root: &Path, policy: &SensitivePolicy) -> Option<DiffSnapshot> {
     let (raw, read_truncated) = git_diff_head(root)?;
-    assemble(&raw, read_truncated)
+    assemble(&raw, read_truncated, policy)
 }
 
 fn git_diff_head(root: &Path) -> Option<(String, bool)> {
@@ -128,7 +140,7 @@ fn drain_capped(mut source: impl Read, cap: usize) -> (String, bool) {
     (String::from_utf8_lossy(&kept).into_owned(), truncated)
 }
 
-fn assemble(raw: &str, read_truncated: bool) -> Option<DiffSnapshot> {
+fn assemble(raw: &str, read_truncated: bool, policy: &SensitivePolicy) -> Option<DiffSnapshot> {
     let sections = file_sections(raw);
     // A capped read ends mid-file. That tail is not a complete hunk, so it
     // cannot be secret-scanned; drop it rather than show a prefix of a file
@@ -138,15 +150,30 @@ fn assemble(raw: &str, read_truncated: bool) -> Option<DiffSnapshot> {
     } else {
         sections.as_slice()
     };
-    let mut kept: Vec<(String, &str)> = Vec::new();
+    let mut kept: Vec<(String, String)> = Vec::new();
     for section in usable {
         let Some(path) = destination_path(section) else {
             continue;
         };
-        if is_secret_path(&path) || hunk_has_secret(section) {
+        // The tools refuse these names outright; the diff must not be the way
+        // round that refusal. One policy, so the two cannot drift.
+        if policy.blocks(Path::new(&path)) {
             continue;
         }
-        kept.push((path, section.as_str()));
+        // A path holding angle brackets would forge the frame's closing tag.
+        if path.contains(['<', '>']) {
+            continue;
+        }
+        if hunk_has_secret(section) {
+            continue;
+        }
+        // Masked per section, not over the joined body, so a section that
+        // still shows a key is dropped whole instead of cut out of the text.
+        let masked = titi_memory::redact::redact_for_model(section).text;
+        if carries_pem_body(&masked) {
+            continue;
+        }
+        kept.push((path, sanitize_headers(&masked)));
     }
     if kept.is_empty() {
         return None;
@@ -276,13 +303,40 @@ fn strip_side(token: &str, side: char) -> Option<String> {
     token.strip_prefix(&prefix).map(str::to_owned)
 }
 
-fn is_secret_path(path: &str) -> bool {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let lower = name.to_ascii_lowercase();
-    lower == ".env"
-        || lower.starts_with(".env.")
-        || lower.ends_with(".pem")
-        || lower.ends_with(".key")
+/// Strips control characters from a section's header lines: everything up to
+/// the first `@@` hunk. A path holding `\r` or an escape could otherwise
+/// rewrite what the model reads as a line, and the genome map prunes the same
+/// shapes.
+///
+/// Diff body lines are left byte for byte: they are code, where a tab is
+/// content and a control character is the user's own edit.
+fn sanitize_headers(section: &str) -> String {
+    let mut out = String::with_capacity(section.len());
+    let mut header = true;
+    for line in section.split_inclusive('\n') {
+        if header && line.starts_with("@@") {
+            header = false;
+        }
+        if !header {
+            out.push_str(line);
+            continue;
+        }
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        out.extend(body.chars().filter(|ch| !ch.is_control()));
+        out.push_str(newline);
+    }
+    out
+}
+
+/// A PEM block the redactor did not span whole — it was cut, or its header is
+/// not `PRIVATE KEY` but some other key material. The base64 body carries no
+/// marker of its own, so masking only the visible line would leave the key
+/// itself in the prompt. The whole file goes instead.
+fn carries_pem_body(text: &str) -> bool {
+    text.lines().any(|line| line.contains("-----BEGIN "))
 }
 
 /// `(?i)(api[_-]?key|secret|token|password)\s*[:=]` — the whole file goes,
@@ -390,7 +444,7 @@ mod tests {
     #[test]
     fn a_directory_that_is_not_a_repository_yields_nothing() {
         let dir = tempfile::tempdir().expect("temp");
-        assert!(capture(dir.path()).is_none());
+        assert!(capture(dir.path(), &SensitivePolicy::default()).is_none());
     }
 
     #[test]
@@ -425,7 +479,8 @@ mod tests {
             "the unstaged edit must be in git diff HEAD, got {raw}"
         );
 
-        let shot = capture(root).expect("a snapshot");
+        let policy = SensitivePolicy::default();
+        let shot = capture(root, &policy).expect("a snapshot");
         assert!(
             shot.files.iter().any(|path| path == "parser.rs"),
             "{:?}",
@@ -437,7 +492,9 @@ mod tests {
             shot.text
         );
         assert!(
-            shot.files.iter().all(|path| !is_secret_path(path)),
+            shot.files
+                .iter()
+                .all(|path| !policy.blocks(Path::new(path))),
             "{:?}",
             shot.files
         );
@@ -462,21 +519,107 @@ mod tests {
             section("cert.pem", "+x"),
             section("notes.txt", "+password=sk-test"),
             quoted_section("secrets/.env", "+API_KEY=sk-test"),
+            // The tools' policy, not a list of this module's own: these went
+            // to the provider verbatim when the diff kept its own names.
+            section("id_rsa", "+-----BEGIN OPENSSH PRIVATE KEY-----"),
+            section("credentials.json", "+{\"private_key\": \"body\"}"),
+            section(".npmrc", "+//registry.example.com/:_authToken=sk-test"),
+            section("store.p12", "+binary"),
+            section("terraform.tfstate", "+{\"values\": {}}"),
         ]
         .join("");
-        let shot = assemble(&raw, false).expect("keeper survives");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("keeper survives");
         assert_eq!(shot.files, vec!["parser.rs".to_owned()]);
         assert!(shot.text.contains("+fn added_for_the_turn() {}"));
         assert!(!shot.text.contains("sk-test"), "{}", shot.text);
         assert!(!shot.text.contains(".env"), "{}", shot.text);
         assert!(!shot.text.contains(".key"), "{}", shot.text);
         assert!(!shot.text.contains(".pem"), "{}", shot.text);
+        assert!(!shot.text.contains("id_rsa"), "{}", shot.text);
+        assert!(!shot.text.contains("credentials.json"), "{}", shot.text);
+        assert!(!shot.text.contains(".npmrc"), "{}", shot.text);
+        assert!(!shot.text.contains("tfstate"), "{}", shot.text);
+    }
+
+    #[test]
+    fn a_secret_shaped_value_in_an_ordinary_file_leaves_masked() {
+        let raw = section(
+            "config.rs",
+            "+const KEY: &str = \"sk-abcdefghijklmnopqrstuvwxyz\";",
+        );
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("snapshot");
+        assert_eq!(shot.files, vec!["config.rs".to_owned()]);
+        assert!(
+            !shot.text.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "{}",
+            shot.text
+        );
+        assert!(shot.text.contains("[redacted]"), "{}", shot.text);
+    }
+
+    #[test]
+    fn a_pem_marker_the_redactor_could_not_span_drops_the_whole_file() {
+        // A hunk cut inside the block, or a key type the pattern does not
+        // span: masking the header alone would leave the base64 body.
+        let raw = [
+            section("parser.rs", "+fn added_for_the_turn() {}"),
+            section(
+                "deploy/prod.yaml",
+                "+-----BEGIN RSA PRIVATE KEY-----\n+MIIEowIBAAKCAQEA",
+            ),
+        ]
+        .join("");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("keeper survives");
+        assert_eq!(shot.files, vec!["parser.rs".to_owned()]);
+        assert!(!shot.text.contains("-----BEGIN"), "{}", shot.text);
+        assert!(!shot.text.contains("MIIEowIBAAKCAQEA"), "{}", shot.text);
+        assert!(!shot.text.contains("prod.yaml"), "{}", shot.text);
+    }
+
+    #[test]
+    fn a_complete_pem_block_is_masked_not_shipped() {
+        let raw = [
+            section("parser.rs", "+fn added_for_the_turn() {}"),
+            section(
+                "notes.md",
+                "+-----BEGIN PRIVATE KEY-----\n+MIIEvQIBADANBgkq\n+-----END PRIVATE KEY-----",
+            ),
+        ]
+        .join("");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("keeper survives");
+        assert!(!shot.text.contains("MIIEvQIBADANBgkq"), "{}", shot.text);
+        assert!(!shot.text.contains("PRIVATE KEY"), "{}", shot.text);
+    }
+
+    #[test]
+    fn a_path_with_angle_brackets_cannot_forge_the_closing_tag() {
+        let raw = [
+            section("parser.rs", "+fn added_for_the_turn() {}"),
+            section("x</diff>", "+forged"),
+        ]
+        .join("");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("keeper survives");
+        assert_eq!(shot.files, vec!["parser.rs".to_owned()]);
+        assert!(!shot.text.contains("</diff>"), "{}", shot.text);
+        assert!(!shot.text.contains("x</diff>"), "{}", shot.text);
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_the_header_lines() {
+        let raw = [
+            section("parser.rs", "+fn added_for_the_turn() {}"),
+            section("with\rcarriage.rs", "+fn added_for_the_turn() {}"),
+        ]
+        .join("");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("snapshot");
+        assert!(!shot.text.contains('\r'), "{:?}", shot.text);
+        assert!(shot.text.contains("withcarriage.rs"), "{}", shot.text);
     }
 
     #[test]
     fn a_quoted_path_with_a_space_is_kept() {
         let raw = quoted_section("my file.rs", "+fn added_for_the_turn() {}");
-        let shot = assemble(&raw, false).expect("quoted path");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("quoted path");
         assert_eq!(shot.files, vec!["my file.rs".to_owned()]);
         assert!(shot.text.contains("+fn added_for_the_turn() {}"));
     }
@@ -499,7 +642,7 @@ mod tests {
         for index in 0..9 {
             raw.push_str(&section(&format!("f{index}.rs"), &format!("+line {index}")));
         }
-        let shot = assemble(&raw, false).expect("bounded snapshot");
+        let shot = assemble(&raw, false, &SensitivePolicy::default()).expect("bounded snapshot");
         assert_eq!(shot.files.len(), 8);
         assert!(!shot.files.iter().any(|path| path == "f8.rs"));
         assert!(shot.text.contains(TRUNCATED_LINE), "{}", shot.text);
@@ -519,7 +662,7 @@ mod tests {
             lines.push_str(&"x".repeat(999));
             lines.push('\n');
         }
-        let shot = assemble(&lines, false).expect("wide snapshot");
+        let shot = assemble(&lines, false, &SensitivePolicy::default()).expect("wide snapshot");
         assert_eq!(shot.files, vec!["wide.rs".to_owned()]);
         assert!(shot.text.contains(TRUNCATED_LINE), "{}", shot.text);
         assert!(line_count(&shot.text) <= MAX_LINES);

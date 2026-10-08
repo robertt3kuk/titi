@@ -157,9 +157,12 @@ async fn genome_map(
 
 /// The working-tree diff, off the async threads. Not a repo, no git, or a
 /// call that does not finish in time is no snapshot — the turn still runs.
-async fn working_tree_diff(root: Option<PathBuf>) -> Option<crate::difftrack::DiffSnapshot> {
+async fn working_tree_diff(
+    root: Option<PathBuf>,
+    policy: titi_tools::SensitivePolicy,
+) -> Option<crate::difftrack::DiffSnapshot> {
     let root = root?;
-    tokio::task::spawn_blocking(move || crate::difftrack::capture(&root))
+    tokio::task::spawn_blocking(move || crate::difftrack::capture(&root, &policy))
         .await
         .ok()
         .flatten()
@@ -1797,7 +1800,7 @@ async fn run_turn(
     let snapshot = if config.mode == crate::protocol::SessionMode::Duck {
         None
     } else {
-        working_tree_diff(config.workspace_root.clone()).await
+        working_tree_diff(config.workspace_root.clone(), config.sensitive.clone()).await
     };
     if let Some(snapshot) = &snapshot {
         let mut edited = touched.lock().await;
