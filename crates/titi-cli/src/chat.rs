@@ -541,6 +541,10 @@ pub struct Chat {
     agent_dir: PathBuf,
     paused: bool,
     context_percent: Option<u8>,
+    /// The model's context window in tokens, as the engine reported it with the
+    /// percentage. The gauge is drawn from it, so `None` — before any turn has
+    /// stated one — is what keeps the line between the groups blank.
+    context_window: Option<u64>,
     /// Which pre-built status line the masthead paints, and what its middle does
     /// with the context. Read from the settings at startup and changed by
     /// `/statusline`.
@@ -680,6 +684,7 @@ impl Chat {
             agent_dir: titi_config::agent_dir(),
             paused: false,
             context_percent: None,
+            context_window: None,
             status_line: StatusLineStyle::default(),
             reply: String::new(),
             recorded_reply: 0,
@@ -1074,6 +1079,10 @@ impl Chat {
             EngineEvent::ContextUsage { tokens, window, .. } if window > 0 => {
                 let percent = tokens.saturating_mul(100) / window;
                 self.context_percent = Some(u8::try_from(percent.min(100)).unwrap_or(100));
+                // The window is the gauge's scale, and the label's second half:
+                // the same number the percentage was taken against, kept rather
+                // than recomputed.
+                self.context_window = Some(window);
                 Applied::none()
             }
             EngineEvent::ModelSwitched { turn_id, from, to } => {
@@ -3773,14 +3782,18 @@ pub fn run(
     .ok();
     let term_env = titi_tui::caps::TermEnv::from_env();
     chat.terminal = TerminalFeatures::resolve(settings.as_ref(), &term_env);
-    // The status line's preset comes from the same settings, resolved before
-    // the first frame: an unknown or unset name is `default`, so a typo in a
-    // cosmetic key changes nothing and never refuses to start.
+    // The status line's preset and gauge come from the same settings, resolved
+    // before the first frame: an unknown or unset name is `default`/`off`, so a
+    // typo in a cosmetic key changes nothing and never refuses to start.
     let preset = setting_string(
         settings.as_ref(),
         titi_config::settings::STATUS_LINE_PRESET_KEY,
     );
-    chat.status_line = StatusLineStyle::resolve(preset.as_deref());
+    let context_line = setting_string(
+        settings.as_ref(),
+        titi_config::settings::STATUS_LINE_CONTEXT_LINE_KEY,
+    );
+    chat.status_line = StatusLineStyle::resolve(preset.as_deref(), context_line.as_deref());
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
@@ -5557,7 +5570,9 @@ fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
     // the state word; `None` hides the segment when there is nothing running.
     snapshot.loops = (!chat.jobs.is_empty()).then_some(chat.jobs.len());
     snapshot.context_pct = chat.context_percent;
-    // The totals are what the `full` preset prints.
+    // The window is what the gauge needs and what only a turn reports; the
+    // totals are what the `full` preset prints.
+    snapshot.context_window = chat.context_window;
     snapshot.tokens = (chat.session_prompt_tokens > 0 || chat.session_completion_tokens > 0)
         .then_some((chat.session_prompt_tokens, chat.session_completion_tokens));
     snapshot

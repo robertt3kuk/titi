@@ -127,6 +127,14 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// `titi_tui::status_bar::PRESETS`.
 pub const STATUS_LINE_PRESET_KEY: &str = "statusLine.preset";
 
+/// How the line between the status line's groups reflects context usage.
+///
+/// `off` (the fallback, and what an unset key means), `percentage` or
+/// `embedded`. The gauge needs the model's context window, which only a turn
+/// reports; until one does, every mode paints the blank gap this key was added
+/// over. See [`STATUS_LINE_PRESET_KEY`]: this crate owns the name only.
+pub const STATUS_LINE_CONTEXT_LINE_KEY: &str = "statusLine.contextLine";
+
 impl Settings {
     /// Discover and load all layers.
     ///

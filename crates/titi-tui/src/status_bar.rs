@@ -1,4 +1,4 @@
-//! The status line: one table of presets, one painter.
+//! The status line: one table of presets, one painter, one context gauge.
 //!
 //! A preset is **data** — a segment set, a separator style and the order the
 //! segments are shed in when the pane is too narrow ([`PRESETS`]). The painter
@@ -6,6 +6,11 @@
 //! fifth `match` arm painting a row of its own. The `default` row is today's
 //! layout segment for segment and byte for byte: a user who sets nothing sees
 //! exactly what they saw before the table existed.
+//!
+//! The gap between the left and right groups is also the **gauge** when
+//! `statusLine.contextLine` asks for one: a rule filled in the accent up to the
+//! used share of the model's context window, the rest in the border colour,
+//! with `72% · 128k` embedded at its right end ([`ContextLine`]).
 //!
 //! What this crate does **not** paint, and why: omp's `nerd`/`custom` presets
 //! need Nerd Font glyphs and a user-written segment list, and its `status`,
@@ -58,6 +63,46 @@ pub enum Separator {
     /// ASCII throughout — separators **and** icons — for a terminal the
     /// default's glyphs do not fit.
     Ascii,
+}
+
+/// How the line between the left and right groups reflects the context.
+///
+/// `Off` is the default: the gap stays air, exactly as it was before this key
+/// existed, which is what makes the compatibility promise keepable — a user who
+/// sets nothing sees no new pixels anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextLine {
+    /// No gauge: the gap between the groups is blank, as it always was.
+    #[default]
+    Off,
+    /// The rule, filled in the accent up to the used share; no label.
+    Percentage,
+    /// The rule with `72% · 128k` embedded at its right end.
+    Embedded,
+}
+
+impl ContextLine {
+    /// Every name the setting accepts, in the order a listing shows them.
+    pub const IDS: [&'static str; 3] = ["off", "percentage", "embedded"];
+
+    /// The setting's own name for this mode.
+    pub fn id(self) -> &'static str {
+        match self {
+            ContextLine::Off => "off",
+            ContextLine::Percentage => "percentage",
+            ContextLine::Embedded => "embedded",
+        }
+    }
+
+    /// Parse a setting name; `None` for anything else.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "off" => Some(ContextLine::Off),
+            "percentage" => Some(ContextLine::Percentage),
+            "embedded" => Some(ContextLine::Embedded),
+            _ => None,
+        }
+    }
 }
 
 /// A pre-built status line, by name.
@@ -230,20 +275,25 @@ pub fn preset(preset: StatusLinePreset) -> &'static PresetDef {
         .unwrap_or_else(|| &PRESETS[0].1)
 }
 
-/// What the status line is set to.
+/// What the status line is set to: a preset, and what its middle does with the
+/// context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StatusLineStyle {
     pub preset: StatusLinePreset,
+    pub context_line: ContextLine,
 }
 
 impl StatusLineStyle {
     /// From the settings' own names. An unset name is the default and an
     /// unknown one falls back to it too: a typo in a cosmetic key must not
     /// change the screen, and must never refuse to start.
-    pub fn resolve(preset: Option<&str>) -> Self {
+    pub fn resolve(preset: Option<&str>, context_line: Option<&str>) -> Self {
         Self {
             preset: preset
                 .and_then(StatusLinePreset::from_id)
+                .unwrap_or_default(),
+            context_line: context_line
+                .and_then(ContextLine::from_id)
                 .unwrap_or_default(),
         }
     }
@@ -286,6 +336,9 @@ pub struct StatusSnapshot {
     pub git_untracked: u32,
     /// Context window fill 0–100.
     pub context_pct: Option<u8>,
+    /// The model's context window in tokens, as the engine reported it. `None`
+    /// until a turn states it — and a gauge cannot be drawn without it.
+    pub context_window: Option<u64>,
     /// Session token totals, `(prompt, completion)`, as the engine has summed
     /// them. `None` before the first turn reports any.
     pub tokens: Option<(u32, u32)>,
@@ -308,6 +361,7 @@ impl Default for StatusSnapshot {
             git_staged: 0,
             git_untracked: 0,
             context_pct: None,
+            context_window: None,
             tokens: None,
             session_name: String::new(),
         }
@@ -354,20 +408,43 @@ pub fn render_status_line(
     let def = preset(style.preset);
     let ascii = def.separator == Separator::Ascii;
     let sep = separator_text(theme, def.separator);
+    // `embedded` moves the number out of the group and into the gauge's label,
+    // so the context segment leaves the group — but only when the window is
+    // known, because with no window there is no gauge and no label to carry it,
+    // and the group must keep showing the slot it always did.
+    let absorbed = style.context_line == ContextLine::Embedded && snap.context_window.is_some();
+    let kept = |seg: &Segment| !(absorbed && *seg == Segment::Context);
+
     let mut left: Vec<(Segment, String)> = def
         .left
         .iter()
         .copied()
+        .filter(kept)
         .filter_map(|seg| segment_text(seg, theme, ascii, snap).map(|text| (seg, text)))
         .collect();
     let mut right: Vec<(Segment, String)> = def
         .right
         .iter()
         .copied()
+        .filter(kept)
         .filter_map(|seg| segment_text(seg, theme, ascii, snap).map(|text| (seg, text)))
         .collect();
 
-    let min_gap = MIN_GAP;
+    // The label's own cells, when `embedded` will draw one: the fit loop
+    // reserves them, so a narrow pane sheds a segment rather than losing the
+    // number entirely. When the pane cannot hold the label at all the
+    // reservation falls back to one cell — the labels cannot render at that
+    // width either way, and the line must still be drawn.
+    let label_cells = if style.context_line == ContextLine::Embedded {
+        embedded_label_cells(snap)
+    } else {
+        0
+    };
+    let min_gap = if label_cells > 0 && label_cells + 2 <= cells {
+        label_cells + 2
+    } else {
+        MIN_GAP
+    };
 
     // What the line gives up, in order, when the pane is too narrow: the
     // preset's shed list, then the model's provider prefix, then the model
@@ -415,8 +492,124 @@ pub fn render_status_line(
     let gap = cells
         .saturating_sub(visible_width(&left_s) + visible_width(&right_s))
         .max(min_gap);
-    let fill = " ".repeat(gap);
+    let fill = match style.context_line {
+        ContextLine::Off => " ".repeat(gap),
+        mode => gauge(theme, ascii, gap, mode, snap),
+    };
     truncate_to_width(&format!("{left_s}{fill}{right_s}"), cells)
+}
+
+/// Cells the embedded label takes: `72% · 128k`, or the window alone before a
+/// percentage is known. Zero when there is no window to label — and a label is
+/// what the fit loop reserves room for, so this is the one place its width is
+/// decided.
+fn embedded_label_cells(snap: &StatusSnapshot) -> usize {
+    let Some(window) = snap.context_window else {
+        return 0;
+    };
+    let window_text = compact_tokens(u32::try_from(window).unwrap_or(u32::MAX));
+    let percent = snap
+        .context_pct
+        .map(|pct| visible_width(&format!("{pct}%")) + 3)
+        .unwrap_or(0);
+    percent + visible_width(&window_text)
+}
+
+/// The gap's rule, and the gauge with it: `mode` cells of the rule, the first
+/// `used` of them in the accent and the rest in the border colour, with the
+/// label embedded at the right end when one fits.
+///
+/// The label is a unit anchored at the right, so a percent that gains a digit
+/// (`9%` → `10%`) grows into the rule instead of moving anything: the groups on
+/// either side of the gap keep their columns. 0% lights nothing and 100% lights
+/// every cell — the two ends are drawn as they are stated.
+fn gauge(
+    theme: &Theme,
+    ascii: bool,
+    cells: usize,
+    mode: ContextLine,
+    snap: &StatusSnapshot,
+) -> String {
+    // No window, no gauge: a rule with nothing to say would read as a fact.
+    let Some(window) = snap.context_window else {
+        return " ".repeat(cells);
+    };
+    let rule = rule_glyph(theme, ascii);
+    // The separator inside the label is three cells in both styles, so the
+    // width the fit loop reserves is one number (`embedded_label_cells`); what
+    // changes with the style is only whether it is printable.
+    let label_sep = if ascii { " - " } else { " · " };
+    let (percent, window_text) = match mode {
+        // One rule cell on each side, so the label reads as embedded in the
+        // line rather than as the end of it.
+        ContextLine::Embedded if embedded_label_cells(snap) + 2 <= cells => {
+            let window_text = compact_tokens(u32::try_from(window).unwrap_or(u32::MAX));
+            (
+                snap.context_pct.map(|pct| format!("{pct}%")),
+                Some(window_text),
+            )
+        }
+        _ => (None, None),
+    };
+    let label_cells = match &window_text {
+        Some(text) => {
+            percent
+                .as_ref()
+                .map_or(0, |p| visible_width(p) + visible_width(label_sep))
+                + visible_width(text)
+        }
+        None => 0,
+    };
+    let label_start = if label_cells > 0 {
+        cells - 1 - label_cells
+    } else {
+        cells
+    };
+
+    let used = snap
+        .context_pct
+        .map(|pct| (usize::from(pct) * cells + 50) / 100)
+        .unwrap_or(0)
+        .min(cells);
+    let mut out = String::new();
+    let mut at = 0usize;
+    while at < cells {
+        if label_cells > 0 && at == label_start {
+            if let Some(text) = &percent {
+                out.push_str(&theme.fg(ThemeColor::StatusLineContext, text));
+                out.push_str(&theme.fg(ThemeColor::Muted, label_sep));
+            }
+            if let Some(text) = &window_text {
+                out.push_str(&theme.fg(ThemeColor::Muted, text));
+            }
+            at += label_cells;
+            continue;
+        }
+        let lit = at < used;
+        let mut end = at + 1;
+        while end < cells && (end < used) == lit && !(label_cells > 0 && end == label_start) {
+            end += 1;
+        }
+        let color = if lit {
+            ThemeColor::BorderAccent
+        } else {
+            ThemeColor::Border
+        };
+        out.push_str(&theme.fg(color, &rule.repeat(end - at)));
+        at = end;
+    }
+    out
+}
+
+/// The rule's own glyph: the box-drawing bar the crate's frames use, or the
+/// ASCII hyphen for a line that must stay printable.
+fn rule_glyph(theme: &Theme, ascii: bool) -> String {
+    let glyph = sym(theme, ascii, "boxRound.horizontal");
+    if glyph.is_empty() {
+        "-".to_owned()
+    } else {
+        glyph.to_owned()
+    }
 }
 
 /// One segment's text, or `None` when the fact behind it is absent.
@@ -832,7 +1025,10 @@ mod tests {
     }
 
     fn style(preset: StatusLinePreset) -> StatusLineStyle {
-        StatusLineStyle { preset }
+        StatusLineStyle {
+            preset,
+            context_line: ContextLine::Off,
+        }
     }
 
     fn visible(line: &str) -> String {
@@ -965,15 +1161,24 @@ mod tests {
 
     #[test]
     fn the_ascii_preset_stays_printable() {
+        // With a window and a percentage, so the gauge and its label are part
+        // of what has to stay printable — the label's own separator included.
+        let mut s = snap();
+        s.context_pct = Some(49);
+        s.context_window = Some(400);
         for width in [60u16, 80, 120] {
             let line = visible(&render_status_line(
                 &theme(),
                 width,
-                style(StatusLinePreset::Ascii),
-                &snap(),
+                StatusLineStyle {
+                    preset: StatusLinePreset::Ascii,
+                    context_line: ContextLine::Embedded,
+                },
+                &s,
             ));
             assert!(line.is_ascii(), "{width}: not ASCII: {line:?}");
             assert!(!line.contains('─'), "{width}: box glyph: {line:?}");
+            assert!(line.contains("49% - 400"), "{width}: {line:?}");
         }
     }
 
@@ -1005,14 +1210,222 @@ mod tests {
     }
 
     #[test]
+    fn no_window_means_no_gauge() {
+        let theme = theme();
+        for mode in [ContextLine::Percentage, ContextLine::Embedded] {
+            let line = render_status_line(
+                &theme,
+                120,
+                StatusLineStyle {
+                    preset: StatusLinePreset::Default,
+                    context_line: mode,
+                },
+                &snap(),
+            );
+            let text = visible(&line);
+            assert!(
+                !text.contains('─'),
+                "{mode:?}: a rule with no window: {text:?}"
+            );
+            assert!(
+                !text.contains('%'),
+                "{mode:?}: a percent with no window: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_absorbs_the_context_segment_into_the_label() {
+        let theme = theme();
+        let mut s = snap();
+        s.context_pct = Some(72);
+        s.context_window = Some(128_000);
+        let line = visible(&render_status_line(
+            &theme,
+            120,
+            StatusLineStyle {
+                preset: StatusLinePreset::Default,
+                context_line: ContextLine::Embedded,
+            },
+            &s,
+        ));
+        assert!(line.contains("72% · 128k"), "{line:?}");
+        assert!(!line.contains(" 72%"), "the slot left the group: {line:?}");
+        assert!(line.contains('─'), "the rule is drawn: {line:?}");
+    }
+
+    #[test]
+    fn the_percentage_gauge_carries_no_label() {
+        let theme = theme();
+        let mut s = snap();
+        s.context_pct = Some(50);
+        s.context_window = Some(128_000);
+        let line = visible(&render_status_line(
+            &theme,
+            120,
+            StatusLineStyle {
+                preset: StatusLinePreset::Default,
+                context_line: ContextLine::Percentage,
+            },
+            &s,
+        ));
+        assert!(line.contains('─'), "{line:?}");
+        assert!(!line.contains("128k"), "{line:?}");
+        assert!(line.contains(" 50%"), "the slot stays: {line:?}");
+    }
+
+    #[test]
+    fn the_gauge_anchors_its_label_at_the_right() {
+        let theme = theme();
+        let at = |pct: u8| {
+            let mut s = snap();
+            s.context_pct = Some(pct);
+            s.context_window = Some(128_000);
+            visible(&render_status_line(
+                &theme,
+                120,
+                StatusLineStyle {
+                    preset: StatusLinePreset::Default,
+                    context_line: ContextLine::Embedded,
+                },
+                &s,
+            ))
+        };
+        let nine = at(9);
+        let ten = at(10);
+        assert!(nine.contains("9% · 128k"), "{nine:?}");
+        assert!(ten.contains("10% · 128k"), "{ten:?}");
+        // The groups do not move: the label grows into the rule, leftwards, and
+        // the model keeps its column.
+        let column = |line: &str, needle: &str| {
+            let text = visible(line);
+            let at = text.find(needle).expect("the needle is on the line");
+            visible_width(&text[..at])
+        };
+        assert_eq!(
+            column(&nine, "glm-5.3-flash"),
+            column(&ten, "glm-5.3-flash"),
+            "{nine:?}\n{ten:?}"
+        );
+        assert_eq!(visible_width(&visible(&nine)), 120);
+        assert_eq!(visible_width(&visible(&ten)), 120);
+    }
+
+    #[test]
+    fn the_gauge_draws_zero_and_hundred_honestly() {
+        let theme = theme();
+        let mut s = snap();
+        s.context_window = Some(128_000);
+        let mut line = |pct: u8| {
+            s.context_pct = Some(pct);
+            render_status_line(
+                &theme,
+                120,
+                StatusLineStyle {
+                    preset: StatusLinePreset::Default,
+                    context_line: ContextLine::Percentage,
+                },
+                &s,
+            )
+        };
+        let open = |color: ThemeColor| {
+            theme
+                .fg(color, "\u{1}")
+                .split('\u{1}')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let rule = theme.symbol("boxRound.horizontal").to_owned();
+        let lit =
+            |line: &str, color: ThemeColor| line.matches(&format!("{}{rule}", open(color))).count();
+        let none = line(0);
+        let all = line(100);
+        assert_eq!(
+            lit(&none, ThemeColor::BorderAccent),
+            0,
+            "0% lights nothing: {none:?}"
+        );
+        assert!(lit(&none, ThemeColor::Border) > 0, "{none:?}");
+        assert_eq!(
+            lit(&all, ThemeColor::Border),
+            0,
+            "100% lights every cell: {all:?}"
+        );
+        assert!(lit(&all, ThemeColor::BorderAccent) > 0, "{all:?}");
+        assert_ne!(none, all);
+    }
+
+    #[test]
+    fn a_one_cell_pane_neither_panics_nor_overflows() {
+        let theme = theme();
+        let mut s = snap();
+        s.context_pct = Some(72);
+        s.context_window = Some(128_000);
+        for width in [0u16, 1, 2, 3, 8] {
+            for context_line in [
+                ContextLine::Off,
+                ContextLine::Percentage,
+                ContextLine::Embedded,
+            ] {
+                for preset in StatusLinePreset::IDS {
+                    let preset = StatusLinePreset::from_id(preset).expect("a known name");
+                    let line = render_status_line(
+                        &theme,
+                        width,
+                        StatusLineStyle {
+                            preset,
+                            context_line,
+                        },
+                        &s,
+                    );
+                    assert!(
+                        visible_width(&line) <= width as usize,
+                        "{width} {preset:?} {context_line:?}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_pane_sheds_a_segment_before_it_loses_the_label() {
+        let theme = theme();
+        let mut s = snap();
+        s.context_pct = Some(49);
+        s.context_window = Some(400);
+        let style = StatusLineStyle {
+            preset: StatusLinePreset::Ascii,
+            context_line: ContextLine::Embedded,
+        };
+        let line = visible(&render_status_line(&theme, 80, style, &s));
+        assert!(line.contains("49% - 400"), "the number survives: {line:?}");
+        assert!(line.is_ascii(), "{line:?}");
+        assert!(
+            !line.contains("main"),
+            "the git state went instead of the number: {line:?}"
+        );
+        // A pane too narrow for the label at all gives the reservation up and
+        // still draws the line.
+        for width in [16u16, 24, 30] {
+            let tiny = render_status_line(&theme, width, style, &s);
+            assert!(visible_width(&tiny) <= width as usize, "{width}: {tiny:?}");
+        }
+    }
+
+    #[test]
     fn an_unknown_name_falls_back_rather_than_failing() {
-        let style = StatusLineStyle::resolve(Some("nope"));
+        let style = StatusLineStyle::resolve(Some("nope"), Some("nope"));
         assert_eq!(style, StatusLineStyle::default());
         assert_eq!(style.preset, StatusLinePreset::Default);
-        assert_eq!(StatusLineStyle::resolve(None), StatusLineStyle::default());
+        assert_eq!(style.context_line, ContextLine::Off);
         assert_eq!(
-            StatusLineStyle::resolve(Some("minimal")).preset,
-            StatusLinePreset::Minimal
+            StatusLineStyle::resolve(None, None),
+            StatusLineStyle::default()
+        );
+        assert_eq!(
+            StatusLineStyle::resolve(Some("minimal"), Some("embedded")).context_line,
+            ContextLine::Embedded
         );
     }
 
