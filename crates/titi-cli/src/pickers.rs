@@ -1033,9 +1033,16 @@ pub(crate) struct SessionHit {
     /// has none: a row is a way to say which session, so it says the name a
     /// person would use.
     label: String,
-    /// When the session's file was last written, seconds since the epoch.
-    /// `None` when the file cannot be stat'ed — a hit whose session was
-    /// deleted between the query and the row.
+    /// When the row's time is, seconds since the epoch, and `None` when there
+    /// is none to show.
+    ///
+    /// A search hit is dated by the line that matched — the entry's own `ts`,
+    /// which is what a search result is a result *of* — so a session whose
+    /// newest line is old reads as old even though its file was written a
+    /// moment ago. A list row has no matching line and is dated by its file,
+    /// which is the time the session list already sorts by, and `None` when
+    /// the file cannot be stat'ed (a session deleted between the listing and
+    /// the row).
     at: Option<u64>,
     /// The matching entry, flattened to the one line a picker row holds.
     line: String,
@@ -1105,9 +1112,9 @@ impl SessionSearch {
 ///
 /// `SessionStore::search` was the capability with no caller — the index is
 /// built and populated on every append, and nothing in the CLI read it. This
-/// is that caller. The session's own time comes from its file, which is what
-/// the session list already sorts by, so a hit row and a list row cannot
-/// disagree about when a session was last written.
+/// is that caller. Everything a row draws comes with the hit: the line, when
+/// it was said, and the session's name — the index answers them in the same
+/// query, so a row costs no stat and no title lookup of its own.
 fn search_sessions(agent_dir: &Path, query: &str) -> Result<Vec<SessionHit>, String> {
     // An empty query is not a search: it is the list every stored session,
     // which is what the panel shows before a word is typed and what Esc
@@ -1128,13 +1135,34 @@ fn search_sessions(agent_dir: &Path, query: &str) -> Result<Vec<SessionHit>, Str
     let mut out = Vec::with_capacity(hits.len().min(SESSION_HITS_MAX));
     for hit in hits.into_iter().take(SESSION_HITS_MAX) {
         out.push(SessionHit {
-            label: session_label(&index, &hit.session_id),
-            at: session_written_at(agent_dir, &hit.session_id),
+            label: hit_label(&index, &hit),
+            // The entry's own time is milliseconds; a row's age is seconds.
+            at: Some(hit.ts / 1_000),
             line: one_line(hit.text.trim(), 60),
             session_id: hit.session_id,
         });
     }
     Ok(out)
+}
+
+/// The name a hit row offers: the title the hit carries when the index holds
+/// a real one for the session, the id otherwise.
+///
+/// The title rides along with the hit ([`titi_core::session::SearchHit::title`]),
+/// so this costs one question per hit — whether the session has been named at
+/// all — and not a title lookup per hit. That question is what decides it: the
+/// placeholder a surface writes at creation time *is* a title in the column and
+/// still counts as unnamed ([`SessionIndex::needs_auto_title`]), so the column
+/// alone would offer a fresh session by the product's own name.
+fn hit_label(
+    index: &titi_core::session::SessionIndex,
+    hit: &titi_core::session::SearchHit,
+) -> String {
+    let named = !index.needs_auto_title(&hit.session_id).unwrap_or(true);
+    match (&hit.title, named) {
+        (Some(title), true) if !title.trim().is_empty() => title.clone(),
+        _ => hit.session_id.clone(),
+    }
 }
 
 /// Every stored session, newest first — the list Ctrl+X offers, with the time

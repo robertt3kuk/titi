@@ -16506,6 +16506,49 @@ mod tests {
         assert!(chat.session_search.is_none(), "and the picker closes");
     }
 
+    /// A search row is dated by the line that matched — the hit's own time,
+    /// not the session file's — and named by the title the hit carries.
+    #[test]
+    fn a_search_hit_is_dated_by_the_line_that_matched() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let index =
+            titi_core::session::SessionIndex::open(&dir.path().join("state.db")).expect("index");
+        // A session with a real name and one old entry, and no file of its
+        // own: the row must not need one to say when the line was said.
+        index
+            .insert_session(
+                "kafka-talk",
+                1_000,
+                &titi_core::session::SessionMeta::default(),
+            )
+            .expect("session");
+        index
+            .set_title("kafka-talk", "kafka sizing")
+            .expect("title");
+        let mut entry =
+            titi_core::session::Entry::new(None, Role::User, "how do we size the kafka consumers");
+        // Two weeks before this test's own clock, in the milliseconds the
+        // store keeps: the row reads weeks, not the moment the index was
+        // written.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        entry.ts = now_ms - 14 * 86_400 * 1_000;
+        index.index_entry("kafka-talk", &entry).expect("entry");
+
+        command(&mut chat, "/sessions kafka");
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("kafka sizing"),
+            "the hit's title names the row: {frame}"
+        );
+        assert!(
+            frame.contains("2w ago"),
+            "dated by the line that matched, not by the file: {frame}"
+        );
+    }
+
     /// No hits says so, and a row says the id when the index holds no real
     /// title for that session.
     #[test]
