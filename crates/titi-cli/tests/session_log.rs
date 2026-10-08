@@ -6,9 +6,10 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, default_theme};
+use titi_cli::app::App;
 use titi_cli::engine::MAX_RESTORED_MESSAGES;
 use titi_cli::session_log::SessionLog;
+use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
 use titi_engine::{AgentKind, AgentStatus, EngineEvent, TurnId};
 use titi_providers::StopReason;
@@ -147,7 +148,7 @@ fn the_restored_history_is_capped() {
 
 #[test]
 fn a_new_session_starts_empty_and_becomes_the_latest() {
-    use titi_cli::app::new_session;
+    use titi_cli::session_fs::new_session;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -170,7 +171,7 @@ fn a_new_session_starts_empty_and_becomes_the_latest() {
 
 #[test]
 fn session_history_matches_what_the_log_wrote() {
-    use titi_cli::app::session_history;
+    use titi_cli::session_fs::session_history;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -196,7 +197,7 @@ fn session_history_matches_what_the_log_wrote() {
 
 #[test]
 fn session_history_stops_at_the_tail_cap() {
-    use titi_cli::app::session_history;
+    use titi_cli::session_fs::session_history;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -220,7 +221,7 @@ fn session_history_stops_at_the_tail_cap() {
 /// assistant made and the output it read back.
 #[test]
 fn a_restored_tool_round_is_the_one_the_live_session_had() {
-    use titi_cli::app::session_history;
+    use titi_cli::session_fs::session_history;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -262,7 +263,7 @@ fn a_restored_tool_round_is_the_one_the_live_session_had() {
 /// OpenAI reject.
 #[test]
 fn a_truncated_restore_never_splits_a_tool_round() {
-    use titi_cli::app::session_history;
+    use titi_cli::session_fs::session_history;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -324,7 +325,7 @@ fn a_truncated_restore_never_splits_a_tool_round() {
 /// the user actually kept having.
 #[test]
 fn a_broken_round_in_the_middle_does_not_erase_what_came_after() {
-    use titi_cli::app::session_history;
+    use titi_cli::session_fs::session_history;
 
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();

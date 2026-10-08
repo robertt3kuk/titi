@@ -10,7 +10,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, checkpoint_session, default_theme, list_checkpoints, rewind_session};
+use titi_cli::app::App;
+use titi_cli::session_fs::{checkpoint_session, list_checkpoints, rewind_session};
+use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
 use titi_tui::slash::Route;
 

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, default_theme};
+use titi_cli::app::App;
+use titi_cli::themes::default_theme;
 use titi_engine::{AgentKind, AgentStatus, EngineEvent, TurnId};
 use titi_providers::{ErrorReason, StopReason};
 

@@ -12,8 +12,11 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, default_theme, delete_session_from, list_sessions_from, model_choices};
+use titi_cli::app::App;
 use titi_cli::engine::ModelCatalog;
+use titi_cli::engine::model_choices;
+use titi_cli::session_fs::{delete_session_from, list_sessions_from};
+use titi_cli::themes::default_theme;
 use titi_engine::{
     EnvCredentialSource, HttpTransportFactory, ProviderDescriptor, ProviderRegistry,
     ProviderRegistryConfig,

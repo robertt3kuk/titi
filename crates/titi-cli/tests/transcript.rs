@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, default_theme};
+use titi_cli::app::App;
+use titi_cli::themes::default_theme;
 use titi_tui::markdown::Section;
 use titi_tui::theme::Theme;
 
@@ -136,7 +137,7 @@ fn mouse_drag_select_applies_background() {
 
 #[test]
 fn mouse_preset_roundtrips_through_config() {
-    use titi_cli::app::{load_mouse_preset_from, save_mouse_preset_to};
+    use titi_cli::session_fs::{load_mouse_preset_from, save_mouse_preset_to};
     use titi_tui::caps::MousePreset;
 
     // Use a temp dir as the agent directory; titi-config creates the yml

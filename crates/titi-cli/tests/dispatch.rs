@@ -3,7 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::{App, Dispatch, default_theme};
+use titi_cli::app::{App, Dispatch};
+use titi_cli::themes::default_theme;
 use titi_tui::composer::QueueMode;
 
 fn app() -> App {

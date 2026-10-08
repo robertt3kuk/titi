@@ -62,7 +62,7 @@ impl LoginDriver for FakeLogin {
 }
 
 fn chat(agent_dir: &Path) -> Chat {
-    let theme = titi_cli::app::default_theme().expect("a theme resolves");
+    let theme = titi_cli::themes::default_theme().expect("a theme resolves");
     let mut chat = Chat::new("openai/gpt-4.1", "session-123", theme);
     chat.set_agent_dir(agent_dir);
     chat
@@ -416,7 +416,11 @@ fn keys_shows_an_env_key_and_a_stored_subscription_together() {
     // environment.
     let exe = std::env::current_exe().expect("test binary");
     let output = std::process::Command::new(exe)
-        .args(["--exact", "keys_env_child_sees_the_variable", "--test-threads=1"])
+        .args([
+            "--exact",
+            "keys_env_child_sees_the_variable",
+            "--test-threads=1",
+        ])
         .env("TITI_TEST_OAUTH_ENV_KEY", "sk-test-env")
         .output()
         .expect("child test runs");

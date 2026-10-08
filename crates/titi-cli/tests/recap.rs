@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::json;
-use titi_cli::app::{App, default_theme};
+use titi_cli::app::App;
 use titi_cli::recap::build;
+use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
 use titi_core::trajectory::{EventKind, TrajectoryRecorder};
 use titi_tui::recap::RecapSection;
