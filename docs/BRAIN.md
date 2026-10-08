@@ -93,7 +93,7 @@ or security hole; high = wrong behaviour on a main path).
 | low | `write` can plant code that runs later — `titi-tools/src/fs.rs:469`; `.git` sits inside the jail | refuse `.git/` for write/edit |
 | low | Checkpoint commits ignore the `SensitivePolicy` — `titi-cli/src/git_checkpoint.rs:17-40` | a staged `.env` gets committed |
 | low | ~~The `<diff>` frame around the snapshot is not sanitised — `runtime.rs:204-209`, `difftrack.rs:152-158,168-183`~~ fixed 2026-10-08 in af985e1 (`sanitize_headers` plus angle-bracket paths dropped) | prompt injection only |
-| low | ~~`titi genome check` reports false positives on a clean tree — 13 `syntax-error` + 19 `unresolved-import` (facts §7)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2 (documented in b1fe30a); a re-run reports 13 `ambiguous-symbol` and neither of the two codes, and since 4c2f465 only a real problem exits non-zero: those thirteen are informational and the gate exits 0 on a clean tree | the remaining 13 are same-name types in two crates each (`AgentState`, `Entry`, `Role`, `VERSION`, …); whether the checker should call those ambiguous is not settled here. All 13 languages are `Full` since 2026-10-09 (the nine grammar commits `9c81d63`–`d658a45`), and `titi genome capabilities` prints the roster with the level and the extensions each row claims |
+| low | ~~`titi genome check` reports false positives on a clean tree — 13 `syntax-error` + 19 `unresolved-import` (facts §7)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2 (documented in b1fe30a); a re-run reports 10 `ambiguous-symbol` and neither of the two codes, and since 4c2f465 only a real problem exits non-zero: those ten are informational and the gate exits 0 on a clean tree (13 before the `App` deletion removed three colliding definitions) | the remaining 10 are same-name types in two crates each (`AgentState`, `Entry`, `Role`, `VERSION`, …); whether the checker should call those ambiguous is not settled here. All 13 languages are `Full` since 2026-10-09 (the nine grammar commits `9c81d63`–`d658a45`), and `titi genome capabilities` prints the roster with the level and the extensions each row claims |
 | low | The mask consumes the credential's key name, so a masked line can end with a dangling quote — `titi-memory/src/redact.rs:349-370` | `"password": "…"` → `[redacted]"`; preserving the key needs a per-pattern capture template (Rust's regex has no lookbehind) |
 | low | `selection.rs` and `space_hold.rs` are kept while nothing calls them — `titi-tui/src/selection.rs`, `titi-tui/src/space_hold.rs` | dead on purpose after the `App` deletion: the next wave ports them into `chat.rs` (mouse selection, the space-hold gesture) or deletes them; the other `App`-only behaviours (history search, hub revive/stop, the details accordion, keybinding customization) are recoverable from git history at `65a2f8b` and are queue items, not silently lost |
 | low | The C row's `.h` retry is a heuristic — `titi-genome/src/lang/c_family.rs:77-81` | a `.h` the C grammar cannot read is re-parsed with the C++ grammar and the tree with fewer errors wins, so a header that is neither pays two parses; the capability roster admits it |
@@ -114,9 +114,10 @@ or security hole; high = wrong behaviour on a main path).
   tool output is the one left depending on the mask patterns alone.
 - Dependency advisories are unchecked: no `cargo audit` was available, so
   RustSec status is unknown, not clean.
-- `titi genome check` exits 0 on a clean tree with 13 informational
-  `ambiguous-symbol` lines (`4c2f465`), so it is usable as a gate; they are
-  same-name types in two crates each, which the checker does not yet call noise.
+- `titi genome check` exits 0 on a clean tree with 10 informational
+  `ambiguous-symbol` lines (`4c2f465`; 13 before the `App` deletion), so it is
+  usable as a gate; they are same-name types in two crates each, which the
+  checker does not yet call noise.
 
 ## Audit history
 

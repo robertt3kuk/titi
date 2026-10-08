@@ -394,8 +394,9 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
 - [x] `low` ~~`titi genome check` reports false positives on a clean tree —
   `docs/audits/2026-10-08-facts.md` §7 (13 `syntax-error` + 19
   `unresolved-import`)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2; a re-run
-  reports 13 `ambiguous-symbol` lines and, since 4c2f465, exits 0 on a clean
-  tree; 3624fe8 moved the per-language capability lines out of the findings.
+  reports 10 `ambiguous-symbol` lines and, since 4c2f465, exits 0 on a clean
+  tree (13 before the `App` deletion removed three colliding definitions:
+  `Entry`, `AgentKind` and `AgentStatus`); 3624fe8 moved the per-language capability lines out of the findings.
 - [ ] `low` `export_to_file` in `crates/titi-core` is the one in-place write the
   durability pass left alone.
 - [ ] `low` the README header test count is stale — `README.md:9` (`1279
