@@ -15,7 +15,15 @@ const PROMPT_EXPORTS: usize = 4;
 /// follows the work instead of the static graph alone.
 const TOUCHED_BOOST: f64 = 3.0;
 
-pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>) -> String {
+/// Render the prompt map.
+///
+/// `pending` is how much work the background indexer has accepted and not yet
+/// folded in; `0` means the graph is current and the header is plain
+/// `<genome>`. A non-zero count is named in the header — `<genome pending="3">`
+/// — because the alternative to naming it is a map the model cannot tell from
+/// a current one, and the cheap recovery (re-read the file) is only available
+/// to a model that knows.
+pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>, pending: usize) -> String {
     let mut ranked: Vec<(&str, f64)> = genome
         .files
         .keys()
@@ -38,7 +46,11 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>) -> Strin
     });
     ranked.truncate(limit.max(1));
 
-    let mut out = String::from("<genome>\n");
+    let mut out = if pending == 0 {
+        String::from("<genome>\n")
+    } else {
+        format!("<genome pending=\"{pending}\">\n")
+    };
     for (path, _) in ranked {
         let file = &genome.files[path];
         let dependents = genome.dependents.get(&file.path).copied().unwrap_or(0);

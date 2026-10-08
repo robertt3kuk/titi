@@ -22,6 +22,7 @@ pub mod ast_edit;
 mod content;
 mod graph;
 mod lang;
+pub mod live;
 mod lsp;
 mod project;
 mod query;
@@ -31,6 +32,7 @@ mod shared;
 mod symbols;
 
 pub use lang::{Capability, Language, Level};
+pub use live::GenomeHandle;
 pub use lsp::serve_lsp;
 pub use project::render;
 pub use scan::list_files;
@@ -825,13 +827,19 @@ impl Genome {
     }
 
     pub fn project(&self, limit: usize) -> String {
-        render(self, limit, &HashSet::new())
+        render(self, limit, &HashSet::new(), 0)
     }
 
     /// Projection biased toward files this session edited or read.
     pub fn project_with(&self, limit: usize, touched: &[String]) -> String {
+        self.project_with_pending(limit, touched, 0)
+    }
+
+    /// [`Self::project_with`], with the background indexer's backlog named in
+    /// the header. See [`render`].
+    pub fn project_with_pending(&self, limit: usize, touched: &[String], pending: usize) -> String {
         let touched: HashSet<String> = touched.iter().cloned().collect();
-        render(self, limit, &touched)
+        render(self, limit, &touched, pending)
     }
 }
 

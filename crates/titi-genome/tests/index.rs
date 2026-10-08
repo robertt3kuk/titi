@@ -191,6 +191,28 @@ fn empty_workspace_projects_an_empty_map() {
     assert_eq!(genome.project(10), "<genome>\n</genome>");
 }
 
+/// A map rendered while the background indexer is behind says so, and one
+/// rendered when it is caught up is byte-identical to the map before there was
+/// a policy: the attribute is the whole of the visible difference.
+#[test]
+fn a_backlog_is_named_in_the_map_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/hub.rs", "pub fn hub() {}\n");
+    let genome = Genome::index(root).unwrap();
+
+    let caught_up = genome.project_with(10, &[]);
+    assert!(caught_up.starts_with("<genome>\n"), "{caught_up}");
+    assert_eq!(caught_up, genome.project(10));
+
+    let behind = genome.project_with_pending(10, &[], 3);
+    assert!(behind.starts_with("<genome pending=\"3\">\n"), "{behind}");
+    assert!(
+        behind.ends_with("</genome>") && behind.contains("src/hub.rs"),
+        "{behind}"
+    );
+}
+
 #[test]
 fn python_relative_imports_resolve() {
     let dir = tempfile::tempdir().unwrap();

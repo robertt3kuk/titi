@@ -12,14 +12,17 @@
 //! [`SharedGenome`] is that moment. The index is mutated privately and
 //! published as one `Arc`: a reader gets an owned snapshot, cheap to clone and
 //! never mutated afterwards, so it sees either the state before an update or
-//! the state after it — never a field-wise mixture of the two.
+//! the state after it — never a field-wise mixture of the two, and never a
+//! wait for the parse an update is doing on its private copy.
 //!
-//! The engine holds one of these instead of `Arc<Mutex<Option<Genome>>>`. Its
-//! writer is the tool loop, which folds a file a tool wrote in as the call
-//! returns, and the per-turn call is the fallback walk that catches what no
-//! tool named.
+//! The engine holds one of these — wrapped in a [`crate::GenomeHandle`], which
+//! owns the background writer — instead of `Arc<Mutex<Option<Genome>>>`. It
+//! has two writers and they are serialised here rather than by a lock a reader
+//! takes: the tool loop folds a file a tool wrote in as the call returns, and
+//! the handle's worker applies the batches nothing named a tool for.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{Genome, RefreshStats};
@@ -32,9 +35,22 @@ use crate::{Genome, RefreshStats};
 #[derive(Clone, Default)]
 pub struct SharedGenome {
     /// The single pointer a reader loads. The lock guards the *pointer*, not
-    /// the genome: a reader takes it only long enough to clone the `Arc`, so
-    /// it never blocks on the parse a writer is doing behind the other side.
+    /// the genome, and no update holds it for longer than the store: a reader
+    /// takes it only long enough to clone the `Arc`, so it never waits for a
+    /// parse, and the graph it gets is the one that was complete when it
+    /// asked.
     state: Arc<RwLock<Arc<Genome>>>,
+    /// Serialises *writers*, of which there may be two: the tool loop folding
+    /// in what a tool just wrote, and [`crate::GenomeHandle`]'s worker
+    /// applying a batch behind it. An update reads the published pointer,
+    /// works on a private copy and stores the result; two updates doing that
+    /// at once would each build from the same base and the second store would
+    /// silently drop the first. Held for the whole of an update — the read,
+    /// the parse, the rank — and never taken by a reader.
+    writer: Arc<Mutex<()>>,
+    /// Bumped by every publish. It is how a reader says "the graph moved"
+    /// without comparing two of them, and how a caller counts applies.
+    generation: Arc<AtomicU64>,
     /// What the last update did. Not part of the graph, so not published with
     /// it: a reader that wants to know whether the index was walked, or how
     /// much work the last update was, reads it here.
@@ -52,17 +68,21 @@ impl SharedGenome {
         let stats = genome.refresh(root)?;
         Ok(Self {
             state: Arc::new(RwLock::new(Arc::new(genome))),
+            writer: Arc::new(Mutex::new(())),
+            generation: Arc::new(AtomicU64::new(1)),
             last: Arc::new(Mutex::new(Some(stats))),
         })
     }
 
     /// Refresh the live index and publish the result, one swap.
     ///
-    /// While no snapshot is outstanding the genome is updated in place — the
-    /// incremental path the refresh already is — and the pointer never moves.
-    /// While one is, the writer copies first and the reader's snapshot keeps
-    /// pointing at the pre-update graph, so a snapshot is never mutated under
-    /// a reader.
+    /// The work happens on a private copy of the published graph, outside
+    /// every lock a reader takes: readers keep answering from the previous
+    /// graph for as long as the update runs, and the new one appears whole at
+    /// the store. The copy is the price of that — the previous shape updated
+    /// the published value in place under the write lock, which was cheaper
+    /// but made every reader wait for the parse, and a background indexer
+    /// whose readers wait has moved the parse rather than removed it.
     ///
     /// # Panics
     ///
@@ -84,12 +104,7 @@ impl SharedGenome {
         root: impl AsRef<Path>,
         urgent: &[String],
     ) -> std::io::Result<RefreshStats> {
-        let stats = {
-            let mut state = self.state.write().expect("genome lock poisoned");
-            Arc::make_mut(&mut state).refresh_urgent(root, urgent)?
-        };
-        self.record(stats);
-        Ok(stats)
+        self.update(|genome| genome.refresh_urgent(root, urgent))
     }
 
     /// Run a targeted update — see [`Genome::apply_changes`] — and publish it.
@@ -98,12 +113,30 @@ impl SharedGenome {
     ///
     /// As [`Self::refresh`].
     pub fn apply_changes(&self, paths: &[String]) -> std::io::Result<RefreshStats> {
-        let stats = {
-            let mut state = self.state.write().expect("genome lock poisoned");
-            Arc::make_mut(&mut state).apply_changes(paths)?
-        };
+        self.update(|genome| genome.apply_changes(paths))
+    }
+
+    /// Do one update against a private copy and publish it whole.
+    ///
+    /// A failed update publishes nothing and bumps nothing: the caller that
+    /// asked keeps the graph it had, and the generation still names it.
+    fn update<F>(&self, work: F) -> std::io::Result<RefreshStats>
+    where
+        F: FnOnce(&mut Genome) -> std::io::Result<RefreshStats>,
+    {
+        let _sole_writer = self.writer.lock().expect("genome writer lock poisoned");
+        let mut next = (*self.snapshot()).clone();
+        let stats = work(&mut next)?;
+        *self.state.write().expect("genome lock poisoned") = Arc::new(next);
+        self.generation.fetch_add(1, Ordering::Release);
         self.record(stats);
         Ok(stats)
+    }
+
+    /// How many times this handle has published. Monotonic; `0` on a handle
+    /// that has never been updated, `1` after [`Self::index`].
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// What the last successful update did, or `None` on a handle that has
@@ -112,10 +145,11 @@ impl SharedGenome {
     /// The publish point's own view of its progress: whether the update walked
     /// the tree or trusted the paths it was handed ([`RefreshStats::walked`]),
     /// how many files it re-parsed, and how many the symbol pass re-resolved.
-    /// It is not part of the published graph — a reader that wants the graph's
-    /// age wants a generation count, which this does not carry. The engine
-    /// builds its handle with `default()` and updates it at the first turn, so
-    /// `None` means "no root has been indexed yet".
+    /// It is not part of the published graph, and it says nothing about
+    /// whether an update is in flight — a handle whose only other writer is a
+    /// background thread needs [`crate::GenomeHandle::pending`] for that. The
+    /// engine builds this with `default()` and updates it at the first turn,
+    /// so `None` means "no root has been indexed yet".
     pub fn last_stats(&self) -> Option<RefreshStats> {
         *self.last.lock().expect("genome stats lock poisoned")
     }
@@ -126,8 +160,9 @@ impl SharedGenome {
 
     /// A consistent snapshot of the graph.
     ///
-    /// An `Arc` clone: a reader that iterates the whole graph costs the writer
-    /// one copy-on-write the next time it publishes, and never a torn read.
+    /// An `Arc` clone: cheap enough for a reader to take per question, and
+    /// never a torn read, because an update builds its result privately and
+    /// only then stores the pointer.
     ///
     /// # Panics
     ///
