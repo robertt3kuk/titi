@@ -1,10 +1,19 @@
-//! The terminal's tab title (OSC 2), for the run state.
+//! The terminal's own channels: the tab title (OSC 2) and the progress bar
+//! (OSC 9;4), for the run state.
 //!
 //! omp keeps the tab readable without looking at the pane: a spinner while the
 //! agent works, `>` when it is the user's turn, `!` when it is blocked on one
 //! (`tui.titleState`; `pi-coding-agent/src/utils/title-generator.ts:862`),
 //! written as `\x1b]0;…\x07` by `pi-tui/src/terminal.ts:2548`). titi wrote no
 //! title at all, so a tab showed the shell's own text for the whole session.
+//!
+//! The same tab strip carries the second channel: omp's `terminal.showProgress`
+//! raises an indeterminate OSC 9;4 bar for the whole turn
+//! (`pi-tui/src/terminal.ts:38-39,602`), so a person who tabbed away sees that
+//! the agent is working without reading the pane. The bar and the title are
+//! one lifecycle — raised with the turn, cleared on every way out of it — so
+//! they are composed by one tick and handed back by one
+//! [`restore`].
 //!
 //! The title here is a function of the run state and the label — never of the
 //! clock. The run loop composes it on the tick it already has (the one the
@@ -136,6 +145,29 @@ pub fn reset_title() -> String {
     "\x1b]2;\x07".to_owned()
 }
 
+/// OSC 9;4 state 3: an indeterminate progress bar — the terminal's own
+/// spinner for the whole turn, with no fraction to report.
+pub const PROGRESS_SET: &str = "\x1b]9;4;3\x07";
+
+/// OSC 9;4 state 0: no bar.
+///
+/// Written on every way out of a turn — it finished, it failed, it was
+/// cancelled, or the screen itself is going away — because a bar left running
+/// says the agent is still working when nobody is.
+pub const PROGRESS_CLEAR: &str = "\x1b]9;4;0\x07";
+
+/// The bytes that hand the terminal's own channels back: the empty OSC 2 that
+/// gives the tab back, and — when the run raised a progress bar — the OSC 9;4
+/// clear, so the bar cannot outlive the screen that raised it.
+pub fn restore(progress: bool) -> String {
+    let title = reset_title();
+    if progress {
+        format!("{title}{PROGRESS_CLEAR}")
+    } else {
+        title
+    }
+}
+
 /// Drops the characters that would end the title's escape early or write to
 /// the terminal through it: a control character in a session name must never
 /// reach the OSC payload (`\x07` would close it, `\x1b` would start a new one).
@@ -235,6 +267,23 @@ mod tests {
     fn the_escape_is_osc_two_and_the_reset_hands_the_tab_back() {
         assert_eq!(set_title("titi > s"), "\x1b]2;titi > s\x07");
         assert_eq!(reset_title(), "\x1b]2;\x07");
+    }
+
+    #[test]
+    fn the_progress_escapes_are_the_indeterminate_set_and_the_clear() {
+        assert_eq!(PROGRESS_SET, "\x1b]9;4;3\x07");
+        assert_eq!(PROGRESS_CLEAR, "\x1b]9;4;0\x07");
+    }
+
+    #[test]
+    fn the_restore_hands_both_channels_back() {
+        // Without a bar the restore is the title's own reset, byte for byte.
+        assert_eq!(restore(false), reset_title());
+        // With one, the clear follows it — the tab back first, then the bar.
+        assert_eq!(
+            restore(true),
+            format!("{}{}", reset_title(), PROGRESS_CLEAR)
+        );
     }
 
     #[test]

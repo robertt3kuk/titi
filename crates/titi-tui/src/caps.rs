@@ -346,7 +346,7 @@ pub const BEL: &str = "\x07";
 /// The terminal's own name and what sits in front of it.
 ///
 /// The probes above ask a terminal a question and read the reply; OSC 777
-/// has no reply to read, so this decision is made from
+/// and OSC 9;4 have no reply to read, so these two decisions are made from
 /// the names the terminal gives itself — the same source omp's
 /// `terminal-capabilities.ts` reads. The table is deliberately short: a
 /// terminal that is not named here gets the BEL, which every one of them
@@ -359,6 +359,8 @@ pub struct TermEnv {
     pub term: Option<String>,
     /// `TMUX`, `STY` or `ZELLIJ` is set: a sequence would have to cross it.
     pub multiplexed: bool,
+    /// `WT_SESSION` is set — Windows Terminal.
+    pub wt_session: bool,
     /// `KONSOLE_VERSION` is set — Konsole.
     pub konsole: bool,
     /// `VTE_VERSION` — the VTE library behind GNOME Terminal and Tilix.
@@ -374,6 +376,7 @@ impl TermEnv {
             term_program: std::env::var("TERM_PROGRAM").ok(),
             term: std::env::var("TERM").ok(),
             multiplexed: ["TMUX", "STY", "ZELLIJ"].iter().any(|key| flag(key)),
+            wt_session: flag("WT_SESSION"),
             konsole: flag("KONSOLE_VERSION"),
             vte_version: std::env::var("VTE_VERSION")
                 .ok()
@@ -414,6 +417,24 @@ impl TermEnv {
             .any(|name| program.contains(name) || term.contains(name))
             || term.contains("rxvt")
             || self.vte_version.is_some_and(|version| version >= 5200)
+    }
+
+    /// Whether the terminal draws OSC 9;4 native progress.
+    ///
+    /// The same kind of name table: Windows Terminal, WezTerm, Ghostty,
+    /// Konsole and iTerm2 speak `9;4`; anything else is left quiet rather
+    /// than sent a sequence it might print on screen.
+    pub fn shows_progress(&self) -> bool {
+        if !self.is_terminal() {
+            return false;
+        }
+        let program = self.lower("term_program");
+        let term = self.lower("term");
+        self.wt_session
+            || self.konsole
+            || ["iterm", "wezterm", "ghostty"]
+                .iter()
+                .any(|name| program.contains(name) || term.contains(name))
     }
 
     /// Whether there is a terminal here at all.
@@ -826,7 +847,7 @@ mod tests {
         );
     }
 
-    // ---- Desktop notifications --------------------------------
+    // ---- Notifications and native progress --------------------------------
 
     /// A terminal named by the table either as `TERM_PROGRAM` or as `TERM`.
     fn env(program: Option<&str>, term: &str) -> TermEnv {
@@ -893,6 +914,7 @@ mod tests {
                 ..TermEnv::default()
             };
             assert_eq!(bare.notification_channel(), NotifyChannel::None, "{term:?}");
+            assert!(!bare.shows_progress(), "{term:?}");
         }
     }
 
@@ -909,5 +931,21 @@ mod tests {
             "\x1b]777;notify;ti,ti;abc\x07"
         );
         assert_eq!(BEL, "\x07");
+    }
+
+    #[test]
+    fn progress_is_only_claimed_where_it_is_known() {
+        let wt = TermEnv {
+            wt_session: true,
+            ..env(None, "xterm-256color")
+        };
+        assert!(wt.shows_progress());
+        assert!(env(Some("WezTerm"), "xterm-256color").shows_progress());
+        assert!(env(Some("ghostty"), "xterm-ghostty").shows_progress());
+        assert!(env(Some("iTerm.app"), "xterm-256color").shows_progress());
+        // An unnamed terminal is left quiet rather than sent a sequence it
+        // may print on screen.
+        assert!(!env(Some("Apple_Terminal"), "xterm-256color").shows_progress());
+        assert!(!env(None, "xterm-kitty").shows_progress());
     }
 }

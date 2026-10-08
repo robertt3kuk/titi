@@ -104,6 +104,13 @@ pub const NOTIFY_ERROR_KEY: &str = "notify.error";
 /// notification. Unset means on. See [`NOTIFY_COMPLETION_KEY`].
 pub const NOTIFY_ASK_KEY: &str = "notify.ask";
 
+/// Whether the terminal shows its own progress for a running turn.
+///
+/// Unset means on. The terminal's own bar is raised while a turn is in
+/// flight and cleared on every way out of it, including a failure; a
+/// terminal that has no such bar is left quiet.
+pub const TERMINAL_PROGRESS_KEY: &str = "terminal.progress";
+
 impl Settings {
     /// Discover and load all layers.
     ///
@@ -884,15 +891,28 @@ mod tests {
         assert_eq!(s.get("theme.dark"), Some(Value::from("titanium")));
     }
 
-    /// The three switches this crate names for the screen's own channels
+    /// The four switches this crate names for the screen's own channels
     /// resolve from a real file, unset means on, and `off` — as a string or a
     /// bool — turns exactly that one off.
     #[test]
     fn the_screen_switches_are_on_unset_and_off_by_their_own_key() {
         let tmp = TempDir::new().unwrap();
         let agent = tmp.path().join("agent");
-        let keys = [NOTIFY_COMPLETION_KEY, NOTIFY_ERROR_KEY, NOTIFY_ASK_KEY];
-        assert_eq!(keys, ["notify.completion", "notify.error", "notify.ask",]);
+        let keys = [
+            NOTIFY_COMPLETION_KEY,
+            NOTIFY_ERROR_KEY,
+            NOTIFY_ASK_KEY,
+            TERMINAL_PROGRESS_KEY,
+        ];
+        assert_eq!(
+            keys,
+            [
+                "notify.completion",
+                "notify.error",
+                "notify.ask",
+                "terminal.progress",
+            ]
+        );
 
         let empty = Settings::load(&agent, tmp.path(), &[]).unwrap();
         for key in keys {
@@ -903,11 +923,13 @@ mod tests {
         write(
             &agent.join("config.yml"),
             "notify:\n  completion: off\n  error: false\n  ask: \"no\"\n\
-",
+             terminal:\n  progress: \"OFF\"\n",
         );
         let s = Settings::load(&agent, tmp.path(), &[]).unwrap();
         assert!(switch_off(&s, NOTIFY_COMPLETION_KEY));
         assert!(switch_off(&s, NOTIFY_ERROR_KEY));
         assert!(switch_off(&s, NOTIFY_ASK_KEY));
+        // The string is read case-insensitively.
+        assert!(switch_off(&s, TERMINAL_PROGRESS_KEY));
     }
 }

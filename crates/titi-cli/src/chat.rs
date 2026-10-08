@@ -54,6 +54,9 @@ struct TerminalFeatures {
     notify_error: bool,
     /// A turn that stopped on an approval raises one (`notify.ask`).
     notify_ask: bool,
+    /// The terminal shows its own progress for a running turn
+    /// (`terminal.progress`).
+    progress: bool,
     /// The channel a notification takes: OSC 777, the BEL, or nothing.
     channel: titi_tui::caps::NotifyChannel,
 }
@@ -67,6 +70,7 @@ impl Default for TerminalFeatures {
             notify_completion: true,
             notify_error: true,
             notify_ask: true,
+            progress: true,
             channel: titi_tui::caps::NotifyChannel::Osc777,
         }
     }
@@ -85,6 +89,9 @@ impl TerminalFeatures {
             notify_completion: on(titi_config::settings::NOTIFY_COMPLETION_KEY),
             notify_error: on(titi_config::settings::NOTIFY_ERROR_KEY),
             notify_ask: on(titi_config::settings::NOTIFY_ASK_KEY),
+            // The bar is the terminal's to draw: the switch alone is not
+            // enough, and a terminal without one is left quiet.
+            progress: on(titi_config::settings::TERMINAL_PROGRESS_KEY) && env.shows_progress(),
             channel: env.notification_channel(),
         }
     }
@@ -631,6 +638,9 @@ pub struct Chat {
     /// The channels this run may use: which of the settings are on and what
     /// the terminal itself supports.
     terminal: TerminalFeatures,
+    /// Whether the terminal is currently showing the turn's progress bar, so
+    /// the tick writes the clear exactly once.
+    progress_on: bool,
     /// A notification the run state owes and the next tick will write. Set by
     /// the one event that is the notification's own — a turn's end, a failure,
     /// an approval — never by a streaming delta, and taken by the tick so it
@@ -705,6 +715,7 @@ impl Chat {
             turn_failed: false,
             last_title: None,
             terminal: TerminalFeatures::default(),
+            progress_on: false,
             pending_notify: None,
         }
     }
@@ -1394,13 +1405,33 @@ impl Chat {
     }
 
     /// Everything this tick owes the terminal's own channels, in one string:
-    /// the tab title when the run state changed, and any notification the
-    /// run state earned. `None` when there is nothing to write, so an
-    /// unchanged tick writes no bytes at all.
+    /// the tab title when the run state changed, the OSC 9;4 progress bar
+    /// raised with the turn and cleared on every way out of it, and any
+    /// notification the run state earned. `None` when there is nothing to
+    /// write, so an unchanged tick writes no bytes at all.
+    ///
+    /// One method owns all three because they are one lifecycle: the bar is
+    /// raised and cleared exactly where the title moves between "your turn"
+    /// and "working", and the clear rides the same exit the title does. A
+    /// second hook for the bar would be a second place to forget on a failure
+    /// or a cancel, and a bar left running says the agent is still working
+    /// when nobody is.
     fn terminal_tick(&mut self) -> Option<String> {
         let mut out = String::new();
         if let Some(title) = self.title_sequence() {
             out.push_str(&title);
+        }
+        // Level-triggered on the turn's own flag, so it is written once when
+        // the turn starts and once when it ends — cancel, failure and finish
+        // all land in `turn_active == false` before the next tick.
+        let want = self.turn_active && self.terminal.progress;
+        if want != self.progress_on {
+            self.progress_on = want;
+            out.push_str(if want {
+                crate::title::PROGRESS_SET
+            } else {
+                crate::title::PROGRESS_CLEAR
+            });
         }
         // Edge-triggered from the events themselves: `take` is what makes it
         // exactly one notification per event.
@@ -3718,7 +3749,7 @@ pub fn run(
         reporter.report(AgentState::Idle, None);
     }
     let mut reported = AgentState::Idle;
-    let mut screen = Screen::open()?;
+    let mut screen = Screen::open(chat.terminal.progress)?;
     chat.start_intro(Instant::now());
     let result = loop {
         let state = chat.agent_state();
@@ -3739,9 +3770,10 @@ pub fn run(
         if pump(&mut engine, &mut chat, &session_log, &mut cast)? {
             break Ok(());
         }
-        // The tab title and any notification ride the same tick as the
-        // progress row: each is written only when the run state changed, so
-        // a tick in an unchanged state writes nothing (crate::title).
+        // The tab title, the terminal's own progress bar and any notification
+        // ride the same tick as the progress row: each is written only when
+        // the run state changed, so a tick in an unchanged state writes
+        // nothing (crate::title).
         if let Some(sequence) = chat.terminal_tick() {
             let backend = screen.terminal.backend_mut();
             backend.write_all(sequence.as_bytes())?;
@@ -3761,10 +3793,13 @@ pub fn run(
 
 struct Screen {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Whether the run raised the terminal's own progress bar, so the way out
+    /// clears it even when the loop never ticked after the turn.
+    progress: bool,
 }
 
 impl Screen {
-    fn open() -> io::Result<Self> {
+    fn open(progress: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(
@@ -3774,7 +3809,7 @@ impl Screen {
         )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self { terminal, progress })
     }
 }
 
@@ -3786,11 +3821,12 @@ impl Drop for Screen {
             ratatui::crossterm::cursor::Show,
             LeaveAlternateScreen
         );
-        // The tab goes back with the screen: an empty OSC 2 hands the title to
-        // the shell, the same way leaving the alternate screen hands back the
-        // pane.
+        // The terminal's own channels go back with the screen: an empty OSC 2
+        // hands the title to the shell, and the OSC 9;4 clear takes the
+        // progress bar down, so a Ctrl+C mid-turn cannot leave a bar running
+        // in a tab whose agent is gone.
         let backend = self.terminal.backend_mut();
-        let _ = backend.write_all(crate::title::reset_title().as_bytes());
+        let _ = backend.write_all(crate::title::restore(self.progress).as_bytes());
         let _ = backend.flush();
     }
 }
@@ -10799,13 +10835,95 @@ mod tests {
         assert!(!tick.contains("777"), "{tick:?}");
     }
 
+    /// The bar is raised with the turn and cleared on every way out of it —
+    /// finish, failure, cancel — exactly once each, and never raised twice.
+    #[test]
+    fn the_progress_bar_is_raised_with_the_turn_and_cleared_on_every_exit() {
+        use crate::title::{PROGRESS_CLEAR, PROGRESS_SET};
+        #[derive(Debug, Clone, Copy)]
+        enum Exit {
+            Finished,
+            Failed,
+            Cancelled,
+        }
+        for exit in [Exit::Finished, Exit::Failed, Exit::Cancelled] {
+            let mut chat = chat();
+            chat.terminal = TerminalFeatures {
+                channel: titi_tui::caps::NotifyChannel::None,
+                ..TerminalFeatures::default()
+            };
+            chat.on_event(EngineEvent::TurnStarted {
+                turn_id: TurnId(1),
+                model: "openai/gpt-4.1".into(),
+            });
+            let start = chat.terminal_tick().unwrap_or_default();
+            assert_eq!(
+                start.matches(PROGRESS_SET).count(),
+                1,
+                "{exit:?}: {start:?}"
+            );
+            assert_eq!(start.matches(PROGRESS_CLEAR).count(), 0, "{exit:?}");
+            // A second tick in the same state raises no second bar.
+            let steady = chat.terminal_tick().unwrap_or_default();
+            assert!(!steady.contains(PROGRESS_SET), "{exit:?}: {steady:?}");
+
+            match exit {
+                Exit::Finished => chat.on_event(EngineEvent::TurnFinished {
+                    turn_id: TurnId(1),
+                    reason: StopReason::Stop,
+                }),
+                Exit::Failed => chat.on_event(EngineEvent::Failed {
+                    turn_id: Some(TurnId(1)),
+                    reason: titi_providers::ErrorReason::Connection,
+                    message: "no route to host".into(),
+                }),
+                Exit::Cancelled => chat.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) }),
+            };
+            let end = chat.terminal_tick().unwrap_or_default();
+            assert_eq!(end.matches(PROGRESS_CLEAR).count(), 1, "{exit:?}: {end:?}");
+            assert_eq!(end.matches(PROGRESS_SET).count(), 0, "{exit:?}: {end:?}");
+            // The clear is written once: nothing keeps clearing a bar that is
+            // already down.
+            let after = chat.terminal_tick().unwrap_or_default();
+            assert!(!after.contains(PROGRESS_CLEAR), "{exit:?}: {after:?}");
+        }
+    }
+
+    /// With the switch off nothing is raised and nothing is cleared: the bar
+    /// belongs to the terminal, and a user who turned it off wants no bytes.
+    #[test]
+    fn the_progress_switch_off_writes_no_bar() {
+        let mut chat = chat();
+        chat.terminal = TerminalFeatures {
+            progress: false,
+            ..TerminalFeatures::default()
+        };
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        let start = chat.terminal_tick().unwrap_or_default();
+        assert!(!start.contains("\x1b]9;4"), "{start:?}");
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let end = chat.terminal_tick().unwrap_or_default();
+        assert!(!end.contains("\x1b]9;4"), "{end:?}");
+    }
+
     /// The switches come from the config and the terminal together: the config
-    /// turns one off.
+    /// turns one off, and a terminal with no bar is quiet whatever the config
+    /// says.
     #[test]
     fn the_resolved_features_read_the_config_and_the_terminal() {
         use titi_tui::caps::{NotifyChannel, TermEnv};
         let dir = tempfile::tempdir().expect("temp");
-        std::fs::write(dir.path().join("config.yml"), "notify:\n  ask: off\n").expect("config");
+        std::fs::write(
+            dir.path().join("config.yml"),
+            "notify:\n  ask: off\nterminal:\n  progress: false\n",
+        )
+        .expect("config");
         let settings =
             titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("load");
         let plain = TermEnv {
@@ -10815,6 +10933,7 @@ mod tests {
         let features = TerminalFeatures::resolve(Some(&settings), &plain);
         assert!(!features.notify_ask, "the config turned it off");
         assert!(features.notify_completion, "and left its siblings on");
+        assert!(!features.progress, "the config turned the bar off");
         // An unnamed terminal gets the BEL, which it certainly understands.
         assert_eq!(features.channel, NotifyChannel::Bell);
 
@@ -10825,7 +10944,10 @@ mod tests {
             ..TermEnv::default()
         };
         let features = TerminalFeatures::resolve(None, &wezterm);
+        assert!(features.progress, "WezTerm has a bar");
         assert_eq!(features.channel, NotifyChannel::Osc777);
+        let no_bar = TerminalFeatures::resolve(None, &plain);
+        assert!(!no_bar.progress, "a terminal without a bar stays quiet");
     }
 
     /// The key hints are not what the status row replaces: whatever the row
