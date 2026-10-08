@@ -7,6 +7,7 @@ pub mod component;
 pub mod composer;
 pub mod cursor;
 pub mod diff;
+pub mod emoji;
 pub mod focus;
 pub mod history;
 pub mod hub;
