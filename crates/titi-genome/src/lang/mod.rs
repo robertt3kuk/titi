@@ -60,8 +60,8 @@ pub struct ParsedFile {
 /// How well a language is understood: what its exports and imports rest on.
 ///
 /// This is a property of the language, not of one file, and every row in
-/// [`LANGS`] states it. It is what lets a user tell that Java's exports are
-/// guesses while Rust's were read off a syntax tree.
+/// [`LANGS`] states it. It is what lets a user tell a language read off a
+/// syntax tree from one whose exports are still a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
     /// Read off a real syntax tree: the grammar's own nodes name every

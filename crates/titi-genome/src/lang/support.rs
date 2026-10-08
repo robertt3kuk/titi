@@ -7,8 +7,6 @@
 
 use std::collections::HashSet;
 
-use regex::Regex;
-
 use crate::refs;
 
 use super::ParsedFile;
@@ -74,31 +72,6 @@ pub(crate) fn record(
         Placement::Missing => unresolved.push(spec.to_owned()),
         Placement::External => {}
     }
-}
-
-pub(crate) fn export_sites_from(re: &Regex, source: &str) -> Vec<crate::ExportSite> {
-    re.captures_iter(source)
-        .filter_map(|cap| {
-            let matched = cap.get(1).or_else(|| cap.get(2))?;
-            let (line, character) = line_character(source, matched.start());
-            Some(crate::ExportSite {
-                name: matched.as_str().to_owned(),
-                line,
-                character,
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn line_character(source: &str, byte: usize) -> (u32, u32) {
-    let byte = byte.min(source.len());
-    let head = source.get(..byte).unwrap_or("");
-    let line = head.bytes().filter(|unit| *unit == b'\n').count() as u32 + 1;
-    let character = head
-        .rfind('\n')
-        .map(|index| byte - index - 1)
-        .unwrap_or(byte) as u32;
-    (line, character)
 }
 
 /// Resolves a module/package path to a known file by trying the path itself
