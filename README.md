@@ -6,7 +6,7 @@ A terminal coding agent in Rust. It follows the [reference product](https://refe
 
 | Version | License | Phase | As of | Tests |
 | --- | --- | --- | --- | --- |
-| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-09-23 | 1279 passed |
+| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-10-08 | 1831 passed (CI run 37744421456) |
 
 ---
 
@@ -74,6 +74,7 @@ titi --mode plan
 | `/usage` | Tokens for this turn and for the session, prompt and completion apart — as the provider counted them, estimated only when it reports none, with the part served from the prompt cache named |
 | `/budget` | Caps what the session may spend: `/budget 200k`, `/budget 1.5m`, `/budget off`. The cap is in tokens; a cap in money is refused, because nothing here knows a price |
 | `/settings` | Every resolved setting with the layer it came from |
+| `/theme` | Chooses a palette; bare `/theme` opens the picker and remembers the choice |
 | `/keys` · `/whoami` | Which providers have a key: env, stored, or none. The key itself is never shown |
 | `/login` | `/login` lists providers. `/login openai` asks for the key and stores it masked. `/login openai <key>` stores it in one step |
 | `/logout` | Forgets the stored key for a provider. An environment variable is left alone |
@@ -93,10 +94,14 @@ titi --mode plan
 | `/loop` | Repeats a prompt in the background: `/loop 5m <prompt>`, intervals `90s`, `5m`, `2h`. The engine owns the timer, so closing the screen does not kill it |
 | `/jobs` | Lists the background loops. `/jobs cancel <id>` stops one |
 | `/advisor` | A toolless second opinion on this conversation, `/advisor <question>` on something specific. It is not a turn: nothing it says is acted on |
+| `/council` | Puts a question to a council of independent briefs on models and efforts of their own; one fold names who dissents |
+| `/graph` | Runs the orchestrator graph: the council decides, the goal loop works |
+| `/git` | Shows git status or diff, read-only |
+| `/genome` | Manages the prompt map: `/genome on`, `/genome off`, `/genome limit <n>` |
+| `/diagnose` | Prints a diagnostics block to paste into a bug report |
 | `/hub` | Shows or hides the roster of the local hub |
 | `/join` | Joins the local hub, `/join <name>` under a name of your own; the default is the session id |
 | `/leave` | Leaves the hub, which unregisters this peer |
-| `/skillful` | Toggles skillful mode for this session |
 | `/btw` | Sends a message that is not recorded in the history; during a turn it steers instead of starting one |
 | `/pause` | Holds the composer and stops the running turn. `/pause` again resumes |
 | `/help` | Lists these commands |
@@ -171,7 +176,7 @@ Agent state lives in `~/.titi/agent`. A named profile uses `~/.titi/profiles/<na
 
 Sessions on one machine talk through a local hub: one broker per agent directory listens on `<agent_dir>/hub.sock`, created with mode `0600`, and validates a sender against the id its connection joined under, so one client cannot speak as another. `/join` puts this session on the roster, `/hub` shows it, `/leave` steps off. Nothing waits on that socket: a broker that is slow, gone, or never started costs the chat loop nothing, and "no hub broker running" is an ordinary answer rather than an error.
 
-The engine also seats a council: two to four briefs answer the same question on models and efforts of their own, none of them seeing the others, and one fold separates what they agree on from what they do not, naming the member that holds each dissent. It is an engine command today (`RunCouncil`), with no slash command in front of it yet.
+The engine also seats a council: two to four briefs answer the same question on models and efforts of their own, none of them seeing the others, and one fold separates what they agree on from what they do not, naming the member that holds each dissent. `/council` puts a question to it from the chat; `/graph` runs it behind the goal loop.
 
 `titi-core` can seal a session export into a share package: ChaCha20-Poly1305 through the audited RustCrypto crate, header authenticated as associated data so a host cannot relabel one session as another, and the key returned separately instead of being stored with the package. Nothing hands one out from the screen yet.
 
@@ -181,7 +186,7 @@ Print the repository map on its own:
 cargo run -p titi-genome --example map -- . 40
 ```
 
-`TITI_NO_GENOME=1` leaves the map out of the prompt. Genome indexes twelve languages. Rust, TypeScript, TSX, JavaScript, and Python are parsed with tree-sitter grammars, so the symbols come from the syntax tree; Go, Java, C, C++, C#, Ruby, Kotlin, Swift, and PHP stay on pattern parsers, and so does import resolution everywhere — an import path is a module specifier, not a declaration, and resolving it needs the repo's file set rather than a tree.
+`TITI_NO_GENOME=1` leaves the map out of the prompt. `genome.enabled` in the agent or project config turns the map on or off, `genome.limit` (1 to 64, default 24) caps the files it projects; the project file wins, and `TITI_NO_GENOME=1` forces one run off without touching either. A turn also carries a `<diff>` block: the working tree's changes next to the genome map, so the model sees its own edits since the turn began. Genome indexes twelve languages. Rust, TypeScript, TSX, JavaScript, and Python are parsed with tree-sitter grammars, so the symbols come from the syntax tree; Go, Java, C, C++, C#, Ruby, Kotlin, Swift, and PHP stay on pattern parsers, and so does import resolution everywhere — an import path is a module specifier, not a declaration, and resolving it needs the repo's file set rather than a tree.
 
 ### What is already here
 
@@ -202,10 +207,10 @@ The handoff notes a public endpoint (`https://opencode.ai/zen/go/v1`) and model 
 The resume point is [`docs/research/STATE.md`](docs/research/STATE.md); the research map is [`docs/research/README.md`](docs/research/README.md). The task cycle is [`docs/CONVEYOR.md`](docs/CONVEYOR.md) and the milestones are [`docs/PLAN.md`](docs/PLAN.md). Decisions live in the theme docs under `docs/research/`.
 
 ```bash
-cargo fmt --check
-cargo test -p titi-engine
-cargo clippy -p titi-engine --all-targets
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets     # informational, not denied
+cargo test --workspace --locked
+gh run list --repo robertt3kuk/titi --branch master --limit 5
 ```
 
 CI runs fmt, clippy (informational), the workspace tests, and a smoke of the real binary on a pty (`scripts/tui-smoke.py`): the ready frame, the `/` listing, `/help`, Ctrl+D, then the terminal restore sequences. No provider key is used and no model turn runs; every wait is bounded, so a hang fails the job instead of hanging it.
@@ -278,6 +283,7 @@ titi --mode plan
 | `/usage` | Токены за ход и за сессию, prompt и completion отдельно — как их посчитал провайдер; оценка, только если он не сообщает; часть из кэша промпта названа отдельно |
 | `/budget` | Ограничивает трату сессии: `/budget 200k`, `/budget 1.5m`, `/budget off`. Лимит в токенах; лимит в деньгах отклоняется — прайса здесь никто не знает |
 | `/settings` | Все разрешённые настройки и слой, из которого пришла каждая |
+| `/theme` | Выбирает палитру; голый `/theme` открывает выбор и запоминает его |
 | `/keys` · `/whoami` | У кого есть ключ: env, сохранён или нет. Сам ключ не показывается |
 | `/login` | `/login` показывает провайдеров. `/login openai` просит ключ и прячет его. `/login openai <ключ>` сохраняет сразу |
 | `/logout` | Забывает сохранённый ключ провайдера. Переменную окружения не трогает |
@@ -300,7 +306,11 @@ titi --mode plan
 | `/hub` | Показывает или прячет ростер локального хаба |
 | `/join` | Подключает к локальному хабу, `/join <имя>` — под своим именем; по умолчанию это id сессии |
 | `/leave` | Выходит из хаба и снимает этого участника с ростера |
-| `/skillful` | Переключает skillful-режим сессии |
+| `/council` | Отдаёт вопрос совету независимых брифов, каждый на своей модели и со своим усилием; свёртка называет несогласных |
+| `/graph` | Гоняет оркестратор-граф: совет решает, цикл цели работает |
+| `/git` | Показывает git status или diff, только чтение |
+| `/genome` | Управляет картой промпта: `/genome on`, `/genome off`, `/genome limit <n>` |
+| `/diagnose` | Печатает блок диагностики, чтобы вставить в баг-репорт |
 | `/btw` | Сообщение, которое не пишется в историю; во время хода это steering, а не новый ход |
 | `/pause` | Держит ввод и останавливает ход. Ещё раз `/pause` продолжает |
 | `/help` | Список этих команд |
@@ -375,7 +385,7 @@ TUI / headless
 
 Сессии на одной машине общаются через локальный хаб: на каталог агента приходится один брокер, он слушает `<agent_dir>/hub.sock` с правами `0600` и сверяет отправителя с тем id, под которым подключение вошло, так что один клиент не может говорить за другого. `/join` ставит сессию в ростер, `/hub` его показывает, `/leave` уводит. Никто этот сокет не ждёт: медленный, пропавший или вовсе не запущенный брокер ничего не стоит циклу чата, а «брокер не запущен» — обычный ответ, а не ошибка.
 
-В движке есть и совет: от двух до четырёх брифов отвечают на один вопрос, каждый на своей модели и со своим усилием, и никто из них не видит остальных; свёртка отделяет то, в чём они сходятся, от того, в чём нет, и называет автора каждого расхождения. Сегодня это команда движка (`RunCouncil`), слэш-команды перед ней пока нет.
+В движке есть и совет: от двух до четырёх брифов отвечают на один вопрос, каждый на своей модели и со своим усилием, и никто из них не видит остальных; свёртка отделяет то, в чём они сходятся, от того, в чём нет, и называет автора каждого расхождения. `/council` отдаёт ему вопрос из чата; `/graph` гоняет его за циклом цели.
 
 `titi-core` умеет запечатать выгрузку сессии в share-пакет: ChaCha20-Poly1305 через аудированный крейт RustCrypto, заголовок аутентифицирован как associated data, поэтому хранилище не переклеит одну сессию под другую, а ключ возвращается отдельно и рядом с пакетом не лежит. С экрана его пока никто не выдаёт.
 
@@ -385,7 +395,7 @@ TUI / headless
 cargo run -p titi-genome --example map -- . 40
 ```
 
-`TITI_NO_GENOME=1` убирает карту из промпта. Genome индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
+`TITI_NO_GENOME=1` убирает карту из промпта. `genome.enabled` в агентском или проектном конфиге включает и выключает карту, `genome.limit` (от 1 до 64, по умолчанию 24) ограничивает число файлов в проекции; проектный файл решает, а `TITI_NO_GENOME=1` выключает на один прогон, не трогая ни то, ни другое. Каждый ход несёт и блок `<diff>`: изменения рабочего дерева рядом с картой репозитория, чтобы модель видела собственные правки. Genome индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
 
 ### Что уже есть
 
@@ -406,10 +416,10 @@ cargo run -p titi-genome --example map -- . 40
 Точка возобновления — [`docs/research/STATE.md`](docs/research/STATE.md); карта ресерча — [`docs/research/README.md`](docs/research/README.md). Цикл задачи — [`docs/CONVEYOR.md`](docs/CONVEYOR.md), майлстоуны — [`docs/PLAN.md`](docs/PLAN.md). Решения живут в доках тем под `docs/research/`.
 
 ```bash
-cargo fmt --check
-cargo test -p titi-engine
-cargo clippy -p titi-engine --all-targets
-cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets     # информационно, не ошибка
+cargo test --workspace --locked
+gh run list --repo robertt3kuk/titi --branch master --limit 5
 ```
 
 CI гоняет fmt, clippy (информационно), тесты воркспейса и smoke настоящего бинаря на pty (`scripts/tui-smoke.py`): кадр готовности, список по `/`, `/help`, Ctrl+D и последовательности восстановления терминала. Ключ провайдера не используется, ход модели не запускается; каждое ожидание ограничено, поэтому зависание роняет джобу, а не висит в ней.
