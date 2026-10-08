@@ -530,7 +530,7 @@ pub(crate) fn model_row_label(row: &ModelRow, current: bool, room: usize) -> Str
 /// Commands first, then skills. A command only counts at the start of the
 /// line, so a slash inside a sentence can only name a skill.
 pub(crate) fn picker_rows(chat: &Chat) -> Vec<PickRow> {
-    if chat.login_for.is_some() {
+    if chat.login_for.is_some() || chat.picker_hidden {
         return Vec::new();
     }
     let Some((start, prefix)) = slash_token(&chat.input) else {

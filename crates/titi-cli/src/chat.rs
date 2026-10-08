@@ -423,6 +423,11 @@ pub struct Chat {
     login_driver: Option<Arc<dyn LoginDriver>>,
     /// Highlight in the leading-slash command list.
     pub(crate) picker: usize,
+    /// Esc hid the list this draft opened. The list is a function of the
+    /// draft, so hiding it has to be remembered: it stays hidden until the
+    /// draft changes again, which is what lets Esc close the list without
+    /// taking the text with it.
+    pub(crate) picker_hidden: bool,
     /// Highlight in the bare-`/login` subscription picker; `None` = closed.
     pub(crate) login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
@@ -600,6 +605,7 @@ impl Chat {
             oauth: None,
             login_driver: None,
             picker: 0,
+            picker_hidden: false,
             login_picker: None,
             session_picker: None,
             session_search: None,
@@ -1294,6 +1300,7 @@ impl Chat {
     pub(crate) fn clear_input(&mut self) {
         self.input.clear();
         self.pastes.clear();
+        self.picker_hidden = false;
     }
 
     pub(crate) fn submit(&mut self, now: Instant) -> Applied {
@@ -6239,8 +6246,10 @@ mod tests {
         assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
     }
 
-    /// A picker keeps its own Esc. See `esc_clears_the_query_then_closes_without_switching`
-    /// for the model browser's half of it.
+    /// Esc on the command list closes it and nothing else: the draft stays
+    /// exactly as typed, the way the emoji picker's Esc works. (The model
+    /// browser's Esc is its own: see
+    /// `esc_clears_the_query_then_closes_without_switching`.)
     #[test]
     fn escape_in_the_command_list_only_closes_it() {
         let mut chat = chat();
@@ -6248,8 +6257,14 @@ mod tests {
         assert!(chat.picking(), "the command list is up");
         assert!(chat.on_key(Key::Esc, Instant::now()).effect.is_none());
         assert!(!chat.picking(), "esc closed the list");
-        assert!(chat.input.is_empty(), "and took the token with it");
+        assert_eq!(chat.input, "/mo", "and left the draft as it was typed");
         assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
+
+        // The list is a function of the draft, so the next keystroke brings
+        // it back rather than leaving the composer in a hidden mode.
+        type_text(&mut chat, "d");
+        assert_eq!(chat.input, "/mod");
+        assert!(chat.picking(), "typing again offers the list");
     }
 
     /// Esc twice on an empty composer is `/rewind` (omp
@@ -7043,8 +7058,7 @@ mod tests {
             );
         }
 
-        // Esc closes and leaves the text alone — unlike the slash list, whose
-        // Esc clears the composer.
+        // Esc closes and leaves the text alone, the way the slash list's does.
         {
             let mut chat = chat();
             type_text(&mut chat, ":sm");

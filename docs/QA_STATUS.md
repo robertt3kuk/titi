@@ -53,5 +53,7 @@ binary run real HTTP turns without a key.
 
 | Composer `/` list: Enter runs the highlighted row | pass | 2026-10-09 | PTY via `scripts/pty-drive.py` (pyte 90×26), debug build of the fix, cwd a scratch git repo, a fresh `TITI_AGENT_DIR`, `TITI_NO_GENOME=1` | PTY check, not visual. `/checkpoint` opens `▶ /checkpoint` over `/checkpoints`; Down moves the marker to `/checkpoints` and Enter prints `· checkpoints: none` (pre-fix the same keys printed `· checkpoint: 0 entries · git …`, the typed word); with the marker left on the typed word, Enter still prints `· checkpoint: 0 entries · git 820c878`. `process: exited status=0`, `restore: True True`. |
 
+| Composer `/` list: Esc closes it and keeps the draft | pass | 2026-10-09 | PTY via `scripts/pty-drive.py` (pyte 90×26), debug build of the fix, cwd a scratch git repo, a fresh `TITI_AGENT_DIR`, `TITI_NO_GENOME=1` | PTY check, not visual. `/who` opens `▶ /whoami`; Esc leaves `› /who▍` with the list gone (pre-fix the composer came back empty); typing `a` brings the list back over `/whoa`; a second Esc hides it, and Enter then submits the typed text plainly (`✕ unknown command /whoa`), so a hidden list neither completes nor intercepts. `process: exited status=0`, `restore: True True`. |
+
 Status values: `pass`, `fail` (link the issue or commit), `partial`,
 `unverified`.

@@ -31,6 +31,7 @@ All notable user-facing changes to titi, newest first.
 
 ### Fixed
 
+- `Escape` on an open command list closes the list and leaves the composer exactly as typed, the way the emoji picker's Esc works; the list comes back on the next keystroke. It used to take the whole draft with it — a mid-sentence skill's sentence included.
 - `Enter` in the composer runs the row the command list is highlighting, not the word under the caret: `/checkpoint` with `/checkpoints` picked used to record a checkpoint instead of listing them. A word that already is the highlighted row still runs as typed, so a complete command (and a sentence naming a skill exactly) keeps sending on one Enter.
 - The provider catalog can no longer be redeclared by a project `.titi/config.yml`, so a cloned repository cannot redirect `openai.base_url` and take the first request with its own key; the `settings` tool also no longer exposes `providers` or key-bearing leaves.
 - A turn before its first visible token that fails walks the rest of the model list in order and says so (`model fallback: a → b`); a `401` and an unknown model are not retried.

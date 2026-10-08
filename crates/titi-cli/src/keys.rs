@@ -319,6 +319,7 @@ impl Chat {
             Key::DeleteWord => {
                 self.disarm();
                 self.delete_word();
+                self.picker_hidden = false;
                 self.sync_emoji_picker();
                 Applied::none()
             }
@@ -329,6 +330,7 @@ impl Chat {
                 // so the picker follows the text here too.
                 self.sync_emoji_picker();
                 self.picker = 0;
+                self.picker_hidden = false;
                 self.scroll_offset = 0;
                 Applied::none()
             }
@@ -336,7 +338,17 @@ impl Chat {
                 self.disarm();
                 self.type_char(ch);
                 self.picker = 0;
+                self.picker_hidden = false;
                 self.scroll_offset = 0;
+                Applied::none()
+            }
+            // Esc on an open list closes it the way the emoji picker's does:
+            // the draft stays exactly as typed, and the next keystroke offers
+            // the list again. On a draft with no list up it still clears, and
+            // on an empty composer the second press is the rewind chord.
+            Key::Esc if self.picking() => {
+                self.picker_hidden = true;
+                self.disarm();
                 Applied::none()
             }
             Key::Esc => self.escape(now),
@@ -397,6 +409,7 @@ impl Chat {
         self.login_picker = None;
         self.model_picker = None;
         self.emoji_picker.hide();
+        self.picker_hidden = false;
         let body = paste_body(text);
         let lines = body.lines().count();
         if lines <= PASTE_INLINE_MAX_LINES {
@@ -476,6 +489,9 @@ impl Chat {
     /// composer a second press inside [`QUIT_WINDOW`] is the rewind chord
     /// (omp `doubleEscapeAction`, default `rewind`), which is exactly what
     /// `/rewind` does, so the chord and the command cannot drift.
+    ///
+    /// A command list that is open is not this function's: `on_key` intercepts
+    /// that Esc and closes the list, leaving the draft as typed.
     fn escape(&mut self, now: Instant) -> Applied {
         let armed = self.esc_armed.take();
         self.disarm();
