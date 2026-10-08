@@ -337,6 +337,138 @@ pub fn osc52_copy(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Desktop notifications and native progress
+// ---------------------------------------------------------------------------
+
+/// The plain bell: the notification channel every terminal that can ring has.
+pub const BEL: &str = "\x07";
+
+/// The terminal's own name and what sits in front of it.
+///
+/// The probes above ask a terminal a question and read the reply; OSC 777
+/// has no reply to read, so this decision is made from
+/// the names the terminal gives itself — the same source omp's
+/// `terminal-capabilities.ts` reads. The table is deliberately short: a
+/// terminal that is not named here gets the BEL, which every one of them
+/// understands, rather than a sequence it may print at the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TermEnv {
+    /// `TERM_PROGRAM` — set by most modern terminals (`iTerm.app`, `WezTerm`).
+    pub term_program: Option<String>,
+    /// `TERM`.
+    pub term: Option<String>,
+    /// `TMUX`, `STY` or `ZELLIJ` is set: a sequence would have to cross it.
+    pub multiplexed: bool,
+    /// `KONSOLE_VERSION` is set — Konsole.
+    pub konsole: bool,
+    /// `VTE_VERSION` — the VTE library behind GNOME Terminal and Tilix.
+    /// VTE 0.52 (5200) is the release that gained OSC 777.
+    pub vte_version: Option<u32>,
+}
+
+impl TermEnv {
+    /// Snapshot the process environment.
+    pub fn from_env() -> Self {
+        let flag = |key: &str| std::env::var_os(key).is_some();
+        TermEnv {
+            term_program: std::env::var("TERM_PROGRAM").ok(),
+            term: std::env::var("TERM").ok(),
+            multiplexed: ["TMUX", "STY", "ZELLIJ"].iter().any(|key| flag(key)),
+            konsole: flag("KONSOLE_VERSION"),
+            vte_version: std::env::var("VTE_VERSION")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+        }
+    }
+
+    /// The channel a finished turn reaches the user through.
+    ///
+    /// Notifications cannot be probed — nothing answers — so this is
+    /// [`TermEnv::osc777`]'s name table plus two honest fallbacks. A terminal
+    /// that is not
+    /// named as an OSC 777 speaker gets the BEL; a run with no terminal at
+    /// all (`TERM` unset, empty or `dumb`) gets nothing, because writing an
+    /// escape into a pipe is garbage rather than a notification. A
+    /// multiplexer forces the BEL too: OSC 777 reaches the outer terminal
+    /// only through a passthrough the multiplexer may refuse to forward, and
+    /// a swallowed sequence is a notification that never arrives.
+    pub fn notification_channel(&self) -> NotifyChannel {
+        if !self.is_terminal() {
+            return NotifyChannel::None;
+        }
+        if !self.multiplexed && self.osc777() {
+            return NotifyChannel::Osc777;
+        }
+        NotifyChannel::Bell
+    }
+
+    /// Whether the terminal names itself as an OSC 777 speaker.
+    fn osc777(&self) -> bool {
+        if self.konsole {
+            return true;
+        }
+        let program = self.lower("term_program");
+        let term = self.lower("term");
+        ["iterm", "wezterm", "ghostty", "konsole"]
+            .iter()
+            .any(|name| program.contains(name) || term.contains(name))
+            || term.contains("rxvt")
+            || self.vte_version.is_some_and(|version| version >= 5200)
+    }
+
+    /// Whether there is a terminal here at all.
+    fn is_terminal(&self) -> bool {
+        let term = self.lower("term");
+        !term.is_empty() && term != "dumb" && term != "unknown"
+    }
+
+    /// One env value, lowercased, `""` when unset.
+    fn lower(&self, field: &str) -> String {
+        let raw = match field {
+            "term" => self.term.as_deref(),
+            _ => self.term_program.as_deref(),
+        };
+        raw.unwrap_or("").to_ascii_lowercase()
+    }
+}
+
+/// The channel a finished turn's notification takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyChannel {
+    /// OSC 777 — the terminal raises its own toast.
+    Osc777,
+    /// A plain BEL — the terminal rings or flashes.
+    Bell,
+    /// No terminal to write to: emit nothing.
+    None,
+}
+
+/// OSC 777 desktop notification:
+/// `ESC ] 777 ; notify ; <title> ; <body> BEL`.
+///
+/// `;` is the payload's field separator, so a semicolon inside the title or
+/// the body would be read as the next field, and a control character would
+/// end the sequence early (`BEL`) or open another one (`ESC`) — the caller
+/// passes a session label and a fact, never file contents, and both are
+/// folded here as well as at the call site.
+pub fn osc777_notify(title: &str, body: &str) -> String {
+    format!(
+        "\x1b]777;notify;{};{}\x07",
+        notify_field(title),
+        notify_field(body)
+    )
+}
+
+/// One field of the OSC 777 payload, with the characters that would split the
+/// payload or escape it removed.
+fn notify_field(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .map(|ch| if ch == ';' { ',' } else { ch })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Mouse presets
 // ---------------------------------------------------------------------------
 
@@ -692,5 +824,90 @@ mod tests {
                 b: 0x9a
             })
         );
+    }
+
+    // ---- Desktop notifications --------------------------------
+
+    /// A terminal named by the table either as `TERM_PROGRAM` or as `TERM`.
+    fn env(program: Option<&str>, term: &str) -> TermEnv {
+        TermEnv {
+            term_program: program.map(str::to_owned),
+            term: Some(term.to_owned()),
+            ..TermEnv::default()
+        }
+    }
+
+    #[test]
+    fn osc777_terminals_are_named_not_guessed() {
+        for terminal in [
+            env(Some("iTerm.app"), "xterm-256color"),
+            env(Some("WezTerm"), "xterm-256color"),
+            env(Some("ghostty"), "xterm-ghostty"),
+            env(None, "xterm-kitty"),
+        ] {
+            // kitty is not named by the table for OSC 777 — it is not known to
+            // speak it — so it lands on the BEL with every other unknown.
+            let expected = if terminal.term.as_deref() == Some("xterm-kitty") {
+                NotifyChannel::Bell
+            } else {
+                NotifyChannel::Osc777
+            };
+            assert_eq!(terminal.notification_channel(), expected, "{terminal:?}");
+        }
+        // Konsole and a VTE new enough for OSC 777 (0.52) are named too.
+        let konsole = TermEnv {
+            konsole: true,
+            ..env(None, "xterm-256color")
+        };
+        assert_eq!(konsole.notification_channel(), NotifyChannel::Osc777);
+        let vte_new = TermEnv {
+            vte_version: Some(5200),
+            ..env(None, "xterm-256color")
+        };
+        assert_eq!(vte_new.notification_channel(), NotifyChannel::Osc777);
+        let vte_old = TermEnv {
+            vte_version: Some(4402),
+            ..env(None, "xterm-256color")
+        };
+        assert_eq!(vte_old.notification_channel(), NotifyChannel::Bell);
+    }
+
+    #[test]
+    fn a_multiplexer_and_an_unknown_terminal_fall_back_to_the_bell() {
+        let tmux = TermEnv {
+            multiplexed: true,
+            ..env(Some("WezTerm"), "tmux-256color")
+        };
+        assert_eq!(tmux.notification_channel(), NotifyChannel::Bell);
+        assert_eq!(
+            env(Some("Apple_Terminal"), "xterm-256color").notification_channel(),
+            NotifyChannel::Bell
+        );
+    }
+
+    #[test]
+    fn no_terminal_emits_nothing() {
+        for term in [None, Some(""), Some("dumb"), Some("unknown")] {
+            let bare = TermEnv {
+                term: term.map(str::to_owned),
+                ..TermEnv::default()
+            };
+            assert_eq!(bare.notification_channel(), NotifyChannel::None, "{term:?}");
+        }
+    }
+
+    #[test]
+    fn osc777_payload_is_bel_terminated_and_folds_its_separators() {
+        assert_eq!(
+            osc777_notify("titi", "blue-otter · turn finished"),
+            "\x1b]777;notify;titi;blue-otter · turn finished\x07"
+        );
+        // A semicolon would be read as the next field; a control character
+        // would close the sequence. Both are folded out, so neither can travel.
+        assert_eq!(
+            osc777_notify("ti;ti", "a\x07b\nc"),
+            "\x1b]777;notify;ti,ti;abc\x07"
+        );
+        assert_eq!(BEL, "\x07");
     }
 }

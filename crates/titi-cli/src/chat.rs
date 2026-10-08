@@ -38,6 +38,91 @@ use crate::session_log::SessionLog;
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
 
+/// Which of the terminal's own channels this run may use.
+///
+/// Resolved once, before the first frame: the config says which of them the
+/// user wants ([`titi_config::settings::switch_off`] on the keys this build
+/// names) and [`titi_tui::caps::TermEnv`] says which of them the terminal
+/// offers. Both halves are needed before anything is written, because a
+/// sequence sent to a terminal that does not know it is again a byte stream
+/// with rubbish in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalFeatures {
+    /// A turn that finished cleanly raises a notification (`notify.completion`).
+    notify_completion: bool,
+    /// A turn that ended in a failure raises one (`notify.error`).
+    notify_error: bool,
+    /// A turn that stopped on an approval raises one (`notify.ask`).
+    notify_ask: bool,
+    /// The channel a notification takes: OSC 777, the BEL, or nothing.
+    channel: titi_tui::caps::NotifyChannel,
+}
+
+impl Default for TerminalFeatures {
+    /// Everything on, over the richest channel: what a chat built without
+    /// reading the config — a test's, a cast's — would do on a terminal that
+    /// takes all three.
+    fn default() -> Self {
+        Self {
+            notify_completion: true,
+            notify_error: true,
+            notify_ask: true,
+            channel: titi_tui::caps::NotifyChannel::Osc777,
+        }
+    }
+}
+
+impl TerminalFeatures {
+    /// The switches the config sets, over the channels the terminal offers.
+    fn resolve(
+        settings: Option<&titi_config::settings::Settings>,
+        env: &titi_tui::caps::TermEnv,
+    ) -> Self {
+        let on = |key: &str| {
+            !settings.is_some_and(|settings| titi_config::settings::switch_off(settings, key))
+        };
+        Self {
+            notify_completion: on(titi_config::settings::NOTIFY_COMPLETION_KEY),
+            notify_error: on(titi_config::settings::NOTIFY_ERROR_KEY),
+            notify_ask: on(titi_config::settings::NOTIFY_ASK_KEY),
+            channel: env.notification_channel(),
+        }
+    }
+}
+
+/// One notification the run state owes the terminal, from an event the screen
+/// saw once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotifyKind {
+    /// A turn finished, cleanly.
+    Completion,
+    /// A turn ended in a failure.
+    Error,
+    /// The agent is blocked on an approval for this tool.
+    Ask { tool: String },
+}
+
+impl NotifyKind {
+    /// The switch this notification answers to.
+    fn enabled_in(&self, features: &TerminalFeatures) -> bool {
+        match self {
+            NotifyKind::Completion => features.notify_completion,
+            NotifyKind::Error => features.notify_error,
+            NotifyKind::Ask { .. } => features.notify_ask,
+        }
+    }
+
+    /// The one short fact the notification carries — never a prompt, never a
+    /// file's contents, never a secret.
+    fn fact(&self) -> String {
+        match self {
+            NotifyKind::Completion => "turn finished".to_owned(),
+            NotifyKind::Error => "turn failed".to_owned(),
+            NotifyKind::Ask { tool } => format!("needs approval: {tool}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The transcript's geometry
 // ---------------------------------------------------------------------------
@@ -543,6 +628,14 @@ pub struct Chat {
     /// The title the terminal was last given, so a tick that changes nothing
     /// writes nothing (`crate::title`).
     last_title: Option<String>,
+    /// The channels this run may use: which of the settings are on and what
+    /// the terminal itself supports.
+    terminal: TerminalFeatures,
+    /// A notification the run state owes and the next tick will write. Set by
+    /// the one event that is the notification's own — a turn's end, a failure,
+    /// an approval — never by a streaming delta, and taken by the tick so it
+    /// cannot be written twice.
+    pending_notify: Option<NotifyKind>,
 }
 
 impl Chat {
@@ -611,6 +704,8 @@ impl Chat {
             turn_history: false,
             turn_failed: false,
             last_title: None,
+            terminal: TerminalFeatures::default(),
+            pending_notify: None,
         }
     }
 
@@ -888,6 +983,12 @@ impl Chat {
                     name: name.to_string(),
                     detail,
                 });
+                // The engine stops here until a person answers, and the person
+                // may be in another window: this is the one event that owes
+                // the `ask` notification, emitted once for the one approval.
+                self.pending_notify = Some(NotifyKind::Ask {
+                    tool: name.to_string(),
+                });
                 // The phase is left as it stands. The engine emits
                 // `ToolStarted` before it asks (crates/titi-engine/src/
                 // tool_loop.rs:145 then :271), so the running call keeps its
@@ -976,16 +1077,25 @@ impl Chat {
                 self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
                 self.turn_failed = true;
                 if turn_id.is_some() && turn_id == self.active_turn_id {
+                    // A failure that ends the turn the user is waiting on is
+                    // the `error` notification; one that belongs to some other
+                    // turn is not this screen's turn and raises nothing.
+                    self.pending_notify = Some(NotifyKind::Error);
                     self.finish_turn()
                 } else {
                     Applied::none()
                 }
             }
             EngineEvent::Cancelled { .. } => {
+                // A cancel is the user's own hand on the screen, and they are
+                // looking at it: no notification.
                 self.push(LineKind::Note, "cancelled".to_owned());
                 self.finish_turn()
             }
-            EngineEvent::TurnFinished { .. } => self.finish_turn(),
+            EngineEvent::TurnFinished { .. } => {
+                self.pending_notify = Some(NotifyKind::Completion);
+                self.finish_turn()
+            }
             EngineEvent::GoalFinished { report } => {
                 self.push(LineKind::Note, report.to_string());
                 Applied::none()
@@ -1268,7 +1378,7 @@ impl Chat {
     /// already rides — so the tab follows the turn without a timer of its own.
     /// The title is a function of the state and the label and not of the
     /// clock, so a tick that changes neither writes nothing at all.
-    fn title_tick(&mut self) -> Option<String> {
+    fn title_sequence(&mut self) -> Option<String> {
         let glyphs = crate::title::TitleGlyphs::for_theme(&self.theme);
         let label = if self.session_label.is_empty() {
             short_model(&self.model)
@@ -1281,6 +1391,49 @@ impl Chat {
         }
         self.last_title = Some(composed.clone());
         Some(crate::title::set_title(&composed))
+    }
+
+    /// Everything this tick owes the terminal's own channels, in one string:
+    /// the tab title when the run state changed, and any notification the
+    /// run state earned. `None` when there is nothing to write, so an
+    /// unchanged tick writes no bytes at all.
+    fn terminal_tick(&mut self) -> Option<String> {
+        let mut out = String::new();
+        if let Some(title) = self.title_sequence() {
+            out.push_str(&title);
+        }
+        // Edge-triggered from the events themselves: `take` is what makes it
+        // exactly one notification per event.
+        if let Some(pending) = self.pending_notify.take()
+            && let Some(sequence) = self.notify_sequence(&pending)
+        {
+            out.push_str(&sequence);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The bytes one notification takes, or `None` when its switch is off or
+    /// the terminal has no channel for it.
+    ///
+    /// The title is the brand and the body is the session's label (or, before
+    /// it has one, the model) plus one short fact. Nothing here is a prompt, a
+    /// file path or any other text the user's work put on the screen.
+    fn notify_sequence(&self, pending: &NotifyKind) -> Option<String> {
+        use titi_tui::caps::{BEL, NotifyChannel, osc777_notify};
+        if !pending.enabled_in(&self.terminal) {
+            return None;
+        }
+        let label = if self.session_label.is_empty() {
+            short_model(&self.model)
+        } else {
+            self.session_label.clone()
+        };
+        let body = format!("{} · {}", label, pending.fact());
+        match self.terminal.channel {
+            NotifyChannel::Osc777 => Some(osc777_notify("titi", &body)),
+            NotifyChannel::Bell => Some(BEL.to_owned()),
+            NotifyChannel::None => None,
+        }
     }
 
     fn switch_model(&mut self, text: &str) -> Option<Applied> {
@@ -3533,6 +3686,19 @@ pub fn run(
     )
     .map_err(io::Error::other)?;
     let mut chat = Chat::new(model, &session_id, theme);
+    // Which of the terminal's own channels this run may use — the switches the
+    // config sets over what the terminal says it supports — resolved before
+    // the first frame, because a sequence sent to a terminal that does not
+    // know it is rubbish in the byte stream. A config that fails to load
+    // leaves every switch at its default (`on`), exactly as `/genome` reads it.
+    let settings = titi_config::settings::Settings::load(
+        &chat.agent_dir,
+        &crate::session_fs::current_workspace(),
+        &[],
+    )
+    .ok();
+    let term_env = titi_tui::caps::TermEnv::from_env();
+    chat.terminal = TerminalFeatures::resolve(settings.as_ref(), &term_env);
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
@@ -3573,10 +3739,10 @@ pub fn run(
         if pump(&mut engine, &mut chat, &session_log, &mut cast)? {
             break Ok(());
         }
-        // The tab title rides the same tick as the progress row: the sequence
-        // is written only when the run state changed, so a tick in an
-        // unchanged state writes nothing (crate::title).
-        if let Some(sequence) = chat.title_tick() {
+        // The tab title and any notification ride the same tick as the
+        // progress row: each is written only when the run state changed, so
+        // a tick in an unchanged state writes nothing (crate::title).
+        if let Some(sequence) = chat.terminal_tick() {
             let backend = screen.terminal.backend_mut();
             backend.write_all(sequence.as_bytes())?;
             backend.flush()?;
@@ -10374,19 +10540,19 @@ mod tests {
     fn the_title_is_written_once_per_state_change() {
         let mut chat = chat();
         // The first tick claims the tab: it is the user's turn.
-        let first = chat.title_tick().unwrap_or_default();
+        let first = chat.terminal_tick().unwrap_or_default();
         assert!(first.starts_with("\x1b]2;titi "), "{first:?}");
         assert_eq!(first.matches('\x07').count(), 1, "{first:?}");
 
         // Five ticks in the same state: not one of them writes.
-        let idle_writes = (0..5).filter(|_| chat.title_tick().is_some()).count();
+        let idle_writes = (0..5).filter(|_| chat.terminal_tick().is_some()).count();
         assert_eq!(idle_writes, 0, "an unchanged tick writes nothing");
 
         // The turn starts — before the first token — and the tab says working.
         chat.turn_active = true;
         chat.turn_started = Some(Instant::now());
         chat.phase = WorkPhase::Waiting;
-        let writes = (0..5).filter(|_| chat.title_tick().is_some()).count();
+        let writes = (0..5).filter(|_| chat.terminal_tick().is_some()).count();
         assert_eq!(
             writes, 1,
             "one write for the one state change, not per tick"
@@ -10396,9 +10562,9 @@ mod tests {
 
         // Every working phase is the same title: still no second write.
         chat.phase = WorkPhase::Streaming;
-        assert!(chat.title_tick().is_none(), "{working}");
+        assert!(chat.terminal_tick().is_none(), "{working}");
         chat.phase = WorkPhase::Thinking;
-        assert!(chat.title_tick().is_none());
+        assert!(chat.terminal_tick().is_none());
         chat.phase = WorkPhase::Tool {
             call_id: "call-1".to_owned(),
             name: "read".to_owned(),
@@ -10406,7 +10572,7 @@ mod tests {
             since: Instant::now(),
         };
         assert!(
-            chat.title_tick().is_some(),
+            chat.terminal_tick().is_some(),
             "a running tool is its own state"
         );
 
@@ -10415,9 +10581,9 @@ mod tests {
             turn_id: TurnId(1),
             reason: StopReason::Stop,
         });
-        let ended = chat.title_tick();
+        let ended = chat.terminal_tick();
         assert!(ended.is_some(), "the turn ended");
-        assert!(chat.title_tick().is_none());
+        assert!(chat.terminal_tick().is_none());
     }
 
     /// A failed turn leaves the tab saying so, and the next turn clears it.
@@ -10435,14 +10601,231 @@ mod tests {
             message: "no route to host".into(),
         });
         assert_eq!(chat.title_state(), TitleState::Error);
-        let failed = chat.title_tick().unwrap_or_default();
+        let failed = chat.terminal_tick().unwrap_or_default();
         assert!(failed.contains('✘'), "the error mark: {failed:?}");
-        assert!(chat.title_tick().is_none());
+        assert!(chat.terminal_tick().is_none());
 
         type_text(&mut chat, "again");
         chat.on_key(Key::Enter, Instant::now());
         assert_eq!(chat.title_state(), TitleState::Waiting);
-        assert!(chat.title_tick().is_some(), "the next turn clears the tab");
+        assert!(
+            chat.terminal_tick().is_some(),
+            "the next turn clears the tab"
+        );
+    }
+
+    /// A finished turn raises exactly one OSC 777 — the brand as its title,
+    /// the session's label and one short fact as its body — and not one byte
+    /// on the deltas that led there.
+    #[test]
+    fn a_finished_turn_notifies_once_with_the_label_and_the_fact() {
+        use titi_tui::caps::NotifyChannel;
+        let mut chat = chat();
+        chat.session_label = "blue-otter".to_owned();
+        chat.terminal = TerminalFeatures {
+            channel: NotifyChannel::Osc777,
+            ..TerminalFeatures::default()
+        };
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        // Streaming is not an event that notifies: the deltas write the tab
+        // and the bar, never a toast.
+        for text in ["Hel", "lo, world"] {
+            chat.on_event(EngineEvent::StreamDelta {
+                turn_id: TurnId(1),
+                text: text.into(),
+            });
+            let tick = chat.terminal_tick().unwrap_or_default();
+            assert!(!tick.contains("777"), "a delta notified: {tick:?}");
+        }
+
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let tick = chat.terminal_tick().expect("the turn's end writes");
+        assert_eq!(tick.matches("\x1b]777;notify;").count(), 1, "{tick:?}");
+        assert!(
+            tick.contains("\x1b]777;notify;titi;blue-otter · turn finished\x07"),
+            "{tick:?}"
+        );
+        // Once: the next tick has nothing left to say about that turn.
+        let again = chat.terminal_tick().unwrap_or_default();
+        assert!(!again.contains("777"), "{again:?}");
+    }
+
+    /// A turn that ended in a failure has its own fact, and an approval its
+    /// own — with the tool's name and nothing of what the tool would read.
+    #[test]
+    fn a_failed_turn_and_an_approval_each_notify_with_their_own_fact() {
+        use titi_tui::caps::NotifyChannel;
+        let mut failing = chat();
+        failing.session_label = "blue-otter".to_owned();
+        failing.terminal = TerminalFeatures {
+            channel: NotifyChannel::Osc777,
+            ..TerminalFeatures::default()
+        };
+        failing.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        failing.on_event(EngineEvent::Failed {
+            turn_id: Some(TurnId(1)),
+            reason: titi_providers::ErrorReason::Connection,
+            message: "no route to host".into(),
+        });
+        let failed = failing.terminal_tick().unwrap_or_default();
+        assert!(
+            failed.contains("\x1b]777;notify;titi;blue-otter · turn failed\x07"),
+            "{failed:?}"
+        );
+        assert!(!failed.contains("no route"), "the failure is not the toast");
+
+        // An approval of the next turn: the fact names the tool, never the
+        // call's arguments.
+        let mut asking = chat();
+        asking.session_label = "blue-otter".to_owned();
+        asking.terminal = TerminalFeatures {
+            channel: NotifyChannel::Osc777,
+            ..TerminalFeatures::default()
+        };
+        asking.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        asking.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+            detail: Some("bash rm -rf /tmp/secret".into()),
+        });
+        asking.on_event(EngineEvent::ToolApprovalNeeded {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "bash".into(),
+        });
+        let asked = asking.terminal_tick().unwrap_or_default();
+        assert!(
+            asked.contains("\x1b]777;notify;titi;blue-otter · needs approval: bash\x07"),
+            "{asked:?}"
+        );
+        assert!(!asked.contains("secret"), "{asked:?}");
+    }
+
+    /// A terminal that does not speak OSC 777 rings instead — and the BEL is
+    /// exactly the difference between that terminal and one with no channel
+    /// at all, so nothing else creeps into the byte stream.
+    #[test]
+    fn a_terminal_without_osc_777_gets_the_bell_and_nothing_else() {
+        use titi_tui::caps::{BEL, NotifyChannel};
+        /// The tick a finished turn writes on a channel, as a string.
+        fn finished_tick(channel: NotifyChannel) -> String {
+            let mut chat = chat();
+            chat.session_label = "blue-otter".to_owned();
+            chat.terminal = TerminalFeatures {
+                channel,
+                ..TerminalFeatures::default()
+            };
+            chat.on_event(EngineEvent::TurnStarted {
+                turn_id: TurnId(1),
+                model: "openai/gpt-4.1".into(),
+            });
+            chat.on_event(EngineEvent::StreamDelta {
+                turn_id: TurnId(1),
+                text: "done".into(),
+            });
+            chat.on_event(EngineEvent::TurnFinished {
+                turn_id: TurnId(1),
+                reason: StopReason::Stop,
+            });
+            chat.terminal_tick().unwrap_or_default()
+        }
+
+        let bell = finished_tick(NotifyChannel::Bell);
+        let silent = finished_tick(NotifyChannel::None);
+        assert!(!bell.contains("777"), "{bell:?}");
+        assert_eq!(bell, format!("{silent}{BEL}"), "one bell, nothing more");
+    }
+
+    /// The switch turns one event off and leaves the others alone; a cancel is
+    /// nobody's event to notify about.
+    #[test]
+    fn a_disabled_switch_emits_nothing_and_a_cancel_notifies_nobody() {
+        use titi_tui::caps::NotifyChannel;
+        /// The tick a finished turn writes, with the completion switch and the
+        /// channel the test asks for.
+        fn completion_tick(switch: bool, channel: NotifyChannel) -> String {
+            let mut chat = chat();
+            chat.session_label = "blue-otter".to_owned();
+            chat.terminal = TerminalFeatures {
+                notify_completion: switch,
+                channel,
+                ..TerminalFeatures::default()
+            };
+            chat.on_event(EngineEvent::TurnStarted {
+                turn_id: TurnId(1),
+                model: "openai/gpt-4.1".into(),
+            });
+            chat.on_event(EngineEvent::TurnFinished {
+                turn_id: TurnId(1),
+                reason: StopReason::Stop,
+            });
+            chat.terminal_tick().unwrap_or_default()
+        }
+
+        let off = completion_tick(false, NotifyChannel::Osc777);
+        // Nothing of the notification is there — and the tick is byte for byte
+        // the one a terminal with no channel at all would get, so the switch
+        // removed the notification and nothing else.
+        assert!(!off.contains("777"), "{off:?}");
+        assert_eq!(off, completion_tick(false, NotifyChannel::None));
+        assert_ne!(off, completion_tick(true, NotifyChannel::Osc777));
+
+        // A cancel is the user's own hand on the screen: no notification.
+        let mut cancelled = chat();
+        cancelled.session_label = "blue-otter".to_owned();
+        cancelled.terminal = TerminalFeatures {
+            channel: NotifyChannel::Osc777,
+            ..TerminalFeatures::default()
+        };
+        cancelled.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        cancelled.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) });
+        let tick = cancelled.terminal_tick().unwrap_or_default();
+        assert!(!tick.contains("777"), "{tick:?}");
+    }
+
+    /// The switches come from the config and the terminal together: the config
+    /// turns one off.
+    #[test]
+    fn the_resolved_features_read_the_config_and_the_terminal() {
+        use titi_tui::caps::{NotifyChannel, TermEnv};
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(dir.path().join("config.yml"), "notify:\n  ask: off\n").expect("config");
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("load");
+        let plain = TermEnv {
+            term: Some("xterm-256color".to_owned()),
+            ..TermEnv::default()
+        };
+        let features = TerminalFeatures::resolve(Some(&settings), &plain);
+        assert!(!features.notify_ask, "the config turned it off");
+        assert!(features.notify_completion, "and left its siblings on");
+        // An unnamed terminal gets the BEL, which it certainly understands.
+        assert_eq!(features.channel, NotifyChannel::Bell);
+
+        // Unset means on, and the terminal then decides what it can take.
+        let wezterm = TermEnv {
+            term_program: Some("WezTerm".to_owned()),
+            term: Some("xterm-256color".to_owned()),
+            ..TermEnv::default()
+        };
+        let features = TerminalFeatures::resolve(None, &wezterm);
+        assert_eq!(features.channel, NotifyChannel::Osc777);
     }
 
     /// The key hints are not what the status row replaces: whatever the row

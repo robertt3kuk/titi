@@ -90,6 +90,20 @@ pub const GENOME_LIMIT_KEY: &str = "genome.limit";
 /// is not this key.
 pub const GENOME_ENABLED_KEY: &str = "genome.enabled";
 
+/// Whether a turn that finished cleanly raises a desktop notification.
+///
+/// Unset means on. This crate owns the name only; the terminal channel the
+/// notification takes is decided by the screen (`titi_tui::caps`).
+pub const NOTIFY_COMPLETION_KEY: &str = "notify.completion";
+
+/// Whether a turn that ended in a failure raises a desktop notification.
+/// Unset means on. See [`NOTIFY_COMPLETION_KEY`].
+pub const NOTIFY_ERROR_KEY: &str = "notify.error";
+
+/// Whether a turn that stopped on an approval raises a desktop
+/// notification. Unset means on. See [`NOTIFY_COMPLETION_KEY`].
+pub const NOTIFY_ASK_KEY: &str = "notify.ask";
+
 impl Settings {
     /// Discover and load all layers.
     ///
@@ -400,6 +414,28 @@ fn lookup(layer: &Value, key: &str) -> Option<Value> {
         current = index(current, seg)?;
     }
     Some(current.clone())
+}
+
+/// Whether an on-by-default switch is off at `key`.
+///
+/// Written for the cosmetic switches whose name this crate owns — the
+/// notification, progress and rate keys — and modelled on the genome switch
+/// the engine reads: unset means on, a JSON `false` means off, and the
+/// strings `off`/`false`/`no` (case-insensitive) mean off. Anything else — a
+/// number, a list, `maybe` — leaves the switch on, because a typo in a
+/// cosmetic key must not change what the screen does.
+///
+/// Read through the effective view, so a project file can set these too:
+/// unlike privacy and approval, none of them guards anything.
+pub fn switch_off(settings: &Settings, key: &str) -> bool {
+    match settings.get(key) {
+        None => false,
+        Some(Value::Bool(on)) => !on,
+        Some(Value::String(text)) => {
+            matches!(text.to_ascii_lowercase().as_str(), "off" | "false" | "no")
+        }
+        Some(_) => false,
+    }
 }
 
 /// One dotted segment into a value: an object key, or a decimal position in
@@ -846,5 +882,32 @@ mod tests {
         );
         let s = Settings::load(&agent, tmp.path(), &[cfg]).unwrap();
         assert_eq!(s.get("theme.dark"), Some(Value::from("titanium")));
+    }
+
+    /// The three switches this crate names for the screen's own channels
+    /// resolve from a real file, unset means on, and `off` — as a string or a
+    /// bool — turns exactly that one off.
+    #[test]
+    fn the_screen_switches_are_on_unset_and_off_by_their_own_key() {
+        let tmp = TempDir::new().unwrap();
+        let agent = tmp.path().join("agent");
+        let keys = [NOTIFY_COMPLETION_KEY, NOTIFY_ERROR_KEY, NOTIFY_ASK_KEY];
+        assert_eq!(keys, ["notify.completion", "notify.error", "notify.ask",]);
+
+        let empty = Settings::load(&agent, tmp.path(), &[]).unwrap();
+        for key in keys {
+            assert_eq!(empty.get(key), None, "{key} is unset by default");
+            assert!(!switch_off(&empty, key), "{key} is on unset");
+        }
+
+        write(
+            &agent.join("config.yml"),
+            "notify:\n  completion: off\n  error: false\n  ask: \"no\"\n\
+",
+        );
+        let s = Settings::load(&agent, tmp.path(), &[]).unwrap();
+        assert!(switch_off(&s, NOTIFY_COMPLETION_KEY));
+        assert!(switch_off(&s, NOTIFY_ERROR_KEY));
+        assert!(switch_off(&s, NOTIFY_ASK_KEY));
     }
 }
