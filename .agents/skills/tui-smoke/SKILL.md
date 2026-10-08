@@ -39,7 +39,9 @@ local one gives real HTTP turns through the real binary, no key involved:
 4. Check the screen and `requests.jsonl` (what the model was really sent).
    `--prompt` and `--headless` need no PTY: pipe them with the same `env`.
 
-Use a fresh agent dir per scenario: the chat resumes the newest session. To
+Use a fresh agent dir per scenario: a fresh agent dir starts a new session,
+since resuming is opt-in (`--continue`/`-c`, or `session.autoResume` in the
+config). To
 stop the server, kill the `python3` process by name, never with
 `pkill -f` on a pattern your own shell command line also contains.
 
