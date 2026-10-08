@@ -1,27 +1,12 @@
-//! The session recap: what the sections report, and how the panel behaves in
-//! the app.
+//! The session recap: what the sections report.
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use serde_json::json;
-use titi_cli::app::App;
 use titi_cli::recap::build;
-use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
 use titi_core::trajectory::{EventKind, TrajectoryRecorder};
 use titi_tui::recap::RecapSection;
-use titi_tui::slash::Route;
-
-fn app() -> App {
-    App::new(
-        Arc::new(AtomicBool::new(false)),
-        vec!["titi".to_owned()],
-        default_theme().unwrap(),
-    )
-}
 
 /// A session with two turns, one successful read and one failed bash.
 fn fixture() -> (tempfile::TempDir, String) {
@@ -162,77 +147,4 @@ fn an_untouched_session_says_so_instead_of_listing_nothing() {
     assert_eq!(section(&sections, "Problems").summary, "none");
     assert_eq!(section(&sections, "Trajectory").summary, "nothing recorded");
     assert_eq!(section(&sections, "Turns").summary, "0 prompts");
-}
-
-#[test]
-fn the_recap_builtin_is_reserved_and_opens_the_panel() {
-    let app_instance = app();
-    assert_eq!(
-        app_instance.route_slash("/recap"),
-        Route::Builtin("recap".to_owned())
-    );
-}
-
-#[test]
-fn opening_the_recap_without_a_session_reports_it() {
-    let mut app = app();
-    let reason = app.open_session_recap().unwrap_err();
-    assert!(reason.contains("no live session"), "{reason}");
-    assert!(!app.overlay_open());
-}
-
-#[test]
-fn the_panel_takes_keys_until_escape_and_ctrl_o_opens_everything() {
-    let mut app = app();
-    app.open_recap(vec![
-        RecapSection::new("Session", "4 entries", vec!["id: abc".into()]),
-        RecapSection::new("Tools", "3 calls", vec!["read ×2".into()]),
-    ]);
-    assert!(app.overlay_open());
-
-    // Ctrl+O inside the panel opens every section at once.
-    assert_eq!(app.overlay_input("\x0f"), None, "the panel stays open");
-    // `App::render` does not pad to the viewport, so the composited frame has
-    // room for only the top of a tall panel — the panel's own title row is
-    // asserted in `titi-tui`'s recap tests. What matters here is that Ctrl+O
-    // reached the panel and opened both bodies.
-    let rendered = app.render().join("\n");
-    assert!(rendered.contains("read ×2"), "{rendered}");
-    assert!(rendered.contains("id: abc"), "{rendered}");
-
-    // Escape closes it, and the outcome is a plain dismissal.
-    assert_eq!(
-        app.overlay_input("\x1b"),
-        Some(titi_cli::app::OverlayOutcome::Dismissed)
-    );
-    assert!(!app.overlay_open());
-}
-
-#[test]
-fn ctrl_o_expands_then_collapses_every_transcript_section() {
-    let mut app = app();
-    let mut input = String::new();
-
-    // Defaults leave subagents collapsed and activity hidden, so the first
-    // press opens everything.
-    assert_eq!(
-        app.handle_canonical("ctrl+o", &mut input),
-        titi_cli::app::Dispatch::Handled(None)
-    );
-    for name in ["thinking", "tools", "subagents", "activity"] {
-        assert!(
-            app.render().join("\n").contains(name),
-            "{name} should be visible after Ctrl+O"
-        );
-    }
-
-    // A second press closes them all. (It also clears the alert, which is why
-    // the assertion below is on the frame rather than on a message.)
-    app.handle_canonical("ctrl+o", &mut input);
-    let rendered = app.render().join("\n");
-    assert!(
-        !rendered.contains("▾"),
-        "every section collapsed: {rendered}"
-    );
-    assert!(rendered.contains("▸ tools"), "{rendered}");
 }

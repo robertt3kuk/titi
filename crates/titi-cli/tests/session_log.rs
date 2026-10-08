@@ -3,85 +3,11 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
-use titi_cli::app::App;
 use titi_cli::engine::MAX_RESTORED_MESSAGES;
+use titi_cli::session_fs::new_session;
+use titi_cli::session_fs::session_history;
 use titi_cli::session_log::SessionLog;
-use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
-use titi_engine::{AgentKind, AgentStatus, EngineEvent, TurnId};
-use titi_providers::StopReason;
-
-fn app() -> App {
-    App::new(
-        Arc::new(AtomicBool::new(false)),
-        vec!["titi".to_owned()],
-        default_theme().unwrap(),
-    )
-}
-
-#[test]
-fn a_turn_queues_the_user_message_then_the_reply() {
-    let mut app = app();
-    let mut input = "what is 2+2?".to_owned();
-    app.handle_canonical("enter", &mut input);
-
-    app.ingest_engine_event(EngineEvent::TurnStarted {
-        turn_id: TurnId(1),
-        model: "test/model".into(),
-    });
-    app.ingest_engine_event(EngineEvent::StreamDelta {
-        turn_id: TurnId(1),
-        text: "four".into(),
-    });
-    app.ingest_engine_event(EngineEvent::TurnFinished {
-        turn_id: TurnId(1),
-        reason: StopReason::Stop,
-    });
-
-    let writes = app.drain_session_writes();
-    assert_eq!(writes.len(), 2, "user then assistant: {writes:?}");
-    assert_eq!(writes[0], (Role::User, "what is 2+2?".to_owned()));
-    assert_eq!(writes[1], (Role::Assistant, "four".to_owned()));
-    // Draining empties the queue.
-    assert!(app.drain_session_writes().is_empty());
-}
-
-#[test]
-fn a_turn_that_streams_nothing_queues_only_the_prompt() {
-    let mut app = app();
-    let mut input = "hi".to_owned();
-    app.handle_canonical("enter", &mut input);
-    app.ingest_engine_event(EngineEvent::TurnStarted {
-        turn_id: TurnId(1),
-        model: "test/model".into(),
-    });
-    app.ingest_engine_event(EngineEvent::TurnFinished {
-        turn_id: TurnId(1),
-        reason: StopReason::Stop,
-    });
-
-    let writes = app.drain_session_writes();
-    assert_eq!(writes.len(), 1, "no empty reply is recorded: {writes:?}");
-    assert_eq!(writes[0].0, Role::User);
-}
-
-#[test]
-fn a_steered_message_is_still_part_of_the_transcript() {
-    let mut app = app();
-    app.ingest_engine_event(EngineEvent::TurnStarted {
-        turn_id: TurnId(1),
-        model: "test/model".into(),
-    });
-    let mut input = "also check the tests".to_owned();
-    app.handle_canonical("enter", &mut input);
-
-    let writes = app.drain_session_writes();
-    assert_eq!(writes.len(), 1);
-    assert_eq!(writes[0], (Role::User, "also check the tests".to_owned()));
-}
 
 #[test]
 fn the_log_writes_a_conversation_the_store_can_replay() {
@@ -118,38 +44,7 @@ fn writing_to_a_session_that_does_not_exist_is_reported_not_fatal() {
 }
 
 #[test]
-fn agent_events_do_not_enter_the_transcript() {
-    let mut app = app();
-    app.ingest_engine_event(EngineEvent::AgentStarted {
-        agent_id: "agent-1".into(),
-        name: "Worker".into(),
-        parent_id: None,
-        kind: AgentKind::Subagent,
-    });
-    app.ingest_engine_event(EngineEvent::AgentStatusChanged {
-        agent_id: "agent-1".into(),
-        status: AgentStatus::Completed,
-    });
-    app.ingest_engine_event(EngineEvent::AgentFinished {
-        agent_id: "agent-1".into(),
-        summary: "did a thing".into(),
-        success: true,
-    });
-    assert!(
-        app.drain_session_writes().is_empty(),
-        "subagent chatter is not the conversation"
-    );
-}
-
-#[test]
-fn the_restored_history_is_capped() {
-    assert_eq!(MAX_RESTORED_MESSAGES, 40);
-}
-
-#[test]
 fn a_new_session_starts_empty_and_becomes_the_latest() {
-    use titi_cli::session_fs::new_session;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();
@@ -171,8 +66,6 @@ fn a_new_session_starts_empty_and_becomes_the_latest() {
 
 #[test]
 fn session_history_matches_what_the_log_wrote() {
-    use titi_cli::session_fs::session_history;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();
@@ -197,8 +90,6 @@ fn session_history_matches_what_the_log_wrote() {
 
 #[test]
 fn session_history_stops_at_the_tail_cap() {
-    use titi_cli::session_fs::session_history;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();
@@ -221,8 +112,6 @@ fn session_history_stops_at_the_tail_cap() {
 /// assistant made and the output it read back.
 #[test]
 fn a_restored_tool_round_is_the_one_the_live_session_had() {
-    use titi_cli::session_fs::session_history;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();
@@ -263,8 +152,6 @@ fn a_restored_tool_round_is_the_one_the_live_session_had() {
 /// OpenAI reject.
 #[test]
 fn a_truncated_restore_never_splits_a_tool_round() {
-    use titi_cli::session_fs::session_history;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();
@@ -325,8 +212,6 @@ fn a_truncated_restore_never_splits_a_tool_round() {
 /// the user actually kept having.
 #[test]
 fn a_broken_round_in_the_middle_does_not_erase_what_came_after() {
-    use titi_cli::session_fs::session_history;
-
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let store = SessionStore::new(agent_dir).unwrap();

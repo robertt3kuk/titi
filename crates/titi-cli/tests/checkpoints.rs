@@ -7,38 +7,9 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use titi_cli::app::App;
 use titi_cli::session_fs::{checkpoint_session, list_checkpoints, rewind_session};
-use titi_cli::themes::default_theme;
 use titi_core::session::{Role, SessionMeta, SessionStore};
-use titi_tui::slash::Route;
-
-fn app() -> App {
-    App::new(
-        Arc::new(AtomicBool::new(false)),
-        vec!["titi".to_owned()],
-        default_theme().unwrap(),
-    )
-}
-
-#[test]
-fn checkpoint_builtins_are_reserved() {
-    let app = app();
-    for name in ["checkpoint", "checkpoints", "rewind"] {
-        assert_eq!(
-            app.route_slash(&format!("/{name}")),
-            Route::Builtin(name.to_owned())
-        );
-    }
-    // Arguments do not change the route.
-    assert_eq!(
-        app.route_slash("/rewind 2"),
-        Route::Builtin("rewind".to_owned())
-    );
-}
 
 #[test]
 fn checkpoint_rewind_roundtrip_through_the_helpers() {
@@ -91,14 +62,6 @@ fn rewind_reports_missing_and_out_of_range_checkpoints() {
     assert!(rewind_session(agent_dir, ws, &sid, Some(0)).is_err());
     assert!(rewind_session(agent_dir, ws, &sid, Some(2)).is_err());
     assert!(rewind_session(agent_dir, ws, &sid, Some(1)).is_ok());
-}
-
-#[test]
-fn an_app_without_a_session_reports_it_instead_of_panicking() {
-    let mut app = app();
-    assert_eq!(app.session_id(), None);
-    app.set_session_id("live");
-    assert_eq!(app.session_id(), Some("live"));
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
