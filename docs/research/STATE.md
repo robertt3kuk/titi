@@ -380,16 +380,19 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
   dropped the pattern helpers no language uses and f4c5799 documents what each
   level names.
-- [ ] `medium` the workspace lints surface 435 `unwrap`/`expect` warning
-  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`; 535
-  `warning:` lines in all, down from 1304/1477 before this wave) — the wave
-  scoped the two lints to production code in nine crates with a crate-level
+- [ ] `medium` the workspace lints surface 441 `unwrap`/`expect` warning
+  headers as of 2026-10-09 (`cargo clippy --workspace --all-targets`; 555
+  `warning:` lines in all; the per-file split below is counted from clippy's
+  JSON messages, not from a log window). The scoping wave took them from
+  1304/1477 by turning the two lints on for **production** code in nine crates
+  with a crate-level
   `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`
   (b7396f9 config, 23ea652 core, 0e71d27 providers, 00908d8 tools, 483806c
   soul, a8b7cc2 secrets, ebaaf15 memory, 22614cf genome, ad76f7c engine), which
-  removed the test-only noise. `titi-cli` and `titi-tui` are not scoped yet and
-  hold most of what is left (183 headers in `titi-cli/src/chat.rs`, 33 in
-  `git_checkpoint.rs`, 25 in `titi-tui/src/theme/schema.rs`), and the audit's
+  removed the test-only noise; this wave then added six of them with the new
+  code. `titi-cli` (322) and `titi-tui` (108) are not scoped yet and hold all
+  but eleven: 189 headers in `titi-cli/src/chat.rs`, 33 in `git_checkpoint.rs`,
+  27 in `tests/genome.rs`, 25 in `titi-tui/src/theme/schema.rs`. The audit's
   ≈36 production sites — ~19 of them behind the module-wide allow at
   `titi-genome/src/parse.rs:3` — still need either a rule or a fix pass.
 - [x] `medium` ~~`selection.rs` and `space_hold.rs` are kept while nothing
@@ -456,6 +459,59 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   the run it quotes (`1774 passed (CI run 37780191533)`), summed from that
   run's `test result:` lines, so it is a dated measurement rather than a
   claim about the newest run.
+
+**Product-review follow-ups (2026-10-08).** Source:
+`docs/research/product-review.md` — a read-only survey at `3c1bc9e` plus the
+wave above, with its own ranked cost table; these are the items it recommends
+next, and the two worker notes it could not see yet.
+
+- [ ] `medium` the paste collapse and the transcript's section model are gone —
+  **a regression from our own `App` deletion, not a feature never built.**
+  `composer.rs`'s 6-line paste collapse went with the module, so a pasted stack
+  trace is inserted whole and the composer shows one row of its tail;
+  `transcript.rs`'s `/details`, the per-section visibility and the fold divider
+  went with it too, leaving one `folded N earlier messages` note on compaction.
+  Both are `chat.rs` work (`Chat::paste`, `composer_view`/`fit_tail`, the
+  `EngineEvent::Compacted` arm) and both are felt by a user after the first
+  compaction or the first long paste.
+- [ ] `medium` `/sessions <query>`: the FTS5 index and `SessionStore::search`
+  exist, are populated on every append, and have **no caller** — the switcher
+  is Ctrl+X only, and the source's own comments name the command `/sessions`
+  while typing it answers `unknown command`. `chat.rs` over the read-only API;
+  a bare `/sessions` should list what Ctrl+X lists, which also makes the
+  comments true.
+- [ ] `medium` no money anywhere: `/budget $2` is refused with "no price
+  table", and neither the turn footer nor `/usage` states a cost. A static
+  price on `ModelDescriptor` (`titi-engine/src/registry.rs`), the `$` figure in
+  `titi-tui/src/status.rs`'s `TurnFooter` and in `/usage`, and the part omitted
+  when a descriptor has no price — a keyless local model must not print
+  `$0.000`.
+- [ ] `medium` sessions record no workspace: `SessionMeta` carries title, bot
+  and source but no cwd, so `--continue` and the switcher are agent-directory
+  wide (the new flag says so in prose). Add `cwd` to the index with a migration,
+  then scope listing, resume and search by it; omp's `autoResume` is cwd-scoped
+  for the same reason.
+- [ ] `low` `bash.autoBackground.thresholdMs` is not a setting yet: the
+  threshold is `titi_tools::BACKGROUND_AFTER` (60 s) or
+  `TITI_BASH_BACKGROUND_MS`, with `EngineConfig::background_after` as the
+  programmatic override — and nothing in `crates/titi-cli/src/engine.rs` sets
+  that field, so a user cannot move it from `config.yml`. Wire the key the way
+  the other `titi-config` settings are read.
+- [ ] `low` no `/tree` view of a tree that is already stored: `parent_id`,
+  `fork` and `walk` are in `titi-core` and `/fork` exists, but the picker is
+  flat. A `/tree` over `store.load` is file-only work, no schema change.
+- [ ] `low` no `/hotkeys`: the screen answers 16 keys and advertises 3, and
+  `/help` lists 41 commands one line each. Generate the list from the same table
+  the keys are read from, so the two cannot drift.
+- [ ] `low` `chat.rs` is this project's serializer: 17.2k lines, one writer,
+  and every UI item above ends in it — which is why they cannot be
+  parallelized, and the review calls the split a finding of its own. A plan for
+  it (sections, views and pickers as modules behind a thin `Chat`) is worth more
+  than any single item in this list.
+- [ ] `low` the README's first paragraph links the placeholder
+  `https://reference-product.com` (`README.md:3` and the verify block), which
+  404s for the first stranger who reads it, and there is no `CHANGELOG.md` at
+  all.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -562,3 +618,43 @@ released after the commit, explicit-path staging and the report-don't-rewrite
 rule (`408c44e`). The two mislabeled commits were reconciled with an
 interactive rebase — one subject reworded, one commit split — that left
 `HEAD^{tree}` byte-identical, so the rewrite moved messages, not content.
+
+The review-and-ergonomics wave (2026-10-09) closed this survey's first
+recommendation and the four parity gaps it found in flight. Safety: every tool
+now names the call it is about to make — `fetch` was the one outbound channel
+approved blind, so its `describe()` renders the masked URL (`fetch
+https://docs.rs/serde`; a query string's secrets are redacted before the length
+bound) and `settings` names the key it reads or writes (`e58ad4c`); a cloud
+metadata target is refused before a socket is opened, the whole link-local block
+included, with loopback left allowed because a dev server is a legitimate fetch.
+
+`bash` gained the auto-background behaviour GAP listed as absent (`17af487`,
+`f00ee88`): a command still running after `BACKGROUND_AFTER` — 60 s, or
+`TITI_BASH_BACKGROUND_MS`, or `EngineConfig::background_after` for a surface that
+wants its own — comes back at once as `moved to the background as bg-N · the
+output will arrive when it finishes` and joins the existing job table instead of
+a second registry, so `/jobs` lists it, `/jobs cancel bg-N` stops its process
+group, and its output reaches the session as a follow-up turn, masked and capped
+exactly like a tool result. No new protocol variant: a command runs once, on no
+timer, so it gets no `JobStarted`. Four cancel behaviours, each tested: a
+**turn** cancel leaves the handed-over command alone, a command under the
+threshold is killed as before, `/jobs cancel` only signals (the thread waiting
+reports the end, so no surface is ever told a job stopped while it still runs),
+and the engine's drain cancels them at shutdown so none outlives the session
+that would report it.
+
+Ergonomics: a bare `exit`, `quit` or `q` — matched whole, so `exit code` is an
+ordinary prompt — leaves, with a second Enter inside the existing `QUIT_WINDOW`
+confirming it when the session holds a conversation (`da28518`); a second Escape
+on an empty composer calls the same cut `/rewind` calls, so the chord and the
+command cannot drift (`1a159cf`); and `--continue`/`-c` or `session.autoResume`
+reopens the newest session (`4ca14d6`). Honest limit: the resume is
+agent-directory-wide, because sessions record no workspace.
+
+`docs/research/product-review.md` is the wave's survey — a read-only read of the
+tree at `3c1bc9e` plus these commits, with the omp-inventory pointers corrected
+and a ranked gap table; it is dated, and the queue above carries what it
+recommends next. The test suite went 1784 → 1812 passed, and the
+`unwrap`/`expect` warning headers 435 → 441 (`cargo clippy --workspace
+--all-targets`; 535 → 555 `warning:` lines): the new code adds production sites,
+while the two unscoped crates still hold most of the number.
