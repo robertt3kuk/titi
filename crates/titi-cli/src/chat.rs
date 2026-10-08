@@ -12464,11 +12464,15 @@ mod tests {
     fn snapshot_for(chat: &Chat, context_pct: Option<u8>) -> StatusSnapshot {
         // Everything the screen states about the session comes from the live
         // helper, so a preset test measures the real line; only this machine's
-        // working directory and git state are pinned.
+        // working directory and git state are pinned. Untracked files are part
+        // of that state: they are counted from the checkout the tests run in,
+        // so a scratch file anywhere in the repository would otherwise add a
+        // `?n` to the line and fail a golden that is about the layout.
         StatusSnapshot {
             path: "~/proj/titi/crates/titi-cli".to_owned(),
             git_branch: Some("master".to_owned()),
             git_unstaged: 2,
+            git_untracked: 0,
             context_pct,
             ..masthead_snapshot(chat)
         }
