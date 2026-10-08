@@ -26,7 +26,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
-use titi_tui::status_bar::{StatusLineStyle, StatusSnapshot, live_snapshot, short_model};
+use titi_tui::status_bar::{
+    StatusLinePreset, StatusLineStyle, StatusSnapshot, live_snapshot, short_model,
+};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -1629,6 +1631,7 @@ impl Chat {
             "logout" => self.logout(args),
             "keys" | "whoami" => self.keys(),
             "theme" => self.theme(args),
+            "statusline" => self.statusline(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
             _ => {
@@ -2575,6 +2578,70 @@ impl Chat {
                 Applied::none()
             }
         }
+    }
+
+    /// `/statusline [preset]`: bare states the preset in force and lists them
+    /// all; a name sets it and remembers it, exactly as `/theme` does.
+    ///
+    /// The name is checked before anything is written, so a typo is neither
+    /// remembered nor painted; the write happens before the swap, so the screen
+    /// never shows a preset the next run would not; and the swap is followed by
+    /// a repaint the moment this returns, which is the frame after the key.
+    fn statusline(&mut self, args: &str) -> Applied {
+        let name = args.trim();
+        if name.is_empty() {
+            self.push(
+                LineKind::Note,
+                format!(
+                    "status line: {} · context {}",
+                    self.status_line.preset.id(),
+                    self.status_line.context_line.id()
+                ),
+            );
+            for id in StatusLinePreset::IDS {
+                let about = StatusLinePreset::from_id(id)
+                    .map(|preset| titi_tui::status_bar::preset(preset).about)
+                    .unwrap_or_default();
+                self.push(LineKind::Note, format!("/{id}  {about}"));
+            }
+            return Applied::none();
+        }
+        let Some(preset) = StatusLinePreset::from_id(name) else {
+            self.push(
+                LineKind::Error,
+                format!(
+                    "no status line preset \"{name}\"; try {}",
+                    StatusLinePreset::IDS
+                        .iter()
+                        .map(|id| format!("/{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            return Applied::none();
+        };
+        let workspace = crate::session_fs::current_workspace();
+        let mut settings =
+            match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[]) {
+                Ok(settings) => settings,
+                Err(reason) => {
+                    self.push(LineKind::Error, format!("status line: {reason}"));
+                    return Applied::none();
+                }
+            };
+        if let Err(reason) = settings.set(
+            titi_config::settings::STATUS_LINE_PRESET_KEY,
+            serde_json::json!(preset.id()),
+        ) {
+            self.push(
+                LineKind::Error,
+                format!("status line: not saved ({reason})"),
+            );
+            return Applied::none();
+        }
+        self.status_line.preset = preset;
+        self.push(LineKind::Note, format!("status line {name}"));
+        Applied::none()
     }
 
     /// What the screen is showing and why: the palette's name, and whether it
@@ -4052,6 +4119,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "diagnose",
         about: "a diagnostics block to paste into a bug report",
+    },
+    Command {
+        name: "statusline",
+        about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },
 ];
 
@@ -7668,7 +7739,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use titi_engine::TurnId;
     use titi_providers::StopReason;
-    use titi_tui::status_bar::StatusLinePreset;
 
     /// A chat with the theme a test names, for the ones that need a palette
     /// where two tokens are two different colours.
@@ -11444,6 +11514,88 @@ mod tests {
                 "{preset:?}"
             );
         }
+    }
+
+    /// Bare `/statusline` states the preset in force and lists every one, the
+    /// way `/help` lists the commands.
+    #[test]
+    fn bare_statusline_states_the_current_preset_and_lists_them() {
+        let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        chat.slash("/statusline").expect("the command parses");
+        let text: Vec<String> = chat.lines.iter().map(|line| line.text.clone()).collect();
+        assert!(
+            text.iter()
+                .any(|line| line == "status line: default · context off"),
+            "{text:?}"
+        );
+        for id in StatusLinePreset::IDS {
+            assert!(
+                text.iter()
+                    .any(|line| line.starts_with(&format!("/{id}  "))),
+                "{id} is not listed: {text:?}"
+            );
+        }
+    }
+
+    /// A name this build does not carry is refused with the list, and nothing
+    /// is written: a typo must not become the remembered preset.
+    #[test]
+    fn an_unknown_preset_is_refused_with_the_list_and_writes_nothing() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let applied = chat.slash("/statusline nope").expect("the command parses");
+        assert!(applied.effect.is_none(), "nothing is dispatched");
+        let refusal = chat.lines.last().expect("a line").text.clone();
+        assert!(refusal.contains("nope"), "{refusal:?}");
+        for id in StatusLinePreset::IDS {
+            assert!(refusal.contains(id), "{id} is not in {refusal:?}");
+        }
+        assert_eq!(chat.status_line.preset, StatusLinePreset::Default);
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("settings");
+        assert_eq!(
+            settings.get(titi_config::settings::STATUS_LINE_PRESET_KEY),
+            None,
+            "a refused name writes no key"
+        );
+    }
+
+    /// A preset that is set is remembered and painted: the write lands on the
+    /// canonical file, and the next frame is the new line.
+    #[test]
+    fn a_preset_is_remembered_and_the_next_frame_uses_it() {
+        let (dir, mut chat) = picker_chat("glm-5.3-flash", "session-123");
+        chat.session_label = "blue-otter".to_owned();
+        let before = masthead_at(&chat, 120, &snapshot_for(&chat, Some(42)));
+        assert!(
+            before.contains("titi"),
+            "the default opens with the mark: {before:?}"
+        );
+        chat.slash("/statusline minimal")
+            .expect("the command parses");
+        assert_eq!(chat.status_line.preset, StatusLinePreset::Minimal);
+        let after = masthead_at(&chat, 120, &snapshot_for(&chat, Some(42)));
+        assert!(!after.contains("titi"), "the mark is gone: {after:?}");
+        assert!(
+            !after.contains("blue-otter"),
+            "and so is the name: {after:?}"
+        );
+        assert!(after.contains("glm-5.3-flash"), "{after:?}");
+        let settings =
+            titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("settings");
+        assert_eq!(
+            settings
+                .get(titi_config::settings::STATUS_LINE_PRESET_KEY)
+                .and_then(|value| value.as_str().map(str::to_owned)),
+            Some("minimal".to_owned())
+        );
+        // What the next run resolves from that file is the same preset.
+        let stored = settings
+            .get(titi_config::settings::STATUS_LINE_PRESET_KEY)
+            .and_then(|value| value.as_str().map(str::to_owned));
+        assert_eq!(
+            StatusLineStyle::resolve(stored.as_deref(), None).preset,
+            StatusLinePreset::Minimal
+        );
     }
 
     /// The masthead's line, as the text a terminal would show.
