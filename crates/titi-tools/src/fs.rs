@@ -2827,16 +2827,12 @@ mod tests {
                 .await;
             assert!(result.is_error, "{path}: {}", result.output);
             assert!(
-                result
-                    .output
-                    .to_string()
-                    .contains("git control directory"),
+                result.output.to_string().contains("git control directory"),
                 "{path}: {}",
                 result.output
             );
             assert!(
-                !root.join(path).exists()
-                    || path == ".git/config",
+                !root.join(path).exists() || path == ".git/config",
                 "{path} was written: {}",
                 fs::read_to_string(root.join(path)).unwrap_or_default()
             );

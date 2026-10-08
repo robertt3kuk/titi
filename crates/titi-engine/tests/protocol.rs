@@ -46,11 +46,15 @@ fn every_engine_command_round_trips_through_its_fixture() {
         r#"{"SubmitPrompt":{"text":"hi"}}"#,
     );
     command(
-        EngineCommand::FollowUp { text: "more".into() },
+        EngineCommand::FollowUp {
+            text: "more".into(),
+        },
         r#"{"FollowUp":{"text":"more"}}"#,
     );
     command(
-        EngineCommand::Steer { text: "left".into() },
+        EngineCommand::Steer {
+            text: "left".into(),
+        },
         r#"{"Steer":{"text":"left"}}"#,
     );
     command(
@@ -68,7 +72,9 @@ fn every_engine_command_round_trips_through_its_fixture() {
     );
     command(EngineCommand::Cancel, r#""Cancel""#);
     command(
-        EngineCommand::SwitchModel { model: "m/one".into() },
+        EngineCommand::SwitchModel {
+            model: "m/one".into(),
+        },
         r#"{"SwitchModel":{"model":"m/one"}}"#,
     );
     command(
@@ -87,27 +93,39 @@ fn every_engine_command_round_trips_through_its_fixture() {
         r#"{"SpawnAgent":{"name":"scout","task":"map the tree","kind":"subagent"}}"#,
     );
     command(
-        EngineCommand::FocusAgent { agent_id: "a1".into() },
+        EngineCommand::FocusAgent {
+            agent_id: "a1".into(),
+        },
         r#"{"FocusAgent":{"agent_id":"a1"}}"#,
     );
     command(
-        EngineCommand::ReviveAgent { agent_id: "a1".into() },
+        EngineCommand::ReviveAgent {
+            agent_id: "a1".into(),
+        },
         r#"{"ReviveAgent":{"agent_id":"a1"}}"#,
     );
     command(
-        EngineCommand::StopAgent { agent_id: "a1".into() },
+        EngineCommand::StopAgent {
+            agent_id: "a1".into(),
+        },
         r#"{"StopAgent":{"agent_id":"a1"}}"#,
     );
     command(
-        EngineCommand::RunGoal { text: "fix it".into() },
+        EngineCommand::RunGoal {
+            text: "fix it".into(),
+        },
         r#"{"RunGoal":{"text":"fix it"}}"#,
     );
     command(
-        EngineCommand::RunCouncil { question: "why?".into() },
+        EngineCommand::RunCouncil {
+            question: "why?".into(),
+        },
         r#"{"RunCouncil":{"question":"why?"}}"#,
     );
     command(
-        EngineCommand::RunGraph { task: "ship it".into() },
+        EngineCommand::RunGraph {
+            task: "ship it".into(),
+        },
         r#"{"RunGraph":{"task":"ship it"}}"#,
     );
     command(EngineCommand::DescribeContext, r#""DescribeContext""#);
@@ -119,7 +137,9 @@ fn every_engine_command_round_trips_through_its_fixture() {
     );
     command(EngineCommand::MemoryList, r#""MemoryList""#);
     command(
-        EngineCommand::MemorySearch { query: "tabs".into() },
+        EngineCommand::MemorySearch {
+            query: "tabs".into(),
+        },
         r#"{"MemorySearch":{"query":"tabs"}}"#,
     );
     command(
@@ -135,7 +155,9 @@ fn every_engine_command_round_trips_through_its_fixture() {
     );
     command(EngineCommand::ListJobs, r#""ListJobs""#);
     command(
-        EngineCommand::CancelJob { job_id: "job-1".into() },
+        EngineCommand::CancelJob {
+            job_id: "job-1".into(),
+        },
         r#"{"CancelJob":{"job_id":"job-1"}}"#,
     );
     command(
@@ -153,7 +175,9 @@ fn every_engine_command_round_trips_through_its_fixture() {
         r#"{"SetBudget":{"tokens":10}}"#,
     );
     command(
-        EngineCommand::SetMode { mode: SessionMode::Plan },
+        EngineCommand::SetMode {
+            mode: SessionMode::Plan,
+        },
         r#"{"SetMode":{"mode":"plan"}}"#,
     );
     command(EngineCommand::Shutdown, r#""Shutdown""#);
@@ -299,23 +323,33 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"Cancelled":{"turn_id":1}}"#,
     );
     event(
-        EngineEvent::PromptReturned { text: "queued".into() },
+        EngineEvent::PromptReturned {
+            text: "queued".into(),
+        },
         r#"{"PromptReturned":{"text":"queued"}}"#,
     );
     event(
-        EngineEvent::GoalFinished { report: "pass".into() },
+        EngineEvent::GoalFinished {
+            report: "pass".into(),
+        },
         r#"{"GoalFinished":{"report":"pass"}}"#,
     );
     event(
-        EngineEvent::CouncilFinished { report: "verdict".into() },
+        EngineEvent::CouncilFinished {
+            report: "verdict".into(),
+        },
         r#"{"CouncilFinished":{"report":"verdict"}}"#,
     );
     event(
-        EngineEvent::GraphFinished { report: "shipped".into() },
+        EngineEvent::GraphFinished {
+            report: "shipped".into(),
+        },
         r#"{"GraphFinished":{"report":"shipped"}}"#,
     );
     event(
-        EngineEvent::Notice { message: "refused".into() },
+        EngineEvent::Notice {
+            message: "refused".into(),
+        },
         r#"{"Notice":{"message":"refused"}}"#,
     );
     event(
@@ -336,7 +370,9 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"SessionNamed":{"session_id":"s1","title":"the fix"}}"#,
     );
     event(
-        EngineEvent::MemoryResult { output: "found".into() },
+        EngineEvent::MemoryResult {
+            output: "found".into(),
+        },
         r#"{"MemoryResult":{"output":"found"}}"#,
     );
     event(
@@ -348,15 +384,21 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"JobList":{"jobs":[{"id":"job-1","prompt":"check the build","interval_secs":300,"runs":2}]}}"#,
     );
     event(
-        EngineEvent::JobFinished { job_id: "job-1".into() },
+        EngineEvent::JobFinished {
+            job_id: "job-1".into(),
+        },
         r#"{"JobFinished":{"job_id":"job-1"}}"#,
     );
     event(
-        EngineEvent::AdvisorAnswer { text: "advice".into() },
+        EngineEvent::AdvisorAnswer {
+            text: "advice".into(),
+        },
         r#"{"AdvisorAnswer":{"text":"advice"}}"#,
     );
     event(
-        EngineEvent::AdvisorFailed { reason: "no model".into() },
+        EngineEvent::AdvisorFailed {
+            reason: "no model".into(),
+        },
         r#"{"AdvisorFailed":{"reason":"no model"}}"#,
     );
     event(
@@ -367,7 +409,10 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"BudgetUpdated":{"spent":5,"limit":10}}"#,
     );
     event(
-        EngineEvent::BudgetExceeded { spent: 10, limit: 10 },
+        EngineEvent::BudgetExceeded {
+            spent: 10,
+            limit: 10,
+        },
         r#"{"BudgetExceeded":{"spent":10,"limit":10}}"#,
     );
     event(

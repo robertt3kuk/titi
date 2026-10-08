@@ -14,12 +14,8 @@ use titi_tools::SensitivePolicy;
 /// the runtime tools read with, or the built-in list when settings cannot
 /// load — a checkpoint is a commit, so it deserves no looser gate.
 fn policy_for(workspace: &Path) -> SensitivePolicy {
-    let settings = titi_config::settings::Settings::load(
-        &titi_config::agent_dir(),
-        workspace,
-        &[],
-    )
-    .unwrap_or_default();
+    let settings = titi_config::settings::Settings::load(&titi_config::agent_dir(), workspace, &[])
+        .unwrap_or_default();
     crate::engine::privacy_policy(&settings).0
 }
 
@@ -234,10 +230,7 @@ mod tests {
         );
         // No commit was written: HEAD still points at the base one.
         let head_after = run(dir.path(), &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(
-            head_after, head_before,
-            "the refusal left a commit behind"
-        );
+        assert_eq!(head_after, head_before, "the refusal left a commit behind");
 
         // Allowed next: once the credential is out of the index, the rest of
         // the staged work still checkpoints.
@@ -252,7 +245,10 @@ mod tests {
         let commit =
             snapshot_with_policy(dir.path(), "clean", &SensitivePolicy::default()).unwrap();
         let tree = run(dir.path(), &["ls-tree", "-r", "--name-only", &commit]).unwrap();
-        assert_eq!(tree, "a.txt", "checkpoint committed more than staged: {tree}");
+        assert_eq!(
+            tree, "a.txt",
+            "checkpoint committed more than staged: {tree}"
+        );
     }
 
     #[test]
@@ -264,8 +260,8 @@ mod tests {
         stage(dir.path(), "a.txt");
         stage(dir.path(), "src/main.rs");
 
-        let commit = snapshot_with_policy(dir.path(), "ordinary", &SensitivePolicy::default())
-            .unwrap();
+        let commit =
+            snapshot_with_policy(dir.path(), "ordinary", &SensitivePolicy::default()).unwrap();
         let status = run(dir.path(), &["status", "--porcelain"]).unwrap();
         assert!(status.is_empty(), "commit failed: {status}");
         let tree = run(dir.path(), &["ls-tree", "-r", "--name-only", &commit]).unwrap();
