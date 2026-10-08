@@ -144,6 +144,78 @@ fn ambiguous_session_has_no_definition_and_short_names_stay_quiet() {
     assert_eq!(on_export.character, site.character);
 }
 
+/// A name two *crates* export is not a finding: `Level` in one crate and
+/// `Level` in another are unrelated types, and nothing in either can be
+/// confused by the other. The graph still draws no edge for the name — that
+/// is the resolution rule and it does not move — but the user is not told.
+#[test]
+fn a_name_two_crates_share_is_not_a_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for crate_name in ["one", "two"] {
+        write(
+            root,
+            &format!("crates/{crate_name}/Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        );
+        write(
+            root,
+            &format!("crates/{crate_name}/src/lib.rs"),
+            "pub struct Shared;\n",
+        );
+    }
+
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(
+        genome.files.len(),
+        2,
+        "both crates are indexed: {:?}",
+        genome.files.keys().collect::<Vec<_>>()
+    );
+    let diagnostics = genome.check();
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|item| item.code == "ambiguous-symbol"),
+        "{diagnostics:?}"
+    );
+    // The name is still ambiguous to the graph: no edge, which is what
+    // `MAX_DEFINERS` is for.
+    assert!(
+        genome.symbols["Shared"].files.len() == 2,
+        "{:?}",
+        genome.symbols["Shared"]
+    );
+}
+
+/// Two files of *one* crate exporting the same name is the collision a
+/// reader can act on, and it is reported with both files named.
+#[test]
+fn a_name_two_files_of_one_crate_share_is_a_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "crates/one/Cargo.toml", "[package]\nname = \"x\"\n");
+    write(root, "crates/one/src/a.rs", "pub struct Shared;\n");
+    write(root, "crates/one/src/b.rs", "pub struct Shared;\n");
+
+    let diagnostics = Genome::index(root).unwrap().check();
+    let hit = diagnostics
+        .iter()
+        .find(|item| item.code == "ambiguous-symbol" && item.message.contains("Shared"))
+        .unwrap_or_else(|| panic!("ambiguous-symbol for Shared: {diagnostics:?}"));
+    assert_eq!(hit.severity, Severity::Info, "{}", hit.message);
+    assert!(
+        hit.message.contains("crates/one/src/a.rs"),
+        "{}",
+        hit.message
+    );
+    assert!(
+        hit.message.contains("crates/one/src/b.rs"),
+        "{}",
+        hit.message
+    );
+}
+
 #[test]
 fn qualified_join_resolves_and_method_join_does_not() {
     let dir = tempfile::tempdir().unwrap();

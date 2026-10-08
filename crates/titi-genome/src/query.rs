@@ -9,6 +9,13 @@ impl Genome {
     /// Index diagnostics: syntax first, then unresolved imports, then
     /// ambiguous symbols. Capped so a noisy repo cannot flood a client.
     ///
+    /// An ambiguous name — one that more than [`MAX_DEFINERS`] files export,
+    /// so it carries no edge — is a finding only when its definers are in the
+    /// **same crate**. `Level` defined in `titi-genome` and in `titi-tools` is
+    /// two unrelated types that happen to share a name, and nothing in either
+    /// crate can be confused by the other; two files of one crate exporting
+    /// the same name is the case a reader can act on.
+    ///
     /// Findings only. What the index *understands* — the level each language
     /// rests on — is reference information about the index rather than
     /// something wrong with the tree, so it lives on
@@ -65,6 +72,15 @@ impl Genome {
             let Some(path) = symbol.files.first() else {
                 continue;
             };
+            // One name, several crates: not a collision a reader can act on.
+            let crate_of = self.crate_of(path);
+            if symbol
+                .files
+                .iter()
+                .any(|file| self.crate_of(file) != crate_of)
+            {
+                continue;
+            }
             let definers = symbol.files.join(", ");
             ambiguous.push(Diagnostic {
                 path: path.clone(),
@@ -167,6 +183,33 @@ impl Genome {
             }
         }
         out
+    }
+
+    /// The crate a path belongs to: the nearest ancestor directory holding a
+    /// `Cargo.toml`, or the workspace root when there is none.
+    ///
+    /// Read from disk because a manifest is not a source file and the walk
+    /// never sees one; one `stat` per directory level, for the handful of
+    /// ambiguous names a check reports. A tree with no manifest anywhere — a
+    /// fixture, a checkout of loose files — is one crate, which is what a
+    /// reader of that tree sees too.
+    fn crate_of(&self, path: &str) -> std::path::PathBuf {
+        let Some(mut dir) = std::path::Path::new(path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return self.root.clone();
+        };
+        loop {
+            let candidate = self.root.join(&dir);
+            if candidate.join("Cargo.toml").is_file() {
+                return candidate;
+            }
+            match dir.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => dir = parent.to_path_buf(),
+                _ => return self.root.clone(),
+            }
+        }
     }
 
     /// The file's text, or the open buffer's when there is one.
