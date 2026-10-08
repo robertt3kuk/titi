@@ -264,8 +264,10 @@ pub const MAX_TOOL_OUTPUT: usize = 40_000;
 
 /// An output past [`MAX_TOOL_OUTPUT`], cut to its head and its tail — where a
 /// listing starts and where a log ends with its error — around a note that
-/// says how much was left out and how to see it.
-fn cap_output(output: &str) -> String {
+/// says how much was left out and how to see it. The one bound of a tool's
+/// answer, so the report a finished background job delivers is bounded the
+/// same way, and not by a second cap that could disagree with this one.
+pub(crate) fn cap_output(output: &str) -> String {
     let total = output.chars().count();
     if total <= MAX_TOOL_OUTPUT {
         return output.to_owned();
@@ -281,7 +283,10 @@ fn cap_output(output: &str) -> String {
     )
 }
 
-fn mask(output: &str, mask_ips: bool) -> String {
+/// Masks a report before it reaches the model, exactly as a tool result is:
+/// a backgrounded command prints whatever it prints, and a key in that output
+/// must not enter the session just because the command outlived its turn.
+pub(crate) fn mask(output: &str, mask_ips: bool) -> String {
     if mask_ips {
         titi_memory::redact::redact_for_model(output).text
     } else {

@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::StreamExt;
@@ -497,6 +498,11 @@ pub struct EngineConfig {
     /// workspace tools with a clone, as the runtime does a subagent's; a
     /// cancel raises it and the next turn lowers it as it starts.
     pub interrupt: titi_tools::Interrupt,
+    /// How long a `bash` call may hold a turn before it is handed to the
+    /// background, where its output reaches the session when it ends. `None`
+    /// reads `TITI_BASH_BACKGROUND_MS`, then [`titi_tools::BACKGROUND_AFTER`];
+    /// tests set a tiny one so a `sleep 5` need not take five seconds.
+    pub background_after: Option<std::time::Duration>,
 }
 
 impl EngineConfig {
@@ -529,6 +535,7 @@ impl EngineConfig {
             judgment_provider: None,
             mode: crate::protocol::SessionMode::Agent,
             interrupt: titi_tools::Interrupt::new(),
+            background_after: None,
         }
     }
 }
@@ -581,8 +588,34 @@ impl Engine {
     }
 }
 
-/// The background loops a runtime is currently running, by job id.
-type JobTable = std::collections::HashMap<SmolStr, LoopJob>;
+/// The background jobs a runtime is holding, by job id: the loops it repeats
+/// on its own timer, and the handed-over `bash` commands it is waiting on.
+type JobTable = std::collections::HashMap<SmolStr, Job>;
+
+/// One background job. `/jobs` lists both kinds and `/jobs cancel` stops
+/// either, which is why they share a table and a vocabulary.
+enum Job {
+    Loop(LoopJob),
+    Command(CommandJob),
+}
+
+impl Job {
+    /// Order the job was started in, so `/jobs` lists job-10 after job-9 and
+    /// does not shuffle between reads.
+    fn seq(&self) -> u64 {
+        match self {
+            Job::Loop(job) => job.seq,
+            Job::Command(job) => job.seq,
+        }
+    }
+
+    fn info(&self, id: &SmolStr) -> crate::protocol::JobInfo {
+        match self {
+            Job::Loop(job) => job.info(id),
+            Job::Command(job) => job.info(id),
+        }
+    }
+}
 
 /// One `/loop` job: what it sends, how often, and the timer sending it.
 struct LoopJob {
@@ -607,6 +640,116 @@ impl LoopJob {
     }
 }
 
+/// One `bash` command a turn handed over after its background threshold: what
+/// it was, and the handle that stops it. The thread waiting on the command
+/// reports the end, so cancelling only has to signal it.
+struct CommandJob {
+    seq: u64,
+    command: SmolStr,
+    cancel: titi_tools::BackgroundCancel,
+}
+
+impl CommandJob {
+    fn info(&self, id: &SmolStr) -> crate::protocol::JobInfo {
+        crate::protocol::JobInfo {
+            id: id.clone(),
+            prompt: self.command.clone(),
+            // A command runs once, on no timer of ours.
+            interval_secs: 0,
+            runs: 0,
+        }
+    }
+}
+
+/// The engine's end of `bash`'s background seam: it mints the job id, records
+/// the command beside the loops so `/jobs` and `/jobs cancel` cover it, and
+/// waits for it off the runtime's thread so its output reaches the session
+/// when it ends.
+struct BackgroundJobs {
+    /// How long a `bash` call may hold a turn before it is handed over.
+    after: std::time::Duration,
+    /// Whether the session masks IPv4 addresses in what a tool prints. Keys
+    /// are masked either way.
+    mask_ips: bool,
+    seq: Arc<AtomicU64>,
+    jobs: Arc<Mutex<JobTable>>,
+    events: mpsc::Sender<EngineEvent>,
+    commands: mpsc::Sender<EngineCommand>,
+}
+
+impl titi_tools::BackgroundSink for BackgroundJobs {
+    fn after(&self) -> std::time::Duration {
+        self.after
+    }
+
+    fn hand_over(&self, command: &str, background: titi_tools::Background) -> SmolStr {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let id = SmolStr::from(format!("bg-{seq}"));
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(
+                id.clone(),
+                Job::Command(CommandJob {
+                    seq,
+                    command: SmolStr::from(command),
+                    cancel: background.cancel(),
+                }),
+            );
+        }
+        let events = self.events.clone();
+        let commands = self.commands.clone();
+        let jobs = Arc::clone(&self.jobs);
+        let report_id = id.clone();
+        let report_command = command.to_owned();
+        let mask_ips = self.mask_ips;
+        tokio::spawn(async move {
+            // Off the async workers: this is the same wait the turn would
+            // have done inline, only nobody is holding a turn for it.
+            let run = match tokio::task::spawn_blocking(move || background.wait()).await {
+                Ok(run) => run,
+                Err(error) => titi_tools::pipe::Run {
+                    output: format!("could not wait on the command: {error}"),
+                    exit_code: None,
+                    success: false,
+                },
+            };
+            if let Ok(mut jobs) = jobs.lock() {
+                jobs.remove(&report_id);
+            }
+            let _ = events
+                .send(EngineEvent::JobFinished {
+                    job_id: report_id.clone(),
+                })
+                .await;
+            // The output reaches the session the way a loop's prompt does:
+            // a follow-up prompt, which queues behind a live turn instead of
+            // interrupting it.
+            let _ = commands
+                .send(EngineCommand::FollowUp {
+                    text: job_report(&report_id, &report_command, &run, mask_ips).into(),
+                })
+                .await;
+        });
+        id
+    }
+}
+
+/// What a finished background command reports into the session: which job it
+/// was, how it exited, what it ran, and what it printed. It goes through the
+/// same mask and the same [`crate::tool_loop::cap_output`] a tool result does,
+/// so a backgrounded command cannot leak more, or spend more, than a
+/// foreground one.
+fn job_report(id: &str, command: &str, run: &titi_tools::pipe::Run, mask_ips: bool) -> String {
+    let status = run.exit_code.map_or_else(
+        || "killed by a signal".to_owned(),
+        |code| format!("exit {code}"),
+    );
+    let report = format!(
+        "background job {id} finished, {status}\n$ {command}\n{}",
+        run.output
+    );
+    crate::tool_loop::cap_output(&crate::tool_loop::mask(&report, mask_ips))
+}
+
 /// UI-independent command loop and turn scheduler.
 pub struct EngineRuntime {
     config: EngineConfig,
@@ -629,10 +772,14 @@ pub struct EngineRuntime {
     /// Bumped by every `RestoreHistory`. A turn that started before the
     /// rewind must not write its stale history back over the replacement.
     history_epoch: u64,
-    /// Loop prompts the engine re-submits to itself on a timer.
-    loops: JobTable,
-    /// Number the next `/loop` job is named after.
-    next_job: u64,
+    /// The background jobs the engine is holding: loops it repeats, and
+    /// `bash` commands a turn handed over. Shared with the sink the tools
+    /// report through, so `/jobs` sees a command the moment it is handed over.
+    jobs: Arc<Mutex<JobTable>>,
+    /// Numbers the next background job is named after, shared for the same
+    /// reason. Loops take `job-N` and handed-over commands `bg-N`, so an id
+    /// says which kind it is.
+    next_job: Arc<AtomicU64>,
     /// A clone of the surface's command sender, so a background job can
     /// queue its prompt through the same door every other prompt uses.
     self_commands: mpsc::Sender<EngineCommand>,
@@ -717,6 +864,22 @@ impl EngineRuntime {
         let claims = Claims::new();
         let findings = Findings::default();
         let touched: TouchedSink = TouchedSink::default();
+        let jobs = Arc::new(Mutex::new(JobTable::new()));
+        let next_job = Arc::new(AtomicU64::new(1));
+        // A command a turn hands over lands in the table `/jobs` reads, and
+        // reports back through the same follow-up door a loop's prompt uses.
+        // The threshold is the session's, not the tool's: the environment
+        // unless the config names one.
+        let background: Arc<dyn titi_tools::BackgroundSink> = Arc::new(BackgroundJobs {
+            after: config
+                .background_after
+                .unwrap_or_else(titi_tools::background_after),
+            mask_ips: config.mask_ips,
+            seq: Arc::clone(&next_job),
+            jobs: Arc::clone(&jobs),
+            events: event_tx.clone(),
+            commands: command_tx.clone(),
+        });
         // A subagent shares the runtime's claim table, touched-file set, read
         // cache and findings bus, so it cannot write a file the parent holds,
         // its reads warm the parent's cache, and the parent can read what it
@@ -733,6 +896,9 @@ impl EngineRuntime {
             ) {
                 tools.register(Arc::from(tool));
             }
+            // A subagent's `bash` hands over to the same table the parent's
+            // does: there is one session, so there is one `/jobs`.
+            tools.install_background(Arc::clone(&background));
             // The registry is the whole policy: a subagent has no surface to
             // show an approval on, so whatever it is handed it must be able
             // to run. Without writes, everything above read tier is dropped
@@ -759,6 +925,10 @@ impl EngineRuntime {
                 .with_mask_ips(config.mask_ips),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
+        // The surface builds the session's tools before the engine starts —
+        // a subagent's registry is built here — so this is where `bash`
+        // learns where a command that outlives the turn goes.
+        tools.install_background(Arc::clone(&background));
         let agents = runner.map(|runner| {
             crate::agents::AgentSupervisor::with_state(
                 runner,
@@ -783,8 +953,8 @@ impl EngineRuntime {
             claims: claims.clone(),
             steering: Steering::default(),
             history_epoch: 0,
-            loops: JobTable::new(),
-            next_job: 1,
+            jobs,
+            next_job,
             self_commands: command_tx.clone(),
             spent: Arc::new(AtomicU64::new(0)),
             budget: None,
@@ -959,11 +1129,20 @@ impl EngineRuntime {
                             let _ = self.events.send(EngineEvent::JobList { jobs }).await;
                         }
                         EngineCommand::CancelJob { job_id } => {
-                            match self.loops.remove(&job_id) {
-                                Some(job) => {
+                            let job = match self.jobs.lock() {
+                                Ok(mut jobs) => jobs.remove(&job_id),
+                                Err(_) => None,
+                            };
+                            match job {
+                                Some(Job::Loop(job)) => {
                                     job.timer.abort();
                                     let _ = self.events.send(EngineEvent::JobFinished { job_id }).await;
                                 }
+                                // Only signal it: the thread waiting on the
+                                // command reports the end once its group is
+                                // really down, so nobody is told a job
+                                // stopped while it still runs.
+                                Some(Job::Command(job)) => job.cancel.cancel(),
                                 None => self.emit_control_failure(&format!("no such job: {job_id}")).await,
                             }
                         }
@@ -996,9 +1175,19 @@ impl EngineRuntime {
                                 self.config.interrupt.raise();
                             }
                             // The timers hold a command sender, so leaving
-                            // them alive keeps the channel open forever.
-                            for (_, job) in self.loops.drain() {
-                                job.timer.abort();
+                            // them alive keeps the channel open forever. A
+                            // handed-over command goes down too: the session
+                            // that would report it is going away, so it must
+                            // not outlive it as an orphan.
+                            let draining: Vec<Job> = match self.jobs.lock() {
+                                Ok(mut jobs) => jobs.drain().map(|(_, job)| job).collect(),
+                                Err(_) => Vec::new(),
+                            };
+                            for job in draining {
+                                match job {
+                                    Job::Loop(job) => job.timer.abort(),
+                                    Job::Command(job) => job.cancel.cancel(),
+                                }
                             }
                             break;
                         }
@@ -1135,9 +1324,8 @@ impl EngineRuntime {
             self.emit_control_failure("loop needs a prompt").await;
             return;
         }
-        let seq = self.next_job;
+        let seq = self.next_job.fetch_add(1, Ordering::SeqCst);
         let id = SmolStr::from(format!("job-{seq}"));
-        self.next_job += 1;
         let runs = Arc::new(AtomicU64::new(0));
         let timer = {
             let commands = self.self_commands.clone();
@@ -1168,7 +1356,9 @@ impl EngineRuntime {
             timer,
         };
         let info = job.info(&id);
-        self.loops.insert(id, job);
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(id, Job::Loop(job));
+        }
         let _ = self
             .events
             .send(EngineEvent::JobStarted { job: info })
@@ -1177,8 +1367,11 @@ impl EngineRuntime {
 
     /// Every live job, in a stable order so the listing does not shuffle.
     fn job_list(&self) -> Vec<crate::protocol::JobInfo> {
-        let mut jobs: Vec<_> = self.loops.iter().collect();
-        jobs.sort_by_key(|(_, job)| job.seq);
+        let Ok(jobs) = self.jobs.lock() else {
+            return Vec::new();
+        };
+        let mut jobs: Vec<_> = jobs.iter().collect();
+        jobs.sort_by_key(|(_, job)| job.seq());
         jobs.into_iter().map(|(id, job)| job.info(id)).collect()
     }
 

@@ -137,6 +137,9 @@ pub enum EngineCommand {
     },
     /// Report the background jobs running right now.
     ListJobs,
+    /// Stop a background job by name: a loop's timer, or a handed-over
+    /// command's process group. Cancelling the *turn* reaches neither — that
+    /// is what handing a command over means.
     CancelJob {
         job_id: SmolStr,
     },
@@ -384,7 +387,11 @@ pub struct ContextPart {
     pub tokens: u64,
 }
 
-/// One background loop the engine repeats on its own timer.
+/// One background job the engine holds: a loop it repeats on its own timer,
+/// or a `bash` command a turn handed over and the engine is waiting on. A
+/// command's `interval_secs` and `runs` are zero — it runs once, on no timer
+/// of ours, and a surface reading them as a schedule would be reading them
+/// wrong.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub id: SmolStr,
