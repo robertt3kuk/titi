@@ -7119,9 +7119,13 @@ fn sgr_colour(parts: &mut std::str::Split<'_, char>) -> Color {
 /// not markdown — a one-liner, a plain summary — keeps the exact rows it had
 /// before the renderer existed, so nothing about it can change because a stray
 /// `*` or `_` looked like emphasis. The markers below are the ones
-/// [`titi_tui::markdown::render_markdown`] acts on.
+/// [`titi_tui::markdown::render_markdown`] acts on, and maths is one of them:
+/// `has_math` answers for the `$…$` and `$$…$$` the LaTeX renderer would
+/// convert — and only for those, so `$5 and $6` and a lone `$` stay plain.
 fn has_markdown(text: &str) -> bool {
-    text.lines().any(markdown_block) || has_inline_markdown(text)
+    text.lines().any(markdown_block)
+        || has_inline_markdown(text)
+        || titi_tui::markdown::has_math(text)
 }
 
 /// A block construct on a row of its own, where the renderer drops the marker
@@ -11595,6 +11599,32 @@ mod tests {
         assert_eq!(
             StatusLineStyle::resolve(stored.as_deref(), None).preset,
             StatusLinePreset::Minimal
+        );
+    }
+
+    /// Maths is markdown: an answer whose only markup is a formula takes the
+    /// renderer's path, so the `$…$` reaches the screen as the formula rather
+    /// than as its own TeX — while a price that only looks like maths keeps the
+    /// plain block it has always had.
+    #[test]
+    fn a_maths_only_answer_takes_the_markdown_path() {
+        let rows = reply_rows_of(r"Binary search is $O(\log n)$.", 80);
+        let texts = row_texts(&rows);
+        assert!(
+            texts.iter().any(|row| row.contains("O(log n)")),
+            "the formula is rendered: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .all(|row| !row.contains(r"\log") && !row.contains('$')),
+            "no TeX and no marker reached the screen: {texts:?}"
+        );
+        // A price is not maths, so the answer stays the plain speech block.
+        let plain = row_texts(&reply_rows_of("It costs $5 and $6.", 80));
+        assert!(
+            plain.iter().any(|row| row.contains("$5 and $6")),
+            "{plain:?}"
         );
     }
 
