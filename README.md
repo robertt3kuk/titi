@@ -1,6 +1,6 @@
 # titi
 
-A terminal coding agent in Rust. It follows the [reference product](https://reference-product.com) product model — one loop, one session, one set of tools — without Electron. The same engine drives a full-screen terminal and a headless JSONL interface. A native GPUI window comes later.
+A terminal coding agent in Rust. It follows the product model of its reference product, omp — one loop, one session, one set of tools — without Electron. The same engine drives a full-screen terminal and a headless JSONL interface. A native GPUI window comes later.
 
 [English](#english) · [Русский](#русский)
 
@@ -55,6 +55,8 @@ titi --headless --goal "cargo test -p titi-core passes"
 titi --mode plan
 ```
 
+`--continue` / `-c` resumes the newest session in this agent directory instead of starting blank; with nothing to resume, it starts fresh and says so. `session.autoResume` set in a config layer (the project file wins) resumes the newest session at every launch; it is off unless set.
+
 `--headless` reads `{"v":1,"command":…}` frames from stdin and writes events to stdout. The first line is `{"ready":true,"protocol":1}`. Not every command answers with an event — `Steer`, `RestoreHistory`, `Cancel` with no turn, and `ApproveTool` are quiet, so a client must not block on a reply to them — and closing stdin ends the run.
 
 `--goal` runs the coder/reviewer loop without a screen and exits with the code CI reads: `0` when the reviewer passes it, `1` on a partial verdict, `3` on anything else, a missing verdict included. Events still go to stdout as JSONL; the report line goes to stderr, where a shell script can read it without parsing the stream.
@@ -68,6 +70,7 @@ titi --mode plan
 | Enter | Sends the turn. During a turn it steers, it does not start a second one |
 | Ctrl+C | Stops the running turn. When idle, press it again within 2 seconds to quit |
 | Ctrl+D | Quits when the input line is empty |
+| `exit` / `quit` / `q` | Leaves the chat: at once before the first turn, and on a second Enter once it has one |
 | `y` / `n` | Approves or refuses a write or a shell command |
 | `/model` | Switches to the next model in the list. `/model <id>` picks one by id or by its short name |
 | `/switch` | Fuzzy search over the same list: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` resolves a model role from the settings |
@@ -132,7 +135,7 @@ Tool approval: `--approval always-ask|write|yolo`. The default is `write` — re
 
 `hashline_edit` pins the lines it replaces by the six-hex anchor of the text that was read. A line that changed since the read is refused as a stale read instead of being overwritten from a picture of the file that is no longer true.
 
-`bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. Either way a run is bounded: by `timeout_secs` (1 to 3600, 300 by default), by Ctrl+C, which stops the command a cancelled turn was waiting on, and by a cap on what it keeps (64 KiB on a pty; the first and last 64 KiB of each stream on a pipe, since a log puts its error last). A stop takes the command's whole process group with it, and a failure starts with its `exit N`. The output is what a terminal would show — colour codes and window titles removed, `\r` progress bars reduced to their last state. Zero means "no deadline" nowhere in titi. A dev server, a watcher or `tail -f` in the foreground is refused before it runs, with the backgrounded form to use instead (`cmd > log 2>&1 &`) and `timeout 30 cmd` to check only that it starts. Every tool result, whatever the tool, is capped at 40,000 characters before the model sees it: past that it keeps the head and the tail around a note saying how much was left out.
+`bash` runs through a pipe by default. `pty: true` runs it under a real terminal, so the command sees a tty and behaves the way it would in your own shell — colour, progress, paging. Either way a run is bounded: by `timeout_secs` (1 to 3600, 300 by default), by Ctrl+C, which stops the command a cancelled turn was waiting on, and by a cap on what it keeps (64 KiB on a pty; the first and last 64 KiB of each stream on a pipe, since a log puts its error last). A stop takes the command's whole process group with it, and a failure starts with its `exit N`. The output is what a terminal would show — colour codes and window titles removed, `\r` progress bars reduced to their last state. Zero means "no deadline" nowhere in titi. A dev server, a watcher or `tail -f` in the foreground is refused before it runs, with the backgrounded form to use instead (`cmd > log 2>&1 &`) and `timeout 30 cmd` to check only that it starts. A command that outlives the background threshold — `TITI_BASH_BACKGROUND_MS`, in milliseconds, 60 000 by default (this one is an environment variable, not a settings key yet) — is handed over as a background job instead of holding the turn. Every tool result, whatever the tool, is capped at 40,000 characters before the model sees it: past that it keeps the head and the tail around a note saying how much was left out.
 
 `todo` is the agent's checklist for multi-step work: `write` sets the whole list, `update` sets one item's status by its number, `view` shows it. At most one item is in progress, a list holds up to 50 items of up to 200 characters, and the list lasts as long as the process.
 
@@ -223,7 +226,7 @@ CI runs fmt, clippy (informational), the workspace tests, and a smoke of the rea
 
 ## Русский
 
-Терминальный агент на Rust. Продуктовая модель [reference product](https://reference-product.com): один цикл, одна сессия, одни инструменты — без Electron. Тот же движок обслуживает полноэкранный терминал и headless JSONL. Нативное окно на GPUI ещё впереди.
+Терминальный агент на Rust. Продуктовая модель его reference product, omp: один цикл, одна сессия, одни инструменты — без Electron. Тот же движок обслуживает полноэкранный терминал и headless JSONL. Нативное окно на GPUI ещё впереди.
 
 ### Запуск
 
@@ -268,6 +271,8 @@ titi --headless --goal "cargo test -p titi-core проходит"
 titi --mode plan
 ```
 
+`--continue` / `-c` открывает последнюю сессию этого каталога вместо чистого старта; если открывать нечего, стартует с чистого листа и об этом говорит. `session.autoResume`, выставленный в слое конфига (проектный файл сильнее), делает то же при каждом запуске; без выставления выключен.
+
 `--headless` читает со stdin кадры `{"v":1,"command":…}` и пишет события в stdout. Первая строка — `{"ready":true,"protocol":1}`. Отвечает событием не каждая команда — `Steer`, `RestoreHistory`, `Cancel` без активного хода и `ApproveTool` молчат, поэтому клиент не должен ждать от них ответа, — а закрытие stdin завершает прогон.
 
 `--goal` гоняет цикл «кодер + ревьюер» без экрана и выходит с кодом, который читает CI: `0`, если ревьюер принял, `1` при частичном вердикте, `3` во всех остальных случаях, включая отсутствие вердикта. События по-прежнему уходят в stdout как JSONL; строка отчёта — в stderr, чтобы её мог прочитать shell-скрипт, не разбирая поток.
@@ -281,6 +286,7 @@ titi --mode plan
 | Enter | Отправляет ход. Во время хода это steering, а не второй ход |
 | Ctrl+C | Останавливает активный ход. В покое второе нажатие за 2 секунды выходит |
 | Ctrl+D | Выход, если строка ввода пустая |
+| `exit` / `quit` / `q` | Уход из чата: сразу до первого хода, а после — по второму Enter |
 | `y` / `n` | Разрешить или отказать записи и shell |
 | `/model` | Следующая модель в списке. `/model <id>` выбирает по id или по короткому имени |
 | `/switch` | Нечёткий поиск по тому же списку: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` разворачивает роль модели из настроек |
@@ -341,7 +347,7 @@ titi --mode plan
 
 `hashline_edit` закрепляет заменяемые строки шестизначным hex-якорем того текста, который был прочитан. Строка, изменившаяся после чтения, отклоняется как устаревшее чтение, а не переписывается по снимку файла, который уже неправда.
 
-`bash` по умолчанию работает через пайп. `pty: true` запускает команду под настоящим терминалом: она видит tty и ведёт себя так, как в вашей собственной оболочке — цвет, прогресс, пейджер. В обоих случаях запуск ограничен: `timeout_secs` (от 1 до 3600, по умолчанию 300), Ctrl+C, который останавливает команду, на которой стоял отменённый ход, и объёмом того, что сохраняется (64 KiB на pty; первые и последние 64 KiB каждого потока на пайпе — ошибка в логе обычно в конце). Остановка забирает всю группу процессов команды, а неудача начинается с `exit N`. Вывод — то, что показал бы терминал: без цветовых кодов и заголовков окна, а `\r`-прогресс-бары сведены к последнему состоянию. Ноль нигде в titi не означает «без дедлайна». Dev-сервер, вотчер или `tail -f` на переднем плане отклоняются до запуска, с подсказкой, как запустить в фоне (`cmd > log 2>&1 &`), и `timeout 30 cmd`, чтобы только проверить, что он стартует. Результат любого инструмента обрезается до 40 000 символов, прежде чем его увидит модель: сверх этого остаются начало и конец, а между ними — пометка, сколько выпало.
+`bash` по умолчанию работает через пайп. `pty: true` запускает команду под настоящим терминалом: она видит tty и ведёт себя так, как в вашей собственной оболочке — цвет, прогресс, пейджер. В обоих случаях запуск ограничен: `timeout_secs` (от 1 до 3600, по умолчанию 300), Ctrl+C, который останавливает команду, на которой стоял отменённый ход, и объёмом того, что сохраняется (64 KiB на pty; первые и последние 64 KiB каждого потока на пайпе — ошибка в логе обычно в конце). Остановка забирает всю группу процессов команды, а неудача начинается с `exit N`. Вывод — то, что показал бы терминал: без цветовых кодов и заголовков окна, а `\r`-прогресс-бары сведены к последнему состоянию. Ноль нигде в titi не означает «без дедлайна». Dev-сервер, вотчер или `tail -f` на переднем плане отклоняются до запуска, с подсказкой, как запустить в фоне (`cmd > log 2>&1 &`), и `timeout 30 cmd`, чтобы только проверить, что он стартует. Команда, которая переживает порог фона — `TITI_BASH_BACKGROUND_MS`, в миллисекундах, по умолчанию 60 000 (это пока переменная окружения, а не ключ настроек), — передаётся как фоновое задание, а не держит ход. Результат любого инструмента обрезается до 40 000 символов, прежде чем его увидит модель: сверх этого остаются начало и конец, а между ними — пометка, сколько выпало.
 
 `todo` — чеклист агента для многошаговой работы: `write` задаёт весь список, `update` меняет статус одного пункта по номеру, `view` показывает его. В работе не больше одного пункта, в списке до 50 пунктов по 200 символов, и живёт он столько же, сколько процесс.
 
