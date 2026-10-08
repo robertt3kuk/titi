@@ -234,8 +234,8 @@ impl GenomeHandle {
     /// has been asked for — including the requests still in the channel, which
     /// is the state a turn's own resync is in when it gives up waiting. Two
     /// deliberate exceptions, both in the safe direction: a window whose apply
-    /// **failed** advances nothing, so the graph stays named as behind until a
-    /// later window folds or finds nothing to fold; and the count can lag a
+    /// **failed** advances nothing and keeps its work, so the graph is named as
+    /// behind until a later window folds that work in; and the count can lag a
     /// publish by the instruction it takes the worker to store it, which
     /// over-reports and never hides.
     pub fn pending(&self) -> usize {
@@ -439,24 +439,39 @@ fn run(
                 }
             }
         }
-        // A window folds nothing for one of two reasons: there was nothing in
-        // it (a bare `Quiesce`), or its apply failed. Only the second leaves
-        // work unfilled, and only the second advances nothing — so a root that
-        // is gone names the backlog for as long as it lasts, while a window
-        // that had nothing to do still says so. A window that did fold marks
-        // everything received so far as applied: the next successful window is
-        // a walk over the same tree in the engine's shape, so it covers what a
-        // single failed one dropped.
+        // A window's work is folded in or kept, never dropped. `applied`
+        // advances only for a window that folded everything it was holding,
+        // which is why a failed one keeps its queue: the next window applies
+        // that work together with whatever arrived since, so a later success
+        // really has covered it and `applied = received` is the truth. A
+        // permanently failing root therefore names the backlog for as long as
+        // it lasts and does not spin — the worker blocks in `recv` until the
+        // next request and retries then, rather than looping on the failure.
+        //
+        // A window with nothing in it can only be reached when nothing is
+        // outstanding, because a failed window keeps its queue; it clears the
+        // count because there is genuinely nothing left to clear.
         let folded = queue.is_empty() || apply(&genome, &root, &queue).is_ok();
         if folded {
             progress.applied.store(received, Ordering::Release);
             progress.items.store(0, Ordering::Release);
+            let generation = genome.generation();
+            for waiter in waiters {
+                let _ = waiter.send(generation);
+            }
+            queue = Queue::default();
+        } else {
+            // Nobody waiting on this window is told it landed: dropping the
+            // senders ends each `quiesce` with `Disconnected`, which reads as
+            // "not caught up" — the truth, where a generation would be a claim
+            // the worker cannot stand behind. Dropped here rather than at the
+            // end of the iteration so the answer does not wait on anything
+            // else this loop does. The window flag is cleared so the kept work
+            // accumulates afresh instead of applying on the first request the
+            // next window receives.
+            drop(waiters);
+            queue.hurry = false;
         }
-        let generation = genome.generation();
-        for waiter in waiters {
-            let _ = waiter.send(generation);
-        }
-        queue = Queue::default();
         if stop {
             return;
         }
@@ -693,6 +708,91 @@ mod tests {
         assert!(live.quiesce(Duration::from_secs(30)));
         assert_eq!(live.pending(), 0);
         assert!(live.snapshot().0.files.contains_key("src/second.rs"));
+    }
+
+    /// A window whose apply failed keeps its work, and a window with nothing
+    /// in it does not clear the count that work is standing in.
+    ///
+    /// A root that has gone away is the failure this can produce: the walk
+    /// cannot read it. No timing is involved — the failure is a fact of the
+    /// tree, and the count is read after the quiesce that carries it.
+    #[test]
+    fn a_failed_window_keeps_its_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/seed.rs", "pub fn seed() {}\n");
+        let live = GenomeHandle::spawn(root, patient()).unwrap();
+        let published = live.generation();
+
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(live.request(Request::Resync));
+        assert!(
+            !live.quiesce(Duration::from_secs(30)),
+            "a window that failed did not fold what it was waiting for"
+        );
+        assert!(live.pending() > 0, "and the work is still outstanding");
+        assert_eq!(live.generation(), published, "nothing was published");
+
+        // The next window is the retried work, not an empty one: the queue
+        // survives the failure, so there is nothing to clear and a second
+        // `Quiesce` cannot make the backlog disappear.
+        assert!(!live.quiesce(Duration::from_secs(30)));
+        assert!(
+            live.pending() > 0,
+            "a window with nothing new in it does not clear a failure"
+        );
+        assert_eq!(live.generation(), published);
+    }
+
+    /// The work of a failed window is retried in the next one rather than
+    /// dropped, including when that next window was asked for something else.
+    ///
+    /// The evidence is the retried walk itself: the second window's own
+    /// request names one path, so a targeted fold would report
+    /// `walked: false` and leave the other file's record stale. It reports a
+    /// walk and re-parses the file the failed window was holding.
+    #[test]
+    fn a_failed_windows_work_is_retried_in_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.rs", "pub fn a() {}\n");
+        let live = GenomeHandle::spawn(root, patient()).unwrap();
+        assert!(
+            live.snapshot().0.files["src/a.rs"]
+                .exports
+                .contains(&"a".to_owned()),
+            "the cold start indexed the file"
+        );
+
+        // The failed window: a walk, with `src/a.rs` named as its priority.
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(live.request(Request::Priority(vec!["src/a.rs".to_owned()])));
+        assert!(live.request(Request::Resync));
+        assert!(!live.quiesce(Duration::from_secs(30)), "the walk failed");
+        assert!(live.pending() > 0);
+
+        // The tree comes back with `a.rs` edited and a second file, and the
+        // next window is asked only for the second.
+        write(root, "src/a.rs", "pub fn a() {}\npub fn a_two() {}\n");
+        write(root, "src/b.rs", "pub fn b() {}\n");
+        assert!(live.request(Request::Changed(vec!["src/b.rs".to_owned()])));
+        assert!(live.quiesce(Duration::from_secs(30)), "the retry landed");
+        assert_eq!(live.pending(), 0);
+
+        let stats = live.last_stats().expect("the retry was applied");
+        assert!(
+            stats.walked,
+            "the failed window's walk was retried, not the new path alone: {stats:?}"
+        );
+        let snapshot = live.snapshot().0;
+        assert!(snapshot.files.contains_key("src/b.rs"));
+        assert!(
+            snapshot.files["src/a.rs"]
+                .exports
+                .contains(&"a_two".to_owned()),
+            "the file the failed window was holding was re-parsed: {:?}",
+            snapshot.files["src/a.rs"].exports
+        );
     }
 
     /// `quiesce` answers once the window it was sent in has landed, and is
