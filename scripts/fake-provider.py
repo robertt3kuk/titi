@@ -10,6 +10,7 @@ the real binary and the real HTTP stack:
   "forever"       a bash call that never exits (Ctrl+C must stop it)
   "dev server"    a bash call on `npm run dev` (refused before it runs)
   "make todo"     a todo write: three items, the second in progress
+  "ask me"        an `ask` call: a question with three options
   "color shell"   a pty bash call printing colour and a `\r` progress bar
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
@@ -113,6 +114,13 @@ def script(last: dict) -> list[tuple[dict, float]]:
             {"content": "Run the suite", "status": "pending"},
         ]
         return [(c, 0) for c in call("call_todo", "todo", {"op": "write", "items": items})]
+    if "ask me" in content:
+        args = {
+            "question": "Which database should I use?",
+            "options": ["postgres", "sqlite", "duckdb"],
+            "multi": False,
+        }
+        return [(c, 0) for c in call("call_ask", "ask", args)]
     if "slow" in content:
         return [(chunk({"content": f"tick{i} "}), 0.15) for i in range(60)] + [(chunk({}, "stop"), 0)]
     if "run bash" in content:

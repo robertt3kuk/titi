@@ -14,13 +14,14 @@ use crate::chat::{Chat, LoginMethod, fg, surface};
 use crate::pickers::ellipsis_label;
 
 pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
-    let (border, caption_color) = if chat.approval.is_some() || chat.login_for.is_some() {
-        (ThemeColor::Warning, ThemeColor::Warning)
-    } else if chat.turn_active {
-        (ThemeColor::Accent, ThemeColor::Accent)
-    } else {
-        (ThemeColor::Border, ThemeColor::Dim)
-    };
+    let (border, caption_color) =
+        if chat.approval.is_some() || chat.pending_ask.is_some() || chat.login_for.is_some() {
+            (ThemeColor::Warning, ThemeColor::Warning)
+        } else if chat.turn_active {
+            (ThemeColor::Accent, ThemeColor::Accent)
+        } else {
+            (ThemeColor::Border, ThemeColor::Dim)
+        };
     let caption = titi_tui::width::truncate_to_width(
         &composer_caption(chat),
         (width as usize).saturating_sub(4),
@@ -73,7 +74,15 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
             Span::styled(shown, fg(theme, color)),
         ])
     } else if chat.input.is_empty() {
-        let placeholder = if chat.paused {
+        let placeholder = if let Some(ask) = &chat.pending_ask {
+            // The row below is the answer field while a question waits: it
+            // says what to do with it, and with a list up that is picking.
+            if ask.answering() {
+                "your answer…"
+            } else {
+                "pick above, or type your own"
+            }
+        } else if chat.paused {
             "paused…"
         } else if chat.turn_active {
             "steer this turn…"
@@ -103,7 +112,17 @@ fn composer_caption(chat: &Chat) -> String {
         Some(percent) => format!("{percent}%  ·  "),
         None => String::new(),
     };
-    let keys = if chat.approval.is_some() {
+    let keys = if let Some(ask) = &chat.pending_ask {
+        if ask.answering() {
+            "enter sends  ·  esc cancels"
+        } else if ask.multi {
+            "↑↓ move  ·  space ticks  ·  enter sends  ·  esc cancels"
+        } else if ask.free_text {
+            "↑↓ move  ·  enter picks  ·  esc cancels  ·  type your own"
+        } else {
+            "↑↓ move  ·  enter picks  ·  esc cancels"
+        }
+    } else if chat.approval.is_some() {
         "y allow  ·  n refuse"
     } else if chat.emoji_picker.is_visible() {
         "↑↓ move  ·  tab takes  ·  esc closes"

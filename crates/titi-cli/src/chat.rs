@@ -307,6 +307,52 @@ pub(crate) struct PendingApproval {
     pub(crate) detail: Option<String>,
 }
 
+/// A question the model asked, waiting on the user.
+///
+/// The engine stops the turn until [`EngineCommand::AnswerAsk`] arrives, so
+/// this is the screen's half of the `ask` tool (`titi_tools::ask`): the
+/// question, the choices, and whether more than one may be taken. An approval
+/// is a yes or a no; this one is the user's to word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingAsk {
+    /// What the answer is correlated with: the engine waits on this id.
+    pub(crate) request_id: String,
+    pub(crate) question: String,
+    /// The choices offered, in the model's order. Empty is a question with no
+    /// list, which the user answers in their own words.
+    pub(crate) options: Vec<String>,
+    /// Whether more than one choice may be taken.
+    pub(crate) multi: bool,
+    /// Whether the user may answer in their own words besides the list.
+    pub(crate) free_text: bool,
+    /// One flag per option: the rows ticked. Only a `multi` question uses them.
+    pub(crate) chosen: Vec<bool>,
+    /// The row the cursor is on.
+    pub(crate) selected: usize,
+    /// Whether the composer is the answer field, because the user started
+    /// typing into it.
+    pub(crate) typing: bool,
+}
+
+impl PendingAsk {
+    /// Whether this question is being answered in the composer: the user has
+    /// started typing, or there is no list to pick from — a question with no
+    /// choices has nothing else to say it with.
+    pub(crate) fn answering(&self) -> bool {
+        self.typing || self.options.is_empty()
+    }
+
+    /// The rows ticked, in the order they were offered.
+    pub(crate) fn ticked(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .zip(&self.chosen)
+            .filter(|(_, ticked)| **ticked)
+            .map(|(option, _)| option.clone())
+            .collect()
+    }
+}
+
 impl PendingApproval {
     /// What the person is asked to allow: the description when the tool gave
     /// one, else the tool's name.
@@ -423,6 +469,9 @@ pub struct Chat {
     assistant_at: Option<usize>,
     thinking_at: Option<usize>,
     pub(crate) approval: Option<PendingApproval>,
+    /// The question the model is waiting on, if any: answered in the panel
+    /// above the composer, or in the composer's own row.
+    pub(crate) pending_ask: Option<PendingAsk>,
     session_prompt_tokens: u32,
     session_completion_tokens: u32,
     last_prompt_tokens: u32,
@@ -642,6 +691,7 @@ impl Chat {
             assistant_at: None,
             thinking_at: None,
             approval: None,
+            pending_ask: None,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             last_prompt_tokens: 0,
@@ -1071,6 +1121,46 @@ impl Chat {
                 // own clock while the person decides, and answering hands
                 // the row back to that call without a second start time.
                 self.hint.clear();
+                Applied::none()
+            }
+            EngineEvent::AskRequested {
+                request_id,
+                question,
+                options,
+                multi,
+                free_text,
+            } => {
+                let options: Vec<String> =
+                    options.iter().map(|option| option.to_string()).collect();
+                // The transcript keeps what was asked, whole, so scrollback
+                // shows the question and the choice that answered it once the
+                // panel is gone: the tool's own chip carries only the head of
+                // a question (`titi_tools::ask`'s `CHIP_CHARS`).
+                self.push(LineKind::Note, format!("ask · {question}"));
+                if !options.is_empty() {
+                    self.push(
+                        LineKind::Note,
+                        format!(
+                            "ask · options: {}{}",
+                            options.join(" · "),
+                            if multi { " · choose any" } else { "" }
+                        ),
+                    );
+                }
+                // The composer becomes the answer field, so a half-typed
+                // prompt goes: an answer and a prompt are different things,
+                // and the turn is stopped until the question is answered.
+                self.clear_input();
+                self.pending_ask = Some(PendingAsk {
+                    request_id: request_id.to_string(),
+                    question: question.to_string(),
+                    chosen: vec![false; options.len()],
+                    options,
+                    multi,
+                    free_text,
+                    selected: 0,
+                    typing: false,
+                });
                 Applied::none()
             }
             EngineEvent::ToolFinished {
@@ -2091,6 +2181,7 @@ impl Chat {
                         self.turn_started = None;
                         self.phase = WorkPhase::Waiting;
                         self.approval = None;
+                        self.pending_ask = None;
                         self.push(LineKind::Note, summary);
                         Applied::send(EngineCommand::RestoreHistory { messages }, None)
                     }
@@ -2273,6 +2364,7 @@ impl Chat {
                 self.turn_started = None;
                 self.phase = WorkPhase::Waiting;
                 self.approval = None;
+                self.pending_ask = None;
                 self.push(LineKind::Note, format!("session {id}"));
                 Applied::send(EngineCommand::RestoreHistory { messages }, None)
             }
@@ -3358,6 +3450,7 @@ impl Chat {
         self.phase = WorkPhase::Waiting;
         self.active_turn_id = None;
         self.approval = None;
+        self.pending_ask = None;
         self.assistant_at = None;
         self.drop_thinking();
         // The turn's usage footer, under the last line of the turn. Only a
@@ -3478,7 +3571,11 @@ impl Chat {
     }
 
     fn agent_state(&self) -> AgentState {
-        if self.approval.is_some() || self.quit_armed.is_some() || self.login_for.is_some() {
+        if self.approval.is_some()
+            || self.pending_ask.is_some()
+            || self.quit_armed.is_some()
+            || self.login_for.is_some()
+        {
             AgentState::Blocked
         } else if self.turn_active {
             AgentState::Working
@@ -4336,7 +4433,7 @@ fn elapsed_label(elapsed: Duration) -> String {
 
 /// The word the masthead shows for the session's state.
 fn state_word(chat: &Chat) -> &'static str {
-    if chat.approval.is_some() {
+    if chat.approval.is_some() || chat.pending_ask.is_some() {
         "needs you"
     } else if chat.login_for.is_some() {
         "sign in"
@@ -4352,7 +4449,11 @@ fn state_word(chat: &Chat) -> &'static str {
 /// The colour of the state word — and of the mode and loop count beside it,
 /// which belong to the same cluster of "what this session is doing".
 fn state_color(chat: &Chat) -> ThemeColor {
-    if chat.approval.is_some() || chat.paused || chat.login_for.is_some() {
+    if chat.approval.is_some()
+        || chat.pending_ask.is_some()
+        || chat.paused
+        || chat.login_for.is_some()
+    {
         ThemeColor::Warning
     } else if chat.turn_active {
         ThemeColor::Accent
@@ -5146,6 +5247,233 @@ mod tests {
             frame.contains("the question nobody asked"),
             "the returned prompt is still shown: {frame}"
         );
+    }
+
+    /// A chat with the model's question on screen: the one event the engine
+    /// sends while it waits, which is the whole of what a surface has to
+    /// answer.
+    fn asked(question_options: &[&str], multi: bool, free_text: bool) -> Chat {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::AskRequested {
+            request_id: "ask-1".into(),
+            question: "Which database should I use?".into(),
+            options: question_options
+                .iter()
+                .map(|option| (*option).into())
+                .collect(),
+            multi,
+            free_text,
+        });
+        chat
+    }
+
+    /// The question arrives as a panel over the composer and as lines in the
+    /// transcript, so scrollback keeps what was asked after the panel is gone.
+    #[test]
+    fn a_question_arrives_as_a_panel_and_a_transcript_line() {
+        let chat = asked(&["postgres", "sqlite"], false, true);
+        let pending = chat.pending_ask.as_ref().expect("the question is up");
+        assert_eq!(pending.request_id, "ask-1");
+        assert_eq!(pending.selected, 0, "the first row is the cursor");
+        assert!(!pending.answering(), "nothing has been typed yet");
+
+        let said: Vec<&str> = chat.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            said,
+            [
+                "ask · Which database should I use?",
+                "ask · options: postgres · sqlite",
+            ]
+        );
+
+        let view = panel_view_for(&chat, 30, 100).expect("the panel is up");
+        let title = view.title.clone().unwrap_or_default();
+        assert!(title.contains("Which database should I use?"), "{title}");
+        assert_eq!(view.lines.len(), 2);
+        assert_eq!(view.selected, Some(0));
+        // The masthead says the session is waiting on a person, as it does for
+        // an approval.
+        assert_eq!(state_word(&chat), "needs you");
+    }
+
+    /// Enter takes the highlighted row of a question that offers one choice,
+    /// and the answer goes to the engine with the id it is waiting on.
+    #[test]
+    fn a_single_choice_is_taken_with_enter() {
+        let mut chat = asked(&["postgres", "sqlite"], false, true);
+        chat.on_key(Key::Down, Instant::now());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::AnswerAsk {
+                request_id: "ask-1".into(),
+                answer: titi_tools::AskAnswer::Chosen(vec!["sqlite".to_owned()]),
+            }))
+        );
+        assert!(chat.pending_ask.is_none(), "the panel closes on the answer");
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "ask · chose sqlite"),
+            "{:?}",
+            chat.lines.last()
+        );
+    }
+
+    /// A question that takes several ticks rows with Space and sends the set
+    /// in the order it was offered; an empty set is not an answer.
+    #[test]
+    fn a_question_that_takes_several_ticks_rows() {
+        let mut chat = asked(&["postgres", "sqlite", "duckdb"], true, true);
+
+        // Nothing ticked yet: Enter refuses rather than answering nothing.
+        let refused = chat.on_key(Key::Enter, Instant::now());
+        assert!(refused.effect.is_none());
+        assert!(chat.pending_ask.is_some());
+        assert_eq!(chat.hint, "pick at least one, or type your own");
+
+        // The third row first, then the first: the answer keeps the offered
+        // order, not the order they were picked in.
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Char(' '), Instant::now());
+        chat.on_key(Key::Up, Instant::now());
+        chat.on_key(Key::Up, Instant::now());
+        chat.on_key(Key::Char(' '), Instant::now());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::AnswerAsk {
+                request_id: "ask-1".into(),
+                answer: titi_tools::AskAnswer::Chosen(vec![
+                    "postgres".to_owned(),
+                    "duckdb".to_owned(),
+                ]),
+            }))
+        );
+
+        // A ticked row is drawn as one, and un-ticking says so.
+        let mut chat = asked(&["postgres", "sqlite"], true, true);
+        chat.on_key(Key::Char(' '), Instant::now());
+        let view = panel_view_for(&chat, 30, 100).expect("the panel is up");
+        let rows: Vec<String> = view
+            .lines
+            .iter()
+            .map(|line| match line {
+                PanelLine::Row { text, .. } => text.clone(),
+                PanelLine::Heading(text) => text.clone(),
+            })
+            .collect();
+        assert_eq!(rows, ["[x] postgres", "[ ] sqlite"]);
+        chat.on_key(Key::Char(' '), Instant::now());
+        assert_eq!(
+            chat.pending_ask.as_ref().expect("up").ticked(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A printable character starts answering in the composer, and Enter sends
+    /// those words: the list the model wrote cannot know it holds the answer.
+    #[test]
+    fn a_question_can_be_answered_in_the_users_own_words() {
+        let mut chat = asked(&["postgres", "sqlite"], false, true);
+        chat.on_key(Key::Char('m'), Instant::now());
+        assert!(chat.pending_ask.as_ref().expect("up").answering());
+        for ch in "ongo".chars() {
+            chat.on_key(Key::Char(ch), Instant::now());
+        }
+        chat.on_key(Key::Backspace, Instant::now());
+        chat.on_key(Key::Char('o'), Instant::now());
+        assert_eq!(chat.input, "mongo");
+
+        // The composer says what the row is for while the answer is written.
+        let frame = frame_rows(&mut chat, 80, 24).join("");
+        assert!(frame.contains("enter sends  ·  esc cancels"), "{frame}");
+
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::AnswerAsk {
+                request_id: "ask-1".into(),
+                answer: titi_tools::AskAnswer::Text("mongo".to_owned()),
+            }))
+        );
+        assert_eq!(chat.input, "", "the answer field is empty again");
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "ask · answered mongo"),
+            "{:?}",
+            chat.lines.last()
+        );
+    }
+
+    /// A question with no list is answered in words from the first keystroke:
+    /// there is nothing else to say it with, whatever `free_text` said.
+    #[test]
+    fn a_question_with_no_list_is_answered_in_words() {
+        let mut chat = asked(&[], false, false);
+        assert!(chat.pending_ask.as_ref().expect("up").answering());
+        let view = panel_view_for(&chat, 30, 100).expect("the panel is up");
+        assert_eq!(view.selected, None, "nothing is pickable");
+        let frame = frame_rows(&mut chat, 80, 24).join("");
+        assert!(frame.contains("your answer…"), "{frame}");
+
+        for ch in "the local one".chars() {
+            chat.on_key(Key::Char(ch), Instant::now());
+        }
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::AnswerAsk {
+                request_id: "ask-1".into(),
+                answer: titi_tools::AskAnswer::Text("the local one".to_owned()),
+            }))
+        );
+    }
+
+    /// Esc refuses to answer, and Ctrl+C interrupts the turn the question
+    /// belongs to — the engine answers `Cancelled` either way.
+    #[test]
+    fn esc_cancels_a_question() {
+        let mut chat = asked(&["postgres", "sqlite"], false, true);
+        let applied = chat.on_key(Key::Esc, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::AnswerAsk {
+                request_id: "ask-1".into(),
+                answer: titi_tools::AskAnswer::Cancelled,
+            }))
+        );
+        assert!(chat.pending_ask.is_none());
+        assert!(chat.lines.iter().any(|line| line.text == "ask · cancelled"));
+
+        let mut chat = asked(&["postgres"], false, true);
+        chat.turn_active = true;
+        assert_eq!(
+            chat.on_key(Key::CtrlC, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::Cancel))
+        );
+        assert!(
+            chat.pending_ask.is_none(),
+            "the question goes with the turn"
+        );
+    }
+
+    /// No question outlives its turn: the panel closes when the turn ends, by
+    /// finishing, failing or being cancelled — the same rule the approval
+    /// panel follows.
+    #[test]
+    fn a_question_is_cleared_when_its_turn_ends() {
+        let mut chat = asked(&["postgres"], false, true);
+        chat.turn_active = true;
+        chat.active_turn_id = Some(TurnId(1));
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        assert!(chat.pending_ask.is_none());
+        assert_eq!(state_word(&chat), "ready");
     }
 
     #[test]
@@ -10246,6 +10574,17 @@ mod tests {
 
         // The states added with the paste menu and the tree: a paste long
         // enough to be offered a way to attach it.
+        // The question the model is waiting on, and the same question with an
+        // answer being typed into the composer.
+        let mut asked = chat();
+        asked.on_event(EngineEvent::AskRequested {
+            request_id: "ask-1".into(),
+            question: "which one?".into(),
+            options: vec!["a".into(), "b".into()],
+            multi: true,
+            free_text: true,
+        });
+
         let mut pasted = chat();
         pasted.paste(
             &(1..=120)
@@ -10264,6 +10603,7 @@ mod tests {
             ("history", history),
             ("session picker", sessions),
             ("paste menu", pasted),
+            ("question", asked),
         ]
     }
 
@@ -10297,6 +10637,9 @@ mod tests {
     /// `map_key` maps ctrl+d to quit before its later half-page arm is reached.
     fn hotkey_spelling(key: Key) -> Option<&'static str> {
         Some(match key {
+            // A space is its own row: the one listing where it does something
+            // (ticking a row of a question that takes several).
+            Key::Char(' ') => "space",
             Key::Char(_) => "any character",
             Key::Backspace => "backspace",
             Key::Enter => "enter",

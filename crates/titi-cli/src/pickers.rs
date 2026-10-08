@@ -734,6 +734,43 @@ impl PasteMenu {
     pub(crate) const FILE: usize = 1;
 }
 
+/// The `ask` panel: the model's question and the choices it offered.
+///
+/// The question is the title (truncated; the transcript holds it whole) and the
+/// choices are the rows: a question that takes several marks the ticked ones
+/// with the checklist's own `[x]`, a single one is picked by the cursor alone.
+/// While the user answers in the composer the cursor is gone from the panel —
+/// the row below is the one being written in.
+fn ask_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(ask) = chat.pending_ask.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let lines: Vec<PanelLine> = ask
+        .options
+        .iter()
+        .zip(&ask.chosen)
+        .map(|(option, ticked)| PanelLine::Row {
+            text: if ask.multi {
+                format!("{} {option}", if *ticked { "[x]" } else { "[ ]" })
+            } else {
+                option.clone()
+            },
+            accent: false,
+        })
+        .collect();
+    let title = format!(
+        "ask · {}{}",
+        one_line(&ask.question, 80),
+        if ask.multi { " · choose any" } else { "" }
+    );
+    panel_view(
+        Some(title),
+        lines,
+        (!ask.answering()).then_some(ask.selected),
+        panel_body(total),
+    )
+}
+
 /// The large-paste panel: what was pasted, and the ways to attach it.
 fn paste_panel(chat: &Chat, total: u16) -> PanelView {
     let Some(menu) = chat.paste_menu.as_ref() else {
@@ -894,6 +931,9 @@ fn tree_panel(chat: &Chat, total: u16) -> PanelView {
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.pending_ask.is_some() {
+        return Some(ask_panel(chat, total));
+    }
     if chat.paste_menu.is_some() {
         return Some(paste_panel(chat, total));
     }
@@ -1633,6 +1673,7 @@ impl Chat {
             || self.session_picker.is_some()
             || self.tree_picker.is_some()
             || self.paste_menu.is_some()
+            || self.pending_ask.is_some()
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.emoji_picker.is_visible()

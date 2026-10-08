@@ -277,6 +277,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     },
     Hotkey {
         group: HotkeyGroup::Lists,
+        keys: "space",
+        what: "tick a row of a question that takes several",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
         keys: "ctrl+r",
         what: "browse this session's own prompts",
     },
@@ -462,6 +467,9 @@ impl Chat {
         if self.approval.is_some() {
             return self.approval_key(key);
         }
+        if self.pending_ask.is_some() {
+            return self.ask_key(key);
+        }
         if self.login_for.is_some() {
             return self.login_key(key);
         }
@@ -625,6 +633,147 @@ impl Chat {
         }
     }
 
+    /// The keys a question the model asked answers to.
+    ///
+    /// Two shapes in one prompt. Until the user types, the panel is the picker:
+    /// arrows move, Enter takes the row (for a question that takes several,
+    /// Space ticks rows and Enter sends the set), Esc cancels. A printable
+    /// character starts answering in the composer instead — whatever
+    /// `free_text` said, a question with no list has nothing else to say with —
+    /// and from there Enter sends the words and Esc cancels. Ctrl+C interrupts
+    /// the turn, exactly as it does over an approval: the engine answers
+    /// `Cancelled` to a question whose turn is gone.
+    fn ask_key(&mut self, key: Key) -> Applied {
+        let Some(ask) = self.pending_ask.clone() else {
+            return Applied::none();
+        };
+        // One keystroke's hint, and no more: whatever this key says, the next
+        // one starts with an empty line above the composer.
+        self.disarm();
+        if ask.answering() {
+            return match key {
+                Key::Enter => {
+                    let text = self.input.trim().to_owned();
+                    if text.is_empty() {
+                        Applied::none()
+                    } else {
+                        self.answer_ask(titi_tools::AskAnswer::Text(text))
+                    }
+                }
+                Key::Backspace => {
+                    self.input.pop();
+                    Applied::none()
+                }
+                Key::Char(ch) if !ch.is_control() => {
+                    self.input.push(ch);
+                    Applied::none()
+                }
+                Key::Esc => self.answer_ask(titi_tools::AskAnswer::Cancelled),
+                Key::CtrlC => self.cancel_ask(),
+                _ => Applied::none(),
+            };
+        }
+        match key {
+            Key::Up => {
+                self.move_ask(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_ask(1);
+                Applied::none()
+            }
+            Key::Char(' ') if ask.multi => {
+                self.toggle_ask();
+                Applied::none()
+            }
+            Key::Enter if ask.multi => {
+                let chosen = ask.ticked();
+                if chosen.is_empty() {
+                    // An empty set is not an answer: the engine's `ask` tool
+                    // was told what the user picked, and it picked nothing.
+                    self.set_hint("pick at least one, or type your own".to_owned());
+                    Applied::none()
+                } else {
+                    self.answer_ask(titi_tools::AskAnswer::Chosen(chosen))
+                }
+            }
+            Key::Enter => {
+                let Some(option) = ask.options.get(ask.selected).cloned() else {
+                    return Applied::none();
+                };
+                self.answer_ask(titi_tools::AskAnswer::Chosen(vec![option]))
+            }
+            Key::Esc => self.answer_ask(titi_tools::AskAnswer::Cancelled),
+            // A character starts the answer in the composer: the list the model
+            // wrote cannot know it holds what the user means.
+            Key::Char(ch) if !ch.is_control() && ask.free_text => {
+                if let Some(pending) = self.pending_ask.as_mut() {
+                    pending.typing = true;
+                }
+                self.input.push(ch);
+                Applied::none()
+            }
+            Key::CtrlC => self.cancel_ask(),
+            _ => Applied::none(),
+        }
+    }
+
+    /// Moves the cursor over the question's rows, wrapping.
+    fn move_ask(&mut self, delta: isize) {
+        let Some(ask) = self.pending_ask.as_mut() else {
+            return;
+        };
+        let len = ask.options.len();
+        if len == 0 {
+            return;
+        }
+        let current = ask.selected % len;
+        ask.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Ticks or unticks the row the cursor is on, for a question that takes
+    /// several.
+    fn toggle_ask(&mut self) {
+        let Some(ask) = self.pending_ask.as_mut() else {
+            return;
+        };
+        let at = ask.selected;
+        if let Some(ticked) = ask.chosen.get_mut(at) {
+            *ticked = !*ticked;
+        }
+    }
+
+    /// Interrupts the turn a question belongs to. The engine answers
+    /// `Cancelled` to the question itself, so nothing is answered here.
+    fn cancel_ask(&mut self) -> Applied {
+        self.pending_ask = None;
+        self.disarm();
+        Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
+    }
+
+    /// Answers the question and says so on screen: the answer goes to the
+    /// engine, which is waiting on this request id, and the transcript keeps
+    /// the line so scrollback shows what was decided.
+    fn answer_ask(&mut self, answer: titi_tools::AskAnswer) -> Applied {
+        let Some(ask) = self.pending_ask.take() else {
+            return Applied::none();
+        };
+        self.input.clear();
+        let said = match &answer {
+            titi_tools::AskAnswer::Chosen(chosen) => format!("ask · chose {}", chosen.join(" · ")),
+            titi_tools::AskAnswer::Text(text) => format!("ask · answered {text}"),
+            titi_tools::AskAnswer::Cancelled => "ask · cancelled".to_owned(),
+        };
+        self.push(LineKind::Note, said);
+        Applied::send(
+            EngineCommand::AnswerAsk {
+                request_id: ask.request_id.into(),
+                answer,
+            },
+            None,
+        )
+    }
+
     /// Insert pasted text into the composer. A paste is usually code or a
     /// log, so its line breaks and tabs are kept — a `\r\n` or lone `\r`
     /// becomes `\n` — and every other control character is dropped.
@@ -636,6 +785,17 @@ impl Chat {
     /// the two, and the transcript echoes the marker rather than the wall.
     pub fn paste(&mut self, text: &str) {
         if self.approval.is_some() {
+            return;
+        }
+        // A paste while a question waits is an answer typed the long way: it
+        // goes into the composer's row, with no marker and no menu, because the
+        // row is the answer field and not a draft.
+        if self.pending_ask.is_some() {
+            if let Some(ask) = self.pending_ask.as_mut() {
+                ask.typing = true;
+            }
+            let body = paste_body(text);
+            self.input.push_str(&body);
             return;
         }
         self.disarm();
