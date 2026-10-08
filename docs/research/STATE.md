@@ -546,9 +546,16 @@ next, and the two worker notes it could not see yet.
 - [ ] `low` no `/tree` view of a tree that is already stored: `parent_id`,
   `fork` and `walk` are in `titi-core` and `/fork` exists, but the picker is
   flat. A `/tree` over `store.load` is file-only work, no schema change.
-- [ ] `low` no `/hotkeys`: the screen answers 16 keys and advertises 3, and
+- [x] `low` ~~no `/hotkeys`: the screen answers 16 keys and advertises 3, and
   `/help` lists 41 commands one line each. Generate the list from the same table
-  the keys are read from, so the two cannot drift.
+  the keys are read from, so the two cannot drift.~~ fixed 2026-10-09 in
+  `7a7e7bc`: `/hotkeys` prints the five groups (composer, lists & pickers,
+  transcript & mouse, turn control, session) from `HOTKEYS` in
+  `crates/titi-cli/src/keys.rs`, beside the `on_key` that answers those keys,
+  and the slash list advertises it beside `/help`;
+  `every_key_the_screen_answers_is_named_in_the_hotkeys_listing` drives every key
+  `map_key` can produce through every state `on_key` branches on, so a binding
+  missing from the listing fails the suite rather than going unadvertised.
 - [ ] `low` `chat.rs` is this project's serializer: 17.2k lines, one writer,
   and every UI item above ends in it — which is why they cannot be
   parallelized, and the review calls the split a finding of its own. A plan for
