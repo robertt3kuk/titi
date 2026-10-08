@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use smol_str::SmolStr;
+use titi_genome::SharedGenome;
 use titi_providers::{ChatMessage, Role, StreamEvent, ToolCallRef};
 use titi_tools::{ApprovalMode, ToolRegistry, ToolResult};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -119,6 +120,10 @@ pub(crate) async fn execute_tools(
     aborted: &AtomicBool,
     trajectory: &TrajectorySink,
     touched: &TouchedSink,
+    // The session's live index, when it has one: a mutating tool call folds
+    // the path it wrote into it before returning. `None` for a caller with no
+    // index of its own — a subagent — which is the fallback walk's business.
+    genome: Option<&SharedGenome>,
     claims: &Claims,
     agent_id: &SmolStr,
     mask_ips: bool,
@@ -176,13 +181,14 @@ pub(crate) async fn execute_tools(
         }
         // A write-tier call takes an exclusive claim on its file, so a
         // parallel agent cannot edit the same path underneath it.
-        let claimed = if WRITING_TOOLS.contains(&call.name.as_str()) {
-            args.get("path")
-                .and_then(|value| value.as_str())
-                .map(|path| claims.try_claim(path, agent_id))
-        } else {
-            None
-        };
+        let write_path: Option<String> = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .filter(|_| WRITING_TOOLS.contains(&call.name.as_str()))
+            .map(str::to_owned);
+        let claimed = write_path
+            .as_deref()
+            .map(|path| claims.try_claim(path, agent_id));
         let started = std::time::Instant::now();
         let result = match claimed {
             Some(Err(error)) => Executed {
@@ -218,6 +224,16 @@ pub(crate) async fn execute_tools(
                 .await
             }
         };
+        // The index hears about a write from the call that made it, not from
+        // the next turn's walk. This runs before the tool returns, so the graph
+        // is current by the time anything reads it; the cost is a `stat`, a
+        // read and a parse of the one file, and a read never pays it. A call
+        // that failed or was refused changed nothing on disk, so it is skipped.
+        if !result.is_error
+            && let (Some(genome), Some(path)) = (genome.cloned(), write_path)
+        {
+            let _ = tokio::task::spawn_blocking(move || genome.apply_changes(&[path])).await;
+        }
         // The answer goes to the provider, the transcript and the session file;
         // a key or a server address the tool printed stops here. The detail is
         // masked with it — a diff quotes what the tool wrote — and goes to the
@@ -434,5 +450,80 @@ mod tests {
         let set = TouchedSet::default();
         assert!(set.is_empty());
         assert!(set.snapshot().is_empty());
+    }
+
+    /// A `write` call through the loop puts its file in the index before the
+    /// call returns, and does it without a walk.
+    ///
+    /// This is the phase-2 claim stated as an experiment: the snapshot is read
+    /// straight after `execute_tools`, with no refresh anywhere, and the stats
+    /// of the update say no tree was listed. Without the fold-in the file is
+    /// simply absent, and with a walk in its place `walked` is true.
+    #[tokio::test]
+    async fn a_tool_write_reaches_the_index_without_a_walk() {
+        use titi_tools::{ApprovalMode, ToolRegistry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/hub.rs"), "pub fn hub() {}\n").unwrap();
+        let live = SharedGenome::index(root).unwrap();
+        assert!(
+            live.last_stats().is_some_and(|stats| stats.walked),
+            "the first index is a walk"
+        );
+
+        let mut tools = ToolRegistry::new();
+        for tool in titi_tools::workspace_tools(root) {
+            tools.register(Arc::from(tool));
+        }
+        let (events, _inbox) = mpsc::channel(8);
+        let touched: TouchedSink = TouchedSink::default();
+        let trajectory: TrajectorySink = TrajectorySink::default();
+        let aborted = AtomicBool::new(false);
+        let claims = Claims::new();
+        let call = PendingToolCall {
+            call_id: "call-1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({
+                "path": "src/fresh.rs",
+                "content": "pub fn fresh() {}\n",
+            })
+            .to_string(),
+        };
+
+        let messages = execute_tools(
+            TurnId(1),
+            vec![call],
+            SmolStr::new_inline("writing"),
+            &tools,
+            ApprovalMode::Yolo,
+            &ApprovalWaiters::default(),
+            &events,
+            &aborted,
+            &trajectory,
+            &touched,
+            Some(&live),
+            &claims,
+            &SmolStr::new_inline("Main"),
+            false,
+        )
+        .await;
+        assert_eq!(messages.len(), 2, "the call message and its result");
+        assert!(
+            !messages[1].content.contains("error"),
+            "the write must have succeeded: {}",
+            messages[1].content
+        );
+
+        let snapshot = live.snapshot();
+        assert!(
+            snapshot.files.contains_key("src/fresh.rs"),
+            "the index knows the file the tool wrote: {:?}",
+            snapshot.files.keys().collect::<Vec<_>>()
+        );
+        let stats = live.last_stats().expect("the write was folded in");
+        assert_eq!(stats.parsed, 1, "one file, read and parsed");
+        assert!(!stats.walked, "and no tree was listed to find it");
     }
 }

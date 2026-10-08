@@ -431,6 +431,96 @@ async fn genome_refreshes_between_turns() {
     );
 }
 
+/// A `write` call through the loop is in the next turn's map.
+///
+/// The map is rebuilt per turn from the session's published index, and the
+/// tool loop is that index's writer: the fold-in happens inside the tool call,
+/// so turn two reads a graph that already knows the file. This drives the real
+/// runtime, the real `write` tool and a scripted provider; the *no walk* half
+/// of the claim is asserted where it is observable, in the tool loop's own
+/// test, because the engine keeps its handle private.
+#[tokio::test]
+async fn a_tool_write_reaches_the_next_turns_map() {
+    use titi_tools::{ApprovalMode, ToolRegistry, workspace_tools};
+
+    let workspace = workspace_with_hub_and_leaf();
+    let call = serde_json::json!({
+        "path": "src/fresh.rs",
+        "content": "pub fn fresh_export() {}\n",
+    });
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(vec![
+            StreamEvent::ToolcallStart {
+                id: BlockId::new("tool"),
+                call: ToolCallRef {
+                    call_id: "call-1".into(),
+                    name: "write".into(),
+                },
+            },
+            StreamEvent::ToolcallDelta {
+                id: BlockId::new("tool"),
+                json: call.to_string().into(),
+            },
+            StreamEvent::ToolcallEnd {
+                id: BlockId::new("tool"),
+            },
+            StreamEvent::Done {
+                reason: StopReason::ToolUse,
+            },
+        ]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut tools = ToolRegistry::new();
+    for tool in workspace_tools(workspace.path()) {
+        tools.register(Arc::from(tool));
+    }
+
+    let mut config = EngineConfig::new("primary");
+    config.genome_root = Some(workspace.path().to_path_buf());
+    config.approval_mode = ApprovalMode::Yolo;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
+        tools,
+    );
+
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "add a file".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "again".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    let second = requests
+        .iter()
+        .find(|request| {
+            request
+                .messages
+                .last()
+                .is_some_and(|message| message.content.ends_with("again"))
+        })
+        .expect("the second turn reached the provider");
+    let map = &second.messages.last().expect("a prompt").content;
+    assert!(
+        map.contains("src/fresh.rs"),
+        "the file the tool wrote must be in the next map: {map}"
+    );
+}
+
 /// What turn 1 said is in turn 2's request. The engine owns the history;
 /// no surface has to replay it after every turn.
 #[tokio::test]

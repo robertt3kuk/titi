@@ -215,6 +215,13 @@ pub struct RefreshStats {
     /// it had, so adding one export costs the files that mention that export
     /// and not the tree. Zero when the graph was not recomputed at all.
     pub reresolved: usize,
+    /// Whether this update listed the tree.
+    ///
+    /// [`Genome::refresh`] walks, [`Genome::apply_changes`] trusts the paths
+    /// it was handed. A caller that logs this can tell a fallback resync from
+    /// a targeted update, and a test can tell that a tool's write reached the
+    /// index without a walk.
+    pub walked: bool,
 }
 
 /// The workspace graph and its derived ranking.
@@ -328,6 +335,7 @@ impl Genome {
             content_unchanged: absorbed.content_unchanged,
             graph_recomputed,
             reresolved,
+            walked: true,
         })
     }
 
@@ -350,6 +358,15 @@ impl Genome {
     /// it is working in first. See [`Self::refresh_urgent`] for what that
     /// buys and what it does not.
     pub fn apply_changes(&mut self, paths: &[String]) -> std::io::Result<RefreshStats> {
+        if self.root.as_os_str().is_empty() {
+            // Nothing has been indexed, so an index-relative path has no root
+            // to be relative to, and `"src/a.rs"` would be read against the
+            // process's working directory instead.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "apply_changes needs a root: refresh first",
+            ));
+        }
         let mut listed = Vec::new();
         let mut removed = 0;
         let mut seen: HashSet<&str> = HashSet::new();
@@ -383,6 +400,7 @@ impl Genome {
             content_unchanged: absorbed.content_unchanged,
             graph_recomputed,
             reresolved,
+            walked: false,
         })
     }
 

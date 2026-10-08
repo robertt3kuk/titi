@@ -12,13 +12,15 @@
 //! [`SharedGenome`] is that moment. The index is mutated privately and
 //! published as one `Arc`: a reader gets an owned snapshot, cheap to clone and
 //! never mutated afterwards, so it sees either the state before an update or
-//! the state after it — never a field-wise mixture of the two. The engine's
-//! per-turn call is the writer; the one-line follow-up to use this from
-//! `titi-engine` is to hold `Arc<SharedGenome>` instead of
-//! `Arc<Mutex<Option<Genome>>>` and call `refresh`/`project_with` on it.
+//! the state after it — never a field-wise mixture of the two.
+//!
+//! The engine holds one of these instead of `Arc<Mutex<Option<Genome>>>`. Its
+//! writer is the tool loop, which folds a file a tool wrote in as the call
+//! returns, and the per-turn call is the fallback walk that catches what no
+//! tool named.
 
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::{Genome, RefreshStats};
 
@@ -33,6 +35,10 @@ pub struct SharedGenome {
     /// the genome: a reader takes it only long enough to clone the `Arc`, so
     /// it never blocks on the parse a writer is doing behind the other side.
     state: Arc<RwLock<Arc<Genome>>>,
+    /// What the last update did. Not part of the graph, so not published with
+    /// it: a reader that wants to know whether the index was walked, or how
+    /// much work the last update was, reads it here.
+    last: Arc<Mutex<Option<RefreshStats>>>,
 }
 
 impl SharedGenome {
@@ -43,9 +49,10 @@ impl SharedGenome {
     /// Index `root` from nothing, then publish it.
     pub fn index(root: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut genome = Genome::default();
-        genome.refresh(root)?;
+        let stats = genome.refresh(root)?;
         Ok(Self {
             state: Arc::new(RwLock::new(Arc::new(genome))),
+            last: Arc::new(Mutex::new(Some(stats))),
         })
     }
 
@@ -64,8 +71,7 @@ impl SharedGenome {
     /// panic is a bug in this crate, not a condition to paper over with a
     /// possibly torn graph.
     pub fn refresh(&self, root: impl AsRef<Path>) -> std::io::Result<RefreshStats> {
-        let mut state = self.state.write().expect("genome lock poisoned");
-        Arc::make_mut(&mut state).refresh(root)
+        self.refresh_urgent(root, &[])
     }
 
     /// [`Self::refresh`], parsing `urgent` first — see [`Genome::refresh_urgent`].
@@ -78,8 +84,12 @@ impl SharedGenome {
         root: impl AsRef<Path>,
         urgent: &[String],
     ) -> std::io::Result<RefreshStats> {
-        let mut state = self.state.write().expect("genome lock poisoned");
-        Arc::make_mut(&mut state).refresh_urgent(root, urgent)
+        let stats = {
+            let mut state = self.state.write().expect("genome lock poisoned");
+            Arc::make_mut(&mut state).refresh_urgent(root, urgent)?
+        };
+        self.record(stats);
+        Ok(stats)
     }
 
     /// Run a targeted update — see [`Genome::apply_changes`] — and publish it.
@@ -88,8 +98,30 @@ impl SharedGenome {
     ///
     /// As [`Self::refresh`].
     pub fn apply_changes(&self, paths: &[String]) -> std::io::Result<RefreshStats> {
-        let mut state = self.state.write().expect("genome lock poisoned");
-        Arc::make_mut(&mut state).apply_changes(paths)
+        let stats = {
+            let mut state = self.state.write().expect("genome lock poisoned");
+            Arc::make_mut(&mut state).apply_changes(paths)?
+        };
+        self.record(stats);
+        Ok(stats)
+    }
+
+    /// What the last successful update did, or `None` on a handle that has
+    /// never been updated.
+    ///
+    /// The publish point's own view of its progress: whether the update walked
+    /// the tree or trusted the paths it was handed ([`RefreshStats::walked`]),
+    /// how many files it re-parsed, and how many the symbol pass re-resolved.
+    /// It is not part of the published graph — a reader that wants the graph's
+    /// age wants a generation count, which this does not carry. The engine
+    /// builds its handle with `default()` and updates it at the first turn, so
+    /// `None` means "no root has been indexed yet".
+    pub fn last_stats(&self) -> Option<RefreshStats> {
+        *self.last.lock().expect("genome stats lock poisoned")
+    }
+
+    fn record(&self, stats: RefreshStats) {
+        *self.last.lock().expect("genome stats lock poisoned") = Some(stats);
     }
 
     /// A consistent snapshot of the graph.
@@ -142,6 +174,27 @@ mod tests {
                     .files
                     .iter()
                     .all(|file| genome.files.contains_key(file))
+            })
+            // The mention index is the inversion of every record's raw refs:
+            // no entry names a file the graph dropped, and no raw mention is
+            // missing from it. A reader that saw one half of that pair from
+            // before an update and one from after would read it as broken.
+            && genome.ref_index.iter().all(|(name, files)| {
+                !files.is_empty()
+                    && files.iter().all(|file| {
+                        genome
+                            .files
+                            .get(file)
+                            .is_some_and(|record| record.raw_refs.contains(name))
+                    })
+            })
+            && genome.files.iter().all(|(path, record)| {
+                record.raw_refs.iter().all(|name| {
+                    genome
+                        .ref_index
+                        .get(name)
+                        .is_some_and(|files| files.contains(path))
+                })
             })
     }
 

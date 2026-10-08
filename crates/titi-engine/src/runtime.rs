@@ -2189,6 +2189,10 @@ async fn run_turn(
                                 &aborted,
                                 &trajectory,
                                 &touched,
+                                // No genome root means no index to feed: a
+                                // write has nowhere to go, and the handle is
+                                // still an empty one.
+                                config.genome_root.is_some().then_some(&genome),
                                 &claims,
                                 &MAIN_AGENT,
                                 config.mask_ips,

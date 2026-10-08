@@ -196,6 +196,10 @@ impl AgentRunner for ToolAgentRunner {
                 &aborted,
                 &trajectory,
                 &self.touched,
+                // A subagent runs under the CLI's runner, which is built
+                // before the session's index exists and has no handle for it.
+                // Its writes are folded in by the session's next turn walk.
+                None,
                 &self.claims,
                 &request.id,
                 self.mask_ips,

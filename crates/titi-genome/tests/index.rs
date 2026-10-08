@@ -717,6 +717,7 @@ fn an_export_change_reresolves_only_the_files_that_mention_the_name() {
     );
     let stats = genome.refresh(root).unwrap();
     assert_eq!(stats.parsed, 1, "one file changed");
+    assert!(stats.walked, "a refresh lists the tree");
     assert_eq!(
         stats.reresolved, 2,
         "the edited file and the file that mentions the new name"
@@ -766,6 +767,10 @@ fn a_specifier_that_now_resolves_is_found_without_reparsing_the_importer() {
         .apply_changes(&["src/missing.ts".to_owned()])
         .unwrap();
     assert_eq!(stats.parsed, 1, "only the new file is read");
+    assert!(
+        !stats.walked,
+        "a targeted update trusts the path it was handed"
+    );
     assert!(
         stats.graph_recomputed,
         "a path appeared and an edge with it"
