@@ -10,6 +10,8 @@
 //!   `PERSONALITY.md` override, session-level [`Overlay`].
 //! - [`scan`] detects prompt-injection patterns before content is injected.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 mod builder;
 mod personality;
 mod scan;
