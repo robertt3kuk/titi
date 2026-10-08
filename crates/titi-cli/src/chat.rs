@@ -17,7 +17,9 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::crossterm::event::{DisableFocusChange, EnableFocusChange};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -45,6 +47,18 @@ use crate::session_log::SessionLog;
 
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 const TOOL_PREVIEW: usize = 120;
+
+/// Pastes longer than this many lines collapse to a marker instead of filling
+/// the draft (the deleted `composer.rs`'s `PASTE_INLINE_MAX_LINES`, restored).
+///
+/// Six is where a paste stops reading as something the user typed: a prompt, a
+/// path, a couple of log lines stay inline, while a stack trace or a file no
+/// longer becomes the prompt verbatim.
+const PASTE_INLINE_MAX_LINES: usize = 6;
+
+/// Where a collapsed paste's marker starts. Only a registered marker is ever
+/// expanded, and only from this prefix, so a literal in prose is never one.
+const PASTE_MARKER_HEAD: &str = "[Paste #";
 
 /// The line above the composer while a second press is owed, one per key: a
 /// two-press exit names the key that confirms *it*.
@@ -561,6 +575,14 @@ struct OAuthLogin {
 pub struct Chat {
     lines: Vec<TranscriptLine>,
     input: String,
+    /// The bodies the collapsed markers in `input` stand for, by marker text.
+    /// A paste too long to sit in the draft leaves a marker here instead, and
+    /// [`Chat::submit`] swaps it for the body; taking the draft away takes
+    /// these with it ([`Chat::clear_input`]).
+    pastes: HashMap<String, String>,
+    /// The number the next paste marker carries: monotonic for the run, so two
+    /// markers in one draft can never stand for the same body.
+    next_paste: u32,
     turn_active: bool,
     /// When the running turn was asked for. `Some` exactly while
     /// `turn_active`: the status row above the composer reads it for the
@@ -746,6 +768,8 @@ impl Chat {
         Self {
             lines: Vec::new(),
             input: String::new(),
+            pastes: HashMap::new(),
+            next_paste: 0,
             turn_active: false,
             turn_started: None,
             phase: WorkPhase::Waiting,
@@ -1080,6 +1104,7 @@ impl Chat {
         };
         match picker.selected_text().map(str::to_owned) {
             Some(text) => {
+                self.pastes.clear();
                 self.input = text;
                 Applied::none()
             }
@@ -1722,6 +1747,7 @@ impl Chat {
                 // records it either way — the text is never gone silently.
                 let preview = one_line(&text, TOOL_PREVIEW);
                 if self.input.is_empty() && self.approval.is_none() {
+                    self.pastes.clear();
                     self.input = text.to_string();
                     self.picker = 0;
                     self.push(
@@ -1848,6 +1874,12 @@ impl Chat {
     /// Insert pasted text into the composer. A paste is usually code or a
     /// log, so its line breaks and tabs are kept — a `\r\n` or lone `\r`
     /// becomes `\n` — and every other control character is dropped.
+    ///
+    /// More than [`PASTE_INLINE_MAX_LINES`] lines do not go into the draft at
+    /// all: the draft takes a one-line marker and the body is kept aside, so a
+    /// pasted stack trace cannot read as the prompt the user is writing (and
+    /// the one-row composer can show the whole draft). [`Chat::submit`] swaps
+    /// the two, and the transcript echoes the marker rather than the wall.
     pub fn paste(&mut self, text: &str) {
         if self.approval.is_some() {
             return;
@@ -1857,20 +1889,58 @@ impl Chat {
         self.login_picker = None;
         self.model_picker = None;
         self.emoji_picker.hide();
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            match ch {
-                '\r' => {
-                    if chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    self.input.push('\n');
+        let body = paste_body(text);
+        let lines = body.lines().count();
+        if lines <= PASTE_INLINE_MAX_LINES {
+            self.input.push_str(&body);
+            return;
+        }
+        self.next_paste += 1;
+        let marker = paste_marker(self.next_paste, lines);
+        self.pastes.insert(marker.clone(), body);
+        self.input.push_str(&marker);
+    }
+
+    /// The draft as it will be sent: every marker this draft holds replaced by
+    /// the body it stands for.
+    ///
+    /// A marker is expanded only where the registry has it, and a substituted
+    /// body is never scanned again, so text that merely looks like a marker —
+    /// or a marker left over from a draft the user has moved on from — stays
+    /// literal and can never ship a body from somewhere else.
+    fn expand_pastes(&self, draft: &str) -> String {
+        if self.pastes.is_empty() {
+            return draft.to_owned();
+        }
+        let mut out = String::with_capacity(draft.len());
+        let mut rest = draft;
+        while let Some(at) = rest.find(PASTE_MARKER_HEAD) {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            match self
+                .pastes
+                .iter()
+                .find(|(marker, _)| tail.starts_with(marker.as_str()))
+            {
+                Some((marker, body)) => {
+                    out.push_str(body);
+                    rest = &tail[marker.len()..];
                 }
-                '\n' | '\t' => self.input.push(ch),
-                ch if ch.is_control() => {}
-                ch => self.input.push(ch),
+                None => {
+                    out.push_str(PASTE_MARKER_HEAD);
+                    rest = &tail[PASTE_MARKER_HEAD.len()..];
+                }
             }
         }
+        out.push_str(rest);
+        out
+    }
+
+    /// Drop the draft — and the pasted bodies its markers stood for, so a
+    /// marker cannot outlive the message it was pasted into.
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.pastes.clear();
     }
 
     fn approval_key(&mut self, key: Key) -> Applied {
@@ -1902,30 +1972,36 @@ impl Chat {
     }
 
     fn submit(&mut self, now: Instant) -> Applied {
-        let text = self.input.trim().to_owned();
-        if text.is_empty() {
+        // The draft as the screen has it — markers, not the walls they stand
+        // for. Every decision below reads this, so a collapsed paste can never
+        // be mistaken for a command the user typed.
+        let draft = self.input.trim().to_owned();
+        if draft.is_empty() {
             return Applied::none();
         }
         // A bare word that means "leave" is the one prompt the composer
         // answers itself. It is matched whole: a prompt that merely starts
         // with those letters (`exit code`) goes to the model like any other.
-        if matches!(text.as_str(), "exit" | "quit" | "q") {
+        if matches!(draft.as_str(), "exit" | "quit" | "q") {
             return self.exit_word(now);
         }
-        if let Some(applied) = self.slash(&text) {
-            self.input.clear();
+        if let Some(applied) = self.slash(&draft) {
+            self.clear_input();
             self.disarm();
             return applied;
         }
         if self.paused {
-            self.input.clear();
+            self.clear_input();
             self.disarm();
             self.push(LineKind::Note, "paused · /pause resumes".to_owned());
             return Applied::none();
         }
-        self.input.clear();
+        // What the model reads: the markers swapped for the bodies they stand
+        // for, so the whole paste is sent while the screen keeps the marker.
+        let text = self.expand_pastes(&draft);
+        self.clear_input();
         self.disarm();
-        self.push(LineKind::User, text.clone());
+        self.push(LineKind::User, draft.clone());
         let log = Some(LogWrite::text(Role::User, text.clone()));
         if self.turn_active {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
@@ -1946,7 +2022,7 @@ impl Chat {
         let armed = self.esc_armed.take();
         self.disarm();
         if !self.input.is_empty() {
-            self.input.clear();
+            self.clear_input();
             self.picker = 0;
             return Applied::none();
         }
@@ -3361,7 +3437,7 @@ impl Chat {
     /// Leaves the login prompt. Dropping the flow is the cancel: the task's
     /// code end sees the channel close and stops waiting.
     fn cancel_login(&mut self) -> Applied {
-        self.input.clear();
+        self.clear_input();
         self.login_for = None;
         self.oauth = None;
         self.push(LineKind::Note, "login cancelled".to_owned());
@@ -3370,6 +3446,7 @@ impl Chat {
 
     fn store_login_secret(&mut self) -> Applied {
         let secret = std::mem::take(&mut self.input);
+        self.pastes.clear();
         let secret = secret.trim().to_owned();
         if self.oauth.is_some() {
             if secret.is_empty() {
@@ -4587,7 +4664,12 @@ impl Screen {
             stdout,
             EnterAlternateScreen,
             ratatui::crossterm::cursor::Hide,
-            EnableFocusChange
+            EnableFocusChange,
+            // Without this the terminal never marks a paste: a wall of text
+            // arrives as keystrokes, and every line break in it is an Enter
+            // that sends the half-typed prompt. With it, the whole paste
+            // arrives as one `Event::Paste` and `Chat::paste` can collapse it.
+            EnableBracketedPaste
         )?;
         stdout.write_all(mouse.enable().as_bytes())?;
         stdout.flush()?;
@@ -4604,7 +4686,8 @@ impl Drop for Screen {
             self.terminal.backend_mut(),
             ratatui::crossterm::cursor::Show,
             LeaveAlternateScreen,
-            DisableFocusChange
+            DisableFocusChange,
+            DisableBracketedPaste
         );
         // The terminal's own channels go back with the screen: mouse reporting
         // is turned off for every mode (`Off`'s sequence is the disable for all
@@ -8304,6 +8387,36 @@ fn composer_view(input: &str) -> String {
     input.replace('\n', "↵").replace('\t', "    ")
 }
 
+/// A pasted body as the composer keeps it: `\r\n` and a lone `\r` become `\n`,
+/// tabs and newlines are kept — a paste is usually code or a log, so its line
+/// breaks and indentation are part of it — and every other control character
+/// is dropped.
+fn paste_body(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(ch),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// The one-line stand-in a collapsed paste leaves in the draft:
+/// `[Paste #2 · 14 lines]`. One line, so the one-row composer can show the
+/// whole draft, and bracketed so it cannot read as prose the user typed.
+fn paste_marker(seq: u32, lines: usize) -> String {
+    format!("[Paste #{seq} · {lines} lines]")
+}
+
 fn fit_tail(text: &str, width: usize) -> String {
     if titi_tui::width::visible_width(text) <= width {
         return text.to_owned();
@@ -9728,8 +9841,8 @@ mod tests {
             store
                 .create(titi_core::session::SessionMeta {
                     title: Some(title.to_owned()),
-                    bot_id: None,
                     source: Some("cli".to_owned()),
+                    ..Default::default()
                 })
                 .expect("create")
         };
@@ -9817,8 +9930,8 @@ mod tests {
         let older = store
             .create(titi_core::session::SessionMeta {
                 title: Some("older".to_owned()),
-                bot_id: None,
                 source: Some("cli".to_owned()),
+                ..Default::default()
             })
             .expect("create older");
         store
@@ -9830,8 +9943,8 @@ mod tests {
         let newer = store
             .create(titi_core::session::SessionMeta {
                 title: Some("newer".to_owned()),
-                bot_id: None,
                 source: Some("cli".to_owned()),
+                ..Default::default()
             })
             .expect("create newer");
         store
@@ -10397,8 +10510,8 @@ mod tests {
             let id = store
                 .create(titi_core::session::SessionMeta {
                     title: Some(title.to_owned()),
-                    bot_id: None,
                     source: Some("cli".to_owned()),
+                    ..Default::default()
                 })
                 .expect("create");
             store.append(&id, Role::User, title).expect("append");
@@ -10786,8 +10899,8 @@ mod tests {
         let named = store
             .create(titi_core::session::SessionMeta {
                 title: Some("named".to_owned()),
-                bot_id: None,
                 source: Some("cli".to_owned()),
+                ..Default::default()
             })
             .expect("create");
         chat.session_id = named.clone();
@@ -14731,6 +14844,157 @@ mod tests {
             .expect("the first line");
         assert!(frame[first + 1].contains("│     println!"), "{frame:?}");
         assert!(!frame[first].contains("println!"), "{frame:?}");
+    }
+
+    /// The text a send carries, whichever command it is: a prompt opens a
+    /// turn and a later one steers it, and a paste test is about the text.
+    fn sent_text(applied: &Applied) -> Option<String> {
+        match applied.effect.as_ref()? {
+            ChatEffect::Send(EngineCommand::SubmitPrompt { text })
+            | ChatEffect::Send(EngineCommand::Steer { text }) => Some(text.to_string()),
+            _ => None,
+        }
+    }
+
+    /// A body taller than the composer's threshold: eight lines of a stack
+    /// trace, which is the shape the collapse exists for.
+    fn stack_trace() -> String {
+        (1..=8)
+            .map(|n| format!("  at frame {n} (module.rs:{n})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A paste above the threshold leaves one marker in the draft, not the
+    /// wall: the draft is what the user can still edit and send.
+    #[test]
+    fn a_long_paste_collapses_to_a_marker() {
+        let mut chat = chat();
+        chat.paste(&stack_trace());
+        assert_eq!(
+            chat.input, "[Paste #1 · 8 lines]",
+            "the draft is the marker, not the body"
+        );
+        // The frame draws the marker whole — and none of the wall.
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("[Paste #1 · 8 lines]"), "{frame}");
+        assert!(!frame.contains("frame 5"), "the body is not on screen: {frame}");
+    }
+
+    /// The boundary the collapse turns on: the threshold sits between the two.
+    #[test]
+    fn a_paste_at_the_threshold_stays_inline() {
+        let six = (1..=6).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let mut chat = chat();
+        chat.paste(&six);
+        assert_eq!(chat.input, six, "six lines are still a draft");
+
+        let mut chat = chat_with_theme(test_theme());
+        let seven = (1..=7).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        chat.paste(&seven);
+        assert_eq!(chat.input, "[Paste #1 · 7 lines]");
+    }
+
+    /// Sending expands the marker: the model reads the whole paste, the
+    /// transcript echoes the marker, and the session file records what was
+    /// sent — so the wall is never lost and the screen is never the wall.
+    #[test]
+    fn a_collapsed_paste_expands_when_it_is_sent() {
+        let mut chat = chat();
+        chat.input.push_str("what is this trace? ");
+        chat.paste(&stack_trace());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+
+        let text = sent_text(&applied).expect("the prompt goes out");
+        assert_eq!(
+            text, "what is this trace?   at frame 1 (module.rs:1)\n  at frame 2 (module.rs:2)\n  at frame 3 (module.rs:3)\n  at frame 4 (module.rs:4)\n  at frame 5 (module.rs:5)\n  at frame 6 (module.rs:6)\n  at frame 7 (module.rs:7)\n  at frame 8 (module.rs:8)",
+            "the whole paste is sent"
+        );
+        let log = applied.log.expect("the prompt is recorded");
+        assert_eq!(log.text, text, "the session file holds what was sent");
+        assert!(
+            !log.text.contains("[Paste #"),
+            "the marker is never text the model reads"
+        );
+
+        // The transcript echo is the marker, and no line of the wall follows.
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("what is this trace? [Paste #1 · 8 lines]"), "{frame}");
+        assert!(!frame.contains("frame 4"), "{frame}");
+    }
+
+    /// The guard: only a marker the open draft registered expands. Once the
+    /// draft is gone the same characters are text, so a marker can never ship
+    /// a body pasted into some earlier draft.
+    #[test]
+    fn a_marker_stops_expanding_once_its_draft_is_gone() {
+        let mut chat = chat();
+        chat.paste(&stack_trace());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert!(applied.log.is_some(), "the first send expands the marker");
+
+        for ch in "[Paste #1 · 8 lines]".chars() {
+            chat.on_key(Key::Char(ch), Instant::now());
+        }
+        assert_eq!(chat.input, "[Paste #1 · 8 lines]");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            sent_text(&applied).as_deref(),
+            Some("[Paste #1 · 8 lines]"),
+            "an unregistered marker is literal text"
+        );
+    }
+
+    /// A pasted body is sent exactly as it was pasted: a break and a tab are
+    /// part of the paste, so the wall that reaches the model is byte for byte
+    /// what the clipboard held (bar `\r\n`).
+    #[test]
+    fn a_collapsed_paste_keeps_its_tabs_and_lines() {
+        let body = "fn main() {\n\tprintln!(\"a\");\n\tprintln!(\"b\");\n\tprintln!(\"c\");\n\tprintln!(\"d\");\n\tprintln!(\"e\");\r\n\tprintln!(\"f\");\r}\n";
+        let mut chat = chat();
+        chat.paste(body);
+        assert_eq!(chat.input, "[Paste #1 · 8 lines]");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        let text = sent_text(&applied).expect("the prompt goes out");
+        // Every `\r\n` and lone `\r` is one `\n`; the tabs are the paste's own.
+        assert_eq!(text, body.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+
+    /// The boundary the marker draws around `/`: a marker is one line with no
+    /// slash in it, so it is never a command token itself, and the completion
+    /// still works on the draft the composer returns to.
+    #[test]
+    fn the_slash_list_is_unaffected_by_a_marker() {
+        let mut chat = chat();
+        chat.paste(&stack_trace());
+        assert!(
+            !chat.input.contains('\n'),
+            "a marker is one line: {:?}",
+            chat.input
+        );
+        assert!(
+            picker_rows(&chat).is_empty(),
+            "a marker alone is not a slash token"
+        );
+
+        // Esc takes the draft — and the body behind the marker — away, and the
+        // command list is what it always was.
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.input.is_empty(), "esc leaves an empty draft");
+        for ch in "/comp".chars() {
+            chat.on_key(Key::Char(ch), Instant::now());
+        }
+        let rows = picker_rows(&chat);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, PickRow::Command(command) if command.name == "compact")),
+            "the command list still completes"
+        );
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("/compact"), "{frame}");
+        // Tab completes the token into the draft.
+        chat.on_key(Key::Tab, Instant::now());
+        assert_eq!(chat.input, "/compact ");
     }
 
     #[test]
