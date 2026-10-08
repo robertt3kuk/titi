@@ -8,9 +8,20 @@ use crate::{Genome, Severity};
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Serves document symbols, definition, references, and diagnostics over LSP
-/// stdio framing. One index at start. Does not spawn a process or bind a socket.
+/// stdio framing. Does not spawn a process or bind a socket.
+///
+/// The index is built once from the tree, then **kept in step with the
+/// client's buffers**: `didOpen`, `didChange` and `didClose` fold the text the
+/// editor holds in as that file's content, so every query answers from the
+/// document under the cursor rather than from the last thing saved. That is
+/// the whole of the difference a client sees — same methods, same replies,
+/// correct for unsaved edits.
+///
+/// The server advertises the protocol's full-sync change kind
+/// (`TextDocumentSyncKind.Full`, `1`), so a change carries the entire document
+/// and the index needs no edit arithmetic to follow it.
 pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::Result<()> {
-    let genome = Genome::index(root)?;
+    let mut genome = Genome::index(root)?;
     let mut reader = reader;
     let mut writer = writer;
     loop {
@@ -27,6 +38,15 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
             .ok_or_else(|| invalid("lsp message has no method"))?;
         if method == "exit" {
             return Ok(());
+        }
+        // The buffer channel first, and before the id test: every one of these
+        // is a notification, and dropping them as "no id" is what used to make
+        // an editor's buffer invisible. An error folding the text is the
+        // client's message being wrong, so it is reported as a protocol error
+        // rather than answered with a stale graph.
+        if let Some(change) = buffer_change(root, &message) {
+            change.apply(&mut genome).map_err(invalid)?;
+            continue;
         }
         let id = message.get("id").filter(|id| !id.is_null());
         if method == "initialized" || id.is_none() {
@@ -63,6 +83,55 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
     }
 }
 
+/// One notification that moves a document in or out of the index.
+enum BufferChange {
+    Open(String, String),
+    Close(String),
+}
+
+impl BufferChange {
+    /// Fold it in. The text is always there for `Open`; the close reads the
+    /// file, because that is what "closed" means for an index.
+    fn apply(self, genome: &mut Genome) -> io::Result<()> {
+        match self {
+            Self::Open(path, text) => genome.open_buffer(&path, &text).map(|_| ()),
+            Self::Close(path) => genome.close_buffer(&path).map(|_| ()),
+        }
+    }
+}
+
+/// The document change a notification carries, or `None` when it is not one.
+///
+/// `didSave` returns `None` deliberately: with full sync the buffer's text is
+/// already what the index parsed, so saving changes the file's copy of it and
+/// nothing the index holds. A `didChange` that carries a `range` also returns
+/// `None` — that is an incremental edit, and this server advertised full sync,
+/// so guessing at the offsets of a client that ignored that would corrupt the
+/// identifier lookup behind every later query. The document keeps the text of
+/// the last full change until the next one.
+fn buffer_change(root: &Path, message: &Value) -> Option<BufferChange> {
+    let path = rel_of(root, message)?;
+    match message.get("method").and_then(Value::as_str)? {
+        "textDocument/didOpen" => {
+            let text = message
+                .pointer("/params/textDocument/text")?
+                .as_str()?
+                .to_owned();
+            Some(BufferChange::Open(path, text))
+        }
+        "textDocument/didChange" => {
+            let change = message.pointer("/params/contentChanges/0")?;
+            if change.get("range").is_some_and(|range| !range.is_null()) {
+                return None;
+            }
+            let text = change.get("text")?.as_str()?.to_owned();
+            Some(BufferChange::Open(path, text))
+        }
+        "textDocument/didClose" => Some(BufferChange::Close(path)),
+        _ => None,
+    }
+}
+
 /// The handshake, including what this index can actually do per language.
 ///
 /// The level roster rides in `experimental`: a client that draws it can tell
@@ -73,6 +142,11 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
+            // Every change carries the whole document, which is what lets the
+            // index follow an editor buffer with a parse instead of an edit
+            // model. A client that ignores it and sends ranges is handled by
+            // `buffer_change`, which refuses to guess at their offsets.
+            "textDocumentSync": 1,
             "documentSymbolProvider": true,
             "definitionProvider": true,
             "referencesProvider": true,

@@ -248,6 +248,16 @@ pub struct Genome {
     /// changed for" without reading one — the re-resolution pass visits these
     /// lists and the files that were re-parsed, and nothing else.
     pub ref_index: HashMap<String, Vec<String>>,
+    /// Text an editor holds for a path, which supersedes the file on disk.
+    ///
+    /// The one consumer is the LSP server: a buffer with unsaved edits is the
+    /// document the client is asking about, so both halves of an answer — the
+    /// record, parsed from this text by [`Self::open_buffer`], and the
+    /// identifier a position points at, which `source_of` reads through here
+    /// — have to come from the buffer rather than from the file. Empty for
+    /// every other caller, and an empty overlay changes nothing: a path not
+    /// in it is read and hashed exactly as before.
+    overlay: HashMap<String, String>,
     /// Root of the last refresh, so definition can read the identifier.
     root: std::path::PathBuf,
 }
@@ -313,7 +323,13 @@ impl Genome {
         let root = root.as_ref();
         self.root = root.to_path_buf();
         let listed = scan::list_files(root)?;
-        let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
+        // A path with an open buffer is part of the workspace even when it is
+        // not on disk yet, so it is kept rather than swept as a removal.
+        let known: HashSet<String> = listed
+            .iter()
+            .map(|file| file.path.clone())
+            .chain(self.overlay.keys().cloned())
+            .collect();
 
         let absorbed = self.absorb(&listed, &known, urgent);
         let gone: Vec<String> = self
@@ -404,6 +420,76 @@ impl Genome {
         })
     }
 
+    /// Fold an editor's buffer for `path` in as that file's content, without
+    /// reading or writing the disk.
+    ///
+    /// The overlay wins over the file for as long as it is open: the record is
+    /// parsed from `source` and the graph is rebuilt if the parse moved its
+    /// tuple, exactly as a re-parse of the file would do. A path the index has
+    /// never carried is added, which is how a buffer for a file that was never
+    /// saved joins the graph.
+    ///
+    /// This is a **synchronous** call on purpose. Its caller is the LSP server
+    /// answering the notification that carried the text, and the very next
+    /// request has to see it; putting it behind a channel would make the
+    /// answer to `didOpen` a race with its own `documentSymbol`. The cost is
+    /// one parse of one file, which is the cost a `didChange` already is.
+    pub fn open_buffer(&mut self, path: &str, source: &str) -> std::io::Result<RefreshStats> {
+        if self.root.as_os_str().is_empty() {
+            // An index-relative path with no root would be read against the
+            // process's working directory. See `apply_changes`.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "open_buffer needs a root: refresh first",
+            ));
+        }
+        let listed = buffer_file(&self.root, path, source);
+        let known: HashSet<String> = self
+            .files
+            .keys()
+            .cloned()
+            .chain(self.overlay.keys().cloned())
+            .chain(std::iter::once(path.to_owned()))
+            .collect();
+        self.overlay.insert(path.to_owned(), source.to_owned());
+        let absorbed = self.absorb(&[listed], &known, &[path.to_owned()]);
+        let graph_recomputed = absorbed.graph_moved;
+        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
+        Ok(RefreshStats {
+            parsed: absorbed.parsed,
+            removed: 0,
+            total: self.files.len(),
+            content_unchanged: absorbed.content_unchanged,
+            graph_recomputed,
+            reresolved,
+            walked: false,
+        })
+    }
+
+    /// Drop `path`'s buffer and put the index's view of it back to the file.
+    ///
+    /// A path with no buffer is a no-op: it reports the empty [`RefreshStats`]
+    /// rather than re-reading a file nothing had overridden.
+    pub fn close_buffer(&mut self, path: &str) -> std::io::Result<RefreshStats> {
+        if self.overlay.remove(path).is_none() {
+            return Ok(RefreshStats::default());
+        }
+        self.apply_changes(&[path.to_owned()])
+    }
+
+    /// The text of `path`: the buffer if one is open, otherwise the file.
+    ///
+    /// Two callers read a file's text to answer a question about a position in
+    /// it — `definition` and `references` — and both would locate the wrong
+    /// identifier if they read disk while the client is looking at an edited
+    /// buffer.
+    pub(crate) fn source_of(&self, path: &str) -> Option<String> {
+        if let Some(source) = self.overlay.get(path) {
+            return Some(source.clone());
+        }
+        fs::read_to_string(self.root.join(path)).ok()
+    }
+
     /// Parse what moved in `listed` and fold it into `files`.
     ///
     /// `known` is every path that exists after this update and feeds import
@@ -429,14 +515,17 @@ impl Genome {
         let stale: Vec<&scan::ListedFile> = listed
             .iter()
             .filter(|file| {
-                !self
-                    .files
-                    .get(&file.path)
-                    .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
+                // An open buffer is always stale, whatever the clock says: its
+                // text is the file as the editor has it, and the record it has
+                // to replace was parsed from something else.
+                self.overlay.contains_key(&file.path)
+                    || !self.files.get(&file.path).is_some_and(|record| {
+                        record.size == file.size && record.mtime == file.mtime
+                    })
             })
             .collect();
         let stale = prioritize(stale, urgent);
-        let records = parse_batch(&stale, known, &self.files);
+        let records = parse_batch(&stale, known, &self.files, &self.overlay);
 
         // A parse can only move the graph by changing the tuple the graph is
         // built from. `exports` and `imports` are compared exactly; `refs` are
@@ -789,6 +878,7 @@ fn parse_batch(
     stale: &[&scan::ListedFile],
     known: &HashSet<String>,
     previous: &HashMap<String, FileRecord>,
+    overlay: &HashMap<String, String>,
 ) -> Vec<(FileRecord, bool)> {
     let workers = std::thread::available_parallelism()
         .map(|cores| cores.get())
@@ -797,7 +887,7 @@ fn parse_batch(
     if workers <= 1 {
         return stale
             .iter()
-            .map(|file| parse_one(file, known, previous.get(&file.path)))
+            .map(|file| parse_one(file, known, previous.get(&file.path), overlay))
             .collect();
     }
     let chunk = stale.len().div_ceil(workers);
@@ -808,7 +898,7 @@ fn parse_batch(
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|file| parse_one(file, known, previous.get(&file.path)))
+                        .map(|file| parse_one(file, known, previous.get(&file.path), overlay))
                         .collect::<Vec<_>>()
                 })
             })
@@ -825,24 +915,51 @@ fn parse_batch(
     })
 }
 
+/// The [`scan::ListedFile`] shape of an editor buffer: the text is the file.
+///
+/// `size` is the text's, so a later walk that finds the file a different
+/// length re-parses it, and `mtime` is now, which is later than any file the
+/// buffer was opened over.
+fn buffer_file(root: &Path, path: &str, source: &str) -> scan::ListedFile {
+    scan::ListedFile {
+        path: path.to_owned(),
+        abs: root.join(path),
+        size: source.len() as u64,
+        mtime: SystemTime::now(),
+    }
+}
+
 fn parse_one(
     file: &scan::ListedFile,
     known: &HashSet<String>,
     previous: Option<&FileRecord>,
+    overlay: &HashMap<String, String>,
 ) -> (FileRecord, bool) {
-    let source = fs::read_to_string(&file.abs).unwrap_or_default();
+    // A buffer needs no read: its text *is* the read, and the fingerprint over
+    // it is the fingerprint of what the editor holds, so a later walk that
+    // finds the file still different re-parses it.
+    let disk;
+    let source: &str = match overlay.get(&file.path) {
+        Some(source) => source,
+        None => {
+            disk = fs::read_to_string(&file.abs).unwrap_or_default();
+            &disk
+        }
+    };
     let hash = content::fingerprint(source.as_bytes());
     if let Some(old) = previous {
         // The pre-filter already said size or mtime moved. Equal size and
         // equal bytes is the case it cannot tell from a real edit: keep the
-        // parse, move the clock.
-        if old.size == file.size && old.hash == hash {
+        // parse, move the clock. Never for a buffer — there the text is new
+        // by the caller's declaration, not by a clock that could have been
+        // reset.
+        if overlay.get(&file.path).is_none() && old.size == file.size && old.hash == hash {
             let mut record = old.clone();
             record.mtime = file.mtime;
             return (record, false);
         }
     }
-    let result = lang::parse(&file.path, &source, known);
+    let result = lang::parse(&file.path, source, known);
     (
         FileRecord {
             language: Language::from_path(&file.path),

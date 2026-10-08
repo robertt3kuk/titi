@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 
 use crate::refs;
 use crate::{Diagnostic, ExportSite, Genome, Location, MAX_DEFINERS, Severity};
@@ -170,11 +169,16 @@ impl Genome {
         out
     }
 
+    /// The file's text, or the open buffer's when there is one.
+    ///
+    /// A position the client sends is a position in the buffer it is showing,
+    /// so reading the file here would locate the identifier under the cursor
+    /// in text the user can no longer see.
     fn read_indexed(&self, path: &str) -> Option<String> {
         if !self.files.contains_key(path) {
             return None;
         }
-        fs::read_to_string(self.root.join(path)).ok()
+        self.source_of(path)
     }
 
     fn site_covering(

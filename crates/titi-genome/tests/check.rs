@@ -263,7 +263,199 @@ fn serve_lsp_answers_initialize_and_document_symbol() {
         text.contains("-32601"),
         "unknown method must be method-not-found: {text}"
     );
+    assert!(
+        text.contains("\"textDocumentSync\":1"),
+        "the server must ask for full sync: {text}"
+    );
 }
+
+/// The replies the server wrote, in order, as JSON.
+fn frames(output: &[u8]) -> Vec<serde_json::Value> {
+    let text = String::from_utf8(output.to_vec()).unwrap();
+    let mut out = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(head) = rest.find("Content-Length: ") {
+        let (len, body) = rest[head + "Content-Length: ".len()..]
+            .split_once("\r\n\r\n")
+            .expect("a header and a body");
+        let len: usize = len.trim().parse().expect("a content length");
+        let (body, tail) = body.split_at(len);
+        out.push(serde_json::from_str(body).expect("a json body"));
+        rest = tail;
+    }
+    out
+}
+
+/// The result of the reply to `id`. A client correlates by id, so a test that
+/// asserts on the stream's text cannot tell which answer it read.
+fn reply(frames: &[serde_json::Value], id: &str) -> serde_json::Value {
+    let wanted = serde_json::Value::String(id.to_owned());
+    frames
+        .iter()
+        .find(|frame| frame.get("id") == Some(&wanted))
+        .unwrap_or_else(|| panic!("no reply to {id}: {frames:?}"))
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// A document-symbol request for `uri`.
+fn symbols_request(id: &str, uri: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":"{id}","method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    )
+}
+
+/// A diagnostic request for `uri`.
+fn diagnostic_request(id: &str, uri: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":"{id}","method":"textDocument/diagnostic","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    )
+}
+
+/// A `didOpen` carrying `text` — or a `didChange`, which is the same
+/// notification minus the language id, because this server advertises full
+/// sync and every change is the whole document.
+fn change_request(method: &str, uri: &str, text: &str) -> String {
+    let text = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let text = text.replace('\n', "\\n");
+    match method {
+        "textDocument/didOpen" => format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"rust","version":1,"text":"{text}"}}}}}}"#
+        ),
+        _ => format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":2}},"contentChanges":[{{"text":"{text}"}}]}}}}"#
+        ),
+    }
+}
+
+fn close_request(uri: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
+    )
+}
+
+/// The editor's buffer is what `documentSymbol` answers from, and closing it
+/// puts the file back.
+///
+/// The two texts share no export, so an answer that still names the disk's
+/// `Widget` while the buffer holds `Gizmo` cannot pass by accident.
+#[test]
+fn a_buffer_is_the_truth_for_symbols_and_closing_restores_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub struct Widget;\n");
+    let uri = format!("file://{}", root.join("src/lib.rs").display());
+
+    let mut input = frame(r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#);
+    input.extend(frame(&symbols_request("disk", &uri)));
+    input.extend(frame(&change_request(
+        "textDocument/didOpen",
+        &uri,
+        "pub struct Gizmo;\n",
+    )));
+    input.extend(frame(&symbols_request("open", &uri)));
+    input.extend(frame(&close_request(&uri)));
+    input.extend(frame(&symbols_request("closed", &uri)));
+    input.extend(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let mut output = Vec::new();
+    serve_lsp(root, Cursor::new(input), &mut output).unwrap();
+    let frames = frames(&output);
+
+    let disk = reply(&frames, "disk").to_string();
+    assert!(
+        disk.contains("Widget"),
+        "the file on disk is the start: {disk}"
+    );
+    let open = reply(&frames, "open").to_string();
+    assert!(
+        open.contains("Gizmo") && !open.contains("Widget"),
+        "the buffer must replace the file, not join it: {open}"
+    );
+    let closed = reply(&frames, "closed").to_string();
+    assert!(
+        closed.contains("Widget") && !closed.contains("Gizmo"),
+        "closing must fall back to the file: {closed}"
+    );
+}
+
+/// A `didChange` moves the diagnostics, which means the record was re-parsed
+/// and not only re-answered.
+#[test]
+fn a_change_moves_the_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub fn present() {}\n");
+    let uri = format!("file://{}", root.join("src/lib.rs").display());
+
+    let mut input = frame(r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#);
+    input.extend(frame(&change_request(
+        "textDocument/didOpen",
+        &uri,
+        "pub fn present() {}\n",
+    )));
+    input.extend(frame(&diagnostic_request("before", &uri)));
+    input.extend(frame(&change_request(
+        "textDocument/didChange",
+        &uri,
+        "use crate::missing::Thing;\npub fn present() {}\n",
+    )));
+    input.extend(frame(&diagnostic_request("after", &uri)));
+    input.extend(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let mut output = Vec::new();
+    serve_lsp(root, Cursor::new(input), &mut output).unwrap();
+    let frames = frames(&output);
+
+    let before = reply(&frames, "before").to_string();
+    assert!(
+        !before.contains("unresolved-import"),
+        "the open buffer starts clean: {before}"
+    );
+    let after = reply(&frames, "after").to_string();
+    assert!(
+        after.contains("unresolved-import"),
+        "the edit must be what moved it: {after}"
+    );
+}
+
+/// Closing reverts the *record*, not just the symbol answer: a diagnostic the
+/// buffer introduced is gone once the file is back.
+#[test]
+fn a_close_puts_the_file_back_for_diagnostics_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub fn present() {}\n");
+    let uri = format!("file://{}", root.join("src/lib.rs").display());
+
+    let mut input = frame(r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#);
+    input.extend(frame(&change_request(
+        "textDocument/didOpen",
+        &uri,
+        "use crate::missing::Thing;\npub fn present() {}\n",
+    )));
+    input.extend(frame(&diagnostic_request("open", &uri)));
+    input.extend(frame(&close_request(&uri)));
+    input.extend(frame(&diagnostic_request("closed", &uri)));
+    input.extend(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+    let mut output = Vec::new();
+    serve_lsp(root, Cursor::new(input), &mut output).unwrap();
+    let frames = frames(&output);
+
+    let open = reply(&frames, "open").to_string();
+    assert!(
+        open.contains("unresolved-import"),
+        "the buffer is the record: {open}"
+    );
+    let closed = reply(&frames, "closed").to_string();
+    assert!(
+        !closed.contains("unresolved-import"),
+        "the file on disk has no such import: {closed}"
+    );
+}
+
 /// Capability is reference information, not a finding. `check` reports what is
 /// wrong in the tree — so a tree with nothing wrong stays quiet and a `clean`
 /// answer keeps its meaning — and the levels live behind an accessor a caller
