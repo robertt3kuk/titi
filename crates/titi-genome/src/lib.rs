@@ -119,7 +119,7 @@ impl SymbolRecord {
     }
 }
 
-/// What one [`Genome::refresh`] actually did.
+/// What one [`Genome::refresh`] or [`Genome::apply_changes`] actually did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RefreshStats {
     /// Files re-read **and re-parsed**: new, or changed in content.
@@ -179,7 +179,9 @@ impl Genome {
     /// This is the **fallback**: it walks the tree, so it catches files no
     /// caller mentioned — created, edited or deleted behind the index's back —
     /// and it is what the engine's per-turn call uses, because a turn can run
-    /// an arbitrary command that changes anything anywhere.
+    /// an arbitrary command that changes anything anywhere. Callers that
+    /// already know which paths changed should prefer [`Self::apply_changes`];
+    /// this walks in addition to the work they know about.
     ///
     /// A file is examined only when its `size` or `mtime` differs from the
     /// recorded one, which is a `stat` per file and no read. A file that does
@@ -211,13 +213,64 @@ impl Genome {
         })
     }
 
+    /// Fold exactly `paths` into the index, without walking.
+    ///
+    /// This is the **targeted** path: a watcher, or the harness's own tool
+    /// events, already knows which files its edits touched, and a `stat` per
+    /// named path is the whole cost of asking. It cannot see a file nobody
+    /// named — a sibling process, a `git checkout`, a generator — so a caller
+    /// that has run an arbitrary command should pair it with, or fall back to,
+    /// [`Self::refresh`].
+    ///
+    /// `paths` are index keys as [`Self::files`] spells them, relative to the
+    /// root of the last [`Self::refresh`]. A named path that is no longer a
+    /// file this index carries — deleted, or never a source file — is dropped
+    /// from the index; every other path is left alone, whether or not it
+    /// changed, because the caller did not name it.
+    pub fn apply_changes(&mut self, paths: &[String]) -> std::io::Result<RefreshStats> {
+        let mut listed = Vec::new();
+        let mut removed = 0;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for path in paths {
+            // A watcher may report one path twice in a burst; it is one change.
+            if !seen.insert(path) {
+                continue;
+            }
+            match scan::stat(&self.root, path) {
+                Some(file) => listed.push(file),
+                // Gone from disk, or never a file this index would carry. The
+                // first is a removal; the second is nothing to do, and
+                // `remove` answers both without a second question.
+                None => removed += usize::from(self.files.remove(path).is_some()),
+            }
+        }
+        let known: HashSet<String> = self
+            .files
+            .keys()
+            .cloned()
+            .chain(listed.iter().map(|file| file.path.clone()))
+            .collect();
+
+        let absorbed = self.absorb(&listed, &known);
+        let graph_recomputed = absorbed.graph_moved || removed > 0;
+        self.finish(graph_recomputed);
+        Ok(RefreshStats {
+            parsed: absorbed.parsed,
+            removed,
+            total: self.files.len(),
+            content_unchanged: absorbed.content_unchanged,
+            graph_recomputed,
+        })
+    }
+
     /// Parse what moved in `listed` and fold it into `files`.
     ///
     /// `known` is every path that exists after this update and feeds import
     /// resolution; `listed` need not be all of it, since a targeted update
     /// names a subset. Paths are neither added nor dropped here — `refresh`
-    /// sweeps what the walk did not list — so this only ever replaces records
-    /// or inserts the ones its caller already accounted for.
+    /// sweeps what the walk did not list, `apply_changes` drops what it was
+    /// told is gone — so this only ever replaces records or inserts the ones
+    /// its caller already accounted for.
     fn absorb(&mut self, listed: &[scan::ListedFile], known: &HashSet<String>) -> Absorption {
         let candidates: Vec<&scan::ListedFile> = listed
             .iter()

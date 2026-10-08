@@ -587,3 +587,82 @@ fn an_edit_that_adds_an_export_recomputes_the_graph() {
     assert_ne!(genome.symbols, before);
     assert!(genome.symbols.contains_key("extra"));
 }
+
+/// A targeted update touches the paths it was given and nothing else, so a
+/// file the caller did not name stays as it was even though it changed on
+/// disk.
+#[test]
+fn apply_changes_updates_only_the_named_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn a() {}\n");
+    write(root, "src/b.rs", "pub fn b() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+
+    write(root, "src/a.rs", "pub fn a() {}\npub fn a2() {}\n");
+    write(root, "src/c.rs", "pub fn c() {}\n");
+    let stats = genome.apply_changes(&["src/a.rs".to_owned()]).unwrap();
+    assert_eq!(stats.parsed, 1, "only the named path was read");
+    assert_eq!(stats.total, 2, "src/c.rs was not named");
+    assert!(genome.files["src/a.rs"].exports.contains(&"a2".to_owned()));
+
+    // The walk is what finds the file nobody named.
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 1);
+    assert_eq!(stats.total, 3);
+    assert!(genome.files.contains_key("src/c.rs"));
+
+    // A named path that is gone leaves the index, and only that path.
+    fs::remove_file(root.join("src/b.rs")).unwrap();
+    let stats = genome.apply_changes(&["src/b.rs".to_owned()]).unwrap();
+    assert_eq!(stats.removed, 1);
+    assert_eq!(stats.total, 2);
+    assert!(stats.graph_recomputed, "a node left the graph");
+    assert!(!genome.files.contains_key("src/b.rs"));
+}
+
+/// An unchanged named path is a `stat` and no more: not parsed, not read, and
+/// the ranking is not rebuilt.
+#[test]
+fn apply_changes_on_unchanged_paths_touches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn a() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+    genome.ranks.insert("src/a.rs".to_owned(), 7.0);
+
+    let stats = genome
+        .apply_changes(&["src/a.rs".to_owned(), "src/absent.rs".to_owned()])
+        .unwrap();
+    assert_eq!(stats.parsed, 0);
+    assert_eq!(stats.content_unchanged, 0);
+    assert_eq!(stats.removed, 0, "a path never in the index is no removal");
+    assert!(!stats.graph_recomputed);
+    assert_eq!(genome.ranks["src/a.rs"], 7.0);
+}
+
+/// A targeted update confirms content by hash exactly as a walk does: a
+/// stream of touches the watcher reports costs reads, not parses.
+#[test]
+fn apply_changes_confirms_content_by_hash_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn a() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+
+    let before = fs::metadata(root.join("src/a.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(root.join("src/a.rs"))
+        .unwrap()
+        .set_modified(before + Duration::from_secs(1))
+        .unwrap();
+
+    let stats = genome.apply_changes(&["src/a.rs".to_owned()]).unwrap();
+    assert_eq!(stats.parsed, 0);
+    assert_eq!(stats.content_unchanged, 1);
+    assert!(!stats.graph_recomputed);
+}

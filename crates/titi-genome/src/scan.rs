@@ -48,6 +48,33 @@ pub fn list_files(root: &Path) -> std::io::Result<Vec<ListedFile>> {
     Ok(out)
 }
 
+/// Stats one index-relative path, or `None` when it is not a file this index
+/// would carry.
+///
+/// [`list_files`] decides those questions for a whole tree; this is the
+/// single-path form a targeted update needs, and it applies the same filters —
+/// source extension, a regular file, within the size cap — so a caller cannot
+/// push into the index through a targeted update what a walk would have
+/// skipped. `path` is a key of the index, relative to `root`, as
+/// `Genome::files` spells it.
+pub fn stat(root: &Path, path: &str) -> Option<ListedFile> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if !is_source(name) {
+        return None;
+    }
+    let abs = root.join(path);
+    let meta = fs::metadata(&abs).ok()?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    Some(ListedFile {
+        path: path.to_owned(),
+        abs,
+        size: meta.len(),
+        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+    })
+}
+
 fn load_rules(root: &Path, name: &str) -> Vec<Rule> {
     let Ok(text) = fs::read_to_string(root.join(name)) else {
         return Vec::new();
