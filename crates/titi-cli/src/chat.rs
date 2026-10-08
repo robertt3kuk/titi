@@ -237,6 +237,10 @@ pub enum Key {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatEffect {
     Send(EngineCommand),
+    /// Several commands from one keystroke, sent in order. `/budget off` is
+    /// the case: the token bound and the money bound are the engine's two
+    /// independent commands, so lifting both takes two of them.
+    SendAll(Vec<EngineCommand>),
     Quit,
 }
 
@@ -494,6 +498,13 @@ pub struct Chat {
     spent_tokens: u64,
     /// The cap `/budget` set, as the engine confirmed it.
     budget: Option<u64>,
+    /// What this session has spent in money, as the engine's ledger reported
+    /// it (micro-dollars), and the money cap in force. The two are the
+    /// engine's own numbers: it bills each round at that round's model price,
+    /// so a surface that counted for itself could disagree with the ledger the
+    /// cap is tripped against.
+    money_spent_micro: u64,
+    money_budget_micro: Option<u64>,
     /// The mode the engine confirmed it is in.
     mode: SessionMode,
     /// Membership in the local hub, when `/join` connected.
@@ -664,6 +675,8 @@ impl Chat {
             jobs: Vec::new(),
             spent_tokens: 0,
             budget: None,
+            money_spent_micro: 0,
+            money_budget_micro: None,
             mode: SessionMode::Agent,
             hub: HubSession::default(),
             hub_open: false,
@@ -1213,6 +1226,7 @@ impl Chat {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                cost_micro_usd,
                 ..
             } => {
                 self.last_prompt_tokens = prompt_tokens;
@@ -1221,15 +1235,14 @@ impl Chat {
                 // The running turn's own ledger, for the footer under its
                 // answer; the totals below outlive it.
                 self.turn_usage = Some((prompt_tokens, cached_tokens, completion_tokens));
-                // Money is a property of the model the turn ran on, so it is
-                // read here, where the turn's tokens and the current model are
-                // both in hand. An unpriced model costs nothing to state: the
-                // footer drops the figure rather than inventing one, and the
-                // session total says it is a floor.
-                match self.catalog.price(&self.model) {
-                    Some(price) => {
-                        let cost =
-                            price.cost_micro_usd(prompt_tokens, cached_tokens, completion_tokens);
+                // Money is the engine's own figure for the turn: its ledger
+                // bills each round at that round's model price, so a surface
+                // that computed its own from the model the turn ended on could
+                // disagree with the cap the engine trips. `None` is unpriced
+                // — or a turn whose rounds were not all priced — and the
+                // session total then says it is a floor, not a bill.
+                match cost_micro_usd {
+                    Some(cost) => {
                         self.turn_cost_micro = Some(cost);
                         self.session_cost_micro = Some(self.session_cost_micro.unwrap_or(0) + cost);
                     }
@@ -1286,6 +1299,44 @@ impl Chat {
             EngineEvent::BudgetUpdated { spent, limit } => {
                 self.spent_tokens = spent;
                 self.budget = limit;
+                Applied::none()
+            }
+            EngineEvent::MoneyBudgetUpdated {
+                spent_micro_usd,
+                limit_micro_usd,
+            } => {
+                self.money_spent_micro = spent_micro_usd;
+                self.money_budget_micro = limit_micro_usd;
+                Applied::none()
+            }
+            EngineEvent::MoneyBudgetExceeded {
+                spent_micro_usd,
+                limit_micro_usd,
+            } => {
+                // The engine has already stopped starting turns: the same
+                // paused state the token cap leaves, in money.
+                self.money_spent_micro = spent_micro_usd;
+                self.money_budget_micro = Some(limit_micro_usd);
+                self.paused = true;
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "budget reached: {} of {} in money · paused · /budget <amount> raises it",
+                        usd(spent_micro_usd),
+                        usd(limit_micro_usd)
+                    ),
+                );
+                Applied::none()
+            }
+            EngineEvent::MoneyBudgetUnpriced { model } => {
+                // An unpriced model is not a free one: the engine cannot
+                // measure it, so it will not pretend the cap binds.
+                self.push(
+                    LineKind::Error,
+                    format!(
+                        "budget: {model} has no price, so a cap in money cannot be enforced over it"
+                    ),
+                );
                 Applied::none()
             }
             EngineEvent::BudgetExceeded { spent, limit } => {
@@ -3103,15 +3154,16 @@ impl Chat {
         }))
     }
 
-    /// `/budget [amount|off]` caps what this session may spend.
+    /// `/budget [amount|off]` caps what this session may spend: tokens
+    /// (`/budget 200k`) or money (`/budget $2`).
     ///
-    /// The cap is counted in tokens, and that is the engine's
-    /// (`runtime.rs`'s `budget`, tripped against `prompt + completion`). A cap
-    /// in money is still refused, and now the refusal can say exactly what is
-    /// missing: the engine counts tokens, not dollars, and prompt and
-    /// completion tokens bill at different rates, so no single dollar figure
-    /// converts into one token cap. Enforcing it needs a cost ledger in the
-    /// engine, which is a change to a file this surface does not own.
+    /// Both bounds are the engine's and they are independent: a token cap is
+    /// tripped against `prompt + completion` (`runtime.rs`'s `budget`), a money
+    /// cap against its cost ledger, which bills each round at that round's
+    /// model price. `off` lifts both — one keystroke, two commands — because
+    /// "no cap" is one intent and neither bound restates the other. A money cap
+    /// over a model with no price is not accepted silently: the engine names
+    /// the model (`MoneyBudgetUnpriced`) and the cap's spend becomes a floor.
     fn budget(&mut self, args: &str) -> Applied {
         let args = args.trim();
         if args.is_empty() {
@@ -3120,10 +3172,13 @@ impl Chat {
         }
         if matches!(args, "off" | "none" | "clear") {
             self.push(LineKind::Note, "budget: no cap".to_owned());
-            return Applied::send(EngineCommand::SetBudget { tokens: None }, None);
+            return Applied::effect(ChatEffect::SendAll(vec![
+                EngineCommand::SetBudget { tokens: None },
+                EngineCommand::SetMoneyBudget { micro_usd: None },
+            ]));
         }
         match parse_budget(args) {
-            Ok(tokens) => {
+            Ok(Budget::Tokens(tokens)) => {
                 self.push(LineKind::Note, format!("budget: {tokens} tokens"));
                 Applied::send(
                     EngineCommand::SetBudget {
@@ -3132,54 +3187,47 @@ impl Chat {
                     None,
                 )
             }
+            Ok(Budget::Money(micro)) => {
+                self.push(LineKind::Note, format!("budget: {}", usd(micro)));
+                Applied::send(
+                    EngineCommand::SetMoneyBudget {
+                        micro_usd: Some(micro),
+                    },
+                    None,
+                )
+            }
             Err(error) => {
-                let said = match error {
-                    BudgetArgError::Money => self.money_budget_refusal(),
-                    other => other.to_string(),
-                };
-                self.push(LineKind::Error, said);
+                self.push(LineKind::Error, error.to_string());
                 Applied::none()
             }
         }
     }
 
-    /// Why a cap in money cannot be honoured here, said with whatever this
-    /// machine knows about the model.
-    ///
-    /// The refusal is not a shrug: when the current model has a price, the
-    /// refusal states it, so the user can see what a dollar would have bought
-    /// and that the missing piece is the engine's tally and not the price.
-    /// Nobody's price is guessed into a token cap — a rate the user did not
-    /// state would be a number they could not act on.
-    fn money_budget_refusal(&self) -> String {
-        match self.catalog.price(&self.model) {
-            Some(price) => format!(
-                "budget: {} costs {} in / {} out per MTok, but the engine's cap counts tokens, \
-                 and those bill at different rates — a cap in money needs the engine's cost \
-                 ledger; cap tokens instead (e.g. /budget 200k)",
-                self.model,
-                titi_tui::status::format_usd(price.input, 2),
-                titi_tui::status::format_usd(price.output, 2),
-            ),
-            None => format!(
-                "budget: {} has no price here — the engine's cap counts tokens, not money, so \
-                 cap tokens instead (e.g. /budget 200k)",
-                self.model,
-            ),
-        }
-    }
-
     /// What has been spent, against the cap if there is one.
     fn show_budget(&mut self) {
-        let text = match self.budget {
+        let tokens = match self.budget {
             Some(limit) => format!(
-                "budget: {} of {limit} tokens spent ({}%)",
+                "{} of {limit} tokens spent ({}%)",
                 self.spent_tokens,
                 share(self.spent_tokens, limit)
             ),
-            None => format!("budget: no cap · {} tokens spent", self.spent_tokens),
+            None => format!("no token cap · {} tokens spent", self.spent_tokens),
         };
-        self.push(LineKind::Note, text);
+        // The money bound rides beside it, when the engine has reported one:
+        // either a cap with what it measured against it, or what it measured
+        // with no cap to measure against.
+        let money = match self.money_budget_micro {
+            Some(limit) => format!(
+                " · {} of {} in money",
+                usd(self.money_spent_micro),
+                usd(limit)
+            ),
+            None if self.money_spent_micro > 0 => {
+                format!(" · {} spent in money", usd(self.money_spent_micro))
+            }
+            None => String::new(),
+        };
+        self.push(LineKind::Note, format!("budget: {tokens}{money}"));
     }
 
     /// `/context` asks the engine what fills the window. It takes no
@@ -3797,38 +3845,52 @@ fn parse_interval(word: &str) -> Option<u64> {
 /// Why `/budget` could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BudgetArgError {
-    /// A cap in money, which no token cap can stand for: prompt and
-    /// completion tokens bill at different rates, so one dollar figure has no
-    /// single token answer. [`Chat::money_budget_refusal`] says this with the
-    /// model's own price; this is the reading's own sentence, for callers
-    /// that only parse.
-    Money,
+    /// A figure that is not a cap in either unit.
     Unreadable(String),
+    /// A money figure finer than a micro-dollar — the unit a cap is kept in,
+    /// so it cannot be rounded away without capping a number nobody wrote.
+    Finer(String),
     Zero,
 }
 
 impl std::fmt::Display for BudgetArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Money => f.write_str(
-                "budget: the engine's cap counts tokens, not money, so a cap in dollars cannot \
-                 be enforced — cap tokens instead (e.g. /budget 200k)",
+            Self::Unreadable(word) => write!(
+                f,
+                "budget: {word} is neither tokens (200000, 200k, 1.5m) nor money ($2, $0.50)"
             ),
-            Self::Unreadable(word) => {
-                write!(
-                    f,
-                    "budget: {word} is not an amount (200000, 200k, 1.5m, off)"
-                )
+            Self::Finer(word) => write!(
+                f,
+                "budget: {word} is finer than a micro-dollar, the unit a money cap is kept in"
+            ),
+            Self::Zero => {
+                f.write_str("budget: the cap must be more than zero; /budget off lifts it instead")
             }
-            Self::Zero => f.write_str("budget: the cap must be at least one token"),
         }
     }
 }
 
 /// `200000`, `200k`, `1.5m` as tokens.
-fn parse_budget(word: &str) -> Result<u64, BudgetArgError> {
-    if word.starts_with('$') {
-        return Err(BudgetArgError::Money);
+/// A cap read off the command line, in the unit it was written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Budget {
+    /// Tokens: `/budget 200k`, `/budget 500`.
+    Tokens(u64),
+    /// Micro-dollars, a millionth of a dollar: `/budget $2`, `/budget $0.50`.
+    Money(u64),
+}
+
+/// Reads a cap in tokens or in money.
+///
+/// Money is parsed digit by digit into micro-dollars, never through a float:
+/// `$2` is exactly 2 000 000 and `$0.50` exactly 500 000, and a figure finer
+/// than a micro-dollar — or one carrying a sign — is refused rather than
+/// rounded into a cap nobody wrote. The token form keeps its own suffixes
+/// (`k`, `m`) and its own rounding.
+fn parse_budget(word: &str) -> Result<Budget, BudgetArgError> {
+    if let Some(money) = word.strip_prefix('$') {
+        return parse_money(money).map(Budget::Money);
     }
     let unreadable = || BudgetArgError::Unreadable(word.to_owned());
     let (digits, scale) = match word.as_bytes().last().ok_or_else(unreadable)? {
@@ -3844,10 +3906,60 @@ fn parse_budget(word: &str) -> Result<u64, BudgetArgError> {
     if tokens == 0 {
         return Err(BudgetArgError::Zero);
     }
-    Ok(tokens)
+    Ok(Budget::Tokens(tokens))
+}
+
+/// The digits after a `$`, as micro-dollars: `2`, `0.50`, `0.000001`.
+///
+/// Six decimal places is the whole of it — a micro-dollar is the unit the
+/// engine's ledger keeps and a price is stated in — so a seventh is refused
+/// rather than dropped.
+fn parse_money(word: &str) -> Result<u64, BudgetArgError> {
+    let unreadable = || BudgetArgError::Unreadable(format!("${word}"));
+    let (whole, fraction) = match word.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (word, ""),
+    };
+    // A sign is not part of an amount: `$-2` is a typo, not a negative cap.
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(unreadable());
+    }
+    if whole.is_empty() && fraction.is_empty() {
+        return Err(unreadable());
+    }
+    if fraction.len() > 6 {
+        return Err(BudgetArgError::Finer(format!("${word}")));
+    }
+    let units: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| unreadable())?
+    };
+    let part: u64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse().map_err(|_| unreadable())?
+    };
+    let micro = units
+        .checked_mul(1_000_000)
+        .and_then(|whole| whole.checked_add(part * 10u64.pow(6 - fraction.len() as u32)))
+        .ok_or_else(unreadable)?;
+    if micro == 0 {
+        return Err(BudgetArgError::Zero);
+    }
+    Ok(micro)
 }
 
 /// `part` as a whole percent of `whole`. An empty whole is 0%, not a panic.
+/// A money figure as the screen states it: `$0.38`, `$2.00`.
+///
+/// Two decimals is the session's own precision (`SESSION_COST_DECIMALS`);
+/// `format_usd` takes more only to keep a real fraction of a cent from reading
+/// as `$0.00`, which the `/budget` cap wants as much as the footer does.
+fn usd(micro_usd: u64) -> String {
+    titi_tui::status::format_usd(micro_usd, titi_tui::status::SESSION_COST_DECIMALS)
+}
+
 fn share(part: u64, whole: u64) -> u64 {
     if whole == 0 {
         0
@@ -5274,6 +5386,17 @@ fn dispatch(
         Some(ChatEffect::Send(command)) => {
             if engine.try_send(command).is_err() {
                 chat.push(LineKind::Error, "engine stopped".to_owned());
+            }
+            false
+        }
+        Some(ChatEffect::SendAll(commands)) => {
+            for command in commands {
+                if engine.try_send(command).is_err() {
+                    // One word per run: an engine that has gone does not take
+                    // the rest either.
+                    chat.push(LineKind::Error, "engine stopped".to_owned());
+                    break;
+                }
             }
             false
         }
@@ -8354,16 +8477,14 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 250,
             cached_tokens: 800,
-            // An unpriced model: the footer states no money.
-            cost_micro_usd: None,
+            // The engine's own figure for the turn ($0.00459, rounded to four
+            // places); the footer states this, not one it computed.
+            cost_micro_usd: Some(4_590),
         });
         chat.on_event(EngineEvent::TurnFinished {
             turn_id: TurnId(1),
             reason: StopReason::Stop,
         });
-
-        // 200 in x $3/MTok + 800 cached x $0.30/MTok + 250 out x $15/MTok
-        // = $0.00459, rounded to four places.
         let footer = last_footer(&chat).unwrap_or_default();
         assert!(
             footer.ends_with("1k prompt (800 cached) · 250 out · $0.0046"),
@@ -8376,6 +8497,57 @@ mod tests {
             rows.join("").contains("· $0.0046"),
             "the money is on the frame: {rows:?}"
         );
+    }
+
+    /// The figure is the engine's, not one this surface could compute: the
+    /// same turn on the same priced model, with the engine reporting another
+    /// number, prints the engine's.
+    #[test]
+    fn the_footer_states_the_engines_figure_not_its_own() {
+        let mut chat = priced_chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now() - Duration::from_millis(1_400));
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "answer".into(),
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 250,
+            cached_tokens: 800,
+            // The catalogue price for these counts would say $0.0046.
+            cost_micro_usd: Some(1_000_000),
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let footer = last_footer(&chat).unwrap_or_default();
+        assert!(footer.ends_with("· $1.00"), "{footer}");
+
+        // An unpriced report leaves no figure at all, and `/usage` states no
+        // session total rather than `$0.00`, which would say the turn was
+        // free. (The floor marker for a *mixed* session is
+        // `usage_marks_a_total_that_leaves_turns_out`.)
+        let mut unpriced = priced_chat();
+        unpriced.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 250,
+            cached_tokens: 800,
+            cost_micro_usd: None,
+        });
+        assert!(last_footer(&unpriced).is_none(), "no usage row is built");
+        type_text(&mut unpriced, "/usage");
+        unpriced.on_key(Key::Enter, Instant::now());
+        let said = unpriced
+            .lines
+            .last()
+            .map(|line| line.text.clone())
+            .unwrap_or_default();
+        assert!(!said.contains('$'), "{said}");
+        assert!(!said.contains("session total"), "{said}");
     }
 
     /// An unpriced model's footer has no money part at all: the screen says
@@ -10976,10 +11148,15 @@ mod tests {
             }))
         );
 
+        // "no cap" is one intent and the engine keeps two bounds: one
+        // keystroke lifts both.
         type_text(&mut chat, "/budget off");
         assert_eq!(
             chat.on_key(Key::Enter, Instant::now()).effect,
-            Some(ChatEffect::Send(EngineCommand::SetBudget { tokens: None }))
+            Some(ChatEffect::SendAll(vec![
+                EngineCommand::SetBudget { tokens: None },
+                EngineCommand::SetMoneyBudget { micro_usd: None },
+            ]))
         );
 
         chat.on_event(EngineEvent::BudgetUpdated {
@@ -11007,28 +11184,156 @@ mod tests {
         );
     }
 
+    /// A cap in money is a cap: `$2` reads as exactly two million
+    /// micro-dollars — no float, no rounding — and goes to the engine as its
+    /// own command, beside the token one.
+    #[test]
+    fn budget_caps_money_as_well_as_tokens() {
+        let mut chat = chat();
+        type_text(&mut chat, "/budget $2");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMoneyBudget {
+                micro_usd: Some(2_000_000)
+            }))
+        );
+        assert!(
+            chat.lines.iter().any(|line| line.text == "budget: $2.00"),
+            "{:?}",
+            chat.lines.last()
+        );
+
+        // A fraction of a cent is a cap too, and prints as one rather than as
+        // `$0.00`.
+        type_text(&mut chat, "/budget $0.000001");
+        assert_eq!(
+            chat.on_key(Key::Enter, Instant::now()).effect,
+            Some(ChatEffect::Send(EngineCommand::SetMoneyBudget {
+                micro_usd: Some(1)
+            }))
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text == "budget: $0.000001"),
+            "{:?}",
+            chat.lines.last()
+        );
+    }
+
+    /// The three money events, each in the shape the token bound's already is:
+    /// the state `/budget` reports, the pause the cap leaves, and the model the
+    /// engine cannot measure.
+    #[test]
+    fn the_money_budget_events_state_themselves() {
+        let mut chat = chat();
+        chat.on_event(EngineEvent::MoneyBudgetUpdated {
+            spent_micro_usd: 380_000,
+            limit_micro_usd: Some(2_000_000),
+        });
+        type_text(&mut chat, "/budget");
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("$0.38 of $2.00 in money")),
+            "{:?}",
+            chat.lines.last()
+        );
+
+        // The cap reached: the same paused screen the token cap leaves.
+        chat.on_event(EngineEvent::MoneyBudgetExceeded {
+            spent_micro_usd: 2_010_000,
+            limit_micro_usd: 2_000_000,
+        });
+        assert!(chat.paused);
+        assert!(
+            chat.lines.iter().any(|line| line.kind == LineKind::Error
+                && line
+                    .text
+                    .contains("budget reached: $2.01 of $2.00 in money")),
+            "{:?}",
+            chat.lines.last()
+        );
+
+        // A cap over a model with no price is named, not silently unenforced.
+        let mut unpriced = chat_with_theme(test_theme());
+        unpriced.on_event(EngineEvent::MoneyBudgetUnpriced {
+            model: "local/llama".into(),
+        });
+        assert!(
+            unpriced
+                .lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error
+                    && line.text
+                        == "budget: local/llama has no price, so a cap in money cannot be enforced \
+                        over it"),
+            "{:?}",
+            unpriced.lines.last()
+        );
+    }
+
     /// A cap in money cannot be enforced by a token cap — the engine counts
     /// tokens, and those bill at different rates — so it is refused, and the
     /// refusal names what is missing instead of converting at a guessed rate.
     #[test]
-    fn budget_refuses_money_and_nonsense() {
+    fn budget_reads_tokens_and_money_exactly() {
+        // Tokens keep their own suffixes and their own rounding.
+        assert_eq!(parse_budget("200k"), Ok(Budget::Tokens(200_000)));
+        assert_eq!(parse_budget("1.5m"), Ok(Budget::Tokens(1_500_000)));
+        assert_eq!(parse_budget("500"), Ok(Budget::Tokens(500)));
+
+        // Money is digits into micro-dollars: exact, never a float.
+        assert_eq!(parse_budget("$2"), Ok(Budget::Money(2_000_000)));
+        assert_eq!(parse_budget("$0.50"), Ok(Budget::Money(500_000)));
+        assert_eq!(parse_budget("$0.5"), Ok(Budget::Money(500_000)));
+        assert_eq!(parse_budget("$0.000001"), Ok(Budget::Money(1)));
+        assert_eq!(parse_budget("$.50"), Ok(Budget::Money(500_000)));
+        assert_eq!(parse_budget("$12"), Ok(Budget::Money(12_000_000)));
+
+        // A typo is a typo in either unit.
+        for word in ["plenty", "$", "$-2", "$2.5.5", "$1e3", "$ 2", ""] {
+            assert!(
+                matches!(parse_budget(word), Err(BudgetArgError::Unreadable(_))),
+                "{word:?} parsed"
+            );
+        }
+        // Zero is no cap in either unit.
+        assert_eq!(parse_budget("0"), Err(BudgetArgError::Zero));
+        assert_eq!(parse_budget("$0"), Err(BudgetArgError::Zero));
+        assert_eq!(parse_budget("$0.00"), Err(BudgetArgError::Zero));
+        // Seven decimals of zero is refused for its shape: the precision is
+        // checked before the amount, because that is the typo it is.
+        assert_eq!(
+            parse_budget("$0.0000000"),
+            Err(BudgetArgError::Finer("$0.0000000".to_owned()))
+        );
+        // Finer than the unit a cap is kept in, so it is refused rather than
+        // rounded into a different cap.
+        assert_eq!(
+            parse_budget("$0.0000001"),
+            Err(BudgetArgError::Finer("$0.0000001".to_owned()))
+        );
+
+        // …and the command says which of them happened.
         let mut chat = chat();
-        type_text(&mut chat, "/budget $5");
+        type_text(&mut chat, "/budget $0.0000001");
         assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
         assert!(
             chat.lines.iter().any(|line| line.kind == LineKind::Error
-                && line.text.contains("has no price here")
-                && line.text.contains("cap tokens instead")),
-            "the refusal says which piece is missing: {:?}",
+                && line.text.contains("finer than a micro-dollar")),
+            "{:?}",
             chat.lines.last()
         );
-
         type_text(&mut chat, "/budget plenty");
         assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
         assert!(
             chat.lines
                 .iter()
-                .any(|line| line.kind == LineKind::Error && line.text.contains("plenty"))
+                .any(|line| line.kind == LineKind::Error && line.text.contains("neither tokens")),
+            "{:?}",
+            chat.lines.last()
         );
     }
 
@@ -11036,19 +11341,6 @@ mod tests {
     /// see that the price is known and that the missing piece is the engine's
     /// tally, not a number this screen failed to look up.
     #[test]
-    fn budget_refusal_states_a_price_it_does_know() {
-        let mut chat = priced_chat();
-        type_text(&mut chat, "/budget $2");
-        assert!(chat.on_key(Key::Enter, Instant::now()).effect.is_none());
-        let said = chat
-            .lines
-            .last()
-            .map(|line| line.text.clone())
-            .unwrap_or_default();
-        assert!(said.contains("$3.00 in / $15.00 out per MTok"), "{said}");
-        assert!(said.contains("cost ledger"), "{said}");
-    }
-
     /// Hitting the cap pauses: the next prompt is held instead of sent.
     #[test]
     fn a_reached_budget_pauses_the_screen() {
@@ -12219,16 +12511,15 @@ mod tests {
             prompt_tokens: 100_000,
             completion_tokens: 5_000,
             cached_tokens: 0,
-            // An unpriced model: the footer states no money.
-            cost_micro_usd: None,
+            // The engine's figures, turn by turn: $0.375 and $0.0015.
+            cost_micro_usd: Some(375_000),
         });
         chat.on_event(EngineEvent::TurnUsage {
             turn_id: TurnId(2),
             prompt_tokens: 1_200,
             completion_tokens: 40,
             cached_tokens: 1_000,
-            // An unpriced model: the footer states no money.
-            cost_micro_usd: None,
+            cost_micro_usd: Some(1_500),
         });
         type_text(&mut chat, "/usage");
         chat.on_key(Key::Enter, Instant::now());
@@ -12253,18 +12544,17 @@ mod tests {
             prompt_tokens: 100_000,
             completion_tokens: 5_000,
             cached_tokens: 0,
-            // An unpriced model: the footer states no money.
-            cost_micro_usd: None,
+            // The engine's own figure: $0.375.
+            cost_micro_usd: Some(375_000),
         });
-        // The switch a `/model ollama/qwen3` makes: the next turn has no
-        // price to read.
+        // The switch a `/model ollama/qwen3` makes: the next turn's report
+        // carries no figure at all, because the engine cannot price it.
         chat.model = "ollama/qwen3".to_owned();
         chat.on_event(EngineEvent::TurnUsage {
             turn_id: TurnId(2),
             prompt_tokens: 500,
             completion_tokens: 20,
             cached_tokens: 0,
-            // An unpriced model: the footer states no money.
             cost_micro_usd: None,
         });
         type_text(&mut chat, "/usage");
