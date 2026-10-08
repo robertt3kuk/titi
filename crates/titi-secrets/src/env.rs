@@ -1,9 +1,15 @@
 //! Layered dotenv resolution.
 //!
-//! Priority (highest wins): process env → `<project>/.env` →
-//! `<agent_dir>/.env`. A later layer fills only
+//! Priority (highest wins): process env → `<agent_dir>/.env` →
+//! `<project>/.env`. A later layer fills only
 //! keys that are still unset; the process environment is never mutated by
 //! resolution — injection happens only through [`load_into`]'s mutator.
+//!
+//! The project layer is deliberately last: a cloned repository must not
+//! choose which credential a request carries, nor shadow a key the user's
+//! own agent layer defines. It may only add keys nobody else defines. This
+//! mirrors `titi_config::Settings::get_user` (`crates/titi-config/src/settings.rs`),
+//! where the project file can add but never override the user's own layer.
 //!
 //! Spec: docs/research/secrets-env/README.md.
 
@@ -34,8 +40,11 @@ impl LayeredEnv {
         Self::new(project_dir, titi_config::agent_dir())
     }
 
+    /// Highest priority first; the project layer resolves last so a cloned
+    /// repository can fill a key nobody else defines but never override the
+    /// agent's own layer (same precedence as `titi_config::Settings::get_user`).
     fn layer_files(&self) -> [PathBuf; 2] {
-        [self.project_dir.join(".env"), self.agent_dir.join(".env")]
+        [self.agent_dir.join(".env"), self.project_dir.join(".env")]
     }
 
     /// Resolve `key` without mutating the process environment.
@@ -49,7 +58,7 @@ impl LayeredEnv {
     }
 
     /// Inject every key that is absent from the process environment, in layer
-    /// order (project → agent); the first file that defines a
+    /// order (agent → project); the first file that defines a
     /// key wins. Values reach the process only through `inject` (e.g.
     /// `|k, v| std::env::set_var(k, v)` in a controlled entry point).
     pub fn load_into(&self, mut inject: impl FnMut(String, String)) {
@@ -229,15 +238,34 @@ mod tests {
     }
 
     #[test]
-    fn priority_layers_project_then_agent() {
+    fn priority_layers_agent_then_project() {
         let dir = tmpdir();
         write_file(dir.path(), ".env", "SHARED=project\nONLY_PROJECT=p\n");
         write_file(dir.path(), "agent/.env", "SHARED=agent\nONLY_AGENT=a\n");
         let env = LayeredEnv::new(dir.path(), dir.path().join("agent"));
-        assert_eq!(env.resolve("SHARED").as_deref(), Some("project"));
+        // Agent's own layer outranks the project's: a cloned repo cannot
+        // choose the credential.
+        assert_eq!(env.resolve("SHARED").as_deref(), Some("agent"));
+        // The project layer can still fill a key nobody else defines.
         assert_eq!(env.resolve("ONLY_PROJECT").as_deref(), Some("p"));
         assert_eq!(env.resolve("ONLY_AGENT").as_deref(), Some("a"));
         assert_eq!(env.resolve("MISSING"), None);
+    }
+
+    #[test]
+    fn load_into_agrees_with_resolve_for_doubly_defined_key() {
+        let dir = tmpdir();
+        write_file(dir.path(), ".env", "SHARED=project\n");
+        write_file(dir.path(), "agent/.env", "SHARED=agent\n");
+        let env = LayeredEnv::new(dir.path(), dir.path().join("agent"));
+        let resolved = env.resolve("SHARED");
+        let mut injected = BTreeMap::new();
+        env.load_into(|k, v| {
+            injected.insert(k, v);
+        });
+        assert_eq!(resolved.as_deref(), Some("agent"));
+        // A tool's child process must see the same key the request carries.
+        assert_eq!(injected.get("SHARED"), resolved.as_ref());
     }
 
     #[test]
@@ -251,7 +279,7 @@ mod tests {
             injected.insert(k, v);
         });
         // Process-env `PATH` is never injected; file keys are.
-        assert_eq!(injected.get("SHARED").map(String::as_str), Some("project"));
+        assert_eq!(injected.get("SHARED").map(String::as_str), Some("agent"));
         assert_eq!(injected.get("AGENT_ONLY").map(String::as_str), Some("1"));
         assert!(!injected.contains_key("PATH"));
         assert_eq!(std::env::var_os("SHARED"), None);
