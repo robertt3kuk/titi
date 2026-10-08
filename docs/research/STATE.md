@@ -644,15 +644,15 @@ next, and the two worker notes it could not see yet.
   surface: `chat.rs` contributes none of the 11 headers the measurement now
   finds, so whatever became of them, nothing in that file is behind an
   unscoped allow any more.
-- [ ] `medium` wire `AskRequested` into the chat, so the held `ask` commits can
-  land: `d52f1cf` (the tool and the engine's `SessionAsk`), `ebf8fc6` (the
-  headless answer path) and `015f8ed` (its test file's mode bit) are committed
-  on the local `master` and **held out of the pushed branch**, because the
-  engine parks a turn on an `AskRequested` that the interactive surface does not
-  answer — a model calling `ask` on the screen would wait for a reply that never
-  comes. The path to add is the one the headless surface already uses
-  (`EngineCommand::AnswerAsk`), answered from a panel of the kind the model,
-  theme and history browsers already share.
+- [x] `medium` ~~wire `AskRequested` into the chat, so the held `ask` commits can
+  land~~ landed 2026-10-09 in `c505bd7`: the panel follows the approval prompt's
+  interaction (the question is the title, the choices are the rows, arrows move
+  and Enter takes a row, Space ticks on a multi-choice question and Enter sends
+  the set with an empty set refused, Esc answers `Cancelled`, Ctrl+C interrupts
+  the turn as over an approval, and a printable character answers in the
+  composer). `d52f1cf` (the tool and the engine's `SessionAsk`), `ebf8fc6` (the
+  headless answer path) and `015f8ed` (its test's mode bit) are on `master` with
+  it.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -1094,46 +1094,74 @@ Two commits landed **while this round was running**, after the eight above, so
 the range grew after the inventory: `e5b72ff` drops a stray doc block and
 `#[test]` that `be0211f` left behind when it removed a test — the next test
 carried two attributes and every test build warned
-`duplicate_macro_attributes` — and **that commit is where this push stops**.
+`duplicate_macro_attributes` — and **`e5b72ff` is where the previous push
+stopped**.
 
-**Held out of `master` on purpose, on the owner's word:** `d52f1cf` adds the
-`ask` tool (the model's way to put a question to the user), `ebf8fc6` wires its
-answer path through `headless.rs`, and `015f8ed` fixes the mode bit on its test
-file. They stay off `master` because the **interactive surface is not wired
-yet**: the engine parks the turn on an `AskRequested` the chat does not answer
-yet, so a model that calls `ask` on the screen would wait for a reply that never
-comes. Their design is recorded here for whoever lands that surface, because it
-was decided deliberately: the tool owns no surface of its own — it hands an
-`AskRequest` to an `AskSink` the session installs (`ToolHandler::set_ask`,
-mirroring `bash`'s background door), and the engine's `SessionAsk` turns one ask
-into one `EngineEvent::AskRequested` plus a wait on a oneshot that
-`EngineCommand::AnswerAsk` resolves; it is **read-tier**, so a question is never
+**`ask` is in, end to end.** `d52f1cf` added the tool and the engine's
+`SessionAsk`, `ebf8fc6` the headless answer path, `c505bd7` the screen's panel
+and `015f8ed` the mode bit on the tool's test file. The whole line landed once
+the interactive surface existed, which is exactly why it was held back a round:
+a question the chat could not answer would have parked the turn. The shape is as
+designed — the tool owns no surface (it hands an `AskRequest` to an `AskSink` the
+session installs, `ToolHandler::set_ask`, the shape `bash`'s background door
+already had), the engine's `SessionAsk` turns one ask into one
+`EngineEvent::AskRequested` plus a wait on a oneshot that
+`EngineCommand::AnswerAsk` resolves, and the panel follows the approval prompt's
+interaction because it is the same kind of moment: the model is stopped, the
+session reads `needs you`, and the keys belong to the prompt until it is
+answered — arrows move, Enter takes a row, Space ticks rows on a multi-choice
+question and Enter sends the set (an empty set is refused with a hint, because
+it is not an answer), Esc answers `Cancelled`, and Ctrl+C interrupts the turn
+exactly as it does over an approval. One question per call, with a cap on the
+choices (a longer dialog "is not a question, it is a document", the module
+says), and a question with no list is answered in the user's own words in the
+composer. Deliberate and unchanged: it is **read-tier**, so a question is never
 itself a prompt to approve (plan mode keeps it with `read`, duck mode withholds
-it with the other read-tier tools); a subagent **cannot** ask (its registry is
-built without the door, so its `ask` answers "no user to ask" and the subagent
-carries on, where omp aborts the whole turn, because forwarding to the parent's
-surface would attribute a question to a worker the user never started); the
-answer path is interruption, not a deadline (a cancel raises the session's
-`Interrupt`, the wait selects on it, and the tool answers `Cancelled` — "the
-user did not answer … the turn was cancelled. Do not assume an answer."); and
-there is **no timeout**, where omp's auto-selects the recommended option,
-because a deadline would have to answer a question only the user can. Until the
-chat answers an `AskRequested`, the tool is a *branch's* work and not `master`'s
-behaviour.
+it); a **subagent cannot ask** — its registry is built without the door, so its
+`ask` answers "no user to ask" and the subagent carries on, where omp aborts the
+whole turn, because forwarding to the parent's surface would attribute a
+question to a worker the user never started; the answer path is **interruption,
+not a deadline** (there is no timeout, where omp's auto-selects the recommended
+option, because a deadline would have to answer a question only the user can);
+and a session with no surface says so rather than waiting forever.
 
-The main checkout holds nothing uncommitted but the two files this commit
-writes; the `ask` line above sits on the local `master` and is not pushed.
+The network guard closed the two holes that were left beside it. `fetch` refused
+a metadata host **by name** and then let its client follow five redirects itself,
+so a page answering `302 Location: http://169.254.169.254/latest/meta-data/`
+walked straight past it; `b8a51ad` makes the client follow nothing
+(`Policy::none()`) and has `fetch` follow by hand — every hop parsed,
+scheme-checked and refused-or-allowed exactly as the first URL is, a relative
+`Location` resolved against the URL that answered, the chain bounded by
+`FETCH_REDIRECTS` (5, the bound the client used to apply) with
+`TooManyRedirects` naming the count and the last URL, and a redirect with no
+`Location` reported as the status it is. Refusing by name *and* by URL still
+cannot catch a name that **resolves** to a metadata address — `metadata.example.
+com` with an A record of 169.254.169.254 passed every check — and resolving in
+the tool would not fix it either, because the address checked and the address
+connected would be two lookups with a rebind or a second answer between them;
+`924190c` moves the refusal to where a name becomes addresses: `GuardedResolver`
+wraps the system's resolution and drops every answer `forbidden_address` names
+(link-local `169.254.0.0/16` and `fe80::/10`, and the metadata addresses),
+failing the lookup with the sentence the URL check uses when every answer is
+forbidden, and `refusal_in` walks the client's error chain so the tool answers
+`Refused` rather than `request failed`. `metadata_refusal` now builds its words
+from the same `forbidden_address`, so the URL check and the address check cannot
+drift apart.
 
-The suite went 1907 → **1925 passed** (77 targets, 0 failed) **at the commit this
-pushes** (`e5b72ff`): engine `tests/budget.rs` +3 (the money cap and its ledger),
-`titi-cli` unit +14 (`/tree`, the paste menu, the decimal parse and the
-self-ignoring directory, less the budget test `be0211f` removed) and
-`titi-genome` unit +1. The held `ask` line is not in that count — it would add
-another target and eight tests, and it is not on `master`. The `unwrap`/`expect`
-headers went 9 → **6** of **95** `warning:` lines: `titi-genome/src/shared.rs` 5
-(the deliberate poisoned-lock panics) and `titi-tui/src/theme/mod.rs` 1 —
-`refs.rs`'s three left the count because `ec6df82` compiled them through
-`patterns::literal_regex`, the single item-level allow whose comment says a
-literal pattern cannot fail for any input. All three gates ran in a clean
-detached worktree of that exact sha with its own target directory, so the shared
-`target/` in the main checkout was never built against.
+`a973055` moved the welcome out of `chat.rs` into `welcome.rs` — 592 lines out,
+611 in — continuing the split the wave before it started.
+
+Nothing is in flight: the main checkout is clean and both workers are idle.
+
+The suite went 1925 → **1952 passed** (78 targets, 0 failed) at this head, with
+the ask line and the network guard in it: the new engine `tests/ask.rs` +3, the
+`titi-cli` unit tests +8 (the screen's panel) and `titi-tools` unit +16 (the
+per-hop redirect check and the guarded resolver). The `unwrap`/`expect` headers
+are unchanged at **6** of **95** `warning:` lines —
+`titi-genome/src/shared.rs` 5 (the deliberate poisoned-lock panics) and
+`titi-tui/src/theme/mod.rs` 1 — because nothing here added a new one, and
+`refs.rs`'s three stay out of the count through `patterns::literal_regex`, the
+single item-level allow whose comment says a literal pattern cannot fail for any
+input. All three gates ran in a clean detached worktree of this head with its
+own target directory, so the shared `target/` in the main checkout was never
+built against.
