@@ -321,6 +321,24 @@ impl ModelCatalog {
     }
 }
 
+/// Models offered by the picker — the fallback chains from
+/// `docs/research/STATE.md`.
+pub fn model_choices() -> Vec<String> {
+    [
+        "opencode-go/glm-5.3-flash",
+        "clinepass/glm-5.3",
+        "opencode-go/deepseek-v4-flash",
+        "clinepass/deepseek-v4-flash",
+        "bai/glm-5.3-flash",
+        "bai/qwen3.8-flash",
+        "clinepass/deepseek-v4-pro",
+        "qwen3.8-max",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 /// A refusal short enough for a one-line header, where the full sentence
 /// would be truncated away. The provider and the status are the two things
 /// the user needs; the rest is in the transcript line beside it.
@@ -744,7 +762,7 @@ pub fn start_engine_with(
             Ok(Some((id, _))) => {
                 // One place builds the replayed history, so `/rewind` and
                 // startup cannot disagree about what the model sees.
-                restored = crate::app::session_history(&agent_dir, &id).unwrap_or_default();
+                restored = crate::session_fs::session_history(&agent_dir, &id).unwrap_or_default();
                 id
             }
             _ => store

@@ -12,5 +12,7 @@ pub mod login;
 pub mod ompcast;
 pub mod recap;
 pub mod secrets;
+pub mod session_fs;
 pub mod session_log;
+pub mod themes;
 pub mod title;

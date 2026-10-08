@@ -218,7 +218,7 @@ pub fn replay<W: Write>(path: &Path, pace: Pace, out: &mut W) -> Result<(), Cast
 pub fn play<W: Write>(records: &[CastRecord], pace: Pace, out: &mut W) -> Result<(), CastError> {
     // Replay colours nothing, but the [`Chat`] it drives carries the theme the
     // live screen would have drawn with, resolved the same way.
-    let theme = crate::app::default_theme()
+    let theme = crate::themes::default_theme()
         .map_err(|reason| CastError::Io(std::io::Error::other(reason)))?;
     let mut chat = Chat::new("replay", "replay", theme);
     let mut shown = 0;

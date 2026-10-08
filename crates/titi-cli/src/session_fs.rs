@@ -1,0 +1,250 @@
+//! Session, checkpoint, workspace and CLI-config helpers.
+//!
+//! These free functions used to live in `app.rs` — a file named after the dead
+//! `App` stack. They are not part of `App`: `chat.rs` imports them 43 times,
+//! `engine.rs`, `ompcast.rs` and `main.rs` too, and one new dead helper landed
+//! in `app.rs` this week precisely because the live code and the dead stack
+//! shared a file. Nothing here depends on `App`.
+
+use titi_tui::caps::MousePreset;
+
+/// The config key that stores the mouse-tracking preset.
+pub const MOUSE_TRACKING_KEY: &str = "display.mouse_tracking";
+
+/// Load the persisted mouse preset from the titi config.
+///
+/// `agent_dir` is the settings root (see [`titi_config::agent_dir`]).
+/// Returns `None` when the key is absent or unparsable (caller falls back to
+/// its own default).
+pub fn load_mouse_preset_from(agent_dir: &std::path::Path) -> Option<MousePreset> {
+    use titi_config::settings::Settings;
+    let settings = Settings::load(
+        agent_dir,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        &[],
+    )
+    .ok()?;
+    let value = settings.get(MOUSE_TRACKING_KEY)?;
+    let name = match value {
+        serde_json::Value::String(s) => s,
+        _ => return None,
+    };
+    MousePreset::parse(&name)
+}
+
+/// Load the persisted mouse preset using the real agent directory.
+pub fn load_mouse_preset() -> Option<MousePreset> {
+    load_mouse_preset_from(&titi_config::agent_dir())
+}
+
+/// Persist the mouse preset to the titi config (`display.mouse_tracking`).
+pub fn save_mouse_preset_to(
+    agent_dir: &std::path::Path,
+    preset: MousePreset,
+) -> Result<(), String> {
+    use titi_config::settings::Settings;
+    let mut settings = Settings::load(
+        agent_dir,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        &[],
+    )
+    .map_err(|e| format!("{e}"))?;
+    settings
+        .set(MOUSE_TRACKING_KEY, serde_json::json!(preset.name()))
+        .map_err(|e| format!("{e}"))
+}
+
+/// Persist the mouse preset using the real agent directory.
+pub fn save_mouse_preset(preset: MousePreset) -> Result<(), String> {
+    save_mouse_preset_to(&titi_config::agent_dir(), preset)
+}
+
+pub fn list_sessions_from(agent_dir: &std::path::Path) -> Vec<String> {
+    let dir = agent_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<(std::time::SystemTime, String)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((
+                modified,
+                e.path().file_stem()?.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect();
+    ids.sort_by_key(|a| std::cmp::Reverse(a.0));
+    ids.into_iter().map(|(_, id)| id).collect()
+}
+
+/// [`list_sessions_from`] against the real agent directory.
+pub fn list_sessions() -> Vec<String> {
+    list_sessions_from(&titi_config::agent_dir())
+}
+
+/// Delete a session's JSONL file.  Callers must gate this behind an
+/// approval prompt — Esc never reaches here.
+pub fn delete_session_from(agent_dir: &std::path::Path, id: &str) -> Result<(), String> {
+    let path = agent_dir.join("sessions").join(format!("{id}.jsonl"));
+    std::fs::remove_file(&path).map_err(|e| format!("{e}"))
+}
+
+/// [`delete_session_from`] against the real agent directory.
+pub fn delete_session(id: &str) -> Result<(), String> {
+    delete_session_from(&titi_config::agent_dir(), id)
+}
+
+/// Creates an empty session and returns its id.
+pub fn new_session(agent_dir: &std::path::Path) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    store
+        .create(titi_core::session::SessionMeta {
+            title: Some("titi".into()),
+            source: Some("cli".into()),
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())
+}
+
+pub fn fork_session(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let new_id = store
+        .fork_session(session_id, titi_core::session::SessionMeta::default())
+        .map_err(|e| e.to_string())?;
+    Ok(format!("forked to {new_id} · restart to resume it"))
+}
+
+pub fn export_session(
+    agent_dir: &std::path::Path,
+    session_id: &str,
+    path: &str,
+) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+
+    // Default to markdown if not specified in path
+    let format = if path.ends_with(".jsonl") {
+        titi_core::session::export::ExportFormat::Jsonl
+    } else {
+        titi_core::session::export::ExportFormat::Markdown
+    };
+
+    let path_val = if path.is_empty() {
+        let exports_dir = agent_dir.join("exports");
+        let _ = std::fs::create_dir_all(&exports_dir);
+        exports_dir.join(format!("{session_id}.md"))
+    } else {
+        std::path::PathBuf::from(path.to_owned())
+    };
+
+    store
+        .export_to_file(session_id, format, &path_val)
+        .map_err(|e| e.to_string())?;
+
+    Ok(format!("exported to {}", path_val.display()))
+}
+
+/// The conversation a resumed session replays: the path to its current leaf,
+/// capped at a boundary that keeps every tool round whole, so an old
+/// transcript cannot crowd out the workspace map or replay an orphan call.
+pub fn session_history(
+    agent_dir: &std::path::Path,
+    session_id: &str,
+) -> Result<Vec<titi_providers::ChatMessage>, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let entries = store.walk(session_id, None).map_err(|e| e.to_string())?;
+    Ok(crate::engine::restore_window(
+        titi_core::session::entries_to_messages(&entries),
+        crate::engine::MAX_RESTORED_MESSAGES,
+    ))
+}
+
+/// The directory a checkpoint pins and a rewind restores: where titi runs.
+pub fn current_workspace() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| ".".into())
+}
+
+/// Record a rewind point on a session; returns a human summary.
+///
+/// `workspace` is explicit: taking the process cwd here made the tests
+/// commit into whatever checkout ran them.
+pub fn checkpoint_session(
+    agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let mut checkpoint = store.checkpoint(session_id).map_err(|e| e.to_string())?;
+    // Also pin the workspace, so a later rewind can undo code and not only
+    // the transcript. A directory that is not a repo stays session-only.
+    let git = crate::git_checkpoint::snapshot(
+        workspace,
+        &format!("{session_id} · {} entries", checkpoint.entries),
+    );
+    if let Ok(commit) = &git {
+        checkpoint.git_commit = Some(commit.clone());
+        let _ = store.record_git_commit(session_id, commit);
+    }
+    let suffix = match &git {
+        Ok(commit) => format!(" · git {}", &commit[..7.min(commit.len())]),
+        Err(_) => String::new(),
+    };
+    Ok(format!(
+        "checkpoint: {} entries{suffix}",
+        checkpoint.entries
+    ))
+}
+
+/// List a session's rewind points, oldest first.
+pub fn list_checkpoints(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let all = store.checkpoints(session_id).map_err(|e| e.to_string())?;
+    if all.is_empty() {
+        return Ok("checkpoints: none".into());
+    }
+    let rows: Vec<String> = all
+        .iter()
+        .enumerate()
+        .map(|(i, cp)| format!("#{} · {} entries", i + 1, cp.entries))
+        .collect();
+    Ok(format!("checkpoints: {}", rows.join(" | ")))
+}
+
+/// Rewind a session to checkpoint `index` (1-based); the newest when `None`.
+pub fn rewind_session(
+    agent_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+    index: Option<usize>,
+) -> Result<String, String> {
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
+    let all = store.checkpoints(session_id).map_err(|e| e.to_string())?;
+    if all.is_empty() {
+        return Err("no checkpoints recorded".into());
+    }
+    let position = match index {
+        None => all.len() - 1,
+        Some(0) => return Err("checkpoints are numbered from 1".into()),
+        Some(n) if n <= all.len() => n - 1,
+        Some(n) => return Err(format!("no checkpoint #{n} (have {})", all.len())),
+    };
+    let target = all[position].clone();
+    store
+        .rewind(session_id, &target)
+        .map_err(|e| e.to_string())?;
+    // Put the files back too, when the checkpoint pinned a commit and the
+    // tree is clean. A dirty tree is reported rather than overwritten.
+    let git = match &target.git_commit {
+        Some(commit) => match crate::git_checkpoint::restore(workspace, commit) {
+            Ok(()) => format!(" · git {}", &commit[..7.min(commit.len())]),
+            Err(reason) => format!(" · git not restored: {reason}"),
+        },
+        None => String::new(),
+    };
+    Ok(format!(
+        "rewound to checkpoint #{} ({} entries){git}",
+        position + 1,
+        target.entries
+    ))
+}

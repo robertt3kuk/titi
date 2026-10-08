@@ -30,8 +30,8 @@ use titi_tui::space_hold::{SpaceHold, SpaceHoldOutcome, delete_before_cursor};
 use titi_tui::status::AgentState;
 use titi_tui::status_bar::{live_snapshot, render_status_bar};
 use titi_tui::theme::{
-    Appearance, AppearanceEvent, AppearanceInputs, ColorMode, SymbolPreset, Theme,
-    appearance_from_rgb, classify_appearance_bytes, global,
+    Appearance, AppearanceEvent, AppearanceInputs, Theme, appearance_from_rgb,
+    classify_appearance_bytes, global,
 };
 use titi_tui::transcript::{Alert, Entry, Transcript};
 
@@ -404,7 +404,7 @@ impl App {
     /// stored under `<agent_dir>/sessions`.
     pub fn open_session_switcher(&mut self) {
         let mut titles = vec!["current".to_owned()];
-        titles.extend(list_sessions());
+        titles.extend(crate::session_fs::list_sessions());
         self.open_session_switcher_over(titles);
     }
 
@@ -1166,7 +1166,7 @@ impl App {
 
     fn model_choices(&self) -> Vec<String> {
         if self.available_models.is_empty() {
-            model_choices()
+            crate::engine::model_choices()
         } else {
             self.available_models.clone()
         }
@@ -1768,9 +1768,9 @@ impl App {
             }
             "checkpoint" => {
                 match self.session_id.as_deref() {
-                    Some(id) => match checkpoint_session(
+                    Some(id) => match crate::session_fs::checkpoint_session(
                         &titi_config::agent_dir(),
-                        &current_workspace(),
+                        &crate::session_fs::current_workspace(),
                         id,
                     ) {
                         Ok(summary) => self.set_alert(summary),
@@ -1782,10 +1782,12 @@ impl App {
             }
             "checkpoints" => {
                 match self.session_id.as_deref() {
-                    Some(id) => match list_checkpoints(&titi_config::agent_dir(), id) {
-                        Ok(summary) => self.set_alert(summary),
-                        Err(reason) => self.set_alert(format!("checkpoints: {reason}")),
-                    },
+                    Some(id) => {
+                        match crate::session_fs::list_checkpoints(&titi_config::agent_dir(), id) {
+                            Ok(summary) => self.set_alert(summary),
+                            Err(reason) => self.set_alert(format!("checkpoints: {reason}")),
+                        }
+                    }
                     None => self.set_alert("checkpoints: no live session"),
                 }
                 None
@@ -1802,9 +1804,9 @@ impl App {
                     (None, _) => self.set_alert("rewind: no live session"),
                     (Some(_), Err(reason)) => self.set_alert(format!("rewind: {reason}")),
                     (Some(id), Ok(index)) => {
-                        match rewind_session(
+                        match crate::session_fs::rewind_session(
                             &titi_config::agent_dir(),
-                            &current_workspace(),
+                            &crate::session_fs::current_workspace(),
                             id,
                             index,
                         ) {
@@ -1865,167 +1867,11 @@ impl App {
     }
 }
 
-/// The config key that stores the mouse-tracking preset.
-pub const MOUSE_TRACKING_KEY: &str = "display.mouse_tracking";
-
 /// How long the first exit request stays armed.
 pub const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
 /// What the first Ctrl+C says.
 pub const EXIT_HINT: &str = "press Ctrl+C again to exit";
-
-/// Load the persisted mouse preset from the titi config.
-///
-/// `agent_dir` is the settings root (see [`titi_config::agent_dir`]).
-/// Returns `None` when the key is absent or unparsable (caller falls back to
-/// its own default).
-pub fn load_mouse_preset_from(agent_dir: &std::path::Path) -> Option<MousePreset> {
-    use titi_config::settings::Settings;
-    let settings = Settings::load(
-        agent_dir,
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        &[],
-    )
-    .ok()?;
-    let value = settings.get(MOUSE_TRACKING_KEY)?;
-    let name = match value {
-        serde_json::Value::String(s) => s,
-        _ => return None,
-    };
-    MousePreset::parse(&name)
-}
-
-/// Load the persisted mouse preset using the real agent directory.
-pub fn load_mouse_preset() -> Option<MousePreset> {
-    load_mouse_preset_from(&titi_config::agent_dir())
-}
-
-/// Persist the mouse preset to the titi config (`display.mouse_tracking`).
-pub fn save_mouse_preset_to(
-    agent_dir: &std::path::Path,
-    preset: MousePreset,
-) -> Result<(), String> {
-    use titi_config::settings::Settings;
-    let mut settings = Settings::load(
-        agent_dir,
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        &[],
-    )
-    .map_err(|e| format!("{e}"))?;
-    settings
-        .set(MOUSE_TRACKING_KEY, serde_json::json!(preset.name()))
-        .map_err(|e| format!("{e}"))
-}
-
-/// Persist the mouse preset using the real agent directory.
-pub fn save_mouse_preset(preset: MousePreset) -> Result<(), String> {
-    save_mouse_preset_to(&titi_config::agent_dir(), preset)
-}
-
-/// Load the process-wide default theme: the user's choice when they made one,
-/// the crate's auto pick otherwise.
-pub fn default_theme() -> Result<Arc<Theme>, String> {
-    theme_for(&titi_config::agent_dir(), &current_workspace(), None)
-}
-
-/// The theme a screen should show.
-///
-/// `override_name` is a `--theme` for this run, which wins over everything. With
-/// none, the settings decide: `theme.dark` and `theme.light` are the two slots
-/// the appearance probe picks between, so a user on a dark terminal who chose
-/// `gruvbox` keeps it when their terminal changes to light and their light
-/// choice is used instead. Neither slot set is `auto` — the crate's own pick
-/// (`titanium` dark, `light` light) stands, which is what a user who never chose
-/// sees.
-pub fn theme_for(
-    agent_dir: &std::path::Path,
-    workspace: &std::path::Path,
-    override_name: Option<&str>,
-) -> Result<Arc<Theme>, String> {
-    if let Some(name) = override_name {
-        return theme_named(name);
-    }
-    use titi_config::settings::{Settings, THEME_DARK_KEY, THEME_LIGHT_KEY};
-    let settings = Settings::load(agent_dir, workspace, &[]).map_err(|e| e.to_string())?;
-    let chosen = |key: &str| {
-        settings
-            .get(key)
-            .and_then(|value| value.as_str().map(str::to_owned))
-    };
-    let inputs = AppearanceInputs::from_env();
-    let (dark, light) = (chosen(THEME_DARK_KEY), chosen(THEME_LIGHT_KEY));
-    if dark.is_none() && light.is_none() {
-        return loaded(global().init_auto(&inputs));
-    }
-    loaded(
-        global().init_auto_mapped(
-            dark.as_deref()
-                .unwrap_or(titi_tui::theme::appearance::AUTO_DARK_THEME),
-            light
-                .as_deref()
-                .unwrap_or(titi_tui::theme::appearance::AUTO_LIGHT_THEME),
-            &inputs,
-        ),
-    )
-}
-
-/// Every palette this build carries: the crate's registry plus
-/// `{agent_dir}/themes`, the list `/theme` opens on.
-pub fn theme_names() -> Vec<String> {
-    titi_tui::theme::loader::get_available_themes()
-}
-
-/// The refusal an unknown theme gets, naming what there is rather than leaving
-/// a blank to guess at. `/theme` and `--theme` say it in one voice.
-pub fn unknown_theme(name: &str) -> String {
-    format!(
-        "unknown theme {name}: this build carries {} ({} and {} are two of them); \
-         /theme lists them, and --theme takes one",
-        theme_names().len(),
-        titi_tui::theme::appearance::AUTO_DARK_THEME,
-        titi_tui::theme::appearance::AUTO_LIGHT_THEME,
-    )
-}
-
-/// A theme by name, refusing one this build does not carry rather than quietly
-/// painting another palette: the fallback in the loader is the built-in dark
-/// theme, which would answer a typo with a theme nobody asked for.
-pub fn theme_named(name: &str) -> Result<Arc<Theme>, String> {
-    if !theme_names().iter().any(|known| known == name) {
-        return Err(unknown_theme(name));
-    }
-    // An explicit name is for this run: `init` is the crate's `setTheme`, which
-    // turns auto-detection off so the probe cannot undo the choice.
-    loaded(global().init(name))
-}
-
-/// The settings key a choice belongs in: the slot the terminal's own
-/// background selects, so a dark terminal's choice is the dark slot's.
-pub fn theme_slot(inputs: &AppearanceInputs) -> &'static str {
-    match titi_tui::theme::appearance::detect_terminal_background(inputs) {
-        titi_tui::theme::appearance::Appearance::Light => titi_config::settings::THEME_LIGHT_KEY,
-        titi_tui::theme::appearance::Appearance::Dark => titi_config::settings::THEME_DARK_KEY,
-    }
-}
-
-/// The theme the global just loaded, or one built from its name when the load
-/// itself failed — the screen always has a palette to draw with.
-fn loaded(name: String) -> Result<Arc<Theme>, String> {
-    match global().current() {
-        Some(theme) => Ok(theme),
-        None => Theme::new(
-            name,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            ColorMode::Truecolor,
-            SymbolPreset::Unicode,
-            std::collections::HashMap::new(),
-            None,
-            None,
-        )
-        .map(Arc::new),
-    }
-}
 
 /// The modal overlay panel currently shown, kept typed so the application
 /// can extract its result when it closes (contract:
@@ -2177,215 +2023,6 @@ pub enum OverlayOutcome {
     HubStop(String),
     /// History search: insert the chosen prompt into the composer.
     HistoryPicked(String),
-}
-
-/// Models offered by the picker — the fallback chains from
-/// `docs/research/STATE.md`.
-pub fn model_choices() -> Vec<String> {
-    [
-        "opencode-go/glm-5.3-flash",
-        "clinepass/glm-5.3",
-        "opencode-go/deepseek-v4-flash",
-        "clinepass/deepseek-v4-flash",
-        "bai/glm-5.3-flash",
-        "bai/qwen3.8-flash",
-        "clinepass/deepseek-v4-pro",
-        "qwen3.8-max",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// List session ids stored under `<agent_dir>/sessions` (newest first).
-pub fn list_sessions_from(agent_dir: &std::path::Path) -> Vec<String> {
-    let dir = agent_dir.join("sessions");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<(std::time::SystemTime, String)> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((
-                modified,
-                e.path().file_stem()?.to_string_lossy().into_owned(),
-            ))
-        })
-        .collect();
-    ids.sort_by_key(|a| std::cmp::Reverse(a.0));
-    ids.into_iter().map(|(_, id)| id).collect()
-}
-
-/// [`list_sessions_from`] against the real agent directory.
-pub fn list_sessions() -> Vec<String> {
-    list_sessions_from(&titi_config::agent_dir())
-}
-
-/// Delete a session's JSONL file.  Callers must gate this behind an
-/// approval prompt — Esc never reaches here.
-pub fn delete_session_from(agent_dir: &std::path::Path, id: &str) -> Result<(), String> {
-    let path = agent_dir.join("sessions").join(format!("{id}.jsonl"));
-    std::fs::remove_file(&path).map_err(|e| format!("{e}"))
-}
-
-/// [`delete_session_from`] against the real agent directory.
-pub fn delete_session(id: &str) -> Result<(), String> {
-    delete_session_from(&titi_config::agent_dir(), id)
-}
-
-/// Creates an empty session and returns its id.
-pub fn new_session(agent_dir: &std::path::Path) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    store
-        .create(titi_core::session::SessionMeta {
-            title: Some("titi".into()),
-            source: Some("cli".into()),
-            ..Default::default()
-        })
-        .map_err(|e| e.to_string())
-}
-
-pub fn fork_session(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    let new_id = store
-        .fork_session(session_id, titi_core::session::SessionMeta::default())
-        .map_err(|e| e.to_string())?;
-    Ok(format!("forked to {new_id} · restart to resume it"))
-}
-
-pub fn export_session(
-    agent_dir: &std::path::Path,
-    session_id: &str,
-    path: &str,
-) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-
-    // Default to markdown if not specified in path
-    let format = if path.ends_with(".jsonl") {
-        titi_core::session::export::ExportFormat::Jsonl
-    } else {
-        titi_core::session::export::ExportFormat::Markdown
-    };
-
-    let path_val = if path.is_empty() {
-        let exports_dir = agent_dir.join("exports");
-        let _ = std::fs::create_dir_all(&exports_dir);
-        exports_dir.join(format!("{session_id}.md"))
-    } else {
-        std::path::PathBuf::from(path.to_owned())
-    };
-
-    store
-        .export_to_file(session_id, format, &path_val)
-        .map_err(|e| e.to_string())?;
-
-    Ok(format!("exported to {}", path_val.display()))
-}
-
-/// The conversation a resumed session replays: the path to its current leaf,
-/// capped at a boundary that keeps every tool round whole, so an old
-/// transcript cannot crowd out the workspace map or replay an orphan call.
-pub fn session_history(
-    agent_dir: &std::path::Path,
-    session_id: &str,
-) -> Result<Vec<titi_providers::ChatMessage>, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    let entries = store.walk(session_id, None).map_err(|e| e.to_string())?;
-    Ok(crate::engine::restore_window(
-        titi_core::session::entries_to_messages(&entries),
-        crate::engine::MAX_RESTORED_MESSAGES,
-    ))
-}
-
-/// The directory a checkpoint pins and a rewind restores: where titi runs.
-pub fn current_workspace() -> std::path::PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| ".".into())
-}
-
-/// Record a rewind point on a session; returns a human summary.
-///
-/// `workspace` is explicit: taking the process cwd here made the tests
-/// commit into whatever checkout ran them.
-pub fn checkpoint_session(
-    agent_dir: &std::path::Path,
-    workspace: &std::path::Path,
-    session_id: &str,
-) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    let mut checkpoint = store.checkpoint(session_id).map_err(|e| e.to_string())?;
-    // Also pin the workspace, so a later rewind can undo code and not only
-    // the transcript. A directory that is not a repo stays session-only.
-    let git = crate::git_checkpoint::snapshot(
-        workspace,
-        &format!("{session_id} · {} entries", checkpoint.entries),
-    );
-    if let Ok(commit) = &git {
-        checkpoint.git_commit = Some(commit.clone());
-        let _ = store.record_git_commit(session_id, commit);
-    }
-    let suffix = match &git {
-        Ok(commit) => format!(" · git {}", &commit[..7.min(commit.len())]),
-        Err(_) => String::new(),
-    };
-    Ok(format!(
-        "checkpoint: {} entries{suffix}",
-        checkpoint.entries
-    ))
-}
-
-/// List a session's rewind points, oldest first.
-pub fn list_checkpoints(agent_dir: &std::path::Path, session_id: &str) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    let all = store.checkpoints(session_id).map_err(|e| e.to_string())?;
-    if all.is_empty() {
-        return Ok("checkpoints: none".into());
-    }
-    let rows: Vec<String> = all
-        .iter()
-        .enumerate()
-        .map(|(i, cp)| format!("#{} · {} entries", i + 1, cp.entries))
-        .collect();
-    Ok(format!("checkpoints: {}", rows.join(" | ")))
-}
-
-/// Rewind a session to checkpoint `index` (1-based); the newest when `None`.
-pub fn rewind_session(
-    agent_dir: &std::path::Path,
-    workspace: &std::path::Path,
-    session_id: &str,
-    index: Option<usize>,
-) -> Result<String, String> {
-    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
-    let all = store.checkpoints(session_id).map_err(|e| e.to_string())?;
-    if all.is_empty() {
-        return Err("no checkpoints recorded".into());
-    }
-    let position = match index {
-        None => all.len() - 1,
-        Some(0) => return Err("checkpoints are numbered from 1".into()),
-        Some(n) if n <= all.len() => n - 1,
-        Some(n) => return Err(format!("no checkpoint #{n} (have {})", all.len())),
-    };
-    let target = all[position].clone();
-    store
-        .rewind(session_id, &target)
-        .map_err(|e| e.to_string())?;
-    // Put the files back too, when the checkpoint pinned a commit and the
-    // tree is clean. A dirty tree is reported rather than overwritten.
-    let git = match &target.git_commit {
-        Some(commit) => match crate::git_checkpoint::restore(workspace, commit) {
-            Ok(()) => format!(" · git {}", &commit[..7.min(commit.len())]),
-            Err(reason) => format!(" · git not restored: {reason}"),
-        },
-        None => String::new(),
-    };
-    Ok(format!(
-        "rewound to checkpoint #{} ({} entries){git}",
-        position + 1,
-        target.entries
-    ))
 }
 
 /// Result of dispatching a canonical key.

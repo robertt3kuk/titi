@@ -1353,12 +1353,12 @@ impl Chat {
             return None;
         }
         let applied = match name {
-            "checkpoint" => self.session_note(crate::app::checkpoint_session(
+            "checkpoint" => self.session_note(crate::session_fs::checkpoint_session(
                 &self.agent_dir,
-                &crate::app::current_workspace(),
+                &crate::session_fs::current_workspace(),
                 &self.session_id,
             )),
-            "checkpoints" => self.session_note(crate::app::list_checkpoints(
+            "checkpoints" => self.session_note(crate::session_fs::list_checkpoints(
                 &self.agent_dir,
                 &self.session_id,
             )),
@@ -1475,7 +1475,7 @@ impl Chat {
     fn genome(&mut self, args: &str) -> Applied {
         // The same effective view the engine reads, so a note cannot disagree
         // with what a run would do: project `.titi/config.yml` wins.
-        let workspace = crate::app::current_workspace();
+        let workspace = crate::session_fs::current_workspace();
         let settings = match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[])
         {
             Ok(settings) => Some(settings),
@@ -1529,7 +1529,7 @@ impl Chat {
                 }
             },
             "check" | "lsp" => {
-                let workspace = crate::app::current_workspace();
+                let workspace = crate::session_fs::current_workspace();
                 local_genome_note(self, bound, &workspace)
             }
             name => {
@@ -1543,12 +1543,15 @@ impl Chat {
         Applied::none()
     }
     fn fork(&mut self) -> Applied {
-        self.session_note(crate::app::fork_session(&self.agent_dir, &self.session_id))
+        self.session_note(crate::session_fs::fork_session(
+            &self.agent_dir,
+            &self.session_id,
+        ))
     }
 
     fn export(&mut self, args: &str) -> Applied {
         let path = args.trim();
-        self.session_note(crate::app::export_session(
+        self.session_note(crate::session_fs::export_session(
             &self.agent_dir,
             &self.session_id,
             path,
@@ -1575,7 +1578,7 @@ impl Chat {
     fn settings(&mut self) -> Applied {
         match titi_config::settings::Settings::load(
             &self.agent_dir,
-            &crate::app::current_workspace(),
+            &crate::session_fs::current_workspace(),
             &[],
         ) {
             Ok(settings) => {
@@ -1636,7 +1639,7 @@ impl Chat {
         let search_query = if let Some(role) = base_query.strip_prefix('@') {
             if let Ok(settings) = titi_config::settings::Settings::load(
                 &self.agent_dir,
-                &crate::app::current_workspace(),
+                &crate::session_fs::current_workspace(),
                 &[],
             ) {
                 if settings.get("modelRoles").is_none() {
@@ -1731,30 +1734,32 @@ impl Chat {
             );
             return Applied::none();
         };
-        match crate::app::rewind_session(
+        match crate::session_fs::rewind_session(
             &self.agent_dir,
-            &crate::app::current_workspace(),
+            &crate::session_fs::current_workspace(),
             &self.session_id,
             index,
         ) {
-            Ok(summary) => match crate::app::session_history(&self.agent_dir, &self.session_id) {
-                Ok(messages) => {
-                    self.show_history(&messages);
-                    self.turn_active = false;
-                    self.turn_started = None;
-                    self.phase = WorkPhase::Waiting;
-                    self.approval = None;
-                    self.push(LineKind::Note, summary);
-                    Applied::send(EngineCommand::RestoreHistory { messages }, None)
+            Ok(summary) => {
+                match crate::session_fs::session_history(&self.agent_dir, &self.session_id) {
+                    Ok(messages) => {
+                        self.show_history(&messages);
+                        self.turn_active = false;
+                        self.turn_started = None;
+                        self.phase = WorkPhase::Waiting;
+                        self.approval = None;
+                        self.push(LineKind::Note, summary);
+                        Applied::send(EngineCommand::RestoreHistory { messages }, None)
+                    }
+                    Err(reason) => {
+                        self.push(
+                            LineKind::Error,
+                            format!("rewind: history not restored ({reason})"),
+                        );
+                        Applied::none()
+                    }
                 }
-                Err(reason) => {
-                    self.push(
-                        LineKind::Error,
-                        format!("rewind: history not restored ({reason})"),
-                    );
-                    Applied::none()
-                }
-            },
+            }
             Err(reason) => {
                 self.push(LineKind::Error, format!("rewind: {reason}"));
                 Applied::none()
@@ -1767,7 +1772,7 @@ impl Chat {
     /// with nothing stored, or one that cannot be read, leaves the screen as
     /// it is, so a fresh start still opens on the welcome.
     pub fn show_stored_history(&mut self) {
-        if let Ok(messages) = crate::app::session_history(&self.agent_dir, &self.session_id)
+        if let Ok(messages) = crate::session_fs::session_history(&self.agent_dir, &self.session_id)
             && !messages.is_empty()
         {
             self.show_history(&messages);
@@ -2030,7 +2035,7 @@ impl Chat {
     }
 
     fn session_choices(&self) -> Vec<String> {
-        crate::app::list_sessions_from(&self.agent_dir)
+        crate::session_fs::list_sessions_from(&self.agent_dir)
     }
 
     /// Typing while the session switcher is up. Like the login picker: arrows
@@ -2082,7 +2087,7 @@ impl Chat {
         if id == self.session_id {
             return Applied::none();
         }
-        match crate::app::session_history(&self.agent_dir, &id) {
+        match crate::session_fs::session_history(&self.agent_dir, &id) {
             Ok(messages) => {
                 self.show_history(&messages);
                 self.session_id = id.clone();
@@ -2288,9 +2293,9 @@ impl Chat {
     /// never shows a theme the next run would not; and the swap is followed by
     /// a repaint the moment this returns, which is the frame after the key.
     fn apply_theme(&mut self, name: &str) -> Applied {
-        let workspace = crate::app::current_workspace();
+        let workspace = crate::session_fs::current_workspace();
         let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
-        let key = crate::app::theme_slot(&inputs);
+        let key = crate::themes::theme_slot(&inputs);
         let mut settings =
             match titi_config::settings::Settings::load(&self.agent_dir, &workspace, &[]) {
                 Ok(settings) => settings,
@@ -2300,8 +2305,12 @@ impl Chat {
                 }
             };
         let auto = name == THEME_AUTO;
-        if !auto && !crate::app::theme_names().iter().any(|known| known == name) {
-            self.push(LineKind::Error, crate::app::unknown_theme(name));
+        if !auto
+            && !crate::themes::theme_names()
+                .iter()
+                .any(|known| known == name)
+        {
+            self.push(LineKind::Error, crate::themes::unknown_theme(name));
             return Applied::none();
         }
         let written = if auto {
@@ -2313,7 +2322,7 @@ impl Chat {
             self.push(LineKind::Error, format!("theme: not saved ({reason})"));
             return Applied::none();
         }
-        match crate::app::theme_for(&self.agent_dir, &workspace, None) {
+        match crate::themes::theme_for(&self.agent_dir, &workspace, None) {
             Ok(theme) => {
                 self.theme = theme;
                 let shown = self.theme_state().name;
@@ -2341,13 +2350,13 @@ impl Chat {
         let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
         let chosen = titi_config::settings::Settings::load(
             &self.agent_dir,
-            &crate::app::current_workspace(),
+            &crate::session_fs::current_workspace(),
             &[],
         )
         .ok()
         .and_then(|settings| {
             settings
-                .get(crate::app::theme_slot(&inputs))
+                .get(crate::themes::theme_slot(&inputs))
                 .and_then(|value| value.as_str().map(str::to_owned))
         });
         ThemeState {
@@ -2773,7 +2782,7 @@ impl Chat {
     /// user declared must be one `/login` accepts, or the key for a model
     /// the engine will call cannot be stored from the screen at all.
     fn registry_providers(&self) -> Vec<titi_engine::ProviderDescriptor> {
-        crate::engine::registry_config_for(&self.agent_dir, &crate::app::current_workspace())
+        crate::engine::registry_config_for(&self.agent_dir, &crate::session_fs::current_workspace())
             .providers
     }
 
@@ -2840,7 +2849,7 @@ impl Chat {
             }
         };
         let op = argv.first().copied().unwrap_or("status");
-        match run_git(&crate::app::current_workspace(), argv) {
+        match run_git(&crate::session_fs::current_workspace(), argv) {
             Ok(output) => {
                 let body = output.trim_end();
                 let text = if body.is_empty() {
@@ -2867,7 +2876,7 @@ impl Chat {
             self.push(LineKind::Error, format!("usage: /diagnose (got {args})"));
             return Applied::none();
         }
-        let workspace = crate::app::current_workspace();
+        let workspace = crate::session_fs::current_workspace();
         let mut rows = vec![
             format!("titi {}", titi_tui::VERSION),
             format!("model: {} · mode: {}", self.model, self.mode.label()),
@@ -3517,9 +3526,9 @@ pub fn run(
     // the terminal's appearance onto the dark (`titanium`) or light slot and
     // lets `{agent_dir}/themes/<name>.json` stand in for any name the built-in
     // registry does not have.
-    let theme = crate::app::theme_for(
+    let theme = crate::themes::theme_for(
         &titi_config::agent_dir(),
-        &crate::app::current_workspace(),
+        &crate::session_fs::current_workspace(),
         theme_name.as_deref(),
     )
     .map_err(io::Error::other)?;
@@ -3786,13 +3795,16 @@ struct SkillRow {
 /// Discovery lives in the engine, so the picker offers exactly the names a
 /// `/name` reference can expand.
 fn discovered_skills(agent_dir: &Path) -> Vec<SkillRow> {
-    titi_engine::skills::catalog(Some(&crate::app::current_workspace()), Some(agent_dir))
-        .into_iter()
-        .map(|skill| SkillRow {
-            name: skill.name,
-            about: skill.description,
-        })
-        .collect()
+    titi_engine::skills::catalog(
+        Some(&crate::session_fs::current_workspace()),
+        Some(agent_dir),
+    )
+    .into_iter()
+    .map(|skill| SkillRow {
+        name: skill.name,
+        about: skill.description,
+    })
+    .collect()
 }
 
 /// One offer in the `/` picker.
@@ -4006,8 +4018,10 @@ impl ModelPicker {
 /// the picker states. A model a local server discovered declares nothing:
 /// its provider is the id's own prefix and its window is unknown.
 fn model_rows(chat: &Chat) -> Vec<ModelRow> {
-    let config =
-        crate::engine::registry_config_for(&chat.agent_dir, &crate::app::current_workspace());
+    let config = crate::engine::registry_config_for(
+        &chat.agent_dir,
+        &crate::session_fs::current_workspace(),
+    );
     let stored = crate::secrets::list_keys(&chat.agent_dir).unwrap_or_default();
     let credentials: Vec<(String, String)> = config
         .providers
@@ -4044,7 +4058,7 @@ fn model_rows(chat: &Chat) -> Vec<ModelRow> {
 fn picker_roles(chat: &Chat) -> Vec<(String, String)> {
     let Ok(settings) = titi_config::settings::Settings::load(
         &chat.agent_dir,
-        &crate::app::current_workspace(),
+        &crate::session_fs::current_workspace(),
         &[],
     ) else {
         return Vec::new();
@@ -4587,7 +4601,7 @@ fn genome_set_limit(
 ///
 /// Check runs the same index + diagnostics pass the terminal verb runs, over
 /// the workspace passed in — the live caller passes
-/// [`crate::app::current_workspace`] — and pushes the same `path:line: code:
+/// [`crate::session_fs::current_workspace`] — and pushes the same `path:line: code:
 /// message` lines — or one error line when the index itself fails. Lsp never
 /// starts a stdio server inside the chat: the pipe is the terminal's, so the
 /// note names the command instead.
@@ -8707,7 +8721,7 @@ mod tests {
     #[test]
     fn the_theme_picker_lists_every_palette_and_filters_by_name() {
         let (_dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
-        let all = crate::app::theme_names();
+        let all = crate::themes::theme_names();
         assert!(all.len() > 50, "the registry is the list: {}", all.len());
 
         type_text(&mut chat, "/theme");
@@ -8785,8 +8799,8 @@ mod tests {
     fn enter_applies_a_theme_and_esc_keeps_the_one_on_screen() {
         let _guard = theme_lock();
         let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
-        let workspace = crate::app::current_workspace();
-        chat.theme = crate::app::theme_for(dir.path(), &workspace, None).expect("a theme");
+        let workspace = crate::session_fs::current_workspace();
+        chat.theme = crate::themes::theme_for(dir.path(), &workspace, None).expect("a theme");
         let before_frame = theme_frame(&mut chat);
         let before_bg = frame_buffer(&mut chat, 80, 20)[(0, 0)].bg;
 
@@ -8830,7 +8844,7 @@ mod tests {
         let settings =
             titi_config::settings::Settings::load(dir.path(), &workspace, &[]).expect("settings");
         let key =
-            crate::app::theme_slot(&titi_tui::theme::appearance::AppearanceInputs::from_env());
+            crate::themes::theme_slot(&titi_tui::theme::appearance::AppearanceInputs::from_env());
         assert_eq!(
             settings
                 .get(key)
@@ -8838,7 +8852,7 @@ mod tests {
             Some("alabaster".to_owned()),
             "the choice is remembered in {key}"
         );
-        let reloaded = crate::app::theme_for(dir.path(), &workspace, None).expect("a theme");
+        let reloaded = crate::themes::theme_for(dir.path(), &workspace, None).expect("a theme");
         assert_eq!(
             reloaded.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
             expected.get_bg_hex(titi_tui::theme::schema::ThemeBg::StatusLineBg),
@@ -9080,10 +9094,10 @@ mod tests {
     /// replaced by another palette, and the refusal names what there is.
     #[test]
     fn an_unknown_theme_is_refused_by_name() {
-        let reason = crate::app::theme_named("nope").expect_err("nope is not a theme");
+        let reason = crate::themes::theme_named("nope").expect_err("nope is not a theme");
         assert!(reason.contains("unknown theme nope"), "{reason}");
         assert!(
-            reason.contains(&crate::app::theme_names().len().to_string()),
+            reason.contains(&crate::themes::theme_names().len().to_string()),
             "the refusal counts what exists: {reason}"
         );
         assert!(
@@ -9104,9 +9118,9 @@ mod tests {
     fn auto_is_the_absence_of_a_choice() {
         let _guard = theme_lock();
         let dir = tempfile::tempdir().expect("temp");
-        let workspace = crate::app::current_workspace();
+        let workspace = crate::session_fs::current_workspace();
         let inputs = titi_tui::theme::appearance::AppearanceInputs::from_env();
-        let picked = crate::app::theme_for(dir.path(), &workspace, None).expect("auto");
+        let picked = crate::themes::theme_for(dir.path(), &workspace, None).expect("auto");
         let expected = titi_tui::theme::loader::load_theme(
             &titi_tui::theme::appearance::resolve_auto_theme(
                 titi_tui::theme::appearance::AUTO_DARK_THEME,
@@ -9138,7 +9152,7 @@ mod tests {
                 serde_json::json!("alabaster"),
             )
             .expect("write");
-        let chosen = crate::app::theme_for(dir.path(), &workspace, None).expect("chosen");
+        let chosen = crate::themes::theme_for(dir.path(), &workspace, None).expect("chosen");
         let alabaster =
             titi_tui::theme::loader::load_theme("alabaster", &theme_options()).expect("alabaster");
         assert_eq!(
@@ -9148,8 +9162,8 @@ mod tests {
         );
 
         // `--theme` wins over the setting for one run.
-        let forced =
-            crate::app::theme_for(dir.path(), &workspace, Some("titanium")).expect("a named theme");
+        let forced = crate::themes::theme_for(dir.path(), &workspace, Some("titanium"))
+            .expect("a named theme");
         let titanium =
             titi_tui::theme::loader::load_theme("titanium", &theme_options()).expect("titanium");
         assert_eq!(
@@ -9158,7 +9172,7 @@ mod tests {
             "the flag overrides the setting"
         );
         assert!(
-            crate::app::theme_for(dir.path(), &workspace, Some("nope")).is_err(),
+            crate::themes::theme_for(dir.path(), &workspace, Some("nope")).is_err(),
             "and an unknown name is refused"
         );
     }

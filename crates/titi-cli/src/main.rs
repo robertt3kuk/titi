@@ -56,7 +56,7 @@ fn main() -> io::Result<()> {
     // its subcommands for positionals.
     if titi_cli::genome_cmd::run(
         &titi_config::agent_dir(),
-        &titi_cli::app::current_workspace(),
+        &titi_cli::session_fs::current_workspace(),
     )
     .is_some()
     {
@@ -171,11 +171,11 @@ fn main() -> io::Result<()> {
                 eprintln!("usage: titi --theme <name>  (bare /theme in the chat opens the list)");
                 std::process::exit(2);
             };
-            if !titi_cli::app::theme_names()
+            if !titi_cli::themes::theme_names()
                 .iter()
                 .any(|known| known == &raw)
             {
-                eprintln!("{}\n\n{USAGE}", titi_cli::app::unknown_theme(&raw));
+                eprintln!("{}\n\n{USAGE}", titi_cli::themes::unknown_theme(&raw));
                 std::process::exit(2);
             }
             theme = Some(raw);
