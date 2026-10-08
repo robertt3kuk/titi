@@ -51,6 +51,11 @@ move, enter picks, tab fills, esc closes.
 ";
 
 fn main() -> io::Result<()> {
+    install_panic_report();
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|arg| arg == "--panic-test") {
+        panic!("deliberate panic for the panic-report check\x07");
+    }
     // `titi genome` never reaches the engine and never needs a model key, so
     // it is short-circuited before the flag loop touched it or could mistake
     // its subcommands for positionals.
@@ -332,4 +337,124 @@ fn main() -> io::Result<()> {
         None => None,
     };
     titi_cli::chat::run(engine, session_log, models, session_id, cast, theme)
+}
+
+/// Installed before the screen opens, so a panic is reported rather than
+/// silently erased.
+///
+/// The chat owns the alternate screen and `Screen::Drop` restores the
+/// terminal on the way out. The default panic behaviour works against that:
+/// its hook prints the message into the alt screen, the unwind then runs
+/// `Drop`, and the leave-alternate-screen sequence wipes the message — the
+/// user sees a clean, restored terminal and no reason for it.
+///
+/// This hook turns it around: it restores what `Screen::Drop` restores (raw
+/// mode, the alternate screen, the cursor, focus reporting — the same order
+/// of things the Drop does when the panic happens *before* the screen, or
+/// when a `panic = "abort"` profile would skip the unwind entirely), then
+/// prints one plain line to stderr. Nothing else changes: the hook does not
+/// exit, so the panic still unwinds / aborts exactly as the default build
+/// does, ending in a non-zero exit (101).
+///
+/// The payload is sanitised: a panic message can carry text the input put
+/// there, and control bytes in it would be resolve into escape sequences in
+/// the very terminal this report is meant to leave clean.
+fn flatten_panic_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        // The strip below loses its use on a line longer than the terminal,
+        // and the location after it matters more than a long message.
+        .chars()
+        .take(200)
+        .collect::<String>()
+}
+
+/// The one line a panic reports with: what panicked, where.
+fn panic_line(info: &std::panic::PanicHookInfo) -> String {
+    panic_report(info.payload(), info.location().copied())
+}
+
+/// `panic_line` for a payload and location already peeled out of the hook
+/// info — constructible as the hook info itself is, so the shape a real
+/// panic would produce is testable without a process going down.
+fn panic_report(
+    payload: &(dyn std::any::Any + Send),
+    location: Option<std::panic::Location<'_>>,
+) -> String {
+    let payload = match payload.downcast_ref::<&str>() {
+        Some(text) => (*text).to_owned(),
+        None => match payload.downcast_ref::<String>() {
+            Some(text) => text.clone(),
+            None => "unknown panic payload".to_owned(),
+        },
+    };
+    let location = match location {
+        Some(at) => format!(" {}:{}:{}", at.file(), at.line(), at.column()),
+        None => String::new(),
+    };
+    format!("panic: {}{location}", flatten_panic_text(&payload))
+}
+
+/// Leaves the console in a shape the message can be read in, once, best
+/// effort: the panic may have hit before the screen existed, in which case
+/// these disables are harmless, or after, in which case `Screen::Drop` runs
+/// this again during the unwind and the double restore is idempotent.
+fn restore_console() {
+    use crossterm::{
+        cursor::Show,
+        event::DisableFocusChange,
+        terminal::{LeaveAlternateScreen, disable_raw_mode},
+    };
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = crossterm::execute!(stdout, Show, LeaveAlternateScreen, DisableFocusChange);
+}
+
+/// The installation itself: swap the default hook for the restored-screen
+/// report. Keeps the single place the hook body lives, so the reason the
+/// message survives is in one place.
+fn install_panic_report() {
+    std::panic::set_hook(Box::new(|info| {
+        restore_console();
+        eprintln!("{}", panic_line(info));
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_line_carries_the_payload_and_location_sanitsed() {
+        let line = panic_report(
+            &"deliberate panic for the panic-report check\x07",
+            Some(*std::panic::Location::caller()),
+        );
+        assert!(
+            line.starts_with("panic: deliberate panic for the panic-report check "),
+            "{line}"
+        );
+        assert!(!line.chars().any(char::is_control), "{line}");
+        assert!(
+            line.contains(&format!(" {}:", file!())),
+            "location should name this file: {line}"
+        );
+    }
+
+    #[test]
+    fn control_characters_are_flattened_not_emitted() {
+        let flattened = flatten_panic_text("line\nbreak\x1b[2;1Htab\there");
+        assert_eq!(flattened, "line break [2;1Htab here");
+    }
+
+    #[test]
+    fn a_string_payload_is_reported_too() {
+        let line = panic_report(
+            &"boxed: one\x1b]0;evil".to_owned(),
+            Some(*std::panic::Location::caller()),
+        );
+        assert!(line.starts_with("panic: boxed: one ]0;evil "), "{line}");
+        assert!(!line.contains('\x1b'), "{line}");
+    }
 }
