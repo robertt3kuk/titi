@@ -7283,17 +7283,52 @@ fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<LogWr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::LazyLock;
     use titi_engine::TurnId;
     use titi_providers::StopReason;
 
     /// A chat with the theme a test names, for the ones that need a palette
     /// where two tokens are two different colours.
+    ///
+    /// Every test chat gets its own fresh agent directory under a
+    /// process-lifetime temp root: a helper that left `Chat::new`'s default
+    /// (`~/.titi/agent`) in place let tests like the slash-command sweep run
+    /// `/logout openai` against the operator's real key store. The root is
+    /// owned by a `LazyLock` (never `Box::leak`); tests that set `agent_dir`
+    /// explicitly still override it.
     fn chat_with_theme(theme: Arc<Theme>) -> Chat {
-        Chat::new("openai/gpt-4.1", "session-123", theme)
+        static ROOT: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
+            tempfile::TempDir::with_prefix("titi-cli-test-agent").expect("temp agent root")
+        });
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = Path::new(ROOT.path()).join(format!("agent-{n}"));
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", theme);
+        chat.set_agent_dir(&dir);
+        chat
     }
 
     fn chat() -> Chat {
         chat_with_theme(test_theme())
+    }
+
+    /// Pins the invariant the helper above exists for: no helper-built chat
+    /// may ever point at the real agent directory, or any mutating command in
+    /// a test (`/logout`, `/export`, `/checkpoint`, `/fork`, ...) operates on
+    /// the developer's own `~/.titi`.
+    #[test]
+    fn helper_chat_isolated_from_real_agent_dir() {
+        let chat = chat();
+        let real = titi_config::agent_dir();
+        assert_ne!(chat.agent_dir, real);
+        assert!(
+            chat.agent_dir.starts_with(std::env::temp_dir()),
+            "agent dir {:?} not under {}",
+            chat.agent_dir,
+            std::env::temp_dir().display()
+        );
     }
 
     /// A built-in theme, with the colour depth pinned so an assertion is about
