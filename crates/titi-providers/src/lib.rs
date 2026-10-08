@@ -4,6 +4,8 @@
 //! arguments, stop-reason tables, compat policies, the credential ladder and a
 //! one-shot fallback chain (see `docs/research/providers-streaming`).
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod anthropic;
 pub mod compat;
 pub mod creds;
