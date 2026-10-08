@@ -286,25 +286,40 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
 - [x] `high` ~~tool-output masking misses quoted and `_`-suffixed key names —
   `crates/titi-memory/src/redact.rs:349-370`~~ fixed 2026-10-08 in 8b33ed9,
   with the bearer-header prefilter in d24f5b1 and the test pinned in 98d40bb.
-- [ ] `high` error lints are inert in 8 of 11 crates —
-  `Cargo.toml:38-43`; blocked by `crates/titi-cli/tests/login_oauth.rs:416,430`
-  (`unsafe env::set_var` under `unsafe_code = "forbid"`).
-- [ ] `high` session files are written without `fsync` and rewritten in place —
-  `crates/titi-core/src/session/store.rs:102-107,215,262,281`.
+- [x] `high` ~~error lints are inert in 8 of 11 crates — `Cargo.toml:38-43`;
+  blocked by `crates/titi-cli/tests/login_oauth.rs:416,430` (`unsafe
+  env::set_var` under `unsafe_code = "forbid"`)~~ fixed 2026-10-08 in 9b9ef2f
+  (the workspace lints now apply to every member) after 13e4fa1 dropped the
+  unsafe env hand-off that blocked it.
+- [x] `high` ~~session files are written without `fsync` and rewritten in
+  place — `crates/titi-core/src/session/store.rs:102-107,215,262,281`~~ fixed
+  2026-10-08 in e4771e8 (a synced temp file), with the trajectory tail repaired
+  before appending in 88386ac and its torn tail told from a damaged line in
+  e3906be; `export_to_file` is the one in-place write left (row below).
 - [x] `high` ~~the `fd-lock` helper runs the guarded write after a failed acquire
   and unlinks the lock — `crates/titi-config/src/config_file.rs:176-185`~~
   fixed 2026-10-08 in cbb8abd.
-- [ ] `high` a stalled provider hangs the turn and `Cancel` cannot unblock it —
-  `crates/titi-providers/src/transport.rs:190-212`, `http.rs:53-55`,
-  `wire.rs:770-777`, `runtime.rs:2159-2165`.
+- [x] `high` ~~a stalled provider hangs the turn and `Cancel` cannot unblock it
+  — `crates/titi-providers/src/transport.rs:190-212`, `http.rs:53-55`,
+  `wire.rs:770-777`, `runtime.rs:2159-2165`~~ fixed 2026-10-08 in 3d179d2 (the
+  http client gets a timeout), 46fa805 (the declared first-event and idle
+  windows are applied and `Stalled` is produced in production) and 0169bbb (a
+  cancel ends a silent read).
 - [ ] `high` `titi_cli::app::App` (2492 lines) is unreachable from the binary
   and kept alive by five integration test files — `crates/titi-cli/src/app.rs`
   (decide: wire in or delete; the pre-existing NEXT item below is this one).
-- [ ] `medium` raw tool arguments are persisted unmasked —
+  Phase 1 landed in 7ace4a6 + 27dc55c: the live helpers moved to
+  `session_fs.rs`/`themes.rs` and 54 call sites were repointed, so `App` has
+  zero production callers now; phase 2 — delete the struct and rehome its
+  ~600–800 lines of tests — is planned in
+  `docs/research/agent-ux/app-rs-decision.md`.
+- [x] `medium` ~~raw tool arguments are persisted unmasked —
   `crates/titi-engine/src/tool_loop.rs:167-171`,
-  `crates/titi-core/src/trajectory.rs:99-107`.
-- [ ] `medium` a cloned repository's `.env` outranks the user's credential
-  layers — `crates/titi-secrets/src/env.rs:37-48`.
+  `crates/titi-core/src/trajectory.rs:99-107`~~ fixed 2026-10-08 in 907f821
+  (masked before the trajectory sees them, and the file locked down).
+- [x] `medium` ~~a cloned repository's `.env` outranks the user's credential
+  layers — `crates/titi-secrets/src/env.rs:37-48`~~ fixed 2026-10-08 in
+  d85614c.
 - [ ] `medium` stringly-typed errors and discarded writes at the CLI seam —
   `crates/titi-cli/src/session_log.rs:25`, `headless.rs:198,227,252,292,314,336`,
   `headless.rs:218,270,329`.
@@ -324,20 +339,33 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `crates/titi-engine/tests/tools.rs:953`.
 - [ ] `medium` the headless JSONL protocol is serde-tested on one sample —
   `crates/titi-cli/tests/headless.rs:8-20`.
-- [ ] `medium` the README slash table is wrong in three ways —
+- [x] `medium` ~~the README slash table is wrong in three ways —
   `README.md:99,174,303,378` (`/skillful` does not exist; `/council` and
-  `/graph` do).
+  `/graph` do)~~ fixed 2026-10-08 in 268a159, which took the header test count
+  and the verify block with it.
+- [ ] `medium` nine tree-sitter grammars are justified and ABI-14 verified but
+  not added — go, java, c/c++, c#, kotlin, php, ruby and swift (the genome
+  worker's report names the release for each); every one must emit ABI 14, the
+  range the workspace's `tree-sitter 0.24` accepts, because newer releases emit
+  ABI 15 and would need a core bump (`crates/titi-genome/Cargo.toml:12-14`,
+  guarded by `grammars_match_the_core_abi`).
+- [ ] `medium` the workspace lints now surface 1381 `unwrap`/`expect` warning
+  headers (`cargo clippy --workspace --all-targets`), nearly all of them inside
+  test modules — the audit counted ≈36 sites outside them; turning that into a
+  rule (per-module allow-lists, or a real fix pass) is its own task.
 - [ ] `low` five direct dependencies are unused or over-declared —
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
 - [ ] `low` a module-wide `#![allow(clippy::expect_used)]` hides a
   caller-supplied pattern — `crates/titi-genome/src/parse.rs:3,553`.
-- [ ] `low` the lenient JSONL reader launders mid-file corruption into missing
-  entries — `crates/titi-core/src/session/store.rs:434-438`.
+- [x] `low` ~~the lenient JSONL reader launders mid-file corruption into
+  missing entries — `crates/titi-core/src/session/store.rs:434-438`~~ fixed
+  2026-10-08 in ffb447d (a corrupt middle line is surfaced, not dropped).
 - [ ] `low` no schema version in either SQLite store or the session entry —
   `crates/titi-core/src/session/index.rs:71-88`,
   `crates/titi-secrets/src/store.rs:219-234`,
-  `crates/titi-memory/src/index.rs:106-108`.
+  `crates/titi-memory/src/index.rs:106-108`; the session index is stamped
+  since c8971a7, the two SQLite stores are not.
 - [ ] `low` the README's local verify commands are weaker than CI —
   `README.md:205-208,409-412`.
 - [ ] `low` the engine boundary is guarded by a manifest substring test —
@@ -352,9 +380,25 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   af985e1.
 - [x] `low` ~~`titi genome check` reports false positives on a clean tree —
   `docs/audits/2026-10-08-facts.md` §7 (13 `syntax-error` + 19
-  `unresolved-import`)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2; a re-run still
-  exits 1 with 10 `ambiguous-symbol` diagnostics (same-name types in two
-  crates each), so the gate is not clean yet.
+  `unresolved-import`)~~ fixed 2026-10-08 in e7c48e1 + fe1abf2; a re-run
+  reports 13 `ambiguous-symbol` lines and, since 4c2f465, exits 0 on a clean
+  tree; 3624fe8 moved the per-language capability lines out of the findings.
+- [ ] `low` `export_to_file` in `crates/titi-core` is the one in-place write the
+  durability pass left alone.
 - [ ] `low` the README header test count is stale — `README.md:9` (`1279
   passed`) against 1805 on CI.
+
+**Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
+Genome per language: `714824d` split the scanner into one module per language
+behind a single table, `2b49fed` reports what each language's index rests on,
+`3624fe8` keeps capability out of the check's findings, `91148a1` prints the
+roster, `520321a` documents the table, and one commit per language carries its
+declarations and placements — `4ce6027` Go, `d445f15` C/C++, `e4b4295` C#,
+`4f972da` Swift, `a59084a` Python, `32fc554` TypeScript, `133c7c0` Java,
+`683d05f` Kotlin, `d3a18b9` PHP, `b83b13b` Ruby. Features: GFM tables in the
+transcript (`ae1f35c`, goldens `39bae94`, input caps `b45b07b`, the cut-cell
+style fix `57b0454`), the turn footer with usage (`9430689`) and the run state
+in the terminal title (`1a2ecc3`), emoji in the live composer (`faa2de9`
+crate-side, `effcf3e` wired, `28394b1` backspace). `4134736` dropped four
+unused dependency edges.
 
