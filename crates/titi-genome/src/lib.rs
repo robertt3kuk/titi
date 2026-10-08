@@ -85,8 +85,17 @@ pub struct FileRecord {
     /// A grammar that refuses the file counts as 1.
     pub syntax_errors: u32,
     /// Exported symbols defined elsewhere that this file mentions — the
-    /// symbol-level half of the dependency graph.
+    /// symbol-level half of the dependency graph. Resolved from
+    /// [`Self::raw_refs`] against the workspace's exports.
     pub used_symbols: Vec<String>,
+    /// The identifiers this file mentions, as the parser collected them.
+    ///
+    /// [`Self::used_symbols`] is the subset of these that resolve: a name
+    /// has to be exported by exactly one known file and not be this file's
+    /// own export to carry an edge. The raw list is what answers "which
+    /// files does an export change concern" without reading them — see
+    /// [`Genome::ref_index`]. Bounded by `refs::MAX_REFS`.
+    pub raw_refs: Vec<String>,
     pub size: u64,
     pub mtime: SystemTime,
     /// FNV-1a of the bytes this record was parsed from.
@@ -148,6 +157,13 @@ pub struct RefreshStats {
     /// what the graph is built from — and it leaves the previous maps in
     /// place rather than paying the rank iteration to reproduce them.
     pub graph_recomputed: bool,
+    /// Files the symbol pass re-resolved against the new definer set.
+    ///
+    /// A file is in that pass when it was re-parsed, or when a name its raw
+    /// mentions name changed definers. Every other file keeps the resolution
+    /// it had, so adding one export costs the files that mention that export
+    /// and not the tree. Zero when the graph was not recomputed at all.
+    pub reresolved: usize,
 }
 
 /// The workspace graph and its derived ranking.
@@ -166,6 +182,14 @@ pub struct Genome {
     pub dependents: HashMap<String, usize>,
     /// Symbol name → defining files and how many files reference it.
     pub symbols: HashMap<String, SymbolRecord>,
+    /// Symbol name → the files whose raw mentions name it.
+    ///
+    /// The inversion of [`FileRecord::raw_refs`]. A name resolves in a file
+    /// only if the workspace exports it and only if that file mentions it, so
+    /// when a definer set moves this answers "which files can that have
+    /// changed for" without reading one — the re-resolution pass visits these
+    /// lists and the files that were re-parsed, and nothing else.
+    pub ref_index: HashMap<String, Vec<String>>,
     /// Root of the last refresh, so definition can read the identifier.
     root: std::path::PathBuf,
 }
@@ -176,6 +200,9 @@ struct Absorption {
     content_unchanged: usize,
     /// Whether anything that feeds `ranks`/`dependents`/`symbols` moved.
     graph_moved: bool,
+    /// The paths that were re-parsed, so the symbol pass knows which files
+    /// can have a resolution to redo beyond the ones the moved names reach.
+    dirty: Vec<String>,
 }
 
 impl Genome {
@@ -210,17 +237,25 @@ impl Genome {
         let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
 
         let absorbed = self.absorb(&listed, &known);
-        let before = self.files.len();
-        self.files.retain(|path, _| known.contains(path));
-        let removed = before - self.files.len();
+        let gone: Vec<String> = self
+            .files
+            .keys()
+            .filter(|path| !known.contains(*path))
+            .cloned()
+            .collect();
+        for path in &gone {
+            self.drop_record(path);
+        }
+        let removed = gone.len();
         let graph_recomputed = absorbed.graph_moved || removed > 0;
-        self.finish(graph_recomputed);
+        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
             parsed: absorbed.parsed,
             removed,
             total: self.files.len(),
             content_unchanged: absorbed.content_unchanged,
             graph_recomputed,
+            reresolved,
         })
     }
 
@@ -251,8 +286,8 @@ impl Genome {
                 Some(file) => listed.push(file),
                 // Gone from disk, or never a file this index would carry. The
                 // first is a removal; the second is nothing to do, and
-                // `remove` answers both without a second question.
-                None => removed += usize::from(self.files.remove(path).is_some()),
+                // `drop_record` answers both without a second question.
+                None => removed += usize::from(self.drop_record(path)),
             }
         }
         let known: HashSet<String> = self
@@ -264,13 +299,14 @@ impl Genome {
 
         let absorbed = self.absorb(&listed, &known);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
-        self.finish(graph_recomputed);
+        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
             parsed: absorbed.parsed,
             removed,
             total: self.files.len(),
             content_unchanged: absorbed.content_unchanged,
             graph_recomputed,
+            reresolved,
         })
     }
 
@@ -282,8 +318,12 @@ impl Genome {
     /// sweeps what the walk did not list, `apply_changes` drops what it was
     /// told is gone — so this only ever replaces records or inserts the ones
     /// its caller already accounted for.
-    fn absorb(&mut self, listed: &[scan::ListedFile], known: &HashSet<String>) -> Absorption {
-        let candidates: Vec<&scan::ListedFile> = listed
+    fn absorb(
+        &mut self,
+        listed: &[scan::ListedFile],
+        known: &HashSet<String>,
+    ) -> Absorption {
+        let stale: Vec<&scan::ListedFile> = listed
             .iter()
             .filter(|file| {
                 !self
@@ -292,7 +332,7 @@ impl Genome {
                     .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
             })
             .collect();
-        let records = parse_batch(&candidates, known, &self.files);
+        let records = parse_batch(&stale, known, &self.files);
 
         // A parse can only move the graph by changing the tuple the graph is
         // built from. `exports` and `imports` are compared exactly; `refs` are
@@ -315,7 +355,7 @@ impl Genome {
                 if !*parsed {
                     continue;
                 }
-                let resolved = resolve(&record.used_symbols, &record.exports, &self.symbols);
+                let resolved = resolve(&record.raw_refs, &record.exports, &self.symbols);
                 if self
                     .files
                     .get(&record.path)
@@ -329,26 +369,82 @@ impl Genome {
 
         let mut parsed = 0;
         let mut content_unchanged = 0;
+        let mut dirty = Vec::new();
         for (mut record, reparsed) in records {
+            let path = record.path.clone();
+            let previous = self
+                .files
+                .get(&path)
+                .map(|old| (old.raw_refs.clone(), old.used_symbols.clone()));
             if reparsed {
                 parsed += 1;
+                dirty.push(path.clone());
                 if !graph_moved {
                     // The graph is not rebuilt, so this record must carry the
-                    // resolved form the previous one did; the raw refs would
-                    // be the only record left unresolved.
-                    if let Some(old) = self.files.get(&record.path) {
-                        record.used_symbols = old.used_symbols.clone();
+                    // resolved form the previous one did: nothing that decides
+                    // a resolution moved, and the parse only produced raw
+                    // mentions.
+                    if let Some((_, resolved)) = &previous {
+                        record.used_symbols = resolved.clone();
                     }
                 }
             } else {
                 content_unchanged += 1;
             }
-            self.files.insert(record.path.clone(), record);
+            // The mention index is the inversion of `raw_refs`, and a parse can
+            // change those without the graph moving at all — a renamed local,
+            // a new call to a symbol no file exports. It has to follow the
+            // record even then, or a later export change would miss this file.
+            if let Some((old_refs, _)) = previous {
+                self.forget_refs(&path, &old_refs);
+            }
+            let raw_refs = record.raw_refs.clone();
+            self.files.insert(path.clone(), record);
+            self.learn_refs(&path, &raw_refs);
         }
         Absorption {
             parsed,
             content_unchanged,
             graph_moved,
+            dirty,
+        }
+    }
+
+    /// Drop a path from the index and from the mention index.
+    ///
+    /// The two move together: a stale mention entry would have this file
+    /// re-resolved for a name it no longer mentions, and a missing one would
+    /// have it skipped for a name it does.
+    fn drop_record(&mut self, path: &str) -> bool {
+        match self.files.remove(path) {
+            Some(record) => {
+                self.forget_refs(path, &record.raw_refs);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record that `path` mentions every name in `names`.
+    fn learn_refs(&mut self, path: &str, names: &[String]) {
+        for name in names {
+            let files = self.ref_index.entry(name.clone()).or_default();
+            if !files.iter().any(|known| known == path) {
+                files.push(path.to_owned());
+            }
+        }
+    }
+
+    /// Drop `path` from the mention lists of `names`.
+    fn forget_refs(&mut self, path: &str, names: &[String]) {
+        for name in names {
+            let Some(files) = self.ref_index.get_mut(name) else {
+                continue;
+            };
+            files.retain(|known| known != path);
+            if files.is_empty() {
+                self.ref_index.remove(name);
+            }
         }
     }
 
@@ -356,71 +452,122 @@ impl Genome {
     ///
     /// A refresh that found nothing the graph is built from leaves all three
     /// maps exactly as they were: not "equal after a rebuild", the previous
-    /// values, untouched.
-    fn finish(&mut self, graph_recomputed: bool) {
+    /// values, untouched. When they are rebuilt, `dirty` names the files this
+    /// update re-parsed; the symbol pass re-resolves those and the mentioners
+    /// of any name whose definers moved, and nothing else. Returns how many
+    /// files that pass visited.
+    fn finish(&mut self, graph_recomputed: bool, dirty: &[String]) -> usize {
         if !graph_recomputed {
-            return;
+            return 0;
         }
-        self.index_symbols();
+        let reresolved = self.index_symbols(dirty);
         let (ranks, dependents) = graph::rank(&self.files, &self.symbols);
         self.ranks = ranks;
         self.dependents = dependents;
+        reresolved
     }
 
-    /// Resolves each file's candidate identifiers against the symbols the
-    /// workspace actually exports, then counts who uses what.
+    /// Rebuild the symbol table, re-resolving only the files it can have
+    /// changed, and count them.
     ///
     /// Resolution is by name alone, so a name several files export — `is_empty`,
     /// `new`, `len` — cannot say which definition a mention refers to. Those
     /// names are ambiguous and carry no edges or user counts: counting them
     /// would make every file depend on every other file that happens to share
     /// a method name.
-    fn index_symbols(&mut self) {
-        let mut symbols: HashMap<String, SymbolRecord> = HashMap::new();
+    ///
+    /// The definer table is rebuilt from every file's `exports`, which is a
+    /// pass over stored names and reads nothing. What that pass does *not*
+    /// cost is the other half: re-resolving every file's identifiers. A file
+    /// can only have a different resolution if it was re-parsed or if a name
+    /// it mentions moved definers, and [`Self::ref_index`] answers the second
+    /// without a scan. Everything else keeps the resolution it already had.
+    fn index_symbols(&mut self, dirty: &[String]) -> usize {
+        let mut definers: HashMap<String, Vec<String>> = HashMap::new();
         for (path, record) in &self.files {
-            for symbol in &record.exports {
-                let entry = symbols.entry(symbol.clone()).or_insert(SymbolRecord {
-                    files: Vec::new(),
-                    users: 0,
-                });
-                entry.files.push(path.clone());
+            for name in &record.exports {
+                definers.entry(name.clone()).or_default().push(path.clone());
             }
         }
-        if !symbols
-            .values()
-            .any(|record| record.files.len() <= MAX_DEFINERS)
-        {
-            self.symbols = symbols;
-            for record in self.files.values_mut() {
-                record.used_symbols.clear();
+        let mut moved: HashSet<String> = HashSet::new();
+        for (name, files) in &mut definers {
+            files.sort();
+            files.dedup();
+            if self.symbols.get(name).map(|symbol| &symbol.files) != Some(files) {
+                moved.insert(name.clone());
             }
-            return;
+        }
+        for name in self.symbols.keys() {
+            // A name nobody exports any more: its file list is empty in the
+            // new table (it is absent), and every file that mentions it has
+            // to lose the edge.
+            if !definers.contains_key(name) {
+                moved.insert(name.clone());
+            }
         }
 
-        // A file's own exports are definitions, not uses of itself. Resolved
-        // into a side list so the pass over `self.files` stays immutable.
-        let mut usage: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut resolved: Vec<(String, Vec<String>)> = Vec::with_capacity(self.files.len());
-        for (path, record) in &self.files {
-            let used = resolve(&record.used_symbols, &record.exports, &symbols);
-            for name in &used {
-                usage.entry(name.clone()).or_default().insert(path.clone());
-            }
-            resolved.push((path.clone(), used));
+        let previous = std::mem::take(&mut self.symbols);
+        let mut symbols: HashMap<String, SymbolRecord> = HashMap::with_capacity(definers.len());
+        for (name, files) in definers {
+            // A name no definer moved for keeps the count it had; the pass
+            // below recomputes the ones that changed.
+            let users = if moved.contains(&name) {
+                0
+            } else {
+                previous.get(&name).map_or(0, |symbol| symbol.users)
+            };
+            symbols.insert(name, SymbolRecord { files, users });
         }
-        for (path, used) in resolved {
+
+        let mut targets: HashSet<String> = dirty.iter().cloned().collect();
+        for name in &moved {
+            if let Some(files) = self.ref_index.get(name) {
+                targets.extend(files.iter().cloned());
+            }
+        }
+        let mut affected: HashSet<String> = moved;
+        let mut reresolved = 0;
+        let mut changed: Vec<(String, Vec<String>)> = Vec::new();
+        for path in targets {
+            let Some(record) = self.files.get(&path) else {
+                continue;
+            };
+            let resolved = resolve(&record.raw_refs, &record.exports, &symbols);
+            affected.extend(
+                record
+                    .raw_refs
+                    .iter()
+                    .filter(|name| symbols.contains_key(*name))
+                    .cloned(),
+            );
+            reresolved += 1;
+            if record.used_symbols != resolved {
+                changed.push((path, resolved));
+            }
+        }
+        for (path, resolved) in changed {
             if let Some(record) = self.files.get_mut(&path) {
-                record.used_symbols = used;
+                record.used_symbols = resolved;
             }
         }
-        for (name, record) in &mut symbols {
-            record.files.sort();
-            record.files.dedup();
-            if let Some(users) = usage.get(name) {
-                record.users = users.len();
-            }
+
+        for name in &affected {
+            let Some(symbol) = symbols.get_mut(name) else {
+                continue;
+            };
+            symbol.users = self.ref_index.get(name).map_or(0, |files| {
+                files
+                    .iter()
+                    .filter(|path| {
+                        self.files
+                            .get(*path)
+                            .is_some_and(|record| record.used_symbols.contains(name))
+                    })
+                    .count()
+            });
         }
         self.symbols = symbols;
+        reresolved
     }
 
     pub fn project(&self, limit: usize) -> String {
@@ -511,9 +658,13 @@ fn parse_one(
             imports: result.imports,
             unresolved_imports: result.unresolved_imports,
             syntax_errors: result.syntax_errors,
-            // Raw candidate identifiers; resolved against the whole repo once
-            // every file has been parsed.
-            used_symbols: result.refs,
+            // Resolved against the workspace's exports by `index_symbols`,
+            // once the batch is in — a name is only an edge when exactly one
+            // file exports it, which one file's parse cannot know. Empty here
+            // means "not resolved yet", and a parse the graph pass skips
+            // carries the previous record's list instead.
+            used_symbols: Vec::new(),
+            raw_refs: result.refs,
             size: file.size,
             mtime: file.mtime,
             hash,

@@ -676,3 +676,65 @@ fn apply_changes_confirms_content_by_hash_too() {
     assert_eq!(stats.content_unchanged, 1);
     assert!(!stats.graph_recomputed);
 }
+
+/// An export that moves the definer set re-resolves the files whose *raw*
+/// mentions name it and nobody else.
+///
+/// `src/other.rs` calls `fresh_export` before any file exports it, so the
+/// mention is stored and unresolved; adding the export to `src/lib.rs` makes
+/// that one name meaningful. The pass that re-resolves is the exporter and the
+/// one file that mentions the name — not the four files in the tree — which is
+/// the whole of what keeping raw mentions buys.
+#[test]
+fn an_export_change_reresolves_only_the_files_that_mention_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub fn alpha() {}\n");
+    write(root, "src/user.rs", "pub fn user() { alpha(); }\n");
+    write(root, "src/other.rs", "pub fn other() { fresh_export(); }\n");
+    write(root, "src/quiet.rs", "pub fn quiet() {}\n");
+
+    let mut genome = Genome::index(root).unwrap();
+    assert_eq!(genome.files.len(), 4);
+    assert!(
+        genome.files["src/user.rs"]
+            .used_symbols
+            .contains(&"alpha".to_owned())
+    );
+    assert!(
+        genome.files["src/other.rs"].used_symbols.is_empty(),
+        "nothing exports `fresh_export` yet"
+    );
+    assert_eq!(
+        genome.ref_index["fresh_export"],
+        vec!["src/other.rs".to_owned()]
+    );
+
+    write(
+        root,
+        "src/lib.rs",
+        "pub fn alpha() {}\npub fn fresh_export() {}\n",
+    );
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 1, "one file changed");
+    assert_eq!(
+        stats.reresolved, 2,
+        "the edited file and the file that mentions the new name"
+    );
+    assert!(
+        stats.reresolved < genome.files.len(),
+        "every other file kept the resolution it had"
+    );
+
+    assert_eq!(
+        genome.files["src/other.rs"].used_symbols,
+        vec!["fresh_export".to_owned()]
+    );
+    assert!(genome.files["src/quiet.rs"].used_symbols.is_empty());
+    assert_eq!(
+        genome.symbols["fresh_export"].files,
+        vec!["src/lib.rs".to_owned()]
+    );
+    assert_eq!(genome.symbols["fresh_export"].users, 1);
+}
+
