@@ -3,6 +3,14 @@
 //! The names come from the grammar's nodes, so an indented `def` inside a
 //! class is a symbol and a commented-out one is not. Import lines are still
 //! matched by pattern: a specifier is a string, not a node this crate walks.
+//!
+//! Both import forms are read — `import a.b` and `from .a import b` — and a
+//! dotted module path resolves to the workspace file it names, so an absolute
+//! intra-repo import like `from app.util import helper` is an edge like any
+//! other. A specifier that resolves to nothing is probed against the file set
+//! once — one pass per unresolved import: a first segment the workspace holds
+//! as a directory is a genuinely missing workspace file and warns, anything
+//! else is a std or third-party package and stays out of the graph.
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -10,13 +18,23 @@ use regex::Regex;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{finish, internal, record, resolve_python_relative};
+use super::support::{
+    Comments, Placement, finish, mask_comments, record, resolve_python_relative, resolve_suffix,
+    root_segment,
+};
 use crate::symbols::{self, Grammar, push_site, text};
+
+/// The files a Python module path can land on: a module is a `.py` file, or a
+/// package's `__init__.py`.
+const EXTS: &[&str] = &["py"];
+
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
-    static IMPORTS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^from\s+(\.+[A-Za-z0-9_\.]*)\s+import").expect("py imports")
+    static FROM: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?ms)^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)")
+            .expect("py from imports")
     });
-    let imports_re = &*IMPORTS;
+    static IMPORT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^[ \t]*import[ \t]+([^\n]+)").expect("py imports"));
     let Some(tree) = symbols::parse(Grammar::Python, source) else {
         return ParsedFile {
             syntax_errors: 1,
@@ -25,16 +43,22 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     };
     let mut sites = Vec::new();
     python_module(tree.root_node(), source.as_bytes(), &mut sites);
+    let masked = mask_comments(source, Comments::Hash);
     let mut imports = Vec::new();
     let mut unresolved = Vec::new();
-    for cap in imports_re.captures_iter(source) {
-        let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        record(
-            spec,
-            internal(resolve_python_relative(path, spec, files)),
-            &mut imports,
-            &mut unresolved,
-        );
+    for cap in FROM.captures_iter(&masked) {
+        let module = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let names = cap
+            .get(2)
+            .map(|m| clause_names(m.as_str()))
+            .unwrap_or_default();
+        from_clause(path, module, &names, files, &mut imports, &mut unresolved);
+    }
+    for cap in IMPORT.captures_iter(&masked) {
+        let clause = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        for spec in clause_modules(clause) {
+            import_module(&spec, files, &mut imports, &mut unresolved);
+        }
     }
     finish(
         source,
@@ -43,6 +67,143 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         unresolved,
         symbols::error_count(tree.root_node()),
     )
+}
+
+/// A `from … import …` clause. The module path names a file when it can; when
+/// it cannot — a dotted-only `from . import sibling`, or a package whose
+/// submodule is what is really meant — the named submodules are tried before
+/// giving up, because in Python `from app import sibling` reaches
+/// `app/sibling.py`.
+fn from_clause(
+    path: &str,
+    module: &str,
+    names: &[String],
+    files: &HashSet<String>,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    if module.is_empty() {
+        return;
+    }
+    let dotted_only = module.chars().all(|c| c == '.');
+    if !dotted_only {
+        if let Some(resolved) = resolve_module(path, module, files) {
+            record(module, Placement::Resolved(resolved), imports, unresolved);
+            return;
+        }
+    }
+    let mut resolved_any = false;
+    for name in names {
+        // A dotted-only module already ends in its dot: `from . import x` is
+        // `.x`, not `..x`.
+        let spec = if dotted_only {
+            format!("{module}{name}")
+        } else {
+            format!("{module}.{name}")
+        };
+        if let Some(resolved) = resolve_module(path, &spec, files) {
+            record(&spec, Placement::Resolved(resolved), imports, unresolved);
+            resolved_any = true;
+        }
+    }
+    if resolved_any {
+        return;
+    }
+    if dotted_only {
+        // Nothing but dots names no file of its own; the names after `import`
+        // are the submodules, and a bare `from . import x` names `.x`.
+        if names.is_empty() {
+            record(module, Placement::Missing, imports, unresolved);
+        } else {
+            for name in names {
+                let spec = format!("{module}{name}");
+                record(&spec, Placement::Missing, imports, unresolved);
+            }
+        }
+        return;
+    }
+    record(module, placement(module, files), imports, unresolved);
+}
+
+/// A plain `import a.b`: always absolute, so a specifier that names no file is
+/// a workspace dependency only when the workspace has a directory of that
+/// first name; otherwise it is a std or third-party package.
+fn import_module(
+    spec: &str,
+    files: &HashSet<String>,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    let placement = match resolve_absolute(spec, files) {
+        Some(resolved) => Placement::Resolved(resolved),
+        None => placement(spec, files),
+    };
+    record(spec, placement, imports, unresolved);
+}
+
+/// Where a dotted module path lands: a relative path walks the file's own
+/// package, an absolute one is looked up by its trailing module path.
+fn resolve_module(path: &str, spec: &str, files: &HashSet<String>) -> Option<String> {
+    if spec.starts_with('.') {
+        return resolve_python_relative(path, spec, files);
+    }
+    resolve_absolute(spec, files)
+}
+
+/// `app.util` → the workspace file for `app/util`.
+fn resolve_absolute(spec: &str, files: &HashSet<String>) -> Option<String> {
+    resolve_suffix(&spec.replace('.', "/"), EXTS, files)
+}
+
+/// A specifier that resolved to nothing: the first segment decides. When the
+/// workspace holds a directory of that name the import is workspace-shaped and
+/// its target is genuinely missing; when it does not, the specifier names a
+/// std or third-party package and is not this workspace's business. Probing
+/// the file set costs one pass per unresolved import.
+fn placement(spec: &str, files: &HashSet<String>) -> Placement {
+    let root = root_segment(spec);
+    if root.is_empty() {
+        return Placement::External;
+    }
+    let top = format!("{root}/");
+    let nested = format!("/{root}/");
+    if files
+        .iter()
+        .any(|known| known.starts_with(&top) || known.contains(&nested))
+    {
+        Placement::Missing
+    } else {
+        Placement::External
+    }
+}
+
+/// The module paths an `import a.b as c, d.e` clause brings in; an `as` alias
+/// names a local binding, not a file.
+fn clause_modules(clause: &str) -> Vec<String> {
+    let cleaned = plain(clause);
+    cleaned
+        .split(',')
+        .filter_map(|entry| entry.split_whitespace().next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The names a `from m import a, b as c` clause brings in, wrapped form
+/// included; `*` is not a name.
+fn clause_names(clause: &str) -> Vec<String> {
+    let cleaned = plain(clause);
+    cleaned
+        .split(',')
+        .filter_map(|entry| entry.split_whitespace().next())
+        .filter(|name| !name.is_empty() && *name != "*")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Drops the parentheses a wrapped import clause is written with.
+fn plain(clause: &str) -> String {
+    clause.chars().filter(|c| *c != '(' && *c != ')').collect()
 }
 
 /// Python: module-level definitions, the methods of module-level classes, and
