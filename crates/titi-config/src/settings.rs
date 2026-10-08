@@ -117,6 +117,16 @@ pub const TERMINAL_PROGRESS_KEY: &str = "terminal.progress";
 /// counts and is an estimate, not a provider count.
 pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 
+/// Which pre-built status line the screen paints.
+///
+/// The names are `default` (today's line, the fallback for anything this key
+/// does not name), `minimal`, `compact`, `full` and `ascii`. Unset, unknown or
+/// unreadable means `default`: a cosmetic key must never change what the screen
+/// does more than it says, and must never refuse to start. This crate owns the
+/// name only; the segments behind each preset live in
+/// `titi_tui::status_bar::PRESETS`.
+pub const STATUS_LINE_PRESET_KEY: &str = "statusLine.preset";
+
 impl Settings {
     /// Discover and load all layers.
     ///

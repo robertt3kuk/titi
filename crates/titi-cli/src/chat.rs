@@ -26,7 +26,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
-use titi_tui::status_bar::{StatusSnapshot, live_snapshot};
+use titi_tui::status_bar::{StatusLineStyle, StatusSnapshot, live_snapshot, short_model};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -541,6 +541,10 @@ pub struct Chat {
     agent_dir: PathBuf,
     paused: bool,
     context_percent: Option<u8>,
+    /// Which pre-built status line the masthead paints, and what its middle does
+    /// with the context. Read from the settings at startup and changed by
+    /// `/statusline`.
+    status_line: StatusLineStyle,
     reply: String,
     /// Bytes of `reply` already written to the session file. A tool call
     /// splits the turn's text into segments, and each is recorded once.
@@ -676,6 +680,7 @@ impl Chat {
             agent_dir: titi_config::agent_dir(),
             paused: false,
             context_percent: None,
+            status_line: StatusLineStyle::default(),
             reply: String::new(),
             recorded_reply: 0,
             shown_from: 0,
@@ -3768,6 +3773,14 @@ pub fn run(
     .ok();
     let term_env = titi_tui::caps::TermEnv::from_env();
     chat.terminal = TerminalFeatures::resolve(settings.as_ref(), &term_env);
+    // The status line's preset comes from the same settings, resolved before
+    // the first frame: an unknown or unset name is `default`, so a typo in a
+    // cosmetic key changes nothing and never refuses to start.
+    let preset = setting_string(
+        settings.as_ref(),
+        titi_config::settings::STATUS_LINE_PRESET_KEY,
+    );
+    chat.status_line = StatusLineStyle::resolve(preset.as_deref());
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
@@ -5473,23 +5486,6 @@ fn elapsed_label(elapsed: Duration) -> String {
     format!("{:.1}s", elapsed.as_secs_f64())
 }
 
-/// Cells the context segment always occupies, whether or not a percentage has
-/// been reported: ` 3%`, `42%`, `100%`.
-///
-/// Reserving it is what keeps the model in one column when the first percentage
-/// arrives; the plan's §1.8 frames show the whole right block sliding three
-/// cells left at that moment.
-const CONTEXT_SLOT: usize = 4;
-
-/// Cells the session's name may take before it is cut with an ellipsis. The
-/// namer caps a title at forty characters (`titi_core::session::namer`), which
-/// is more than a narrow pane can give away.
-const SESSION_SLOT: usize = 18;
-
-/// One cell kept between the groups, so a full line cannot run the state word
-/// into the model.
-const MASTHEAD_GAP: usize = 1;
-
 /// The word the masthead shows for the session's state.
 fn state_word(chat: &Chat) -> &'static str {
     if chat.approval.is_some() {
@@ -5517,17 +5513,6 @@ fn state_color(chat: &Chat) -> ThemeColor {
     }
 }
 
-/// The separator between masthead segments: the crate's thin powerline, in the
-/// colour its own status line uses for it.
-fn masthead_sep(theme: &Theme) -> String {
-    let sep = theme.symbol("sep.powerlineThinLeft");
-    if sep.is_empty() {
-        " > ".to_owned()
-    } else {
-        format!(" {} ", theme.fg(ThemeColor::StatusLineSep, sep))
-    }
-}
-
 /// The masthead: the brand and the session's state, then the working directory
 /// and its git state on the left, and the session's name, the model and the
 /// context slot on the right.
@@ -5535,6 +5520,16 @@ fn masthead(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
     let snapshot = masthead_snapshot(chat);
     let line = Line::from(masthead_spans(chat, width, theme, &snapshot));
     Paragraph::new(line).style(page(theme))
+}
+
+/// One string out of the settings, when the layer that set it holds a string.
+///
+/// A number, a list or a mapping at a key that wants a name is not a name, so
+/// the caller falls back exactly as it does for an unset key.
+fn setting_string(settings: Option<&titi_config::settings::Settings>, key: &str) -> Option<String> {
+    settings?
+        .get(key)
+        .and_then(|value| value.as_str().map(str::to_owned))
 }
 
 /// The masthead's facts in the crate's own status-line shape, so the working
@@ -5546,13 +5541,25 @@ fn masthead(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
 /// `stat`s instead of a `git` process.
 fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
     let mut snapshot = live_snapshot(&chat.model, chat.session_label.trim());
+    // The mark and the state word open the line as one cluster: the word is the
+    // session's state, in the colour of what it is doing, and the preset table
+    // paints the pair only when its row names them.
+    snapshot.brand = Some("titi".to_owned());
+    snapshot.state = Some(state_word(chat).to_owned());
+    snapshot.state_color = state_color(chat);
     // The badge is the engine's mode, not a local toggle: it says what the
     // next turn may actually do.
     snapshot.mode = match chat.mode {
         SessionMode::Agent => None,
         other => Some(other.label().to_owned()),
     };
+    // A loop running unseen is the whole problem, which is why this sits beside
+    // the state word; `None` hides the segment when there is nothing running.
+    snapshot.loops = (!chat.jobs.is_empty()).then_some(chat.jobs.len());
     snapshot.context_pct = chat.context_percent;
+    // The totals are what the `full` preset prints.
+    snapshot.tokens = (chat.session_prompt_tokens > 0 || chat.session_completion_tokens > 0)
+        .then_some((chat.session_prompt_tokens, chat.session_completion_tokens));
     snapshot
 }
 
@@ -5561,245 +5568,27 @@ fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
 /// Split from [`masthead`] so a test can measure the layout: this machine's
 /// working directory and git state must not decide what a test sees.
 ///
-/// # The right group is laid out first, and its width is reserved
-///
-/// The right group is what must not move, so it is measured first and the gap
-/// takes what is left. The context percent lives in [`CONTEXT_SLOT`] cells that
-/// are drawn whether or not a percentage has been reported, so its arrival
-/// cannot shift the model. A name longer than [`SESSION_SLOT`] is cut with an
-/// ellipsis, so a name arriving reflows the line once, when it arrives.
-///
-/// # What the line gives up, in order
-///
-/// The brand, the state word, the model and the context slot are never dropped.
-/// Everything else goes, in this order, when the pane is too narrow: the git
-/// state (the most cells for the least actionable fact), the working directory,
-/// the session's name (the model beside it says more about this session, and
-/// the name is in the picker), the mode, the loop count, and then the model's
-/// provider prefix. Only when even the bare model and the state word do not fit
-/// — a pane under about thirty cells — is the model cut, and with an ellipsis,
-/// so a cut can never be read as a whole id.
+/// The line itself is the crate's status line, painted from the preset table
+/// (`titi_tui::status_bar::PRESETS`) in the chat's own style. That table owns
+/// the segment set, the separator and the order the segments are shed in when
+/// the pane is too narrow, so a preset is a row there — with `default` the
+/// row that reproduces this line exactly — and never a branch here. What the
+/// line gives up, in order, is the git state (the most cells for the least
+/// actionable fact), the directory, the session's name, the mode, the loop
+/// count, and last the model's provider prefix, then the model itself, cut
+/// with an ellipsis so a cut can never be read as a whole id.
 fn masthead_spans(
     chat: &Chat,
     width: u16,
     theme: &Theme,
     snapshot: &StatusSnapshot,
 ) -> Vec<Span<'static>> {
-    let width = width as usize;
-    let sep = masthead_sep(theme);
-    // The brand and the state word open the line as one cluster; every other
-    // segment is a fact of its own, joined by the crate's thin separator.
-    let head = format!(
-        " {}  {}",
-        theme.fg(ThemeColor::Accent, &theme.bold("titi")),
-        theme.fg(state_color(chat), state_word(chat)),
-    );
-    let mut git = git_segment(snapshot, theme);
-    let mut path = path_segment(snapshot, theme);
-    let mut name = name_segment(chat, theme);
-    let mut mode = mode_segment(chat, theme);
-    let mut loops = loops_segment(chat, theme);
-    let mut model = model_segment(chat, theme, false);
-    let short = model_segment(chat, theme, true);
-    let context = context_segment(snapshot, theme);
-
-    let left_of = |git: &Option<String>,
-                   path: &Option<String>,
-                   mode: &Option<String>,
-                   loops: &Option<String>| {
-        let mut line = head.clone();
-        for part in [mode, loops, path, git].into_iter().flatten() {
-            line.push_str(&sep);
-            line.push_str(part);
-        }
-        line
-    };
-    let right_of = |name: &Option<String>, model: &str| {
-        let parts: Vec<&str> = name
-            .iter()
-            .map(String::as_str)
-            .chain([model, context.as_str()])
-            .collect();
-        parts.join(&sep)
-    };
-
-    let mut step = 0usize;
-    let (left, right) = loop {
-        let left = left_of(&git, &path, &mode, &loops);
-        let right = right_of(&name, &model);
-        if titi_tui::width::visible_width(&left)
-            + MASTHEAD_GAP
-            + titi_tui::width::visible_width(&right)
-            <= width
-        {
-            break (left, right);
-        }
-        step += 1;
-        match step {
-            1 => git = None,
-            2 => path = None,
-            3 => name = None,
-            4 => mode = None,
-            5 => loops = None,
-            6 => model = short.clone(),
-            _ => {
-                // Nothing left to give: the model is cut to what the rest of
-                // the line leaves it, with an ellipsis.
-                let others = right_of(&name, "");
-                let room = width.saturating_sub(
-                    titi_tui::width::visible_width(&left)
-                        + MASTHEAD_GAP
-                        + titi_tui::width::visible_width(&others),
-                );
-                model = fitted_model(&short_model(&chat.model), theme, room);
-                break (left, right_of(&name, &model));
-            }
-        }
-    };
-
-    let gap = width
-        .saturating_sub(
-            titi_tui::width::visible_width(&left) + titi_tui::width::visible_width(&right),
-        )
-        .max(MASTHEAD_GAP);
-    let line = format!("{left}{}{right}", " ".repeat(gap));
-    // The gap can be forced past the pane only by the last resort above, and
-    // ratatui would then clip the line; cut it here so the width a test measures
-    // is the width a terminal gets.
-    sgr_row(&titi_tui::width::truncate_to_width(&line, width))
-}
-
-/// The git segment: the branch, and the counts of what is not committed, in the
-/// crate's own tokens (`left_parts` of `status_bar`, segment for segment).
-fn git_segment(snapshot: &StatusSnapshot, theme: &Theme) -> Option<String> {
-    let branch = snapshot.git_branch.as_ref()?;
-    let icon = theme.symbol("icon.branch");
-    let mut git = if icon.is_empty() {
-        branch.clone()
-    } else {
-        format!("{icon} {branch}")
-    };
-    for (count, mark, token) in [
-        (snapshot.git_unstaged, "*", ThemeColor::StatusLineDirty),
-        (snapshot.git_staged, "+", ThemeColor::StatusLineStaged),
-        (snapshot.git_untracked, "?", ThemeColor::StatusLineUntracked),
-    ] {
-        if count > 0 {
-            git.push(' ');
-            git.push_str(&theme.fg(token, &format!("{mark}{count}")));
-        }
-    }
-    let dirty = snapshot.git_unstaged > 0 || snapshot.git_staged > 0 || snapshot.git_untracked > 0;
-    let color = if dirty {
-        ThemeColor::StatusLineGitDirty
-    } else {
-        ThemeColor::StatusLineGitClean
-    };
-    Some(theme.fg(color, &git))
-}
-
-/// The working directory, folded to `~` and abbreviated by the crate's reader.
-fn path_segment(snapshot: &StatusSnapshot, theme: &Theme) -> Option<String> {
-    if snapshot.path.is_empty() {
-        return None;
-    }
-    let icon = theme.symbol("icon.folder");
-    let text = if icon.is_empty() {
-        snapshot.path.clone()
-    } else {
-        format!("{icon} {}", snapshot.path)
-    };
-    Some(theme.fg(ThemeColor::StatusLinePath, &text))
-}
-
-/// The session's name: what the engine calls this session, never its id.
-///
-/// A session the namer has not reached yet has no name and no segment; the
-/// engine announces one when it makes it, and a resumed session already has one.
-fn name_segment(chat: &Chat, theme: &Theme) -> Option<String> {
-    let name = chat.session_label.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let shown = if titi_tui::width::visible_width(name) > SESSION_SLOT {
-        format!(
-            "{}…",
-            titi_tui::width::truncate_to_width(name, SESSION_SLOT.saturating_sub(1))
-        )
-    } else {
-        name.to_owned()
-    };
-    Some(theme.fg(ThemeColor::Muted, &shown))
-}
-
-/// The mode badge, when the engine is in one that is worth saying.
-fn mode_segment(chat: &Chat, theme: &Theme) -> Option<String> {
-    let mode = match chat.mode {
-        SessionMode::Agent => return None,
-        other => other.label(),
-    };
-    Some(theme.fg(state_color(chat), mode))
-}
-
-/// The background loops the engine reported, when there are any: a loop running
-/// unseen is the whole problem, which is why this sits beside the state word.
-fn loops_segment(chat: &Chat, theme: &Theme) -> Option<String> {
-    if chat.jobs.is_empty() {
-        return None;
-    }
-    Some(theme.fg(state_color(chat), &format!("{} loop(s)", chat.jobs.len())))
-}
-
-/// The model, whole or in the crate's short form (`status_bar::short_model`,
-/// which is private, so its rule lives here): a provider prefix is the first
-/// thing to go, because half a prefix (`open -codex/gpt-5.5`) names nothing.
-fn model_segment(chat: &Chat, theme: &Theme, short: bool) -> String {
-    let icon = theme.symbol("icon.model");
-    let model = if short {
-        short_model(&chat.model)
-    } else {
-        chat.model.clone()
-    };
-    let text = if icon.is_empty() {
-        model
-    } else {
-        format!("{icon} {model}")
-    };
-    theme.fg(ThemeColor::Muted, &text)
-}
-
-/// The model cut to `room` cells, with an ellipsis: the last resort, when even
-/// the short form does not fit beside the state word.
-fn fitted_model(model: &str, theme: &Theme, room: usize) -> String {
-    let icon = theme.symbol("icon.model");
-    let prefix = if icon.is_empty() {
-        String::new()
-    } else {
-        format!("{icon} ")
-    };
-    let room = room.saturating_sub(titi_tui::width::visible_width(&prefix));
-    let head = titi_tui::width::truncate_to_width(model, room.saturating_sub(1));
-    theme.fg(ThemeColor::Muted, &format!("{prefix}{head}…"))
-}
-
-/// A model id without its provider prefix (`openai-codex/gpt-5.5` → `gpt-5.5`),
-/// the crate's own rule for a status line.
-fn short_model(id: &str) -> String {
-    id.rsplit('/').next().unwrap_or(id).to_owned()
-}
-
-/// The context slot: always [`CONTEXT_SLOT`] cells, so the model beside it
-/// cannot move when the first percentage arrives. Blank until one has been
-/// reported, so the digits appear where the space already was.
-fn context_segment(snapshot: &StatusSnapshot, theme: &Theme) -> String {
-    let text = match snapshot.context_pct {
-        Some(percent) => format!("{percent:>3}%"),
-        None => String::new(),
-    };
-    theme.fg(
-        ThemeColor::StatusLineContext,
-        &format!("{text:>CONTEXT_SLOT$}"),
-    )
+    sgr_row(&titi_tui::status_bar::render_status_line(
+        theme,
+        width,
+        chat.status_line,
+        snapshot,
+    ))
 }
 
 /// The live status row, drawn on the single line between the conversation and
@@ -7864,6 +7653,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use titi_engine::TurnId;
     use titi_providers::StopReason;
+    use titi_tui::status_bar::StatusLinePreset;
 
     /// A chat with the theme a test names, for the ones that need a palette
     /// where two tokens are two different colours.
@@ -11527,18 +11317,117 @@ mod tests {
     /// A snapshot a test controls: the layout must not depend on this
     /// machine's working directory or git state.
     fn snapshot_for(chat: &Chat, context_pct: Option<u8>) -> StatusSnapshot {
+        // Everything the screen states about the session comes from the live
+        // helper, so a preset test measures the real line; only this machine's
+        // working directory and git state are pinned.
         StatusSnapshot {
-            model: chat.model.clone(),
-            mode: match chat.mode {
-                SessionMode::Agent => None,
-                other => Some(other.label().to_owned()),
-            },
             path: "~/proj/titi/crates/titi-cli".to_owned(),
             git_branch: Some("master".to_owned()),
             git_unstaged: 2,
             context_pct,
-            session_name: chat.session_label.clone(),
-            ..StatusSnapshot::default()
+            ..masthead_snapshot(chat)
+        }
+    }
+
+    /// The default status line is today's line, byte for byte.
+    ///
+    /// The promise the preset table makes is a compatibility one: a user who
+    /// sets nothing sees exactly the frame they saw before the table existed.
+    /// These strings were captured from the screen before the presets landed
+    /// (`masthead_at` over a pinned snapshot, at the three widths the layout is
+    /// judged at), and the last case is the context slot with a percentage in
+    /// it — the one thing that changes between two frames of this line.
+    #[test]
+    fn the_default_status_line_is_todays_line() {
+        let mut chat = chat();
+        chat.model = "glm-5.3-flash".to_owned();
+        chat.session_label = "blue-otter".to_owned();
+        let golden = [
+            (
+                60u16,
+                None,
+                r#" titi  ready             blue-otter > ⬢ glm-5.3-flash >     "#,
+            ),
+            (
+                60,
+                Some(42),
+                r#" titi  ready             blue-otter > ⬢ glm-5.3-flash >  42%"#,
+            ),
+            (
+                80,
+                None,
+                r#" titi  ready                                 blue-otter > ⬢ glm-5.3-flash >     "#,
+            ),
+            (
+                80,
+                Some(42),
+                r#" titi  ready                                 blue-otter > ⬢ glm-5.3-flash >  42%"#,
+            ),
+            (
+                120,
+                None,
+                r#" titi  ready > 📁 ~/proj/titi/crates/titi-cli > ⑂ master *2                          blue-otter > ⬢ glm-5.3-flash >     "#,
+            ),
+            (
+                120,
+                Some(42),
+                r#" titi  ready > 📁 ~/proj/titi/crates/titi-cli > ⑂ master *2                          blue-otter > ⬢ glm-5.3-flash >  42%"#,
+            ),
+        ];
+        for (width, percent, expected) in golden {
+            let line = masthead_at(&chat, width, &snapshot_for(&chat, percent));
+            assert_eq!(line, expected, "{width} at {percent:?}");
+        }
+    }
+
+    /// A preset is a row of the table, and the row decides the segments: what
+    /// the masthead paints is what the row names, and `ascii` paints it in
+    /// printable glyphs only.
+    #[test]
+    fn the_masthead_paints_the_preset_it_is_set_to() {
+        let mut chat = chat();
+        chat.model = "glm-5.3-flash".to_owned();
+        chat.session_label = "blue-otter".to_owned();
+        let at = |chat: &mut Chat, preset: StatusLinePreset| {
+            chat.status_line.preset = preset;
+            let snapshot = snapshot_for(chat, Some(42));
+            masthead_at(chat, 120, &snapshot)
+        };
+        let default = at(&mut chat, StatusLinePreset::Default);
+        for expected in ["titi", "ready", "blue-otter", "glm-5.3-flash", "~/proj"] {
+            assert!(
+                default.contains(expected),
+                "{expected:?} missing: {default:?}"
+            );
+        }
+        let minimal = at(&mut chat, StatusLinePreset::Minimal);
+        assert!(minimal.contains("glm-5.3-flash"), "{minimal:?}");
+        assert!(!minimal.contains("titi"), "{minimal:?}");
+        assert!(!minimal.contains("blue-otter"), "{minimal:?}");
+        let compact = at(&mut chat, StatusLinePreset::Compact);
+        assert!(
+            compact.contains("glm-5.3-flash") && compact.contains("~/proj"),
+            "{compact:?}"
+        );
+        assert!(!compact.contains("blue-otter"), "{compact:?}");
+        let full = at(&mut chat, StatusLinePreset::Full);
+        assert!(full.contains("blue-otter"), "{full:?}");
+        let ascii = at(&mut chat, StatusLinePreset::Ascii);
+        assert!(ascii.is_ascii(), "{ascii:?}");
+        assert!(ascii.contains("[D]") || ascii.contains("[M]"), "{ascii:?}");
+        // Every preset fills the pane it is given.
+        for preset in [
+            StatusLinePreset::Default,
+            StatusLinePreset::Minimal,
+            StatusLinePreset::Compact,
+            StatusLinePreset::Full,
+            StatusLinePreset::Ascii,
+        ] {
+            assert_eq!(
+                titi_tui::width::visible_width(&at(&mut chat, preset)),
+                120,
+                "{preset:?}"
+            );
         }
     }
 
