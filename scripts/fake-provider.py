@@ -21,6 +21,8 @@ the real binary and the real HTTP stack:
   "read dir"      a read call on the workspace root (a directory)
   "write file"    a write call creating smoke.txt
   "think"         reasoning deltas, then markdown
+  "markdown table"  a GFM table: alignment colons, a bold and an inline-code
+                  cell, a CJK cell, and a wide cell that must wrap
   "wide text"     CJK and emoji
   "fail401" / "fail429" / "fail500"   that HTTP status with an error body
   a tool result   "tool said: <first line of the result>"
@@ -132,6 +134,16 @@ def script(last: dict) -> list[tuple[dict, float]]:
     if "think" in content:
         thinking = [(chunk({"reasoning_content": w + " "}), 0.05) for w in "let me consider this".split()]
         return thinking + [(chunk({"content": "**Thought** done. `code` here."}), 0), (chunk({}, "stop"), 0)]
+    if "markdown table" in content:
+        table = (
+            "Here is the comparison:\n\n"
+            "| Option | Latency | Notes |\n"
+            "|:-------|:-------:|------:|\n"
+            "| alpha | 12ms | `fast` |\n"
+            "| **beta** | 340ms | 日本語のテキストです |\n"
+            "| gamma | 7ms | one two three four five six seven |\n"
+        )
+        return words(table, 0.01) + [(chunk({}, "stop"), 0)]
     if "wide text" in content:
         parts = ["日本語のテキスト ", "and emoji 🎉🚀 ", "mixed 中文 text ", "done."]
         return [(chunk({"content": p}), 0) for p in parts] + [(chunk({}, "stop"), 0)]
