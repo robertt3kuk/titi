@@ -39,6 +39,7 @@ All notable user-facing changes to titi, newest first.
 
 ### Fixed
 
+- A dotted key written flat in a config file — `editor.vim: true` at the top level, which is exactly what `/settings` prints — is read as the setting its name spells, instead of being shown by `/settings` and silently doing nothing. Nothing is rewritten, so a name that really contains a dot (a provider named `openai.azure` under `providers`) is still one key; where a file writes both spellings, the nested one wins, because that is the shape this project writes; and `/settings reset` takes out whichever spelling the file has.
 - A `/sessions <query>` row is dated by the line that matched — when that entry was written, which is what the result is a result of — and named by the session's own title; it used to say when the session's *file* was last written, so a hit inside an old session read as brand new, and it looked the title up per hit instead of taking the one the search already carried.
 
 - `Escape` on an open command list closes the list and leaves the composer exactly as typed, the way the emoji picker's Esc works; the list comes back on the next keystroke. It used to take the whole draft with it — a mid-sentence skill's sentence included.

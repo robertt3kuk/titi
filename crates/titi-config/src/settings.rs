@@ -314,12 +314,10 @@ impl Settings {
 
     /// Effective value of a dotted key (`theme.dark`), highest layer wins.
     pub fn get(&self, key: &str) -> Option<Value> {
-        let effective = self.effective();
-        let mut current = &effective;
-        for seg in key.split('.') {
-            current = index(current, seg)?;
-        }
-        Some(current.clone())
+        // The same walk every other read uses, so the flat spelling of a key
+        // (`editor.vim: true` at the top level, which is what `/settings`
+        // prints) is the setting its name spells. See [`lookup`].
+        lookup(&self.effective(), key)
     }
 
     /// [`PASTE_MENU_THRESHOLD_KEY`] as a line count, `Some(0)` meaning the menu
@@ -497,7 +495,7 @@ impl Settings {
     /// Remove a dotted key from the global layer, restoring the next layer's
     /// (or default) value at read time.
     pub fn reset(&mut self, key: &str) -> Result<(), SettingsError> {
-        remove_nested(&mut self.global, key).map_err(|reason| SettingsError::Key {
+        remove_key(&mut self.global, key).map_err(|reason| SettingsError::Key {
             key: key.into(),
             reason,
         })?;
@@ -505,7 +503,7 @@ impl Settings {
     }
 
     pub fn reset_project(&mut self, key: &str) -> Result<(), SettingsError> {
-        remove_nested(&mut self.project, key).map_err(|reason| SettingsError::Key {
+        remove_key(&mut self.project, key).map_err(|reason| SettingsError::Key {
             key: key.into(),
             reason,
         })?;
@@ -551,7 +549,32 @@ impl Settings {
     }
 }
 
+/// A dotted key's value in one layer: the nested path it names, and a flat key
+/// spelled exactly like that path when the path is not there.
+///
+/// The second half is what makes a copy of `/settings` a setting. The listing
+/// prints every scalar by its dotted name ([`Settings::flatten`]), so a person
+/// who copies a line out of it writes `editor.vim: true` at the top level —
+/// one literal key in YAML, not a path — and before this it was read as
+/// nothing at all while the listing went on showing it. Nothing is rewritten
+/// here, so a name that really contains a dot (a provider named
+/// `openai.azure` under `providers`) stays exactly one key.
+///
+/// Where a layer holds both, the nested one wins: that is the shape this crate
+/// writes and every file it has written uses, so a file that says both is read
+/// by its structure.
 fn lookup(layer: &Value, key: &str) -> Option<Value> {
+    if let Some(value) = lookup_nested(layer, key) {
+        return Some(value);
+    }
+    // A flat key spelled exactly like the path, which is what `/settings`
+    // prints and what a person who copies a line out of it writes: in YAML
+    // `editor.vim: true` is one literal key, not `editor` -> `vim`.
+    layer.get(key).cloned()
+}
+
+/// The nested walk a dotted key names (`theme.dark` -> `theme` -> `dark`).
+fn lookup_nested(layer: &Value, key: &str) -> Option<Value> {
     let mut current = layer;
     for seg in key.split('.') {
         current = index(current, seg)?;
@@ -651,6 +674,16 @@ fn set_nested(tree: &mut Value, key: &str, value: Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Drops a dotted key from one layer: the nested path, and the flat key
+/// spelled exactly like it — the same two spellings [`lookup`] reads, so a
+/// reset takes out whichever one the file has.
+fn remove_key(tree: &mut Value, key: &str) -> Result<(), String> {
+    if let Value::Object(map) = tree {
+        map.remove(key);
+    }
+    remove_nested(tree, key)
+}
+
 fn remove_nested(tree: &mut Value, key: &str) -> Result<(), String> {
     let mut current = match tree {
         Value::Object(map) => map,
@@ -729,6 +762,78 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    /// A flat dotted key is the setting its name spells: what `/settings`
+    /// prints, and what a person who copies a line out of it writes. The
+    /// nested form and the flat one are the same setting.
+    #[test]
+    fn a_flat_dotted_key_is_read_as_its_path() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(&agent.path().join("config.yml"), "editor.vim: true\n");
+        let flat = Settings::load(agent.path(), project.path(), &[]).expect("load flat");
+        assert_eq!(flat.get(EDITOR_VIM_KEY), Some(Value::Bool(true)));
+        assert!(switch_on(&flat, EDITOR_VIM_KEY));
+
+        let nested_agent = TempDir::new().unwrap();
+        write(
+            &nested_agent.path().join("config.yml"),
+            "editor:\n  vim: true\n",
+        );
+        let nested = Settings::load(nested_agent.path(), project.path(), &[]).expect("load nested");
+        assert_eq!(nested.get(EDITOR_VIM_KEY), flat.get(EDITOR_VIM_KEY));
+        assert!(switch_on(&nested, EDITOR_VIM_KEY));
+
+        // And `/settings` names the layer the flat key came from, rather than
+        // calling it unknown.
+        assert_eq!(
+            flat.flatten()
+                .get(EDITOR_VIM_KEY)
+                .map(|(source, _)| source.clone()),
+            Some("agent".to_owned())
+        );
+
+        // A reset takes out whichever spelling the file has.
+        let mut flat = flat;
+        flat.reset(EDITOR_VIM_KEY).expect("reset");
+        assert_eq!(flat.get(EDITOR_VIM_KEY), None);
+        let on_disk = std::fs::read_to_string(agent.path().join("config.yml")).expect("read");
+        assert!(!on_disk.contains("vim"), "{on_disk}");
+    }
+
+    /// A file that says both is read by its structure: the nested path wins,
+    /// because that is the shape this crate writes.
+    #[test]
+    fn a_nested_key_wins_over_a_flat_one_in_the_same_file() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "editor:\n  vim: false\neditor.vim: true\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).expect("load");
+        assert_eq!(settings.get(EDITOR_VIM_KEY), Some(Value::Bool(false)));
+        assert!(!switch_on(&settings, EDITOR_VIM_KEY));
+    }
+
+    /// Accepting the flat spelling rewrites nothing: a name that really
+    /// contains a dot stays one key under its parent.
+    #[test]
+    fn a_dotted_name_under_a_parent_is_not_a_path() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &agent.path().join("config.yml"),
+            "providers:\n  openai.azure:\n    id: azure\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).expect("load");
+        // The provider is one entry under `providers`, not `azure` under
+        // `openai`, and no path built out of its name resolves.
+        let providers = settings.get("providers").expect("providers");
+        assert!(providers.get("openai.azure").is_some(), "{providers}");
+        assert!(providers.get("openai").is_none(), "{providers}");
+        assert_eq!(settings.get("providers.openai.azure.id"), None);
     }
 
     #[test]
