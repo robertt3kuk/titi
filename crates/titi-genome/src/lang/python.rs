@@ -19,9 +19,10 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, first_known, literal_regex, mask_comments, record,
-    resolve_python_relative, resolve_suffix, root_segment,
+    Comments, Placement, finish, first_known, mask_comments, record, resolve_python_relative,
+    resolve_suffix, root_segment,
 };
+use crate::patterns::literal_regex;
 use crate::symbols::{self, Grammar, push_site, text};
 use crate::{Candidate, UnresolvedImport};
 

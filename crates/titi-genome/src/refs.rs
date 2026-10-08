@@ -14,6 +14,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::patterns::literal_regex;
+
 /// Distinct identifiers recorded per file. Past this the file is mostly noise
 /// and the symbol lookup cost stops paying for itself.
 pub const MAX_REFS: usize = 512;
@@ -257,11 +259,10 @@ pub(crate) fn is_noise_name(name: &str) -> bool {
 /// `path` is not a dependency on whatever file exports `path`.
 pub(crate) fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
     static CALL: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\(").expect("call regex"));
+        LazyLock::new(|| literal_regex(r"([A-Za-z_][A-Za-z0-9_]{2,})\s*\("));
     static PATH: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"::\s*([A-Za-z_][A-Za-z0-9_]{2,})").expect("path regex"));
-    static TYPE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([A-Z][A-Za-z0-9_]{2,})\b").expect("type regex"));
+        LazyLock::new(|| literal_regex(r"::\s*([A-Za-z_][A-Za-z0-9_]{2,})"));
+    static TYPE: LazyLock<Regex> = LazyLock::new(|| literal_regex(r"\b([A-Z][A-Za-z0-9_]{2,})\b"));
 
     let own: HashSet<&str> = exports.iter().map(String::as_str).collect();
     let mut seen: HashSet<String> = HashSet::new();
@@ -352,4 +353,41 @@ fn qualifier_before(source: &str, name_start: usize) -> Option<&str> {
         i -= 1;
     }
     if i == end { None } else { source.get(i..end) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_refs;
+
+    /// The three literal patterns compile, and each pass reaches its own.
+    ///
+    /// `collect_refs` derefs `CALL`, `PATH` and `TYPE` in one call — the three
+    /// scans are unconditional — so a pattern that stopped compiling fails
+    /// here instead of in a user's session. Each is asserted separately,
+    /// because a pattern that still compiled but stopped *matching* would
+    /// otherwise go unnoticed: a bare call, a qualified name whose qualifier is
+    /// not std, and a capitalized type name. The names are ones the noise
+    /// filter keeps, so the assertion is about the pattern and not the filter.
+    #[test]
+    fn the_call_path_and_type_patterns_compile_and_match() {
+        let call = collect_refs("load_widget();\n", &[]);
+        assert!(
+            call.contains(&"load_widget".to_owned()),
+            "call pass: {call:?}"
+        );
+
+        // The call pass skips a name preceded by `::`, so this one is the path
+        // pattern's to answer.
+        let path = collect_refs("hub::load_widget();\n", &[]);
+        assert!(
+            path.contains(&"load_widget".to_owned()),
+            "path pass: {path:?}"
+        );
+
+        let kind = collect_refs("let x = WidgetFactory::default();\n", &[]);
+        assert!(
+            kind.contains(&"WidgetFactory".to_owned()),
+            "type pass: {kind:?}"
+        );
+    }
 }

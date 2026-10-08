@@ -22,9 +22,9 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, internal, literal_regex, mask_comments, record, resolve_relative,
-    resolve_suffix,
+    Comments, Placement, finish, internal, mask_comments, record, resolve_relative, resolve_suffix,
 };
+use crate::patterns::literal_regex;
 
 use crate::UnresolvedImport;
 use crate::symbols::{self, has_child_kind, push_field, push_site, text};

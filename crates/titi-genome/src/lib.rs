@@ -24,6 +24,7 @@ mod graph;
 mod lang;
 pub mod live;
 mod lsp;
+mod patterns;
 mod project;
 mod query;
 mod refs;

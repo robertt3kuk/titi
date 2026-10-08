@@ -7,25 +7,10 @@
 
 use std::collections::HashSet;
 
-use regex::Regex;
-
 use crate::refs;
 use crate::{Candidate, UnresolvedImport};
 
 use super::ParsedFile;
-
-/// Compile a regex from a pattern written in this crate.
-///
-/// Every call site passes a literal, so a pattern that does not compile is a
-/// bug in this source and not a condition a caller could handle: there is no
-/// input that makes it fail. The allow is on this one function instead of on
-/// the whole language module tree, where it would have covered every future
-/// `expect` too, and [`the_literal_patterns_compile`] is the test that holds
-/// the invariant in CI.
-#[allow(clippy::expect_used)] // a literal pattern cannot fail for any input
-pub(crate) fn literal_regex(pattern: &str) -> Regex {
-    Regex::new(pattern).expect("a literal regex compiles")
-}
 
 /// The first candidate `files` can satisfy, in the order it was emitted.
 ///
