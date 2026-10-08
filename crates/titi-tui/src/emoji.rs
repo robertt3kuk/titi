@@ -418,6 +418,16 @@ impl EmojiPicker {
         self.visible
     }
 
+    /// Index of the highlighted row.
+    ///
+    /// A host that paints its own rows (the live chat paints a ratatui buffer,
+    /// not text) needs the selection to mark it; [`Self::item_rows`] carries
+    /// pre-rendered ANSI styling only the text host can use.
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
     /// Matching shortcodes (longest first), glyph last.
     pub fn matches(&self) -> impl Iterator<Item = (&str, &str)> {
         let query = self.query.clone();

@@ -486,6 +486,10 @@ pub struct Chat {
     /// The model browser bare `/model` and bare `/switch` open; `None` =
     /// closed.
     model_picker: Option<ModelPicker>,
+    /// The emoji suggestion picker: visible while the caret sits after a
+    /// `:xx` (2+ name characters and no closing colon), the fourth picker
+    /// beside the model, theme and login ones.
+    emoji_picker: titi_tui::emoji::EmojiPicker,
     /// Skills the engine discovered, offered by the same picker.
     skills: Vec<SkillRow>,
     /// Kitty or Ghostty unicode placeholders are available.
@@ -584,6 +588,7 @@ impl Chat {
             session_picker: None,
             theme_picker: None,
             model_picker: None,
+            emoji_picker: titi_tui::emoji::EmojiPicker::default(),
             skills: Vec::new(),
             kitty: false,
             tmux: false,
@@ -693,6 +698,9 @@ impl Chat {
         if self.model_picker.is_some() {
             return self.model_picker_key(key, now);
         }
+        if self.emoji_picker.is_visible() {
+            return self.emoji_picker_key(key, now);
+        }
         match key {
             Key::CtrlC if self.turn_active => {
                 self.disarm();
@@ -718,6 +726,10 @@ impl Chat {
                 Applied::none()
             }
             Key::Enter => {
+                // A space terminates an emoticon as it is typed; Enter is the
+                // other terminator, so the line reaches the transcript as the
+                // glyph rather than the keystrokes.
+                self.expand_trailing_emoticon();
                 let token = slash_token(&self.input).map(|(start, name)| (start, name.to_owned()));
                 if let Some((start, name)) = token {
                     let at_line_start = self.input[..start].trim().is_empty();
@@ -746,7 +758,7 @@ impl Chat {
             }
             Key::Char(ch) => {
                 self.disarm();
-                self.input.push(ch);
+                self.type_char(ch);
                 self.picker = 0;
                 self.scroll_offset = 0;
                 Applied::none()
@@ -1131,6 +1143,7 @@ impl Chat {
         // A pasted body is composer input, not a picker keystroke.
         self.login_picker = None;
         self.model_picker = None;
+        self.emoji_picker.hide();
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
             match ch {
@@ -1862,6 +1875,112 @@ impl Chat {
         self.input.push_str(&name);
         self.input.push(' ');
         self.picker = 0;
+    }
+
+    // -----------------------------------------------------------------------
+    // Emoji shortcodes and emoticons
+    // -----------------------------------------------------------------------
+
+    /// Type `ch` into the composer, expanding the shortcode a closing `:`
+    /// closes or the emoticon a terminating space ends. The table and the
+    /// guards are `titi_tui::emoji`'s; this is the live composer's own buffer,
+    /// so the expansion runs over it here.
+    ///
+    /// The caret is the end of the buffer, so an expansion lands it directly
+    /// after the glyph and nothing else has to move.
+    fn type_char(&mut self, ch: char) {
+        let terminator = matches!(ch, ' ' | '\n' | '\r');
+        let expansion = if terminator {
+            titi_tui::emoji::try_expand_emoticon(&self.input)
+        } else if ch == ':' {
+            titi_tui::emoji::try_expand_shortcode(&self.input)
+        } else {
+            None
+        };
+        self.input.push(ch);
+        if let Some((start, glyph)) = expansion {
+            self.input.truncate(start);
+            self.input.push_str(glyph);
+            // The closing colon of a shortcode *is* the trigger: the
+            // expansion consumed it. An emoticon's terminator is kept after
+            // the glyph, the way it was typed.
+            if terminator {
+                self.input.push(ch);
+            }
+        }
+        self.sync_emoji_picker();
+    }
+
+    /// Expand an emoticon sitting at the end of the composer, for the Enter
+    /// terminator: the space case is handled as the space is typed, and Enter
+    /// does the same before the line is sent.
+    fn expand_trailing_emoticon(&mut self) {
+        if let Some((start, glyph)) = titi_tui::emoji::try_expand_emoticon(&self.input) {
+            self.input.truncate(start);
+            self.input.push_str(glyph);
+        }
+    }
+
+    /// Open or close the emoji picker to match the trailing `:query` under the
+    /// caret. It opens on 2+ name characters with at least one match, and a
+    /// slash list already up keeps it shut, so the two never show at once.
+    fn sync_emoji_picker(&mut self) {
+        let query = titi_tui::emoji::trailing_query(&self.input)
+            .filter(|query| query.chars().count() >= 2)
+            .filter(|_| !self.picking())
+            .map(str::to_owned);
+        match query {
+            Some(query) => {
+                self.emoji_picker.open(&query);
+                if self.emoji_picker.matches().next().is_none() {
+                    self.emoji_picker.hide();
+                }
+            }
+            None => self.emoji_picker.hide(),
+        }
+    }
+
+    /// Typing while the emoji picker is up. Arrows move, Tab or Enter takes the
+    /// highlighted shortcode, Esc closes and leaves the text exactly as typed;
+    /// anything else closes the picker and is handled as ordinary composer
+    /// input, the way the `/login` picker hands a key back.
+    fn emoji_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.emoji_picker.move_selection(true);
+                Applied::none()
+            }
+            Key::Down => {
+                self.emoji_picker.move_selection(false);
+                Applied::none()
+            }
+            Key::Tab | Key::Enter => self.accept_emoji_picker(),
+            Key::Esc => {
+                self.emoji_picker.hide();
+                self.disarm();
+                Applied::none()
+            }
+            other => {
+                self.emoji_picker.hide();
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    /// Tab or Enter on the emoji picker: replace the `:query` under the caret
+    /// with the highlighted glyph.
+    fn accept_emoji_picker(&mut self) -> Applied {
+        let glyph = self.emoji_picker.accept();
+        self.emoji_picker.hide();
+        let Some(glyph) = glyph else {
+            return Applied::none();
+        };
+        if let Some(colon) = self.input.rfind(':') {
+            self.input.truncate(colon);
+        }
+        self.input.push_str(glyph);
+        self.picker = 0;
+        Applied::none()
     }
 
     /// Typing while the subscription picker is up. Arrows move, Enter signs
@@ -4549,6 +4668,9 @@ fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
     if chat.model_picker.is_some() {
         return Some(model_panel(chat, total, width));
     }
+    if chat.emoji_picker.is_visible() {
+        return Some(emoji_panel(chat, total));
+    }
     if picker_rows(chat).is_empty() {
         return None;
     }
@@ -4683,6 +4805,32 @@ fn login_panel(chat: &Chat, total: u16) -> PanelView {
         })
         .collect();
     panel_view(None, lines, chat.login_picker, panel_body(total))
+}
+
+/// The emoji suggestion picker: `:query` typed at the caret, one row per
+/// matching shortcode with its glyph. The rows are plain text, not the
+/// picker's pre-styled `item_rows` — the live host paints its own buffer, so
+/// the selection has to be a real row here.
+fn emoji_panel(chat: &Chat, total: u16) -> PanelView {
+    let matched: Vec<(&str, &str)> = chat.emoji_picker.matches().collect();
+    let lines: Vec<PanelLine> = matched
+        .iter()
+        .map(|(name, glyph)| PanelLine::Row {
+            text: format!("{name}  {glyph}"),
+            accent: false,
+        })
+        .collect();
+    let selected = Some(
+        chat.emoji_picker
+            .selected()
+            .min(matched.len().saturating_sub(1)),
+    );
+    panel_view(
+        Some(format!("emoji · {}", lines.len())),
+        lines,
+        selected,
+        panel_body(total),
+    )
 }
 
 /// The slash/skill list, in the order the arrows walk it.
@@ -7124,6 +7272,8 @@ fn composer_caption(chat: &Chat) -> String {
     };
     let keys = if chat.approval.is_some() {
         "y allow  ·  n refuse"
+    } else if chat.emoji_picker.is_visible() {
+        "↑↓ move  ·  tab takes  ·  esc closes"
     } else if chat.model_picker.is_some() {
         "↑↓ move  ·  enter switches  ·  esc clears or closes"
     } else if chat
@@ -8699,6 +8849,213 @@ mod tests {
         assert_eq!(settings.get(key), None, "auto clears the slot");
         let auto = theme_frame(&mut chat);
         assert!(auto.contains("(auto)"), "{auto}");
+    }
+
+    /// A closing `:` expands a known shortcode and the caret lands on the
+    /// glyph's far side; an unknown name stays exactly as it was typed.
+    #[test]
+    fn a_closing_colon_expands_the_shortcode_and_the_caret_follows_it() {
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":tada:");
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains('🎉'), "{frame}");
+            assert!(
+                !frame.contains(":tada:"),
+                "the keystrokes are gone, the glyph is not: {frame}"
+            );
+            assert!(
+                frame.contains("🎉▍"),
+                "the caret sits directly after the glyph: {frame}"
+            );
+            assert!(!chat.emoji_picker.is_visible());
+        }
+
+        // Unknown names stay literal, and nothing was expanded for them.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":nope:");
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains(":nope:▍"), "{frame}");
+            assert!(
+                !frame.contains("emoji ·"),
+                "a name with no match opens no picker: {frame}"
+            );
+        }
+    }
+
+    /// A terminating space expands an emoticon, and so does Enter; a fenced
+    /// block keeps the keystrokes, and a URL's colon is never a shortcode.
+    #[test]
+    fn a_terminator_expands_an_emoticon_and_a_fence_or_url_keeps_the_text() {
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":-)");
+            type_text(&mut chat, " ");
+            let frame = frame_text(&mut chat);
+            assert!(
+                frame.contains("🙂 ▍"),
+                "space replaced :-) and is kept before the caret: {frame}"
+            );
+            assert!(!frame.contains(":-)"), "{frame}");
+        }
+
+        // Enter is the other terminator: the sent line holds the glyph, not
+        // the keystrokes.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, "<3");
+            chat.on_key(Key::Enter, Instant::now());
+            assert!(
+                chat.lines.iter().any(|line| line.text == "❤️"),
+                "the sent line holds the glyph: {:?}",
+                chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains("❤️"), "{frame}");
+        }
+
+        // A fence is code-like: the text is shown, not expanded. A paste is
+        // how a fence gets into the composer (Enter would send the line).
+        {
+            let mut chat = chat();
+            chat.paste("```\n:-)");
+            type_text(&mut chat, " ");
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains(":-)"), "a fence keeps it: {frame}");
+            assert!(!frame.contains("🙂"), "{frame}");
+        }
+
+        // The word-like character before the opening colon keeps a URL whole.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, "http://x:y:");
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains("http://x:y:"), "{frame}");
+        }
+    }
+
+    /// `:xx` opens the picker with the matching rows; Tab takes the
+    /// highlighted glyph and consumes the query, Esc closes and leaves the
+    /// text exactly as it was typed.
+    #[test]
+    fn a_trailing_query_opens_the_picker_and_tab_takes_a_row() {
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":sm");
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains("emoji ·"), "the picker is up: {frame}");
+            assert!(frame.contains("smiley"), "{frame}");
+            assert!(frame.contains("smirk"), "{frame}");
+            assert!(frame.contains("🙂"), "a row carries its glyph: {frame}");
+
+            // Tab takes the highlighted row — `smiley`, the first match — and
+            // the `:sm` is gone.
+            chat.on_key(Key::Tab, Instant::now());
+            let frame = frame_text(&mut chat);
+            assert!(
+                frame.contains("😊"),
+                "tab took the highlighted row: {frame}"
+            );
+            assert!(!frame.contains(":sm"), "the query is consumed: {frame}");
+            assert!(!frame.contains("emoji ·"), "and the picker closed: {frame}");
+            assert!(!chat.emoji_picker.is_visible());
+        }
+
+        // Esc closes and leaves the text alone — unlike the slash list, whose
+        // Esc clears the composer.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":sm");
+            chat.on_key(Key::Esc, Instant::now());
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains(":sm▍"), "esc leaves the text: {frame}");
+            assert!(!frame.contains("emoji ·"), "{frame}");
+            assert!(!chat.emoji_picker.is_visible());
+        }
+    }
+
+    /// While the emoji picker is up Enter belongs to it — the line is not
+    /// sent. The slash list's own Enter is untouched, and the two panels
+    /// never show at once.
+    #[test]
+    fn the_emoji_picker_owns_enter_and_the_slash_list_keeps_its_own() {
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":sm");
+            chat.on_key(Key::Enter, Instant::now());
+            assert!(
+                chat.lines.is_empty() && !chat.turn_active,
+                "enter took the row instead of sending: {:?}",
+                chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains("😊"), "{frame}");
+            assert!(!frame.contains("emoji ·"), "{frame}");
+        }
+
+        // A `/` trigger opens the slash list, not the emoji picker, and its
+        // Enter is the list's: `/he` completes and `/help` runs.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, "/he");
+            assert!(
+                !chat.emoji_picker.is_visible(),
+                "a slash trigger does not open the emoji picker"
+            );
+            let frame = frame_text(&mut chat);
+            assert!(
+                frame.contains("/help"),
+                "the slash list owns the panel: {frame}"
+            );
+            assert!(!frame.contains("emoji ·"), "{frame}");
+            chat.on_key(Key::Enter, Instant::now());
+            let frame = frame_text(&mut chat);
+            assert!(
+                frame.contains("ask titi…"),
+                "enter sent the completed command, so the composer is empty: {frame}"
+            );
+        }
+    }
+
+    /// An expansion — and the picker showing a glyph — leave every row exactly
+    /// the pane's width: a glyph is two cells, measured with the crate's
+    /// width model and never with `chars().count()`.
+    #[test]
+    fn a_frame_after_an_expansion_still_fits_the_pane() {
+        {
+            let mut chat = chat();
+            type_text(&mut chat, "ship it :tada:");
+            assert!(frame_text(&mut chat).contains("🎉"));
+            for (width, height) in [(60u16, 20u16), (80, 20), (120, 30)] {
+                let rows = frame_rows(&mut chat, width, height);
+                assert_eq!(rows.len(), height as usize);
+                for row in &rows {
+                    assert_eq!(
+                        titi_tui::width::visible_width(row),
+                        width as usize,
+                        "{width}x{height}: {row:?}"
+                    );
+                }
+            }
+        }
+
+        // The picker's own rows carry glyphs too; they fit just the same.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":sm");
+            for (width, height) in [(60u16, 20u16), (80, 20), (120, 30)] {
+                let rows = frame_rows(&mut chat, width, height);
+                assert_eq!(rows.len(), height as usize);
+                for row in &rows {
+                    assert_eq!(
+                        titi_tui::width::visible_width(row),
+                        width as usize,
+                        "{width}x{height}: {row:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A theme this build does not carry is refused by name, never silently
