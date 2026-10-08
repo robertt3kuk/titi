@@ -7,6 +7,38 @@ description: Commit and push a change in titi the project way — one concern pe
 
 Rules live in `docs/COMMITS.md`; this is the procedure.
 
+## Several agents, one index
+
+The index is a single resource shared by every agent in the checkout. `git add`
+and the `commit` that follows are not atomic: between them another agent can
+stage its own file, and your commit will carry someone else's work. Real
+symptoms seen today: a commit whose subject names one crate and whose stat
+lists another; a docs fix swept into a peer's commit three commits in a row so
+its message never matched its content.
+
+Serialize:
+
+- Take the workspace commit lock **before** staging, release it **after** the
+  commit:
+
+  ```sh
+  while ! mkdir "$(git rev-parse --git-dir)/titi-commit.lock" 2>/dev/null; do
+    sleep 1
+  done
+  ```
+  … commit … then `rmdir "$(git rev-parse --git-dir)/titi-commit.lock"`.
+  The lock directory belongs to whoever created it; a stale one must be
+  reported (to the holder or the user), never deleted.
+- Stage by explicit path. Never `git add -A`, `git add .`, or `git commit
+  -am` — that is how sibling work gets swept in.
+- Before committing: `git status --short` — anything staged that you did not
+  stage is a stop sign.
+- Right after committing: `git show --stat --format='%h %s' HEAD`. If it shows
+  a path you did not stage, say so in your report — do not rewrite the commit
+  to hide it, do not `reset` history another agent may be building on.
+- Never delete `.git/index.lock`: it means another agent is mid-commit. Wait
+  and retry.
+
 1. `git status` and `git diff` — see exactly what changed. Unrelated hunks
    or files → split into separate commits (`git add -p` is interactive and
    unavailable; stage whole files or write patches).
