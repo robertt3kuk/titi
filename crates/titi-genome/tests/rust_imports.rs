@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! The import shapes the line-regex scanner could not see.
 //!
 //! Every one of the 154 `unresolved-import` specs `genome check` produced on
@@ -8,8 +10,6 @@
 //! a `mod x;` beside `mod.rs`, or `use` text inside a string literal. Imports
 //! now come from the syntax tree and resolve against the enclosing module, so
 //! these stay quiet while paths this repo does not contain are still reported.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

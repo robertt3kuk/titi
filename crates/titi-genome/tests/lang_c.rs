@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! C and C++ extraction: masked comments, decorated and qualified
 //! declarations, `static` privacy, and quoted-include resolution.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

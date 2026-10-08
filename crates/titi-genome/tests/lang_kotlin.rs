@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Kotlin: comment masking, receiver names and package-rooted import
 //! placement, through the [`Genome`] a user gets.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

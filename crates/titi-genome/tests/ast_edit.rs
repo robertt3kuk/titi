@@ -1,8 +1,8 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! P4-4: structural edits resolve through the grammar, or are refused.
 //!
 //! Spec: `docs/PLAN.md` (P4-4).
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use titi_genome::ast_edit::{AstEditError, ItemKind, Part, Target, apply, find};
 

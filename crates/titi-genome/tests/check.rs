@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::fs;
 use std::io::Cursor;

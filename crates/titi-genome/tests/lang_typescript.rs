@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! E3: TypeScript/JavaScript import extraction — relative paths, monorepo
 //! aliases, `require` and dynamic `import`, without warning on bare packages.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

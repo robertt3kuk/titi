@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! The grammar limitation that made 13 clean files look broken.
 //!
 //! The pinned `tree-sitter-rust` 0.23 reads `&raw` as the opening of a raw
@@ -7,8 +9,6 @@
 //! reported on this workspace was that token, not a macro, not edition-2024
 //! syntax, and not a truncated read. These tests pin both halves: the borrow
 //! stays quiet, and a genuinely unparseable file is still reported.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

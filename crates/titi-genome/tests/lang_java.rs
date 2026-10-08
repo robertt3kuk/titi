@@ -1,10 +1,10 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Java: exports, imports and the capability line, through `Genome`.
 //!
 //! The fixture is real-shaped: `package com.acme;` in a Maven layout, a
 //! workspace type import, a JDK import, a static import and the method shapes
 //! a caller can name.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

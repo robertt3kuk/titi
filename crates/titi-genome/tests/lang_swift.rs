@@ -1,10 +1,10 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Swift extraction through [`Genome`]: `import` module resolution by the
 //! module-file convention, declaration kinds, and `public` properties.
 //!
 //! Every assertion is on a real extracted name or path, so deleting the
 //! per-language handling in `src/lang/swift.rs` fails this file.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

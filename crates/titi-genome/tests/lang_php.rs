@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! PHP: comment masking, grouped/`function`/`const` `use` forms and
 //! namespace-rooted import placement, through the [`Genome`] a user gets.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

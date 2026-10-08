@@ -1,9 +1,9 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! C#: exports, imports and the capability line, through `Genome`.
 //!
 //! The fixture is real-shaped: a `namespace Acme` block, a BCL import, a
 //! workspace namespace import and the alias form of the same import.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

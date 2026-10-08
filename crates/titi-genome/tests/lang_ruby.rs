@@ -1,10 +1,10 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Ruby extraction through [`Genome`]: singleton methods, namespaced
 //! constants, `attr_*`, and `require` vs `require_relative`.
 //!
 //! Every assertion is on a real extracted name or path, so deleting the
 //! per-language handling in `src/lang/ruby.rs` fails this file.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

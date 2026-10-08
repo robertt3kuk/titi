@@ -1,8 +1,8 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! E3: language coverage and the symbol-level graph.
 //!
 //! The research note that used to specify this coverage is gone.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! E3: Python's import extraction — absolute module paths, relative paths and
 //! the package-submodule form, without warning on the stdlib.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
 use std::path::Path;

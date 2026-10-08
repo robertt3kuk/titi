@@ -9,6 +9,8 @@
 //! The research note that used to specify this graph is gone; the paragraphs
 //! above are the description.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
