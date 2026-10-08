@@ -31,6 +31,7 @@ pub enum Grammar {
     Java,
     C,
     Cpp,
+    Kotlin,
 }
 
 impl Grammar {
@@ -44,6 +45,7 @@ impl Grammar {
             Self::Java => tree_sitter_java::LANGUAGE.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
         }
     }
 }
@@ -58,6 +60,7 @@ struct Parsers {
     java: Option<Parser>,
     c: Option<Parser>,
     cpp: Option<Parser>,
+    kotlin: Option<Parser>,
 }
 
 impl Parsers {
@@ -71,6 +74,7 @@ impl Parsers {
             Grammar::Java => &mut self.java,
             Grammar::C => &mut self.c,
             Grammar::Cpp => &mut self.cpp,
+            Grammar::Kotlin => &mut self.kotlin,
         }
     }
 }
@@ -166,6 +170,7 @@ mod tests {
             Grammar::Java,
             Grammar::C,
             Grammar::Cpp,
+            Grammar::Kotlin,
         ] {
             assert!(grammar_available(grammar), "{grammar:?} failed to load");
         }

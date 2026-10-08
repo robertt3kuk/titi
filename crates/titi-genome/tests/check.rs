@@ -342,6 +342,7 @@ fn the_roster_needs_no_workspace() {
             "go",
             "java",
             "javascript",
+            "kotlin",
             "python",
             "rust",
             "typescript"

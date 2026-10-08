@@ -1,89 +1,149 @@
-//! Kotlin: declarations and `import` lines, from patterns over the text.
+//! Kotlin: declarations and `import` lines, read off the grammar's nodes.
 //!
-//! Comments are masked before any pattern runs, so a commented-out `class`
-//! is not an export. Every declaration still comes from the text and can be
-//! missed: a `val`/`var` without an explicit type is not an export (its name
-//! is not distinguishable from a local), and neither is a declaration written
-//! inside a multi-line string.
-//!
-//! A function exports the last dotted segment of its name, so an extension
-//! function `fun String.toSlug()` exports `toSlug`, not the receiver, and a
-//! generic `fun <T> first(...)` exports `first`.
+//! A commented-out `class` is not a class and a declaration written inside a
+//! function body is not an export: the grammar knows the difference, so only
+//! file-scope and class-member declarations are read. A function exports the
+//! name the grammar recorded, so an extension function `fun String.toSlug()`
+//! exports `toSlug`, not the receiver, and a generic `fun <T> first(...)`
+//! exports `first`. A `val`/`var` is read from its `variable_declaration`, so
+//! an inferred top-level `val hit = 1` is an export where the pattern — which
+//! needed the explicit `: Type` to tell a property from a local — missed it.
 //!
 //! `import a.b.C` resolves by suffix over `.kt`/`.kts`. A specifier whose
 //! root segment differs from the file's own `package` root is another world —
 //! the JDK, a dependency — so `import java.util.List` is not a missing file.
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
 
-use regex::Regex;
+use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{
-    Comments, Placement, export_sites_from, finish, is_workspace_spec, mask_comments, record,
-    resolve_suffix, root_segment,
-};
+use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
 
-/// `import a.b.C` and `import a.b.C as D`: the leading segments name the
-/// package, the trailing one the type.
-const IMPORT: &str = r"(?m)^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)";
-
-/// The file's own `package a.b;`, whose first segment marks this workspace's
-/// root.
-const PACKAGE: &str = r"(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_.]*)";
-
-/// `class`, `interface`, `object` and their `data`/`enum`/`sealed` variants.
-const TYPES: &str = r"(?m)^\s*(?:(?:public|internal|protected|private|open|abstract|final|sealed|data|value|annotation|enum|inner|expect|actual)\s+)*(?:class|interface|object)\s+([A-Za-z_][A-Za-z0-9_]*)";
-
-/// `fun`, with an optional type-parameter list and an optional receiver. The
-/// capture is the last dotted segment, so `String.toSlug` exports `toSlug`.
-const FUNS: &str = r"(?m)^\s*(?:(?:public|internal|protected|private|open|abstract|final|sealed|data|inline|tailrec|operator|infix|suspend|external|override|expect|actual|const|lateinit|annotation)\s+)*fun\s+(?:<[^>\n]*>\s*)?(?:[A-Za-z_][A-Za-z0-9_]*(?:<[^>\n]*>)?\s*\.\s*)*([A-Za-z_][A-Za-z0-9_]*)\s*\(";
-
-/// `val retries: Int` and `var` with an explicit type.
-const PROPERTIES: &str = r"(?m)^\s*(?:(?:public|internal|protected|private|open|abstract|final|sealed|data|override|expect|actual|const|lateinit|annotation)\s+)*(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:";
-
-/// `typealias Name = ...`.
-const TYPEALIASES: &str =
-    r"(?m)^\s*(?:(?:public|internal|private)\s+)*typealias\s+([A-Za-z_][A-Za-z0-9_]*)";
-
-static IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(IMPORT).expect("kotlin import"));
-static PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(PACKAGE).expect("kotlin package"));
-static TYPES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(TYPES).expect("kotlin types"));
-static FUNS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(FUNS).expect("kotlin functions"));
-static PROPERTIES_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(PROPERTIES).expect("kotlin properties"));
-static TYPEALIASES_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(TYPEALIASES).expect("kotlin typealias"));
+use crate::symbols::{self, Grammar, push_field, push_site, text};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
-    // Offsets computed on the masked text still describe the original: it
-    // keeps every byte and newline, only comments are blanked.
-    let masked = mask_comments(source, Comments::Slashes);
-
-    let own = PACKAGE_RE
-        .captures(&masked)
-        .and_then(|cap| cap.get(1))
-        .map(|decl| root_segment(decl.as_str()));
-
+    let Some(tree) = symbols::parse(Grammar::Kotlin, source) else {
+        return ParsedFile {
+            syntax_errors: 1,
+            ..ParsedFile::default()
+        };
+    };
+    let bytes = source.as_bytes();
     let mut sites = Vec::new();
-    for re in [&*TYPES_RE, &*FUNS_RE, &*PROPERTIES_RE, &*TYPEALIASES_RE] {
-        sites.extend(export_sites_from(re, &masked));
-    }
-    sites.sort_by_key(|site| (site.line, site.character));
+    kotlin_items(tree.root_node(), bytes, &mut sites);
 
+    let own = package_name(tree.root_node(), bytes);
+    let own = own.as_deref().map(root_segment);
     let mut imports = Vec::new();
     let mut unresolved = Vec::new();
-    for cap in IMPORT_RE.captures_iter(&masked) {
-        let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+    kotlin_imports(
+        tree.root_node(),
+        bytes,
+        own,
+        files,
+        &mut imports,
+        &mut unresolved,
+    );
+    finish(
+        source,
+        sites,
+        imports,
+        unresolved,
+        symbols::error_count(tree.root_node()),
+    )
+}
+
+/// Declarations reachable from outside their body: a `class`/`interface`/
+/// `object`, a `fun`, a `val`/`var` and a `typealias`. A function body is not
+/// walked — a `val` or a `fun` inside one is a local, not a name a caller can
+/// reach, and the pattern could not tell the two apart.
+fn kotlin_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "class_declaration" | "object_declaration" | "function_declaration" => {
+                push_field(child, source, out);
+            }
+            "property_declaration" => {
+                if let Some(name) = property_name(child) {
+                    push_site(name, source, out);
+                }
+            }
+            // `typealias Slug = String`: the grammar stores the alias's own
+            // name under the `type` field.
+            "type_alias" => {
+                if let Some(name) = child.child_by_field_name("type") {
+                    push_site(name, source, out);
+                }
+            }
+            _ => {}
+        }
+        if child.kind() != "function_body" {
+            kotlin_items(child, source, out);
+        }
+    }
+}
+
+/// The name of a `val`/`var`, which the grammar keeps on the declaration's
+/// `variable_declaration` rather than behind a `name` field.
+fn property_name(declaration: Node) -> Option<Node> {
+    let mut cursor = declaration.walk();
+    let variable = declaration
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "variable_declaration")?;
+    let mut names = variable.walk();
+    variable
+        .named_children(&mut names)
+        .find(|child| child.kind() == "identifier")
+}
+
+/// The file's own `package a.b`, whose first segment decides what "workspace
+/// shaped" means for its imports.
+fn package_name(root: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = root.walk();
+    let header = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "package_header")?;
+    let mut names = header.walk();
+    let name = header
+        .named_children(&mut names)
+        .find(|child| matches!(child.kind(), "qualified_identifier" | "identifier"))?;
+    text(name, source)
+}
+
+/// Every `import` at the top of the file: the dotted name the import names,
+/// without its `as` alias. A commented-out import is not a node.
+fn kotlin_imports(
+    root: Node,
+    source: &[u8],
+    own: Option<&str>,
+    files: &HashSet<String>,
+    imports: &mut Vec<String>,
+    unresolved: &mut Vec<String>,
+) {
+    let mut cursor = root.walk();
+    for import in root.named_children(&mut cursor) {
+        if import.kind() != "import" {
+            continue;
+        }
+        let mut names = import.walk();
+        let Some(name) = import
+            .named_children(&mut names)
+            .find(|child| matches!(child.kind(), "qualified_identifier" | "identifier"))
+        else {
+            continue;
+        };
+        let Some(spec) = text(name, source) else {
+            continue;
+        };
         let resolved = resolve_suffix(&spec.replace('.', "/"), &["kt", "kts"], files);
         let placement = match resolved {
             Some(path) => Placement::Resolved(path),
             // A specifier under another root is a library, not a missing file.
-            None if is_workspace_spec(root_segment(spec), own) => Placement::Missing,
+            None if is_workspace_spec(root_segment(&spec), own) => Placement::Missing,
             None => Placement::External,
         };
-        record(spec, placement, &mut imports, &mut unresolved);
+        record(&spec, placement, imports, unresolved);
     }
-    finish(&masked, sites, imports, unresolved, 0)
 }

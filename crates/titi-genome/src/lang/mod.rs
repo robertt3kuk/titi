@@ -267,11 +267,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Kotlin,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "kotlin",
-        note: "declarations and `import` lines are matched by pattern; comments are masked first",
+        note: "declarations come from a syntax tree; a local inside a function body is not an export; import paths are resolved by package suffix",
         extensions: &["kt", "kts"],
-        grammar: None,
+        grammar: Some(Grammar::Kotlin),
         parse: kotlin::parse,
     },
     Lang {

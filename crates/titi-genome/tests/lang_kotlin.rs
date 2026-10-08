@@ -26,7 +26,10 @@ import com.acme.Util
 import java.util.List
 
 class App {
-    fun run() {}
+    fun run() {
+        val local: Int = 1
+        fun inner() {}
+    }
 }
 
 fun String.toSlug(): String = this
@@ -34,6 +37,8 @@ fun String.toSlug(): String = this
 fun <T> first(list: List<T>): T? = null
 
 val retries: Int = 3
+
+val inferred = 3
 
 typealias Slug = String
 
@@ -68,6 +73,23 @@ fn kotlin_exports_skip_comments_and_unwrap_the_receiver() {
         assert!(
             app.exports.iter().any(|export| export == name),
             "missing export {name}: {:?}",
+            app.exports
+        );
+    }
+    // A top-level `val` whose type is inferred is an export the grammar can
+    // name; the pattern needed an explicit `: Type` to spot it at all.
+    assert!(
+        app.exports.iter().any(|export| export == "inferred"),
+        "an inferred top-level property is an export: {:?}",
+        app.exports
+    );
+    // A `val` and a `fun` inside a function body are locals: the pattern
+    // exported both (an indented line with a type, and a line-anchored `fun`),
+    // the tree knows they are not reachable.
+    for local in ["local", "inner"] {
+        assert!(
+            !app.exports.iter().any(|export| export == local),
+            "`{local}` is a local, not an export: {:?}",
             app.exports
         );
     }
@@ -147,12 +169,13 @@ fn kotlin_splits_library_imports_from_missing_workspace_ones() {
 }
 
 #[test]
-fn kotlin_is_a_heuristic_language_in_the_capability_roster() {
+fn kotlin_is_a_parsed_language_in_the_capability_roster() {
     let kotlin = Genome::capabilities()
         .into_iter()
         .find(|capability| capability.language == "kotlin")
         .expect("a kotlin capability");
-    assert_eq!(kotlin.level, Level::Heuristic, "{}", kotlin.note);
+    assert_eq!(kotlin.level, Level::Full, "{}", kotlin.note);
+    assert!(kotlin.note.contains("syntax tree"), "{}", kotlin.note);
     assert!(
         kotlin.extensions.contains(&"kt") && kotlin.extensions.contains(&"kts"),
         "{:?}",
