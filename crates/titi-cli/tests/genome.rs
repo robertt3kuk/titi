@@ -225,7 +225,10 @@ fn check_treats_an_ambiguous_only_tree_as_clean() {
         1,
         "one ambiguous-symbol line for the ambiguous name: {stdout}"
     );
-    assert!(stdout.lines().all(|line| line.contains("ambiguous-symbol")), "{stdout}");
+    assert!(
+        stdout.lines().all(|line| line.contains("ambiguous-symbol")),
+        "{stdout}"
+    );
 }
 
 /// A tree the indexer cannot even walk blames itself, not a clean report.

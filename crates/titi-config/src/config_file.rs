@@ -160,10 +160,7 @@ pub(crate) fn strip_jsonc_comments(text: &str) -> String {
 /// point, and unlinking it while another process is waiting on its own open
 /// descriptor would create a race where a lock holder believes it holds the
 /// lock while a waiter acquires "the" lock on a different inode.
-pub fn with_file_lock<T, E>(
-    path: &Path,
-    f: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E>
+pub fn with_file_lock<T, E>(path: &Path, f: impl FnOnce() -> Result<T, E>) -> Result<T, E>
 where
     E: From<std::io::Error>,
 {
@@ -209,7 +206,10 @@ mod tests {
 
     fn bump(path: &std::path::Path) -> Result<(), io::Error> {
         with_file_lock(path, || -> Result<(), io::Error> {
-            let n: u32 = std::fs::read_to_string(path)?.trim().parse().map_err(|e| io::Error::other(e))?;
+            let n: u32 = std::fs::read_to_string(path)?
+                .trim()
+                .parse()
+                .map_err(|e| io::Error::other(e))?;
             // Keep the critical section slow and wobbly so interleaving would
             // be near-certain without a real lock.
             thread::sleep(Duration::from_millis(1));
@@ -252,7 +252,10 @@ mod tests {
         std::fs::create_dir(dir.path().join("counter.yml.lock")).unwrap();
 
         let err: io::Error = with_file_lock(&target, || -> Result<(), io::Error> {
-            let n: u32 = std::fs::read_to_string(&target)?.trim().parse().map_err(|e| io::Error::other(e))?;
+            let n: u32 = std::fs::read_to_string(&target)?
+                .trim()
+                .parse()
+                .map_err(|e| io::Error::other(e))?;
             std::fs::write(&target, (n + 1).to_string())?;
             Ok(())
         })
@@ -266,8 +269,7 @@ mod tests {
     #[test]
     fn failing_closure_propagates_error() {
         let (_dir, path) = counter_file("7");
-        let result: Result<(), io::Error> =
-            with_file_lock(&path, || Err(io::Error::other("boom")));
+        let result: Result<(), io::Error> = with_file_lock(&path, || Err(io::Error::other("boom")));
         assert_eq!(result.unwrap_err().to_string(), "boom");
     }
 

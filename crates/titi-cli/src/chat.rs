@@ -7284,8 +7284,8 @@ fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<LogWr
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use titi_engine::TurnId;
     use titi_providers::StopReason;
 

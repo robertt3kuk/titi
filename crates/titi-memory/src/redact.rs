@@ -668,7 +668,11 @@ mod tests {
             "{}",
             redacted.text
         );
-        assert!(redacted.text.contains(r#""model": "gpt-4""#), "{}", redacted.text);
+        assert!(
+            redacted.text.contains(r#""model": "gpt-4""#),
+            "{}",
+            redacted.text
+        );
     }
 
     #[test]
@@ -687,7 +691,11 @@ mod tests {
     fn a_quoted_password_value_is_masked() {
         let redacted = redact(r#""password": "hunter2-hunter2""#);
         assert_eq!(redacted.removed, 1, "{}", redacted.text);
-        assert!(!redacted.text.contains("hunter2-hunter2"), "{}", redacted.text);
+        assert!(
+            !redacted.text.contains("hunter2-hunter2"),
+            "{}",
+            redacted.text
+        );
         // The mask replaces the whole match, so the key name goes with the
         // value and this input comes out as `[redacted]"`. Keeping the key
         // would need a capture-based replacement template per pattern, and
@@ -700,7 +708,11 @@ mod tests {
     fn a_bare_passwd_assign_is_masked() {
         let redacted = redact("passwd=topsecretval123");
         assert_eq!(redacted.removed, 1, "{}", redacted.text);
-        assert!(!redacted.text.contains("topsecretval123"), "{}", redacted.text);
+        assert!(
+            !redacted.text.contains("topsecretval123"),
+            "{}",
+            redacted.text
+        );
     }
 
     #[test]
@@ -712,7 +724,11 @@ mod tests {
             "{}",
             redacted.text
         );
-        assert!(redacted.text.contains("Authorization:"), "{}", redacted.text);
+        assert!(
+            redacted.text.contains("Authorization:"),
+            "{}",
+            redacted.text
+        );
     }
 
     #[test]
