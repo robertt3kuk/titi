@@ -6,7 +6,7 @@ A terminal coding agent in Rust. It follows the [reference product](https://refe
 
 | Version | License | Phase | As of | Tests |
 | --- | --- | --- | --- | --- |
-| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-10-08 | 1831 passed (CI run 37744421456) |
+| `0.1.0` | [MIT](LICENSE) | Phase 3–4 · tools, providers, agents — in progress | 2026-10-08 | 1774 passed (CI run 37780191533) |
 
 ---
 
@@ -99,6 +99,8 @@ titi --mode plan
 | `/git` | Shows git status or diff, read-only |
 | `/genome` | Manages the prompt map: `/genome on`, `/genome off`, `/genome limit <n>` |
 | `/diagnose` | Prints a diagnostics block to paste into a bug report |
+| `/statusline` | Chooses the status line preset (default, minimal, compact, full, ascii). Bare `/statusline` states the preset in force and lists them all |
+| `/mouse` | Mouse reporting: off, wheel, buttons, all (drag selects, release copies) |
 | `/hub` | Shows or hides the roster of the local hub |
 | `/join` | Joins the local hub, `/join <name>` under a name of your own; the default is the session id |
 | `/leave` | Leaves the hub, which unregisters this peer |
@@ -110,7 +112,9 @@ titi --mode plan
 
 The picker also offers the skills it found in `<agent_dir>/skills/`, `.agents/skills/`, and `.titi/skills/`. A `/name` that is not a command and is a skill expands that `SKILL.md` into the prompt, after the same screening the metadata gets. A skill's scripts are never executed.
 
-The screen is a ratatui chat: model and session on top — plus a `plan` or `duck` badge when the engine confirms that mode — the transcript in the middle, one input line at the bottom. `--mouse` is still accepted so older commands do not fail; this screen does not track the mouse.
+The screen is a ratatui chat: model and session on top — plus a `plan` or `duck` badge when the engine confirms that mode — the transcript in the middle, one input line at the bottom. `/mouse` turns mouse reporting over (`off`, `wheel`, `buttons`, `all`; a drag selects, releasing inside the transcript copies), and its choice is remembered for the next run.
+
+The same settings style as `genome.enabled` and `genome.limit` covers the screen's own switches: `statusLine.preset` (`default|minimal|compact|full|ascii`, `default` when unset) chooses which row of the preset table the top line paints, and `statusLine.contextLine` (`off|percentage|embedded`, **default off** — the default frame stays byte-identical until a turn reports a context window for the gauge to fill) lets the gap between the status line's groups double as a context gauge. `notify.completion`, `notify.error` and `notify.ask` (each unset = on) raise a desktop notification when a turn finishes, fails or stops on an approval — OSC 777 where the terminal speaks it, a bell fallback where it does not; `terminal.progress` (unset = on) raises the terminal's own OSC 9;4 progress bar for a running turn; `composer.tokenRate` (unset = on) shows the generation rate on the working row, an estimate marked `~`, not a provider count.
 
 In Kitty or Ghostty, a local photo named in the transcript is drawn in place: png, jpeg, gif, bmp, or ico, including a markdown image. The pixels are sent once. Other terminals leave the path as text. `TITI_NO_KITTY_PLACEHOLDERS=1` turns the pictures off.
 

@@ -1,39 +1,42 @@
 # omp → titi: what is missing, ranked
 
+> **Inventory as of 2026-10-08.** The wave list below is a record of what was open when it was written, not a live ledger: entries marked **ported** or **partly ported** have had work land since — the marking is per-entry status against the current tree, not a rewrite of the entries themselves, which keep the numbering and the omp analysis they were written with. Changes since are recorded in `docs/research/STATE.md`. Entries left unmarked are untouched since the inventory.
+
 omp source: `~/.bun/install/global/node_modules/@oh-my-pi/` (`pi-coding-agent/src` = product, `pi-tui/src` = the TUI it renders with). Its user-visible surface is its settings registry — every key is a `register({ id: "…" })` — plus its slash commands and its TUI components. Ranked by user-visible value ÷ cost. Gate: M6 (MCP/skills/hooks runtime) and M9 (GPUI) are out; nothing here needs a network service, a paid API, or vendored omp code.
 
 ## Already ported (do not re-list)
 Welcome lockup · todo tool · read ranges · real globs · regex grep · bash bounds · real token usage · OSC 8 links · model picker · progress row · panels + scrollbar · theme choice. Pieces still missing from these are folded into the entries below (todo reminders, read line numbers, read previews, grep context lines, startup changelog, per-turn usage row, auto-background bash).
 
-## 1. Turn footer: token usage + turn time + cache-miss marker
+## 1. Turn footer: token usage + turn time + cache-miss marker — **partly ported** (wave: usage + turn time, `9430689`; cache-miss marker in the footer row, `crates/titi-tui/src/status.rs:111-134`)
 - omp: `display.showTokenUsage` (`modes/settings.ts:646`), `display.showTurnTime` (`:658`), `display.cacheMissMarker` (`:670`); drawn on the assistant message's usage row in `pi-tui/src/chat/chat-transcript-builder.ts:430,535` (`cacheMissMarker`, `turnElapsedMs`), preferences in `pi-tui/src/chat/display-preferences.ts:6-18`.
+- **status: partly ported.** The footer exists: `TurnFooter` in `crates/titi-tui/src/status.rs:83+` (a `~`-free dim row — `1.4s · 3.4k prompt (2.9k cached) · 250 out · cache miss`) is built and pushed at turn end in `crates/titi-cli/src/chat.rs:4213-4229`, wired by `9430689`. What is still missing: the footer shows both, always — omp has separate `display.showTokenUsage`/`display.showTurnTime`/`display.cacheMissMarker` switches to mute one; titi has no respect desk for the three toggles.
 - titi: partly/absent — real `TurnUsage` incl. `cached_tokens` exists (`titi-engine`), but nothing prints it per turn: `grep -rn "usage\|tokens" crates/titi-tui/src/transcript.rs crates/titi-tui/src/status.rs` → none; `grep -rn "turn_time\|cache_miss" crates/` → only `titi-providers/src/openai.rs` (wire cache).
 - value: every user, after the first answer — the only place titi's token accounting and its cache behaviour (`docs/research/prompt-cache.md`) become visible.
 - cost: small. `crates/titi-tui/src/status.rs` (a new usage-row formatter; it already owns "turn timers, badges") + one call where the turn ends in `crates/titi-cli/src/chat.rs`.
 - beauty: one dim row under the answer — `1.4s · 3.4k prompt (2.9k cached) · 250 out`; cache miss adds a `——— cache miss ———` divider. No new chrome, theme `muted`/`error` colours.
 
-## 2. Transcript markdown tables (GFM)
+## 2. Transcript markdown tables (GFM) — **ported** (`ae1f35c feat(tui): render GFM tables in the transcript`)
 - omp: `pi-tui/src/components/markdown.ts:1281` (`TableToken`), `:1159` (table cells as containers), `:3750-3794` (column widths, borders, theme glyphs via `theme.symbols.table`).
 - titi: absent — `crates/titi-tui/src/markdown.rs:1-30` documents every construct it renders (headings … paragraphs) and tables are not among them; `grep -rn "table\|Table" crates/titi-tui/src/markdown.rs` → none; repo-wide `grep -rln "TableAlign\|pipe_table" crates/` → none.
 - value: every user, constantly — models emit tables and titi currently shows raw `|`-rows.
 - cost: medium. `crates/titi-tui/src/markdown.rs` only (+ golden rows in `crates/titi-tui/tests/markdown_golden.rs`); wrapping/width helpers and the theme already exist.
 - beauty: box-drawn table in `MdCodeBlockBorder`/`MdHeading` colours, columns padded to width, right-align honoured; wraps or falls back to code-block form when too wide.
 
-## 3. Terminal title run state (spinner / your-turn / waiting)
+## 3. Terminal title run state (spinner / your-turn / waiting) — **ported** (`1a2ecc3 feat(cli): put the run state in the terminal title`)
 - omp: `tui.titleState` (`modes/settings.ts:495`) and `tui.titleSpinner` (`:508`, braille/pulse/dots/line); written with `setTitle` → `\x1b]0;…\x07` in `pi-tui/src/terminal.ts:2548-2550`.
 - titi: absent — `grep -rn 'SetTitle\|\x1b]0;' crates/ --include=*.rs` → none; the tab title never changes.
 - value: every user who tabs away — the tab shows work state without looking back at the pane.
 - cost: small. New `crates/titi-cli/src/title.rs` + one write on the existing 50 ms tick in `crates/titi-cli/src/chat.rs`; spinner frames can come from `titi-tui/src/theme` (`symbols::spinner_frames`).
 - beauty: `<⠋> titi · <session>` while working, `> …` when it is your turn, `! …` when blocked on approval; no screen chrome, pure OSC.
 
-## 4. Completion / error / ask notifications
+## 4. Completion / error / ask notifications — **ported** (`f8ea043 feat(cli): notify when a turn finishes, fails or asks`)
 - omp: `completion.notify` (`modes/settings.ts:1172`), `error.notify` (`:1185`), `ask.notify` (`:1217`); delivery in `pi-tui/src/desktop-notify.ts:1-20` (OSC 777/BEL, `notify-send` fallback) with the protocol chosen from `terminal-capabilities.ts`.
 - titi: absent — `grep -rni "osc 777\|\x07\|bell" crates/ --include=*.rs` → none (only "mislabelled"/"relabelled" text matches).
 - value: every user on a long turn; the single biggest "come back to the terminal" affordance.
 - cost: small. `crates/titi-tui/src/caps.rs` (capability flag) + one emit in `crates/titi-cli/src/chat.rs`; no new crate.
 - beauty: nothing on screen — the terminal raises a toast/rings once when the turn ends or fails, never on streaming deltas.
 
-## 5. Native terminal progress (OSC 9;4)
+## 5. Native terminal progress (OSC 9;4) — **ported** (`e7cd8ae feat(cli): raise the terminal's own progress for a running turn`)
 - omp: `terminal.showProgress` (`modes/settings.ts:391`); sequences at `pi-tui/src/terminal.ts:38-39,602`.
 - titi: absent — `grep -rni "9;4" crates/` → none.
 - value: every user — the tab/window shows an indeterminate bar for the whole turn.
@@ -47,14 +50,14 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: small. `crates/titi-tui/src/composer.rs` (a small select overlay) + key routing in `crates/titi-cli/src/chat.rs`.
 - beauty: a 3-row picker above the composer after a ≥100-line paste; the input then shows a fenced block or `<paste>` wrapper.
 
-## 7. Emoji autocomplete
+## 7. Emoji autocomplete — **ported** (`faa2de9 feat(tui): expand emoji shortcodes and emoticons in the composer`, `effcf3e feat(cli): expand emoji and open the picker in the live composer`)
 - omp: `emojiAutocomplete` (`modes/settings.ts:999`); shortcode + emoticon expansion in `pi-tui/src/prompt/emoji-autocomplete.ts:2,12` against `pi-tui/src/prompt/data/emojis.json` (33 KB, sorted longest-first).
 - titi: absent — `grep -rn "emoji" crates/titi-tui/src/` → only `width.rs` (emoji = 2 cells) and a `is_valid_symbol_preset("emoji")` negative test in `theme/schema.rs:515`.
 - value: everyone who types `:tada:` or `:-)`; small but noticed daily.
 - cost: small. `crates/titi-tui/src/composer.rs` + a new `crates/titi-tui/src/emoji.rs` with its own shortcode table (hand-written, no vendoring).
 - beauty: `:smile:` turns into 🙂 inline as you type; the composer shows the glyph, the sent message keeps it.
 
-## 8. LaTeX math in markdown
+## 8. LaTeX math in markdown — **partly ported** (`3a49b6a feat(tui): a LaTeX subset rendered to Unicode`)
 - omp: always on as part of markdown — `pi-tui/src/components/markdown.ts:21-22,1334,3078,3119` render inline and display math via `pi-tui/src/latex-to-unicode.ts` and `pi-tui/src/latex-block.ts` (1460 lines). No settings key.
 - titi: absent — `grep -rni "latex" crates/ --include=*.rs` → none. A model answer with `$O(n\log n)$` reaches the screen verbatim.
 - value: every user who asks anything mathematical — answers currently show raw TeX.
@@ -68,14 +71,14 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: medium. New `crates/titi-tui/src/vim.rs` + composer entry point in `crates/titi-tui/src/composer.rs`, key routing in `crates/titi-cli/src/chat.rs`, mode chip in the composer's top border (`render_box_composer`, `composer.rs:243`).
 - beauty: a `NORMAL`/`VISUAL` chip in the box border's top rule; block cursor in Normal, bar in Insert; nothing else changes.
 
-## 10. Status line: presets, custom segments, context gauge
+## 10. Status line: presets, custom segments, context gauge — **partly ported** (presets + gauge: `6de3f1d`, `8f2072e`, `/statusline` command `8f20ced`)
 - omp: `statusLine.preset` (`modes/settings.ts:152`, default/minimal/compact/full/nerd/ascii/custom), `statusLine.leftSegments`/`rightSegments` (`:277,284`), `separator` (`:174`), `contextLine` (`:196`, the accent line between the segments doubles as a context gauge), `sessionAccent` (`:227`), `transparent` (`:239`); implementation `pi-tui/src/status-line/presets.ts`, `segments.ts`, `context-usage.ts`.
 - titi: partly — only the default preset is painted, hard-coded (`crates/titi-tui/src/status_bar.rs:77`, snapshot fields at `:15-40`); no preset/segment setting exists (`grep -rn "preset" crates/titi-tui/src/status_bar.rs` → the doc comment only).
 - value: every user, from the first frame — the bar is the biggest piece of always-on chrome.
 - cost: medium. `crates/titi-tui/src/status_bar.rs` + `crates/titi-config/src/settings.rs` (new `statusLine.*` keys) + snapshot plumbing in `crates/titi-cli/src/chat.rs`.
 - beauty: `/statusline minimal|compact|full`; the box composer's top rule fills with an accent-coloured context gauge with an embedded `72% · 128k` label.
 
-## 11. Generation rate (tok/s)
+## 11. Generation rate (tok/s) — **ported** (`64bc233 feat(tui): show the generation rate on the working row`)
 - omp: `composer.tokenRate` (`modes/settings.ts:138`); `token_rate` segment at `pi-tui/src/status-line/segments.ts:760,1294`.
 - titi: absent — `grep -rn "token_rate\|tok/s" crates/` → only a symbol table entry in `theme/symbols_data.rs`.
 - value: every user, while waiting — turns "is it stuck?" into a number; free, since deltas are already counted.
