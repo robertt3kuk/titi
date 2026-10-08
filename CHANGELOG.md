@@ -41,6 +41,7 @@ All notable user-facing changes to titi, newest first.
 - The provider catalog can no longer be redeclared by a project `.titi/config.yml`, so a cloned repository cannot redirect `openai.base_url` and take the first request with its own key; the `settings` tool also no longer exposes `providers` or key-bearing leaves.
 - A turn before its first visible token that fails walks the rest of the model list in order and says so (`model fallback: a → b`); a `401` and an unknown model are not retried.
 - Network tools (`fetch`, `web_search`, `settings`) say in their approval prompt what they will do, and addresses named `localhost` or the metadata host are refused.
+- `fetch` follows a redirect one hop at a time and judges every URL it lands on, so a page answering `302 Location: http://169.254.169.254/…` is refused by name instead of handing the instance's credentials to the model. The chain is still bounded at five, and a hop to a scheme this tool does not speak is refused like the first URL is.
 - Provider errors are quoted as the provider wrote them (`rejected (HTTP 401): …`) instead of `upstream status N`.
 - A `edit` on a CRLF or BOM-carrying file matches from the LF text and keeps the file's line endings and byte-order mark.
 - Transient provider retries wait between rounds (500 ms doubling to 8 s) instead of hammering, always stoppable.

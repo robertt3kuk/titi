@@ -33,6 +33,13 @@ pub const FETCH_BYTE_CAP: usize = 64 * 1024;
 
 /// One deadline for connect, headers and body together.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Most redirects one `fetch` follows before it gives up.
+///
+/// The same bound the http client used to apply, moved into the tool: a
+/// redirect is a *new URL*, and the metadata guard is decided from the URL, so
+/// following one inside the client would walk past a check that only ever saw
+/// the first.
+pub const FETCH_REDIRECTS: u32 = 5;
 
 /// Search endpoint, e.g. `https://api.search.example/res`.
 pub const SEARCH_ENDPOINT_ENV: &str = "TITI_SEARCH_ENDPOINT";
@@ -67,6 +74,8 @@ pub enum WebError {
     Client { message: String },
     #[error("{reason}")]
     Refused { reason: String },
+    #[error("gave up after {hops} redirects; the last one pointed at {url}")]
+    TooManyRedirects { hops: u32, url: String },
 }
 
 /// Where `web_search` sends a query and how the key rides along. Held by
@@ -162,29 +171,66 @@ impl FetchTool {
         })
     }
 
+    /// One GET, following redirects by hand so every hop is judged.
+    ///
+    /// The metadata refusal is decided from the URL, and a redirect hands back
+    /// a URL the model never wrote. Following one inside the http client would
+    /// mean the check saw only the first URL, which is the whole guard: a page
+    /// that answers `302 Location: http://169.254.169.254/…` would put the
+    /// instance's credentials in the model's context. So each hop is parsed,
+    /// scheme-checked and refused-or-allowed exactly as the first URL is, and
+    /// the chain is bounded by [`FETCH_REDIRECTS`].
     async fn fetch(&self, args: Value) -> Result<String, WebError> {
         let raw = arg_str(&args, "url").ok_or(WebError::MissingArg("url"))?;
-        let url = http_url(raw.trim())?;
-        // The same refusal the engine asks for before approval, asked again
-        // here: `invoke` is reachable on its own, and a metadata service must
-        // not be reached through it either.
-        if let Some(reason) = metadata_refusal(&url) {
-            return Err(WebError::Refused { reason });
+        let mut url = http_url(raw.trim())?;
+        let mut hops = 0;
+        loop {
+            // The same refusal the engine asks for before approval, asked
+            // again here: `invoke` is reachable on its own, and a metadata
+            // service must not be reached through it either.
+            if let Some(reason) = metadata_refusal(&url) {
+                return Err(WebError::Refused { reason });
+            }
+            let response = self
+                .client
+                .get(url.clone())
+                .send()
+                .await
+                .map_err(request_error)?;
+            let status = response.status();
+            if !status.is_redirection() {
+                if !status.is_success() {
+                    return Err(WebError::Status {
+                        status: status.as_u16(),
+                        url: url.to_string(),
+                    });
+                }
+                return read_capped(response, self.cap).await;
+            }
+            // A redirection with nowhere to go is answered as what it is: a
+            // status the tool cannot use, not a body.
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(WebError::Status {
+                    status: status.as_u16(),
+                    url: url.to_string(),
+                });
+            };
+            if hops >= FETCH_REDIRECTS {
+                return Err(WebError::TooManyRedirects {
+                    hops: FETCH_REDIRECTS,
+                    url: url.to_string(),
+                });
+            }
+            let location = String::from_utf8_lossy(location.as_bytes()).into_owned();
+            // Relative locations resolve against the URL that answered, which
+            // is what every browser does and what a server means by `/next`.
+            let next = url.join(&location).map_err(|error| WebError::InvalidUrl {
+                url: location.clone(),
+                reason: error.to_string(),
+            })?;
+            url = http_url(next.as_str())?;
+            hops += 1;
         }
-        let response = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(request_error)?;
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(WebError::Status {
-                status,
-                url: url.to_string(),
-            });
-        }
-        read_capped(response, self.cap).await
     }
 }
 
@@ -217,6 +263,10 @@ impl ToolHandler for FetchTool {
     /// Asked before anyone is asked to approve the call: a metadata service
     /// hands the instance's credentials to whoever can reach it, so a call
     /// there is answered instead of put to the person.
+    ///
+    /// This judges the URL the model wrote, which is all an approval can name;
+    /// a redirect to a metadata host is caught at the hop, in [`Self::fetch`],
+    /// where the redirect's own URL is in hand.
     fn refusal(&self, args: &serde_json::Value) -> Option<String> {
         let raw = arg_str(args, "url")?;
         let url = http_url(raw.trim()).ok()?;
@@ -342,7 +392,11 @@ pub fn web_tools(provider: Option<SearchProvider>) -> Vec<Box<dyn ToolHandler>> 
 fn http_client() -> Result<reqwest::Client, WebError> {
     reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // `fetch` follows redirects itself, one hop at a time, so that every
+        // URL it reaches is judged before a request is built for it: the
+        // client's own policy follows a `Location` it never shows anyone, and
+        // a redirect to a metadata service would land there unchecked.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| WebError::Client {
             message: error.to_string(),
@@ -516,12 +570,20 @@ mod tests {
 
     impl MockServer {
         fn start(status_line: &str, body: &str) -> Self {
+            Self::start_with(status_line, &[], body)
+        }
+
+        fn start_with(status_line: &str, headers: &[(&str, &str)], body: &str) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
             let port = listener.local_addr().expect("bound address").port();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::clone(&requests);
+            let extra: String = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
             let response = format!(
-                "HTTP/1.1 {status_line}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status_line}\r\ncontent-type: text/plain\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             std::thread::spawn(move || {
@@ -536,6 +598,39 @@ mod tests {
                 }
             });
             Self { port, requests }
+        }
+
+        /// Answers every connection with a `302` pointing at `to`.
+        fn redirecting(to: &str) -> Self {
+            Self::start_with("302 Found", &[("location", to)], "")
+        }
+
+        /// Answers every connection with a `302` pointing back at itself, so a
+        /// chain of any length can be asked for.
+        fn redirecting_loop(path: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
+            let port = listener.local_addr().expect("bound address").port();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\ncontent-type: text/plain\r\nlocation: http://127.0.0.1:{port}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = [0_u8; 8192];
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                    }
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Self { port, requests }
+        }
+
+        fn hits(&self) -> usize {
+            self.requests.lock().map(|seen| seen.len()).unwrap_or(0)
         }
 
         fn url(&self, path: &str) -> String {
@@ -563,6 +658,99 @@ mod tests {
             .await;
         assert!(!result.is_error, "{}", result.output);
         assert_eq!(result.output, "hello from example.invalid");
+    }
+
+    /// A redirect to a metadata host is refused at the hop, before a request
+    /// is built for it: the guard is decided from the URL, and a `Location`
+    /// is a URL the model never wrote.
+    #[tokio::test]
+    async fn fetch_refuses_a_redirect_to_a_metadata_host() {
+        let server = MockServer::redirecting("http://169.254.169.254/latest/meta-data/");
+        let result = fetch_tool()
+            .invoke(serde_json::json!({ "url": server.url("/page") }))
+            .await;
+        assert!(result.is_error, "the redirect must not be followed");
+        assert!(
+            result.output.contains("169.254.169.254"),
+            "the refusal names the host it refused: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("metadata service"),
+            "and says what that host is: {}",
+            result.output
+        );
+        assert_eq!(
+            server.hits(),
+            1,
+            "the redirector was asked once; nothing followed the Location"
+        );
+    }
+
+    /// A redirect to another URL is followed and that URL's body is the answer.
+    #[tokio::test]
+    async fn fetch_follows_a_redirect_to_another_url() {
+        let target = MockServer::start("200 OK", "second page");
+        let server = MockServer::redirecting(&target.url("/moved"));
+        let result = fetch_tool()
+            .invoke(serde_json::json!({ "url": server.url("/page") }))
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "second page");
+        assert_eq!(server.hits(), 1);
+        assert_eq!(target.hits(), 1, "the hop was requested");
+    }
+
+    /// A relative `Location` resolves against the URL that answered, as it
+    /// does in a browser.
+    #[tokio::test]
+    async fn fetch_resolves_a_relative_redirect() {
+        let server = MockServer::redirecting("/elsewhere");
+        let result = fetch_tool()
+            .invoke(serde_json::json!({ "url": server.url("/page") }))
+            .await;
+        // The server answers every path with the same 302, so this is the
+        // chain limit rather than a body -- what matters is that the second
+        // request went to the resolved path on the same host.
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("gave up after 5 redirects"),
+            "{}",
+            result.output
+        );
+        assert_eq!(server.hits(), 6, "the first request plus five hops");
+    }
+
+    /// The chain is bounded, and the bound is reported rather than hidden.
+    #[tokio::test]
+    async fn fetch_gives_up_after_five_redirects() {
+        let server = MockServer::redirecting_loop("/again");
+        let result = fetch_tool()
+            .invoke(serde_json::json!({ "url": server.url("/again") }))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("gave up after 5 redirects"),
+            "{}",
+            result.output
+        );
+        assert_eq!(server.hits(), 6, "the first request plus five hops");
+    }
+
+    /// A hop to a scheme this tool does not speak is refused like the first
+    /// URL is, not handed to the client to fail on.
+    #[tokio::test]
+    async fn fetch_refuses_a_redirect_to_another_scheme() {
+        let server = MockServer::redirecting("file:///etc/passwd");
+        let result = fetch_tool()
+            .invoke(serde_json::json!({ "url": server.url("/page") }))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("file://"),
+            "the refusal names the scheme: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
