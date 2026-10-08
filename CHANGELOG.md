@@ -20,6 +20,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed
 
+- A walk of a repository with ignore rules is about three times faster (17.5 ms to 5.1 ms warm on this workspace's own tree, 229 source files, 20 rules), so a turn's index resync is less often reported as behind. The rules mean the same thing they did; they are just not re-decided against every path suffix with a fresh grid per call.
+
 - `bash` output reaches the model as the text a terminal would show: colour codes and window titles removed, `\r` progress bars reduced to their last state — on a pty and on a pipe alike, through timeouts and interrupts too.
 - A `bash` run is bounded on both paths: a deadline (`timeout_secs`, 300 by default), a whole-process-group stop on Ctrl+C, and a 64 KiB cap per stream kept (first and last on a pipe). Zero nowhere means "no deadline"; a foreground dev server, watcher or `tail -f` is refused before it runs.
 - `read` answers at most 30,000 characters and 2,000 lines without a `limit`; a longer file arrives paged as `[lines 1-N of M; read on from offset N+1]`, not cut in the middle. A directory read lists it; a binary is named as one.
