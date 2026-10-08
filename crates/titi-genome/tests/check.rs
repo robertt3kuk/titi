@@ -338,6 +338,7 @@ fn the_roster_needs_no_workspace() {
         full,
         vec![
             "c",
+            "c#",
             "c++",
             "go",
             "java",

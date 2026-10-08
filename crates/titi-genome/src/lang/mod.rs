@@ -249,11 +249,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::CSharp,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "c#",
-        note: "types and `using` lines are matched by pattern; comments are masked first",
+        note: "type declarations come from a syntax tree; `using` lines are resolved by namespace suffix",
         extensions: &["cs"],
-        grammar: None,
+        grammar: Some(Grammar::CSharp),
         parse: csharp::parse,
     },
     Lang {

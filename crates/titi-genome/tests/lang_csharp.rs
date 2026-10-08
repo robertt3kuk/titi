@@ -27,6 +27,10 @@ namespace Acme
     public class App
     {
         public void Run() {}
+
+        const string Doc = @"
+public class Quoted {}
+";
     }
 }
 
@@ -69,6 +73,13 @@ fn csharp_exports_types_and_places_imports_by_namespace_root() {
     assert!(
         !app.exports.contains(&"Ghost".to_owned()),
         "{:?}",
+        app.exports
+    );
+    // `public class Quoted {}` inside a verbatim string is string content: the
+    // line patterns read it as a type, the grammar does not.
+    assert!(
+        !app.exports.contains(&"Quoted".to_owned()),
+        "a verbatim string's content is not a type: {:?}",
         app.exports
     );
     assert!(
@@ -134,7 +145,8 @@ fn csharp_reports_its_level_in_the_capability_roster() {
         .into_iter()
         .find(|capability| capability.language == "c#")
         .expect("a c# capability");
-    assert_eq!(csharp.level, Level::Heuristic, "{}", csharp.note);
+    assert_eq!(csharp.level, Level::Full, "{}", csharp.note);
+    assert!(csharp.note.contains("syntax tree"), "{}", csharp.note);
     assert_eq!(csharp.extensions, vec!["cs"]);
-    assert_eq!(Language::CSharp.level(), Level::Heuristic);
+    assert_eq!(Language::CSharp.level(), Level::Full);
 }
