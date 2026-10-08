@@ -6,6 +6,8 @@
 //! Merge rules follow `omp://settings`: objects deep-merge, scalars and arrays
 //! are replaced wholesale by the higher layer.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod config_file;
 pub mod fallback;
 pub mod roles;
