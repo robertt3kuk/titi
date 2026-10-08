@@ -300,7 +300,75 @@ fn an_unknown_genome_subcommand_is_named_and_shows_usage() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("genome: unknown command wat\n"), "{stderr}");
     assert!(
-        stderr.contains("usage: titi genome [on|off|limit <n>|check|lsp]\n"),
+        stderr.contains("usage: titi genome [on|off|limit <n>|check|capabilities|lsp]\n"),
         "{stderr}"
     );
+}
+
+/// `titi genome capabilities` is the reference answer: one line per language
+/// the index understands, its level, its extensions and what the level costs.
+///
+/// It is a separate verb from `check` on purpose — a listing is not a finding,
+/// so `check` keeps its `genome: clean` answer — and the roster comes from the
+/// build rather than the workspace, so this answers in a directory that cannot
+/// be indexed at all.
+#[test]
+fn capabilities_lists_every_language_with_its_level() {
+    let dir = tempfile::tempdir().expect("temp agent dir");
+    let (stdout, stderr, code) = run(dir.path(), dir.path(), &["genome", "capabilities"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let summary = lines.last().expect("a summary line");
+    assert!(
+        summary.ends_with("languages: 4 full, 9 heuristic"),
+        "{stdout}"
+    );
+
+    let row = |language: &str| {
+        lines
+            .iter()
+            .find(|line| line.split_whitespace().next() == Some(language))
+            .unwrap_or_else(|| panic!("no row for {language}: {stdout}"))
+    };
+    // A parsed language and a pattern language must not read alike.
+    let rust = row("rust");
+    assert!(rust.contains("Full"), "{rust}");
+    assert!(rust.contains(".rs"), "{rust}");
+    assert!(rust.contains("syntax tree"), "{rust}");
+    let java = row("java");
+    assert!(java.contains("Heuristic"), "{java}");
+    assert!(java.contains(".java"), "{java}");
+    // Every extension of a language is on its one line.
+    assert!(row("typescript").contains(".ts") && row("typescript").contains(".tsx"));
+    assert!(row("c++").contains(".cpp") && row("c++").contains(".hxx"));
+    assert!(row("c#").contains(".cs"));
+
+    // The unreadable root that check and lsp refuse is no obstacle here: the
+    // roster is a property of the build, not of the workspace.
+    if let Some(unreadable) = unreadable_root(dir.path()) {
+        let (stdout, _, code) = run(dir.path(), &unreadable, &["genome", "capabilities"]);
+        assert_eq!(code, 0, "{stdout}");
+        assert!(stdout.contains("languages:"), "{stdout}");
+    }
+}
+
+/// The vetter still says what it always said: a tree with nothing wrong is
+/// `genome: clean`, exit 0. Capability is not a finding, so it does not appear
+/// in this report at all.
+#[test]
+fn check_stays_clean_and_never_lists_capability() {
+    let dir = tempfile::tempdir().expect("temp tree");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("App.java"),
+        "package com.acme;\npublic class App {}\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = run(dir.path(), dir.path(), &["genome", "check"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(stdout, "genome: clean\n", "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
 }

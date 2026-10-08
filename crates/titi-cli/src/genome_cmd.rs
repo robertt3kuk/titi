@@ -5,6 +5,12 @@
 //! so a user who cannot reach the chat still sees why the map is on or off.
 //! `genome.limit` is a separate key and this never touches it: enabling and
 //! capping are one verb each, not one decision.
+//!
+//! Two reports go past the switches. `check` is a vetter: the findings in the
+//! workspace, one line each, exit 1 on a Warning or Error. `capabilities` is
+//! reference: what level each language's exports rest on, on demand. They are
+//! separate verbs because a listing is not a finding, and a vetter that also
+//! narrated its own reach could no longer say `genome: clean`.
 
 use std::path::Path;
 
@@ -51,6 +57,9 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         Some("check") => {
             check_cmd(workspace);
         }
+        Some("capabilities") => {
+            capabilities_cmd();
+        }
         Some("lsp") => {
             // The blocks here are the server: a client is on the other side
             // of the pipe, so nothing prints before the frames.
@@ -63,7 +72,7 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         }
         Some(name) => {
             eprintln!("genome: unknown command {name}");
-            eprintln!("usage: titi genome [on|off|limit <n>|check|lsp]");
+            eprintln!("usage: titi genome [on|off|limit <n>|check|capabilities|lsp]");
             std::process::exit(USAGE_EXIT);
         }
     }
@@ -106,6 +115,58 @@ fn check_cmd(workspace: &Path) {
         .iter()
         .any(|item| !matches!(item.severity, titi_genome::Severity::Info));
     std::process::exit(i32::from(has_problem));
+}
+
+/// `titi genome capabilities`: one line per language this index understands —
+/// its level, the extensions it answers to, and what that level costs.
+///
+/// A verb of its own rather than `check --capabilities`. `check` is a vetter:
+/// its exit code and its one-line `genome: clean` answer are about findings,
+/// and a reference listing is not a finding — mixing them either floods the
+/// findings or makes `clean` unreachable. The roster is a property of the
+/// build, so this reads no directory and cannot fail on a workspace it cannot
+/// walk, unlike `check` and `lsp`.
+fn capabilities_cmd() {
+    let roster = titi_genome::Genome::capabilities();
+    let extensions = |capability: &titi_genome::Capability| {
+        capability
+            .extensions
+            .iter()
+            .map(|extension| format!(".{extension}"))
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+    let width = |field: &dyn Fn(&titi_genome::Capability) -> String| {
+        roster
+            .iter()
+            .map(|capability| field(capability).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (language_width, level_width) = (
+        width(&|capability| capability.language.to_owned()),
+        width(&|capability| capability.level.as_str().to_owned()),
+    );
+    let extension_width = width(&|capability| extensions(capability));
+    for capability in &roster {
+        println!(
+            "{:<language_width$} {:<level_width$} {:<extension_width$} {}",
+            capability.language,
+            capability.level.as_str(),
+            extensions(capability),
+            capability.note,
+        );
+    }
+    let full = roster
+        .iter()
+        .filter(|capability| matches!(capability.level, titi_genome::Level::Full))
+        .count();
+    println!(
+        "{} languages: {full} full, {} heuristic",
+        roster.len(),
+        roster.len() - full,
+    );
+    std::process::exit(0);
 }
 
 /// Writes the boolean to the agent's own config: the canonical global file,
