@@ -752,6 +752,9 @@ impl Chat {
             Key::Backspace => {
                 self.disarm();
                 self.input.pop();
+                // The query may still stand after the pop (`:sm` from `:smi`),
+                // so the picker follows the text here too.
+                self.sync_emoji_picker();
                 self.picker = 0;
                 self.scroll_offset = 0;
                 Applied::none()
@@ -8960,6 +8963,21 @@ mod tests {
             assert!(!frame.contains(":sm"), "the query is consumed: {frame}");
             assert!(!frame.contains("emoji ·"), "and the picker closed: {frame}");
             assert!(!chat.emoji_picker.is_visible());
+        }
+
+        // Backspace takes the query back and the picker follows it, the way
+        // the model browser's does.
+        {
+            let mut chat = chat();
+            type_text(&mut chat, ":smi");
+            assert!(frame_text(&mut chat).contains("emoji ·"));
+            chat.on_key(Key::Backspace, Instant::now());
+            let frame = frame_text(&mut chat);
+            assert!(frame.contains(":sm▍"), "{frame}");
+            assert!(
+                frame.contains("emoji ·"),
+                "the query still stands, so the picker stays: {frame}"
+            );
         }
 
         // Esc closes and leaves the text alone — unlike the slash list, whose
