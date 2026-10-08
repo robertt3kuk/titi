@@ -5,7 +5,7 @@
 //! still owns, and is the storage half of the mouse-selection port
 //! (`titi_tui::selection`).
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use titi_cli::session_fs::{load_mouse_preset_from, save_mouse_preset_to};
 use titi_tui::caps::MousePreset;

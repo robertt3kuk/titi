@@ -1,6 +1,6 @@
 //! The session recap: what the sections report.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use serde_json::json;
 use titi_cli::recap::build;

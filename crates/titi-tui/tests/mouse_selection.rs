@@ -10,6 +10,7 @@
 //! What stays asserted here is the model: an anchor plus a drag paints the
 //! selected rows, releases into a rectangle, and never invents one from a
 //! bare default.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use serde_json::json;
 use std::collections::HashMap;

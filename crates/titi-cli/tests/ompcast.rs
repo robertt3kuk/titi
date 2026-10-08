@@ -4,7 +4,7 @@
 //! after the engine has masked them; the key test below pins that a secret in
 //! tool output never reaches the file.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 

@@ -1,7 +1,7 @@
 //! `--set-key` / `--list-keys`: stored credentials reach the engine's
 //! credential ladder without an environment variable.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use titi_cli::secrets::{list_keys, store_key};
 use titi_engine::{CredentialSource, LayeredCredentialSource, ProviderDescriptor};

@@ -3,7 +3,7 @@
 //! `genome.limit` shares the same load path: an out-of-range or non-integer
 //! value keeps the engine default instead of failing startup.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 

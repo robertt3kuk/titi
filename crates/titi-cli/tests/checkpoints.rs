@@ -3,7 +3,7 @@
 //!
 //! Contract: `docs/research/reference-product-port/README.md` (E2 — checkpoints).
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 use std::process::Command;

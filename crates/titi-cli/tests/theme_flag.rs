@@ -4,6 +4,7 @@
 //! The flag is parsed before the screen opens, so a refusal is answered on
 //! stderr with the exit code the other bad-argument paths use — no terminal,
 //! no engine, nothing started.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 /// A theme this build does not carry is refused by name, with the count of
 /// what it does carry, rather than falling back to another palette.

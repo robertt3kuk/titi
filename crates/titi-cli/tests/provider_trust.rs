@@ -4,7 +4,7 @@
 //! goes there, so a catalog read from a cloned repo's `.titi/config.yml`
 //! could redefine `openai` and receive the user's key with its first request.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 

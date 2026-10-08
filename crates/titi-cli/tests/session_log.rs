@@ -1,7 +1,7 @@
 //! The transcript must actually reach the session store, or a resume replays
 //! nothing and a checkpoint marks an empty tree.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use titi_cli::engine::MAX_RESTORED_MESSAGES;
 use titi_cli::session_fs::new_session;

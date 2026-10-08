@@ -5,6 +5,7 @@
 //!
 //! A synthetic theme with explicit hex values for every markdown token makes
 //! the ANSI output deterministic, so the committed golden files are stable.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use serde_json::json;
 use std::collections::HashMap;

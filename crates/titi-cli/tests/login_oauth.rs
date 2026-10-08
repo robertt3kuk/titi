@@ -1,6 +1,7 @@
 //! OAuth login from the surfaces: the chat's code mode, the `--login` flag
 //! and the credential listing. No socket, browser or provider is involved —
 //! the chat gets a fake driver, the flag tests run against a temp store.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 use std::sync::Arc;

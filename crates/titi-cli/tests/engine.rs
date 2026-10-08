@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use titi_cli::engine::{
     default_registry_config, merge_registry_config, parse_approval, prefer_available_models,
 };

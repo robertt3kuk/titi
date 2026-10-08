@@ -3,7 +3,7 @@
 //! Every test points `TITI_AGENT_DIR` at a fresh temp dir, the same way the
 //! headless tests do, so no machine's `~/.titi` is ever read or written.
 
-#![allow(clippy::unwrap_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;

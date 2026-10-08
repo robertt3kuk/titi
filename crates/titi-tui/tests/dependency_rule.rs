@@ -3,6 +3,7 @@
 //!
 //! Contract: `docs/research/tui-renderer/README.md` — "ни один модуль
 //! titi-tui не зависит от titi-providers/titi-tools".
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::PathBuf;
 
