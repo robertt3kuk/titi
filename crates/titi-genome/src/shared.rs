@@ -68,6 +68,20 @@ impl SharedGenome {
         Arc::make_mut(&mut state).refresh(root)
     }
 
+    /// [`Self::refresh`], parsing `urgent` first — see [`Genome::refresh_urgent`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::refresh`].
+    pub fn refresh_urgent(
+        &self,
+        root: impl AsRef<Path>,
+        urgent: &[String],
+    ) -> std::io::Result<RefreshStats> {
+        let mut state = self.state.write().expect("genome lock poisoned");
+        Arc::make_mut(&mut state).refresh_urgent(root, urgent)
+    }
+
     /// Run a targeted update — see [`Genome::apply_changes`] — and publish it.
     ///
     /// # Panics

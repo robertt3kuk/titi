@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::StreamExt;
 use smol_str::SmolStr;
-use titi_genome::Genome;
+use titi_genome::SharedGenome;
 use titi_providers::{
     ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, TokenUsage, Transport,
     TransportError, WireRequest,
@@ -113,9 +113,6 @@ const PLAN_TIERS: &[ApprovalTier] = &[ApprovalTier::Read];
 /// no network tool registered still goes out with no tools at all.
 const DUCK_TIERS: &[ApprovalTier] = &[ApprovalTier::Network];
 
-/// The live repository index, shared by the command loop and its turns.
-type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>;
-
 /// The memories relevant to this turn, ranked against the files it has
 /// already touched. Off the runtime thread: the index is synchronous
 /// SQLite, and blocking the runtime thread panics.
@@ -137,21 +134,38 @@ async fn recalled_memory(agent_dir: Option<PathBuf>, touched: &TouchedSink) -> O
 }
 
 /// Refresh the live index off the async threads and render this turn's map.
+///
+/// The genome is a published handle, not a lock over a genome: the writer is
+/// the tool loop, which folds every file a tool wrote into the same handle
+/// before that tool returns, so by the time this runs the graph already knows
+/// the turn's own writes. This call is the **fallback walk**, and it is kept
+/// because a turn can run an arbitrary command — a formatter, a `git checkout`
+/// — that changes files no tool named. It cannot silently serve a graph that
+/// is behind, because nothing else writes: with one writer, synchronous inside
+/// the call that caused it, the snapshot is current by construction. What that
+/// does *not* cover is a writer outside this process (phase 3's watcher) and a
+/// concurrent one (phase 4); today the only other writer is another process,
+/// whose edits this walk picks up at the start of the next turn.
+///
+/// The files this session touched are parsed first, most recent first, so the
+/// one the agent is working in is handed out at the front of the batch.
 async fn genome_map(
     root: Option<PathBuf>,
     limit: usize,
-    genome: &GenomeIndex,
+    genome: &SharedGenome,
     touched: &TouchedSink,
 ) -> Option<SmolStr> {
     let root = root?;
-    let genome = Arc::clone(genome);
+    let genome = genome.clone();
     let touched = Arc::clone(touched);
     run_off_thread(move || {
-        let mut guard = genome.blocking_lock();
-        let index = guard.get_or_insert_with(Genome::default);
-        index.refresh(&root).ok()?;
         let touched: Vec<String> = touched.blocking_lock().snapshot();
-        Some(SmolStr::from(index.project_with(limit, &touched)))
+        let mut urgent = touched.clone();
+        urgent.reverse();
+        genome.refresh_urgent(&root, &urgent).ok()?;
+        Some(SmolStr::from(
+            genome.read(|index| index.project_with(limit, &touched)),
+        ))
     })
     .await
 }
@@ -761,8 +775,9 @@ pub struct EngineRuntime {
     tools: ToolRegistry,
     approval_waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
-    /// Live index, refreshed from `config.genome_root` before each turn.
-    genome: GenomeIndex,
+    /// Live index: written by the tool loop as it runs, and re-walked from
+    /// `config.genome_root` before each turn.
+    genome: SharedGenome,
     /// Files this session read or edited; boosts their rank in the projection.
     touched: TouchedSink,
     /// Per-file write claims shared by every agent in this runtime.
@@ -948,7 +963,7 @@ impl EngineRuntime {
             tools,
             approval_waiters: ApprovalWaiters::default(),
             trajectory,
-            genome: Arc::new(tokio::sync::Mutex::new(None)),
+            genome: SharedGenome::default(),
             touched,
             claims: claims.clone(),
             steering: Steering::default(),
@@ -1658,7 +1673,7 @@ impl EngineRuntime {
         let waiters = Arc::clone(&self.approval_waiters);
         let trajectory = Arc::clone(&self.trajectory);
         let touched = Arc::clone(&self.touched);
-        let genome = Arc::clone(&self.genome);
+        let genome = self.genome.clone();
         let claims = self.claims.clone();
         let steering = self.steering.clone();
         let spent = Arc::clone(&self.spent);
@@ -1960,7 +1975,7 @@ async fn run_turn(
     waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
     touched: TouchedSink,
-    genome: GenomeIndex,
+    genome: SharedGenome,
     claims: Claims,
     steering: Steering,
     // Session-wide token meter the turn adds its own spend to.
@@ -1994,7 +2009,7 @@ async fn run_turn(
         }
     }
     let recalled = recalled_memory(config.agent_dir.clone(), &touched).await;
-    let genome = genome_map(
+    let genome_text = genome_map(
         config.genome_root.clone(),
         config.genome_limit,
         &genome,
@@ -2004,7 +2019,7 @@ async fn run_turn(
     let contextual_prompt = prompt_with_context(
         &prompt,
         recalled.as_deref(),
-        genome.as_deref(),
+        genome_text.as_deref(),
         snapshot.as_ref().map(|shot| shot.text.as_str()),
     );
 
