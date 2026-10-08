@@ -34,7 +34,10 @@ pub fn entries_to_messages(entries: &[Entry]) -> Vec<titi_providers::ChatMessage
 /// Filesystem store: one JSONL file per session under `<agent_dir>/sessions`,
 /// a per-session leaf pointer, and the SQLite/FTS5 index at
 /// `<agent_dir>/state.db`. The agent directory is injected — no env lookups —
-/// so tests point it at a `tempfile::TempDir`.
+/// so tests point it at a `tempfile::TempDir`. The one thing read from the
+/// environment is the working directory recorded as a new session's
+/// workspace; a test that cares about it says so in `SessionMeta::cwd`, which
+/// wins.
 pub struct SessionStore {
     dir: PathBuf,
     index: SessionIndex,
@@ -50,9 +53,24 @@ impl SessionStore {
     }
 
     /// Creates an empty session and returns its id.
+    ///
+    /// `meta.cwd` is the workspace the session is started in. A caller that
+    /// does not name one still gets one recorded — the process working
+    /// directory, which is the directory the CLI calls the workspace
+    /// (`session_fs::current_workspace`) — because a session that recorded
+    /// nothing is unreachable by a workspace-scoped resume for no reason, and
+    /// the live creation path passes a default `SessionMeta`. Nothing is
+    /// recorded only when the working directory cannot be read or is not
+    /// valid UTF-8, which is also what a session written before the field
+    /// existed reports: `None` means "unknown workspace", never "not in
+    /// yours".
     pub fn create(&self, meta: SessionMeta) -> Result<String, SessionError> {
+        let meta = SessionMeta {
+            cwd: meta.cwd.or_else(working_directory),
+            ..meta
+        };
         let id = entry::new_id();
-        File::create_new(self.session_file(&id)).map_err(|e| SessionError::Io(e))?;
+        File::create_new(self.session_file(&id)).map_err(SessionError::Io)?;
         self.index.insert_session(&id, entry::now_ms(), &meta)?;
         Ok(id)
     }
@@ -358,6 +376,11 @@ impl SessionStore {
             title: meta.title.or(inherited.title),
             bot_id: meta.bot_id.or(inherited.bot_id),
             source: Some(meta.source.unwrap_or_else(|| format!("{kind}:{source_id}"))),
+            // A copy is still about the workspace the conversation happened
+            // in, so a fork taken from another directory keeps searching and
+            // resuming there. A source that never recorded one leaves this
+            // unset, and `create` records the directory the copy is made in.
+            cwd: meta.cwd.or(inherited.cwd),
         };
         let new_id = self.create(meta)?;
         for entry in entries {
@@ -434,6 +457,20 @@ impl SessionStore {
         }
         parse_lines(&read_lines(&file)?)
     }
+}
+
+/// The process working directory, as a workspace key, when it can be read.
+///
+/// Recorded for a session whose creator named no workspace. It is the same
+/// directory the CLI pins a checkpoint to and rewinds into, so it is what
+/// "this project" means to the resume paths; but it is read here rather than
+/// passed in because the live creation path (`engine::launch_session`) builds
+/// its metadata from `Default` and a session that records nothing would be
+/// unreachable by a workspace-scoped resume.
+fn working_directory() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
 }
 
 /// Every line of a JSONL file, in order.
@@ -565,6 +602,7 @@ mod tests {
             title: Some(format!("bot-{bot_id}")),
             bot_id: Some(bot_id.into()),
             source: Some("cli".into()),
+            cwd: None,
         }
     }
 
@@ -721,6 +759,61 @@ mod tests {
             Some(second.clone())
         );
         assert_ne!(first, second);
+    }
+
+    /// A session says where it was started. A named workspace is kept as it
+    /// is; an unnamed one falls back to the process working directory, which
+    /// is what makes `--continue` project-scoped without every creation site
+    /// having to say so.
+    #[test]
+    fn create_records_the_workspace_it_is_given_or_runs_in() {
+        let (_dir, s) = store();
+        let named = s
+            .create(SessionMeta {
+                cwd: Some("/work/named".into()),
+                ..meta("a")
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let named = s
+            .session_meta(&named)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("named was created"));
+        assert_eq!(named.cwd.as_deref(), Some("/work/named"));
+
+        let unnamed = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let unnamed = s
+            .session_meta(&unnamed)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("unnamed was created"));
+        let here = std::env::current_dir()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(unnamed.cwd.as_deref(), Some(here.as_str()));
+    }
+
+    /// A fork or branch of a session stays in that session's workspace even
+    /// when it is taken from somewhere else: the copy is about the same tree.
+    #[test]
+    fn a_fork_keeps_the_workspace_of_the_session_it_copied() {
+        let (_dir, s) = store();
+        let source = s
+            .create(SessionMeta {
+                cwd: Some("/work/source".into()),
+                ..meta("a")
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&source, Role::User, "hello")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let fork = s
+            .fork_session(&source, meta("a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let fork = s
+            .session_meta(&fork)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("the fork was created"));
+        assert_eq!(fork.cwd.as_deref(), Some("/work/source"));
     }
 
     #[test]

@@ -79,4 +79,16 @@ pub struct SessionMeta {
     pub title: Option<String>,
     pub bot_id: Option<String>,
     pub source: Option<String>,
+    /// The workspace root the session was started in, as an absolute path
+    /// string.
+    ///
+    /// `None` means no workspace was ever recorded for this session — every
+    /// session written before this field existed, and nothing else: the store
+    /// records the process working directory when a caller does not name one
+    /// ([`SessionStore::create`](store::SessionStore::create)). A reader must
+    /// therefore treat `None` as "unknown", never as "not this workspace": a
+    /// workspace-scoped lookup that matches nothing falls back to the wider
+    /// scope, so an old session stays reachable instead of being hidden by a
+    /// filter it cannot satisfy.
+    pub cwd: Option<String>,
 }

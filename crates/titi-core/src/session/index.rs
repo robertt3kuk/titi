@@ -26,6 +26,8 @@ pub struct SessionIndex {
 /// chose, `auto` for one the session namer generated, `NULL` for a session
 /// nobody has named yet. The placeholder a surface writes at creation time
 /// counts as unnamed, so a fresh session can still be given a real title.
+/// `cwd` is the workspace the session was started in; `NULL` means it was
+/// never recorded (see [`SessionMeta::cwd`]).
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id           TEXT PRIMARY KEY,
@@ -33,7 +35,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at   INTEGER NOT NULL,
     bot_id       TEXT,
     source       TEXT,
-    title_source TEXT
+    title_source TEXT,
+    cwd          TEXT
 );
 CREATE TABLE IF NOT EXISTS entries (
     session_id TEXT NOT NULL,
@@ -49,10 +52,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 
 /// Schema version recorded in `PRAGMA user_version`.
 ///
+/// `1` is the catalog, entries and FTS tables with the title's provenance;
+/// `2` adds `sessions.cwd`, the workspace a session was started in.
+///
 /// Read before anything else is done to the file: a database stamped with a
 /// number this build does not know cannot be interpreted with the column
 /// meanings it was written under, and guessing is worse than refusing.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 impl SessionIndex {
     /// Opens (or creates) the index database, running the schema migration.
@@ -75,12 +81,14 @@ impl SessionIndex {
     /// Accepts this build's schema and anything older, and refuses anything
     /// newer.
     ///
-    /// `0` is what SQLite reports for a file that never stamped one — every
-    /// `state.db` written before this constant existed — so it is treated as
-    /// current and stamped now. A stamp *below* the constant cannot happen
-    /// while version 1 is the first version; when it can, that branch is where
-    /// a migration is called, and refusing a newer file is what keeps this
-    /// from needing one in the other direction.
+    /// A stamp below the constant is a file from an earlier release — the
+    /// normal case now that version 2 exists — and `0` is what SQLite reports
+    /// for a file that never stamped one at all (every `state.db` written
+    /// before the constant did). Both are stamped current here; the columns
+    /// they are missing are added by [`Self::migrate`], which runs on every
+    /// open, so a stamp this file already carries never has to be trusted for
+    /// the shape of the table. Refusing a newer file is what keeps this from
+    /// needing a migration in the other direction.
     fn check_version(conn: &Connection) -> Result<(), SessionError> {
         let found: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -101,22 +109,41 @@ impl SessionIndex {
     /// Adds what a database from an earlier release is missing.
     ///
     /// `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it
-    /// was, so without this every title write against an already-created
-    /// `state.db` would fail on an unknown column.
+    /// was, so without this every write against an already-created
+    /// `state.db` would fail on an unknown column: the title's provenance and,
+    /// since version 2, the workspace a session was started in.
     fn migrate(conn: &Connection) -> Result<(), SessionError> {
+        Self::add_column_if_missing(
+            conn,
+            "title_source",
+            "ALTER TABLE sessions ADD COLUMN title_source TEXT;",
+        )?;
+        Self::add_column_if_missing(conn, "cwd", "ALTER TABLE sessions ADD COLUMN cwd TEXT;")
+    }
+
+    /// Adds a column an older `sessions` table does not have yet.
+    ///
+    /// The table's columns are read back rather than the stamped version
+    /// trusted, so this is safe to run on every open and heals a file whose
+    /// stamp was written before its columns were (the two are not one
+    /// transaction).
+    fn add_column_if_missing(
+        conn: &Connection,
+        column: &str,
+        alter: &str,
+    ) -> Result<(), SessionError> {
         let mut columns = conn
             .prepare("PRAGMA table_info(sessions)")
             .map_err(SessionError::Db)?;
-        let has_title_source = columns
+        let present = columns
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(SessionError::Db)?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(SessionError::Db)?
             .iter()
-            .any(|name| name == "title_source");
-        if !has_title_source {
-            conn.execute_batch("ALTER TABLE sessions ADD COLUMN title_source TEXT;")
-                .map_err(SessionError::Db)?;
+            .any(|name| name == column);
+        if !present {
+            conn.execute_batch(alter).map_err(SessionError::Db)?;
         }
         Ok(())
     }
@@ -130,9 +157,16 @@ impl SessionIndex {
     ) -> Result<(), SessionError> {
         self.conn
             .execute(
-                "INSERT INTO sessions (id, title, created_at, bot_id, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, meta.title, created_at as i64, meta.bot_id, meta.source],
+                "INSERT INTO sessions (id, title, created_at, bot_id, source, cwd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    meta.title,
+                    created_at as i64,
+                    meta.bot_id,
+                    meta.source,
+                    meta.cwd
+                ],
             )
             .map_err(SessionError::Db)?;
         Ok(())
@@ -242,13 +276,14 @@ impl SessionIndex {
     pub fn session_meta(&self, session_id: &str) -> Result<Option<SessionMeta>, SessionError> {
         self.conn
             .query_row(
-                "SELECT title, bot_id, source FROM sessions WHERE id = ?1",
+                "SELECT title, bot_id, source, cwd FROM sessions WHERE id = ?1",
                 params![session_id],
                 |row| {
                     Ok(SessionMeta {
                         title: row.get(0)?,
                         bot_id: row.get(1)?,
                         source: row.get(2)?,
+                        cwd: row.get(3)?,
                     })
                 },
             )
@@ -316,6 +351,15 @@ mod tests {
             title: None,
             bot_id: bot_id.map(String::from),
             source: Some("cli".into()),
+            cwd: None,
+        }
+    }
+
+    /// A session started in `workspace`.
+    fn meta_in(bot_id: Option<&str>, workspace: &str) -> SessionMeta {
+        SessionMeta {
+            cwd: Some(workspace.to_owned()),
+            ..meta(bot_id)
         }
     }
 
@@ -336,6 +380,73 @@ mod tests {
             index.resume_latest().unwrap_or_else(|e| panic!("{e}")),
             Some("s2".into())
         );
+    }
+
+    /// A session keeps the workspace it was recorded in, and an absent one
+    /// reads back as absent rather than as an empty string.
+    #[test]
+    fn a_session_keeps_the_workspace_it_was_recorded_in() {
+        let (_dir, index) = tmp_index();
+        index
+            .insert_session("here", 100, &meta_in(None, "/work/here"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .insert_session("unknown", 200, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let here = index
+            .session_meta("here")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("here was inserted"));
+        assert_eq!(here.cwd.as_deref(), Some("/work/here"));
+        let unknown = index
+            .session_meta("unknown")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("unknown was inserted"));
+        assert_eq!(unknown.cwd, None);
+    }
+
+    /// A `state.db` stamped 1 — the release before sessions carried a
+    /// workspace — opens, keeps the sessions it has, and gains the column:
+    /// its rows read back as "no workspace recorded", never as missing.
+    #[test]
+    fn a_version_1_index_gains_the_workspace_column() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = dir.path().join("state.db");
+        let old = Connection::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        old.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL,
+                 bot_id TEXT, source TEXT, title_source TEXT
+             );
+             INSERT INTO sessions (id, title, created_at, source)
+                 VALUES ('s1', 'titi', 1, 'cli');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(old);
+
+        let index = SessionIndex::open(&path).unwrap_or_else(|e| panic!("open: {e}"));
+        let legacy = index
+            .session_meta("s1")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("the old session survived the migration"));
+        assert_eq!(legacy.cwd, None, "no workspace was ever recorded for it");
+
+        index
+            .insert_session("s2", 2, &meta_in(None, "/work/a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let fresh = index
+            .session_meta("s2")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("the new session was written"));
+        assert_eq!(fresh.cwd.as_deref(), Some("/work/a"));
+
+        let stamped: i64 = index
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap_or_else(|e| panic!("user_version: {e}"));
+        assert_eq!(stamped, SCHEMA_VERSION);
     }
 
     #[test]
