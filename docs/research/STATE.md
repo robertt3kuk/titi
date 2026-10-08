@@ -343,12 +343,17 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `README.md:99,174,303,378` (`/skillful` does not exist; `/council` and
   `/graph` do)~~ fixed 2026-10-08 in 268a159, which took the header test count
   and the verify block with it.
-- [ ] `medium` nine tree-sitter grammars are justified and ABI-14 verified but
-  not added — go, java, c/c++, c#, kotlin, php, ruby and swift (the genome
-  worker's report names the release for each); every one must emit ABI 14, the
-  range the workspace's `tree-sitter 0.24` accepts, because newer releases emit
-  ABI 15 and would need a core bump (`crates/titi-genome/Cargo.toml:12-14`,
-  guarded by `grammars_match_the_core_abi`).
+- [x] `medium` ~~nine tree-sitter grammars are justified and ABI-14 verified but
+  not added — go, java, c/c++, c#, kotlin, php, ruby and swift; every one must
+  emit ABI 14, the range the workspace's `tree-sitter 0.24` accepts, because
+  newer releases emit ABI 15 and would need a core bump
+  (`crates/titi-genome/Cargo.toml:12-14`, guarded by
+  `grammars_match_the_core_abi`)~~ all nine added 2026-10-09 in 9c81d63 (Go),
+  ea73eec (Java), 583f27c (C and C++), a43ac34 (Kotlin), 2e46e36 (C#), 918604a
+  (Ruby), ddee4be (PHP) and d658a45 (Swift), each with its grammar crate, its
+  `Cargo.lock` entry and its `tests/lang_<lang>.rs` in the same commit; d81a6cf
+  dropped the pattern helpers no language uses and f4c5799 documents what each
+  level names.
 - [ ] `medium` the workspace lints now surface 1381 `unwrap`/`expect` warning
   headers (`cargo clippy --workspace --all-targets`), nearly all of them inside
   test modules — the audit counted ≈36 sites outside them; turning that into a
@@ -401,4 +406,19 @@ style fix `57b0454`), the turn footer with usage (`9430689`) and the run state
 in the terminal title (`1a2ecc3`), emoji in the live composer (`faa2de9`
 crate-side, `effcf3e` wired, `28394b1` backspace). `4134736` dropped four
 unused dependency edges.
+
+The grammar wave (2026-10-09) finished that genome work: every language row now
+reads its declarations from a syntax tree instead of patterns, so all 13
+languages are `Full` and `Level::Heuristic` has no instance left — it stays as
+the name of the state a `grammar: None` row describes, pinned by
+`crates/titi-genome/src/lang/mod.rs:508-522`. Terminal chrome landed with it:
+notifications on a finished, failed or asking turn (`notify.completion`,
+`notify.error`, `notify.ask`, f8ea043), the terminal's own progress for a
+running turn (`terminal.progress`, e7cd8ae), and the generation rate on the
+working row (`composer.tokenRate`, 64bc233 — the characters the row already
+counts ÷ 4 over a rolling 4 s window, printed with a `~` because it is an
+estimate, `titi-tui/src/status.rs:182-235`). Honest limits: the C row claims
+`.h` and retries the C++ grammar when the C parse is broken (`titi genome
+capabilities` says so), `export_to_file` is still a plain `fs::write`, and the
+lints' 1381 `unwrap`/`expect` warnings stand.
 
