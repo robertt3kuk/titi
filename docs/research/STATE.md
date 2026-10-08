@@ -358,6 +358,13 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   headers (`cargo clippy --workspace --all-targets`), nearly all of them inside
   test modules — the audit counted ≈36 sites outside them; turning that into a
   rule (per-module allow-lists, or a real fix pass) is its own task.
+- [ ] `medium` `selection.rs` and `space_hold.rs` are kept while nothing calls
+  them — `crates/titi-tui/src/selection.rs`, `space_hold.rs`; dead on purpose
+  after the `App` deletion, so the next wave ports them into `chat.rs` (mouse
+  selection, the space-hold gesture) or deletes them. The other `App`-only
+  behaviours (history search, hub revive/stop, the details accordion,
+  keybinding customization) are recoverable from git history at `65a2f8b` and
+  are work, not losses.
 - [ ] `low` five direct dependencies are unused or over-declared —
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
@@ -422,4 +429,25 @@ estimate, `titi-tui/src/status.rs:182-235`). Honest limits: the C row claims
 capabilities` says so), `export_to_file` is still a plain `fs::write`, and the
 lints' 1392 `unwrap`/`expect` warnings stand (1381 before this wave's
   grammar code).
+
+The `App` deletion wave (2026-10-09) closed the audit's last structural item.
+Phase 1 had moved the live helpers out; phase 2 deleted the stack — `app.rs`
+(2129 lines), the eleven `titi-tui` modules only it used (5315 lines) and the
+seven test files that only drove it (`dispatch`, `engine_events`,
+`overlays_paste`, `queue`, `slash_completion`, `transcript`,
+`slash_snapshot`). `cli/src` went 22201 → 20071 and `tui/src` 22171 → 16607 in
+those commits (at this head 20157 and 19468, the later feature work adding to
+both); `tests/mouse_preset.rs` is new because the helper it covers outlived
+the stack. Terminal chrome: the status line is painted from a five-entry
+preset table (Default, Minimal, Compact, Full, Ascii) chosen by
+`statusLine.preset` or `/statusline <preset>` (validated before anything is
+written), with the context gauge filling the gap between the groups in accent
+and its label anchored at the right so `9%` → `10%` shifts nothing;
+`statusLine.contextLine` defaults to off, so the default frame stays
+byte-identical to before. LaTeX landed as a subset rendered to Unicode —
+154 symbol commands, 17 big operators, 87 function names, accents and
+`\frac`/`\sqrt`, inline and display (`crates/titi-tui/src/latex.rs`) — with
+the contract that nothing is ever deleted: an unknown command prints verbatim,
+a multi-character script keeps its meaning, an inline fraction stays flat; and
+7d83722 lets a maths-only answer take the markdown path at all.
 
