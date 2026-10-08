@@ -106,6 +106,19 @@ fn runs_a_turn(command: &EngineCommand) -> bool {
     )
 }
 
+/// Whether a frame may be read while a turn is running.
+///
+/// Two things, and nothing else: the answer to a question the parked turn
+/// asked, and a cancel that ends it. Everything else keeps its place in the
+/// pipe, because the protocol is one turn at a time — and a question nobody
+/// can answer would park the turn forever.
+fn readable_mid_turn(command: &EngineCommand) -> bool {
+    matches!(
+        command,
+        EngineCommand::AnswerAsk { .. } | EngineCommand::Cancel
+    )
+}
+
 /// The event that ends a job command's reply. `Failed` covers a job that
 /// could not start at all.
 fn ends_a_turn(event: &EngineEvent) -> bool {
@@ -154,6 +167,11 @@ pub async fn run(
     let mut stdin_open = true;
     let mut shutdown_sent = false;
     let mut awaiting_turn = false;
+    // A turn is parked on a question it asked. The only frames read while
+    // that is true are the two things that turn is waiting for — an answer,
+    // and a cancel — because the protocol is one turn at a time and a question
+    // nobody can answer is a deadlock.
+    let mut awaiting_answer = false;
     let mut reply = String::new();
 
     loop {
@@ -161,7 +179,7 @@ pub async fn run(
             tokio::select! {
                 biased;
                 event = engine.recv() => Step::Event(event),
-                line = line_rx.recv(), if !awaiting_turn => Step::Line(line),
+                line = line_rx.recv(), if !awaiting_turn || awaiting_answer => Step::Line(line),
             }
         } else {
             Step::Event(engine.recv().await)
@@ -184,6 +202,21 @@ pub async fn run(
                         continue;
                     }
                 };
+                if awaiting_turn && !readable_mid_turn(&frame.command) {
+                    // A turn is running, so this frame is neither read nor
+                    // queued behind it: saying so is better than answering a
+                    // frame the client thinks was sent.
+                    writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "error": "a turn is running: only an answer to its question, or a cancel, is read until it ends",
+                            "protocol": RPC_PROTOCOL
+                        })
+                    )?;
+                    stdout.flush()?;
+                    continue;
+                }
                 if let EngineCommand::Shutdown = frame.command {
                     // The client asked for the end: read no more frames.
                     stdin_open = false;
@@ -196,6 +229,11 @@ pub async fn run(
                 ) = (&log, &frame.command)
                 {
                     let _ = log.user(text);
+                }
+                if matches!(frame.command, EngineCommand::AnswerAsk { .. }) {
+                    // The answer is on its way; a later question sets this
+                    // again when it is asked.
+                    awaiting_answer = false;
                 }
                 awaiting_turn = runs_a_turn(&frame.command);
                 if engine.send(frame.command).await.is_err() {
@@ -227,8 +265,12 @@ pub async fn run(
                     let _ = log.assistant(&reply);
                     reply.clear();
                 }
+                if let EngineEvent::AskRequested { .. } = &event {
+                    awaiting_answer = true;
+                }
                 if ends_a_turn(&event) {
                     awaiting_turn = false;
+                    awaiting_answer = false;
                 }
                 if !stdin_open && !awaiting_turn && !shutdown_sent {
                     shutdown_sent = true;
@@ -365,6 +407,27 @@ fn goal_exit_code(event: &EngineEvent) -> Option<i32> {
 mod tests {
     use super::*;
     use titi_engine::{GoalOutcome, GoalStop, Verdict, goal_report};
+
+    /// A parked turn reads the two frames it is waiting for and nothing else:
+    /// anything else would either be lost behind the question or answer for a
+    /// client that never saw it arrive.
+    #[test]
+    fn only_an_answer_and_a_cancel_are_read_mid_turn() {
+        assert!(readable_mid_turn(&EngineCommand::AnswerAsk {
+            request_id: "ask-1".into(),
+            answer: titi_tools::AskAnswer::Cancelled,
+        }));
+        assert!(readable_mid_turn(&EngineCommand::Cancel));
+        for other in [
+            EngineCommand::SubmitPrompt { text: "hi".into() },
+            EngineCommand::Steer {
+                text: "left".into(),
+            },
+            EngineCommand::SetBudget { tokens: None },
+        ] {
+            assert!(!readable_mid_turn(&other), "{other:?}");
+        }
+    }
 
     /// The event the engine sends for a goal that ended this way, built from
     /// the engine's own report line so a change to it fails here.

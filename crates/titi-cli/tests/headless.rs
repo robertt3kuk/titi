@@ -21,6 +21,16 @@ fn engine_events_round_trip_as_jsonl() {
     let frame = serde_json::json!({ "command": command });
     let decoded: EngineCommand = serde_json::from_value(frame["command"].clone()).unwrap();
     assert_eq!(decoded, command);
+
+    // A question's answer is a frame like any other command: the surface the
+    // model asks is whichever one reads the event stream, JSONL included.
+    let answer = EngineCommand::AnswerAsk {
+        request_id: "ask-1".into(),
+        answer: titi_tools::AskAnswer::Chosen(vec!["blue".into()]),
+    };
+    let frame = serde_json::json!({ "command": answer });
+    let decoded: EngineCommand = serde_json::from_value(frame["command"].clone()).unwrap();
+    assert_eq!(decoded, answer);
 }
 
 #[test]
