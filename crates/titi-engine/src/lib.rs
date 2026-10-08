@@ -1,5 +1,7 @@
 //! UI-independent agent runtime shared by terminal, desktop, and headless surfaces.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod advisor;
 pub mod agents;
 pub mod claims;

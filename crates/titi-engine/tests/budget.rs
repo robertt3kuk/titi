@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! A token cap the engine enforces: reaching it stops turns starting.
 
 use std::collections::HashMap;

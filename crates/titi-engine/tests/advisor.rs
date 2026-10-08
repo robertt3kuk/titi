@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! `/advisor` end to end: a consult is answered or reported, never dropped.
 
 use std::collections::HashMap;

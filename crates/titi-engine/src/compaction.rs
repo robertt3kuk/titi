@@ -94,8 +94,6 @@ fn to_entry(message: &ChatMessage) -> Entry {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use super::*;
 
     fn user(text: &str) -> ChatMessage {

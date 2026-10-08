@@ -1,8 +1,8 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Goal loop: coder then fresh reviewer, bounded, with patch oscillation.
 //!
 //! Spec: `docs/research/reference-product-port/README.md` (autonomous loop).
-
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use async_trait::async_trait;
 use smol_str::SmolStr;

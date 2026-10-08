@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! A finished turn names its session, cheaply and without being able to hurt
 //! the turn (`P1-SES-9`).
 

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! The working-tree diff rides the turn the provider sees, and a repo-blind
 //! duck turn does not receive it.
 

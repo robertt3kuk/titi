@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Background loops: the engine owns the timer, the surface only asks.
 
 use std::collections::HashMap;

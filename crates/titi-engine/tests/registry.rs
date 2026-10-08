@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;

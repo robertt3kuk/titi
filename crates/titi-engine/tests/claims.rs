@@ -1,8 +1,8 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! E4 integration: per-file write claims and mid-flight steering.
 //!
 //! Spec: `docs/research/reference-product-port/README.md` (E4).
-
-#![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

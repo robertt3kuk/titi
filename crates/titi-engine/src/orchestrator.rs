@@ -499,8 +499,6 @@ pub fn graph_report(run: &GraphRun) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;

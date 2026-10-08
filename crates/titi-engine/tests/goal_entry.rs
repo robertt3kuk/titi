@@ -1,7 +1,7 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! `/goal` calls [`titi_engine::run_goal`]. These are the two outcomes the
 //! slash must be able to report. The rest of the loop is covered in `goal.rs`.
-
-#![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

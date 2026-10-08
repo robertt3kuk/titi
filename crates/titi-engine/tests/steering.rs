@@ -1,11 +1,11 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Steering that arrives after a turn's last step boundary.
 //!
 //! A turn drains the steering queue before each provider attempt, so a
 //! message typed while the final answer streams has no boundary left to land
 //! on. It must still be answered, or handed back on a cancel — never left in
 //! the queue to surface after some later prompt.
-
-#![allow(clippy::unwrap_used)]
 
 use std::sync::{Arc, Mutex};
 

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Council: two to four briefs answer one question on their own, and one
 //! fold turns their answers into a single text that still shows where they
 //! disagree.
@@ -5,8 +7,6 @@
 //! The fold is the part worth testing: a synthesis that quietly drops the
 //! dissent reads like a panel that agreed, which is the one thing it must
 //! never be mistaken for.
-
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! A turn's usage is the provider's own count when it reports one, and the
 //! project's estimate only for a round it reported nothing for.
 

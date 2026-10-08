@@ -1,9 +1,9 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! E4: a subagent that works — its own tool loop, sharing the runtime's
 //! claims, touched set and read cache.
 //!
 //! Spec: `docs/research/reference-product-port/README.md` (E4).
-
-#![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

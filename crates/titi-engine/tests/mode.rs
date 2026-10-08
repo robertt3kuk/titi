@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 //! Session modes decide what a turn is allowed to reach for.
 
 use std::collections::HashMap;
