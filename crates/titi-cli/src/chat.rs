@@ -608,6 +608,10 @@ pub struct Chat {
     session_cached_tokens: u32,
     last_cached_tokens: u32,
     quit_armed: Option<Instant>,
+    /// When Esc was last pressed on an empty composer: the first press arms
+    /// this, a second inside [`QUIT_WINDOW`] is the rewind chord, and typing
+    /// clears it. One field, so the two-press shape has one window.
+    esc_armed: Option<Instant>,
     hint: String,
     /// Provider waiting for a key or an OAuth code. The composer masks
     /// whatever is typed in either case.
@@ -772,6 +776,7 @@ impl Chat {
             session_cached_tokens: 0,
             last_cached_tokens: 0,
             quit_armed: None,
+            esc_armed: None,
             hint: String::new(),
             login_for: None,
             oauth: None,
@@ -1452,12 +1457,7 @@ impl Chat {
                 self.scroll_offset = 0;
                 Applied::none()
             }
-            Key::Esc if self.picking() => {
-                self.input.clear();
-                self.picker = 0;
-                self.disarm();
-                Applied::none()
-            }
+            Key::Esc => self.escape(now),
             // ↑ at an empty composer is the prompt history's (omp
             // `app.history.search`); with text in the composer it scrolls the
             // transcript, as it always has.
@@ -1490,7 +1490,7 @@ impl Chat {
                 self.scroll_offset = self.scroll_offset.saturating_sub(h.max(1));
                 Applied::none()
             }
-            Key::Esc | Key::CtrlD | Key::Tab => {
+            Key::CtrlD | Key::Tab => {
                 self.disarm();
                 Applied::none()
             }
@@ -1936,6 +1936,25 @@ impl Chat {
             self.begin_rate();
             Applied::send(EngineCommand::SubmitPrompt { text: text.into() }, log)
         }
+    }
+
+    /// Esc. On a draft it clears the composer, as it always has; on an empty
+    /// composer a second press inside [`QUIT_WINDOW`] is the rewind chord
+    /// (omp `doubleEscapeAction`, default `rewind`), which is exactly what
+    /// `/rewind` does, so the chord and the command cannot drift.
+    fn escape(&mut self, now: Instant) -> Applied {
+        let armed = self.esc_armed.take();
+        self.disarm();
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.picker = 0;
+            return Applied::none();
+        }
+        if armed.is_some_and(|at| now.saturating_duration_since(at) <= QUIT_WINDOW) {
+            return self.rewind("");
+        }
+        self.esc_armed = Some(now);
+        Applied::none()
     }
 
     /// A new turn for the rate estimate: no reading until this turn's own
@@ -4216,6 +4235,7 @@ impl Chat {
 
     fn disarm(&mut self) {
         self.quit_armed = None;
+        self.esc_armed = None;
         self.hint.clear();
     }
 
@@ -9341,6 +9361,80 @@ mod tests {
         );
     }
 
+    /// Esc on a draft clears it, as it always has — and clearing a draft is
+    /// not also the first press of the rewind chord.
+    #[test]
+    fn one_escape_clears_the_draft_and_arms_nothing() {
+        let mut chat = chat();
+        type_text(&mut chat, "a draft");
+        let at = Instant::now();
+        assert!(chat.on_key(Key::Esc, at).effect.is_none());
+        assert!(chat.input.is_empty(), "the draft is gone");
+        assert!(chat.lines.is_empty(), "nothing was sent or printed");
+
+        // The next press on the now-empty composer only arms the chord: no
+        // checkpoint exists, so a chord that fired would be an error line.
+        let next = chat.on_key(Key::Esc, at + Duration::from_millis(200));
+        assert!(next.effect.is_none());
+        assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
+    }
+
+    /// A picker keeps its own Esc. See `esc_clears_the_query_then_closes_without_switching`
+    /// for the model browser's half of it.
+    #[test]
+    fn escape_in_the_command_list_only_closes_it() {
+        let mut chat = chat();
+        type_text(&mut chat, "/mo");
+        assert!(chat.picking(), "the command list is up");
+        assert!(chat.on_key(Key::Esc, Instant::now()).effect.is_none());
+        assert!(!chat.picking(), "esc closed the list");
+        assert!(chat.input.is_empty(), "and took the token with it");
+        assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
+    }
+
+    /// Esc twice on an empty composer is `/rewind` (omp
+    /// `doubleEscapeAction`, default `rewind`): the same cut the typed
+    /// command makes, because it is the same function.
+    #[test]
+    fn double_escape_on_an_empty_composer_rewinds() {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("session");
+        store.append(&id, Role::User, "keep").expect("keep");
+        store.checkpoint(&id).expect("checkpoint");
+        store.append(&id, Role::User, "drop").expect("drop");
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        let start = Instant::now();
+        let first = chat.on_key(Key::Esc, start);
+        assert!(first.effect.is_none(), "one Esc is not the chord");
+        let second = chat.on_key(Key::Esc, start + Duration::from_millis(200));
+        match second.effect {
+            Some(ChatEffect::Send(EngineCommand::RestoreHistory { messages })) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].content.as_str(), "keep");
+            }
+            other => panic!("expected restore, got {other:?}"),
+        }
+        assert!(chat.lines.iter().any(|line| line.text == "keep"));
+        assert!(!chat.lines.iter().any(|line| line.text == "drop"));
+    }
+
+    /// The chord is a window, not a chain: a second Esc after it has run out
+    /// only arms a new one.
+    #[test]
+    fn a_late_second_escape_does_not_rewind() {
+        let mut chat = chat();
+        let start = Instant::now();
+        chat.on_key(Key::Esc, start);
+        let later = chat.on_key(Key::Esc, start + QUIT_WINDOW + Duration::from_millis(1));
+        assert!(later.effect.is_none());
+        assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
+    }
+
     /// Enter switches to the highlighted row and confirms in the words
     /// `/model <id>` uses — the argument form keeps working unchanged.
     #[test]
@@ -14110,14 +14204,6 @@ mod tests {
         let applied = chat.on_key(Key::Enter, Instant::now());
         assert!(applied.effect.is_none());
         assert!(chat.lines.iter().any(|line| line.text.contains("recap")));
-    }
-
-    #[test]
-    fn esc_clears_a_leading_slash() {
-        let mut chat = chat();
-        type_text(&mut chat, "/mo");
-        chat.on_key(Key::Esc, Instant::now());
-        assert!(chat.input.is_empty());
     }
 
     fn chat_with_skills() -> Chat {
