@@ -6,6 +6,14 @@
 //! JavaScript and JSX as well. Import specifiers are still matched by pattern
 //! — a specifier is a string, not a node this crate walks — but every export
 //! is a node the grammar produced.
+//!
+//! Three specifier shapes reach one resolution rule: a static `from '…'`, an
+//! `import '…'` for its side effect, and a call — `require('./legacy')` or a
+//! dynamic `import('./x')`. A relative specifier stays exact, so one that
+//! names no file is a real broken path and warns. Anything else is a package
+//! (`react`) or a monorepo alias (`widgets/Widget`); resolving it by module
+//! path makes the alias an edge, and naming no file makes it external rather
+//! than a missing workspace file.
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -13,15 +21,22 @@ use regex::Regex;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{finish, internal, record, resolve_relative};
+use super::support::{
+    Comments, Placement, finish, internal, mask_comments, record, resolve_relative, resolve_suffix,
+};
 
 use crate::symbols::{self, has_child_kind, push_field, push_site, text};
 
+/// The files a specifier can land on, relative or resolved by module path.
+const EXTS: &[&str] = &["ts", "tsx", "js", "jsx"];
+
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
-    static IMPORTS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?m)(?:from|import)\s+['"](\.[^'"]+)['"]"#).expect("ts imports")
+    static FROM: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?m)(?:^|\s)(?:from|import)\s+['"]([^'"]+)['"]"#).expect("ts from")
     });
-    let imports_re = &*IMPORTS;
+    static CALL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]"#).expect("ts require")
+    });
     let Some(grammar) = super::grammar_for(path) else {
         return ParsedFile::default();
     };
@@ -33,21 +48,19 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     };
     let mut sites = Vec::new();
     ts_module(tree.root_node(), source.as_bytes(), &mut sites);
+    let masked = mask_comments(source, Comments::Slashes);
     let mut imports = Vec::new();
     let mut unresolved = Vec::new();
-    for cap in imports_re.captures_iter(source) {
-        let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        record(
-            spec,
-            internal(resolve_relative(
-                path,
+    for re in [&*FROM, &*CALL] {
+        for cap in re.captures_iter(&masked) {
+            let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            record(
                 spec,
-                files,
-                &["ts", "tsx", "js", "jsx"],
-            )),
-            &mut imports,
-            &mut unresolved,
-        );
+                placement(path, spec, files),
+                &mut imports,
+                &mut unresolved,
+            );
+        }
     }
     finish(
         source,
@@ -56,6 +69,19 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         unresolved,
         symbols::error_count(tree.root_node()),
     )
+}
+
+/// A relative specifier is resolved against the importing file and a miss is a
+/// warning; a bare or alias specifier is resolved by module path and a miss
+/// means it belongs to node_modules, not to this workspace.
+fn placement(path: &str, spec: &str, files: &HashSet<String>) -> Placement {
+    if spec.starts_with('.') {
+        return internal(resolve_relative(path, spec, files, EXTS));
+    }
+    match resolve_suffix(spec, EXTS, files) {
+        Some(resolved) => Placement::Resolved(resolved),
+        None => Placement::External,
+    }
 }
 
 /// TypeScript and JavaScript: what an `export` publishes, plus the public
