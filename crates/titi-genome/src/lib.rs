@@ -26,12 +26,14 @@ mod project;
 mod query;
 mod refs;
 mod scan;
+mod shared;
 mod symbols;
 
 pub use lang::{Capability, Language, Level};
 pub use lsp::serve_lsp;
 pub use project::render;
 pub use scan::list_files;
+pub use shared::SharedGenome;
 
 /// Crate version, mirrors the workspace release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -148,6 +150,15 @@ pub struct RefreshStats {
     pub graph_recomputed: bool,
 }
 
+/// The workspace graph and its derived ranking.
+///
+/// Every field is public and mutated in place by [`Self::refresh`] and
+/// [`Self::apply_changes`], which take `&mut self`: a single reader beside a
+/// writer needs no more than that, because Rust will not hand out a `&Genome`
+/// while a `&mut Genome` exists. A reader that is *concurrent* with the writer
+/// — a second agent, a watcher thread — needs a publish point, since it would
+/// otherwise have to hold a borrow across an update; [`SharedGenome`] is that
+/// point and hands out whole snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct Genome {
     pub files: HashMap<String, FileRecord>,
