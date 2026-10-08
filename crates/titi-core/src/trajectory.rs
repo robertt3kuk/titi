@@ -16,6 +16,14 @@ use serde_json::Value;
 pub enum TrajectoryError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    /// A line that has valid lines after it does not parse: only the last one
+    /// can be torn by a crash, so an earlier one is damage and is reported
+    /// rather than quietly dropped from the replayed tail.
+    Corrupt {
+        /// 1-based line number in the file at [`TrajectoryRecorder::path`].
+        line: usize,
+        source: serde_json::Error,
+    },
 }
 
 impl fmt::Display for TrajectoryError {
@@ -23,6 +31,9 @@ impl fmt::Display for TrajectoryError {
         match self {
             TrajectoryError::Io(e) => write!(f, "trajectory io: {e}"),
             TrajectoryError::Json(e) => write!(f, "trajectory json: {e}"),
+            TrajectoryError::Corrupt { line, source } => {
+                write!(f, "trajectory line {line} is corrupt: {source}")
+            }
         }
     }
 }
@@ -32,6 +43,7 @@ impl std::error::Error for TrajectoryError {
         match self {
             TrajectoryError::Io(e) => Some(e),
             TrajectoryError::Json(e) => Some(e),
+            TrajectoryError::Corrupt { source, .. } => Some(source),
         }
     }
 }
@@ -200,18 +212,36 @@ impl TrajectoryRecorder {
         digests.len() == repeats && digests.windows(2).all(|w| w[0] == w[1])
     }
 
-    /// Lenient replay: a torn final line left by a crash is skipped.
+    /// Replays the file, oldest first.
+    ///
+    /// Contract, matching the session reader: a line that does not parse is
+    /// tolerated only when it is the *last* non-empty line, which is all a
+    /// crash mid-append can tear. Anything earlier is [`TrajectoryError::Corrupt`]
+    /// naming the line, because a replayed tail that silently lost a middle
+    /// event would misreport what the session did — the stuck-loop detector
+    /// counts calls, and a dropped one hides a repeat.
     fn load(path: &Path) -> Result<Vec<TrajectoryEvent>, TrajectoryError> {
         let file = File::open(path).map_err(TrajectoryError::Io)?;
+        let lines: Vec<String> = BufReader::new(file)
+            .lines()
+            .collect::<std::result::Result<_, _>>()
+            .map_err(TrajectoryError::Io)?;
+        let last = lines.iter().rposition(|line| !line.trim().is_empty());
         let mut out = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(TrajectoryError::Io)?;
+        for (index, line) in lines.iter().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(e) = serde_json::from_str::<TrajectoryEvent>(line) {
-                out.push(e);
+            match serde_json::from_str::<TrajectoryEvent>(line) {
+                Ok(event) => out.push(event),
+                Err(_) if last == Some(index) => break,
+                Err(source) => {
+                    return Err(TrajectoryError::Corrupt {
+                        line: index + 1,
+                        source,
+                    });
+                }
             }
         }
         Ok(out)
