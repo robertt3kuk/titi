@@ -125,6 +125,9 @@ impl HashlineEditTool {
         }
 
         let path = readable_path(&self.root, &raw_path, &self.policy)
+            .and_then(|resolved| {
+                crate::fs::refuse_git_dir(&self.root, &resolved, &raw_path).map(|_| resolved)
+            })
             .map_err(|reason| HashlineError::Path { reason })?;
         let content = fs::read_to_string(&path).map_err(|error| HashlineError::Io {
             path: raw_path.clone(),

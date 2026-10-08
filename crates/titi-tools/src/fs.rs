@@ -64,6 +64,37 @@ pub(crate) fn readable_path(
     Ok(resolved)
 }
 
+/// `.git/` is git's own control directory, not workspace content: something
+/// written under it — `hooks/pre-commit`, `config` with a `hooksPath` or
+/// `fsmonitor`, an alias — is executed by the next git command, including
+/// titi's own checkpoint commit. Write-tier tools refuse any path under a
+/// `.git` directory. Reading is untouched, and a `.git` that is a plain file
+/// — a linked worktree's `gitdir:` pointer, which `git init` and `git clone
+/// --separate-git-dir` both write — does not gate its own non-existent
+/// subtree, so edits beside it stay allowed.
+pub(crate) fn refuse_git_dir(root: &Path, resolved: &Path, raw: &str) -> Result<(), String> {
+    let base = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let relative = resolved.strip_prefix(&base).unwrap_or(resolved);
+    let mut ancestor = PathBuf::new();
+    for component in relative.components() {
+        ancestor.push(component);
+        if component.as_os_str() == ".git" {
+            let entry = base.join(&ancestor);
+            // An existing file is a worktree pointer and nothing under it can
+            // exist; absent or a directory, git's layout either already holds
+            // the internals or is about to be created for them.
+            if !entry.is_file() {
+                return Err(format!(
+                    "{raw} writes into .git/, the git control directory — \
+                     titi refuses writes there (a planted hook or rewritten \
+                     config would run with the user's own git commands)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ok(output: impl Into<String>) -> ToolResult {
     ToolResult {
         output: output.into().into(),
@@ -466,17 +497,19 @@ impl ToolHandler for WriteFileTool {
         let Some(content) = arg_str(&args, "content") else {
             return err("missing content");
         };
-        match jail_path(&self.root, &path).and_then(|resolved| {
-            // What the write replaces is read here, for the diff: this is the
-            // only moment that text exists.
-            let before = replacing_text(&resolved);
-            if let Some(parent) = resolved.parent() {
-                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            fs::write(&resolved, &content).map_err(|error| error.to_string())?;
-            self.cache.invalidate(&resolved);
-            Ok((resolved.display().to_string(), before))
-        }) {
+        match jail_path(&self.root, &path)
+            .and_then(|resolved| refuse_git_dir(&self.root, &resolved, &path).map(|_| resolved))
+            .and_then(|resolved| {
+                // What the write replaces is read here, for the diff: this is the
+                // only moment that text exists.
+                let before = replacing_text(&resolved);
+                if let Some(parent) = resolved.parent() {
+                    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                fs::write(&resolved, &content).map_err(|error| error.to_string())?;
+                self.cache.invalidate(&resolved);
+                Ok((resolved.display().to_string(), before))
+            }) {
             Ok((written, before)) => {
                 // The answer is the one line it always was; the diff is the
                 // surface's to draw, and the model never reads it.
@@ -542,12 +575,14 @@ impl ToolHandler for EditFileTool {
             return err("missing new_string");
         };
         let replace_all = arg_bool(&args, "replace_all").unwrap_or(false);
-        match readable_path(&self.root, &path, &self.policy).and_then(|resolved| {
-            let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
-            let edit = apply_edit(&content, &old, &new, replace_all)?;
-            fs::write(&resolved, &edit.text).map_err(|error| error.to_string())?;
-            Ok((unified_diff(&path, &content, &edit.text), edit))
-        }) {
+        match readable_path(&self.root, &path, &self.policy)
+            .and_then(|resolved| refuse_git_dir(&self.root, &resolved, &path).map(|_| resolved))
+            .and_then(|resolved| {
+                let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
+                let edit = apply_edit(&content, &old, &new, replace_all)?;
+                fs::write(&resolved, &edit.text).map_err(|error| error.to_string())?;
+                Ok((unified_diff(&path, &content, &edit.text), edit))
+            }) {
             Ok((diff, edit)) => {
                 let answer = if edit.loose {
                     "edited: old_string matched once whitespace was set aside, and the \
@@ -2766,5 +2801,111 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_under_git_is_refused() {
+        let root = temp_root();
+        fs::remove_file(root.join("hello.txt")).ok();
+        // A real checkout has the control directory already; the jail needs
+        // the parent to exist, and git always has.
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        fs::write(root.join(".git/config"), "orig\n").unwrap();
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let edit = EditFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+
+        for path in [".git/hooks/pre-commit", ".git/config"] {
+            let result = write
+                .invoke(serde_json::json!({ "path": path, "content": "sent" }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(
+                result
+                    .output
+                    .to_string()
+                    .contains("git control directory"),
+                "{path}: {}",
+                result.output
+            );
+            assert!(
+                !root.join(path).exists()
+                    || path == ".git/config",
+                "{path} was written: {}",
+                fs::read_to_string(root.join(path)).unwrap_or_default()
+            );
+
+            let result = edit
+                .invoke(serde_json::json!({
+                    "path": ".git/config",
+                    "old_string": "orig",
+                    "new_string": "sent"
+                }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert_eq!(
+                fs::read_to_string(root.join(".git/config")).unwrap(),
+                "orig\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_git_directory_gates_but_a_git_named_file_does_not() {
+        // The workspace jail must keep working beside a real checkout: the
+        // tool root here is a subdirectory, so no ancestor lies.
+        let root = temp_root();
+        fs::create_dir_all(root.join("repo/.git/hooks")).unwrap();
+        fs::write(root.join("repo/.git/hooks/pre-commit"), "old\n").unwrap();
+        fs::create_dir_all(root.join("repo/src")).unwrap();
+        fs::write(root.join("repo/src/git.rs"), "mod x;\n").unwrap();
+        // A `.git` that is a file: a linked worktree's `gitdir:` pointer.
+        fs::create_dir_all(root.join("wt")).unwrap();
+        fs::write(root.join("wt/.git"), "gitdir: ../repo/.git\n").unwrap();
+
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        let inside = write
+            .invoke(serde_json::json!({
+                "path": "repo/.git/hooks/pre-commit", "content": "sent"
+            }))
+            .await;
+        assert!(inside.is_error, "{}", inside.output);
+
+        let lookalike = write
+            .invoke(serde_json::json!({
+                "path": "repo/src/git.rs", "content": "// git\n"
+            }))
+            .await;
+        assert!(!lookalike.is_error, "{}", lookalike.output);
+        assert_eq!(
+            fs::read_to_string(root.join("repo/src/git.rs")).unwrap(),
+            "// git\n"
+        );
+
+        let dot_gh = write
+            .invoke(serde_json::json!({
+                "path": "repo/.github.md", "content": "docs\n"
+            }))
+            .await;
+        assert!(!dot_gh.is_error, "{}", dot_gh.output);
+
+        let pointer = write
+            .invoke(serde_json::json!({
+                "path": "wt/.git", "content": "gitdir: ../elsewhere\n"
+            }))
+            .await;
+        // The pointer file itself keeps its name, and no directory is created
+        // over it: the write lands on the file.
+        assert!(!pointer.is_error, "{}", pointer.output);
+        assert!(root.join("wt/.git").is_file());
     }
 }
