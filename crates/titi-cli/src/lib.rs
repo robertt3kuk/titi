@@ -17,3 +17,4 @@ pub mod session_fs;
 pub mod session_log;
 pub mod themes;
 pub mod title;
+pub mod transcript;
