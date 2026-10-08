@@ -494,6 +494,7 @@ fn a_no_op_mtime_touch_does_not_reparse() {
     let quiet = genome.refresh(root).unwrap();
     assert_eq!(quiet.parsed, 0);
     assert_eq!(quiet.content_unchanged, 0, "not read, not counted");
+    assert!(!quiet.graph_recomputed);
 
     let before = fs::metadata(root.join("src/a.rs"))
         .unwrap()
@@ -509,6 +510,7 @@ fn a_no_op_mtime_touch_does_not_reparse() {
     let stats = genome.refresh(root).unwrap();
     assert_eq!(stats.parsed, 0, "same bytes, no re-parse");
     assert_eq!(stats.content_unchanged, 1, "read, and settled by hash");
+    assert!(!stats.graph_recomputed);
     assert_eq!(stats.total, 2);
     assert_eq!(genome.files["src/a.rs"].exports, vec!["a".to_owned()]);
     assert_ne!(genome.files["src/a.rs"].mtime, before, "the clock moved");
@@ -527,5 +529,61 @@ fn an_edit_that_keeps_the_length_is_still_reparsed() {
     let stats = genome.refresh(root).unwrap();
     assert_eq!(stats.parsed, 1, "same length, different bytes");
     assert_eq!(stats.content_unchanged, 0);
+    assert!(stats.graph_recomputed, "an export changed name");
     assert!(genome.files["src/a.rs"].exports.contains(&"ab".to_owned()));
+}
+
+/// A re-parse that yields the same `(exports, imports, used_symbols)` tuple
+/// cannot move the graph, so the previous ranking is left in place.
+///
+/// The sentinel is the proof: a rebuild would overwrite it even if it produced
+/// equal values, so equality alone could not tell "recomputed to the same
+/// answer" from "not recomputed".
+#[test]
+fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/hub.rs", "pub fn hub() {}\n");
+    write(root, "src/leaf.rs", "pub fn leaf() { hub(); }\n");
+    let mut genome = Genome::index(root).unwrap();
+    assert_eq!(genome.dependents["src/hub.rs"], 1, "the fixture has an edge");
+
+    genome.ranks.insert("src/hub.rs".to_owned(), 123.5);
+    genome.dependents.insert("src/leaf.rs".to_owned(), 9);
+
+    write(root, "src/leaf.rs", "// a comment\npub fn leaf() { hub(); }\n");
+    let stats = genome.refresh(root).unwrap();
+
+    assert_eq!(stats.parsed, 1, "the bytes changed");
+    assert_eq!(stats.content_unchanged, 0, "…and they did change");
+    assert!(!stats.graph_recomputed, "nothing the graph is built from moved");
+    assert_eq!(genome.ranks["src/hub.rs"], 123.5, "ranks untouched");
+    assert_eq!(genome.dependents["src/leaf.rs"], 9, "dependents untouched");
+    assert_eq!(
+        genome.files["src/leaf.rs"].used_symbols,
+        vec!["hub".to_owned()],
+        "the record still carries its resolved uses"
+    );
+}
+
+/// The negative half of the condition: one more export is one more graph
+/// input, and the ranking is rebuilt.
+#[test]
+fn an_edit_that_adds_an_export_recomputes_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/hub.rs", "pub fn hub() {}\n");
+    write(root, "src/leaf.rs", "pub fn leaf() { hub(); }\n");
+    let mut genome = Genome::index(root).unwrap();
+    genome.ranks.insert("src/hub.rs".to_owned(), 123.5);
+    let before = genome.symbols.clone();
+
+    write(root, "src/hub.rs", "pub fn hub() {}\npub fn extra() {}\n");
+    let stats = genome.refresh(root).unwrap();
+
+    assert_eq!(stats.parsed, 1);
+    assert!(stats.graph_recomputed, "a new export is a new graph input");
+    assert_ne!(genome.ranks["src/hub.rs"], 123.5, "the maps were rebuilt");
+    assert_ne!(genome.symbols, before);
+    assert!(genome.symbols.contains_key("extra"));
 }

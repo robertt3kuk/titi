@@ -137,6 +137,15 @@ pub struct RefreshStats {
     /// was not examined, so calling it "unchanged" would claim more evidence
     /// than a `stat` gives.
     pub content_unchanged: usize,
+    /// Whether `ranks`, `dependents` and `symbols` were rebuilt this time.
+    ///
+    /// False only when nothing that feeds the graph moved: no path appeared or
+    /// vanished, and every re-parse yielded the same `(exports, imports,
+    /// used_symbols)` tuple as the record it replaced. A body-only edit is the
+    /// common case — a changed `mtime` and a changed byte range, no change to
+    /// what the graph is built from — and it leaves the previous maps in
+    /// place rather than paying the rank iteration to reproduce them.
+    pub graph_recomputed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +159,14 @@ pub struct Genome {
     root: std::path::PathBuf,
 }
 
+/// One refresh's file-level outcome, before the graph decision is folded in.
+struct Absorption {
+    parsed: usize,
+    content_unchanged: usize,
+    /// Whether anything that feeds `ranks`/`dependents`/`symbols` moved.
+    graph_moved: bool,
+}
+
 impl Genome {
     pub fn index(root: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut genome = Self::default();
@@ -157,23 +174,52 @@ impl Genome {
         Ok(genome)
     }
 
-    /// Re-walk `root` and re-parse only the files that moved.
+    /// Re-walk `root` and fold every file that moved into the index.
     ///
-    /// The **fallback** path: it walks the tree, so it catches files no caller
-    /// mentioned, and it is what the engine's per-turn call uses. A file is
-    /// examined only when its `size` or `mtime` differs from the recorded one
-    /// — a `stat` per file and no read — and a file that passes that gate is
-    /// read, hashed and, if the bytes match, kept without being parsed; see
-    /// [`FileRecord::hash`].
+    /// This is the **fallback**: it walks the tree, so it catches files no
+    /// caller mentioned — created, edited or deleted behind the index's back —
+    /// and it is what the engine's per-turn call uses, because a turn can run
+    /// an arbitrary command that changes anything anywhere.
     ///
-    /// `ranks`, `dependents` and `symbols` are rebuilt every time (it is cheap
-    /// relative to parsing).
+    /// A file is examined only when its `size` or `mtime` differs from the
+    /// recorded one, which is a `stat` per file and no read. A file that does
+    /// pass that gate is read, hashed and — if the bytes match — kept without
+    /// being parsed; see [`FileRecord::hash`].
+    ///
+    /// `ranks`, `dependents` and `symbols` are rebuilt only when the graph
+    /// inputs moved: a path appeared or vanished, or a re-parse changed some
+    /// file's `(exports, imports, used_symbols)`. [`RefreshStats`] reports
+    /// which happened.
     pub fn refresh(&mut self, root: impl AsRef<Path>) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
         self.root = root.to_path_buf();
         let listed = scan::list_files(root)?;
         let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
-        let stale: Vec<&scan::ListedFile> = listed
+
+        let absorbed = self.absorb(&listed, &known);
+        let before = self.files.len();
+        self.files.retain(|path, _| known.contains(path));
+        let removed = before - self.files.len();
+        let graph_recomputed = absorbed.graph_moved || removed > 0;
+        self.finish(graph_recomputed);
+        Ok(RefreshStats {
+            parsed: absorbed.parsed,
+            removed,
+            total: self.files.len(),
+            content_unchanged: absorbed.content_unchanged,
+            graph_recomputed,
+        })
+    }
+
+    /// Parse what moved in `listed` and fold it into `files`.
+    ///
+    /// `known` is every path that exists after this update and feeds import
+    /// resolution; `listed` need not be all of it, since a targeted update
+    /// names a subset. Paths are neither added nor dropped here — `refresh`
+    /// sweeps what the walk did not list — so this only ever replaces records
+    /// or inserts the ones its caller already accounted for.
+    fn absorb(&mut self, listed: &[scan::ListedFile], known: &HashSet<String>) -> Absorption {
+        let candidates: Vec<&scan::ListedFile> = listed
             .iter()
             .filter(|file| {
                 !self
@@ -182,31 +228,80 @@ impl Genome {
                     .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
             })
             .collect();
+        let records = parse_batch(&candidates, known, &self.files);
+
+        // A parse can only move the graph by changing the tuple the graph is
+        // built from. `exports` and `imports` are compared exactly; `refs` are
+        // resolved here against the previous symbols — valid exactly when no
+        // `exports` moved, which is what the first pass establishes — and the
+        // resolved set compared to the record's. Same tuple on every re-parse,
+        // same path set, same graph.
+        let mut graph_moved = false;
+        for (record, parsed) in &records {
+            if !*parsed {
+                continue;
+            }
+            match self.files.get(&record.path) {
+                Some(old)
+                    if old.exports == record.exports && old.imports == record.imports => {}
+                _ => graph_moved = true,
+            }
+        }
+        if !graph_moved {
+            for (record, parsed) in &records {
+                if !*parsed {
+                    continue;
+                }
+                let resolved = resolve(&record.used_symbols, &record.exports, &self.symbols);
+                if self
+                    .files
+                    .get(&record.path)
+                    .is_some_and(|old| old.used_symbols != resolved)
+                {
+                    graph_moved = true;
+                    break;
+                }
+            }
+        }
+
         let mut parsed = 0;
         let mut content_unchanged = 0;
-        for (record, was_parsed) in parse_batch(&stale, &known, &self.files) {
-            if was_parsed {
+        for (mut record, reparsed) in records {
+            if reparsed {
                 parsed += 1;
+                if !graph_moved {
+                    // The graph is not rebuilt, so this record must carry the
+                    // resolved form the previous one did; the raw refs would
+                    // be the only record left unresolved.
+                    if let Some(old) = self.files.get(&record.path) {
+                        record.used_symbols = old.used_symbols.clone();
+                    }
+                }
             } else {
                 content_unchanged += 1;
             }
             self.files.insert(record.path.clone(), record);
         }
+        Absorption {
+            parsed,
+            content_unchanged,
+            graph_moved,
+        }
+    }
 
-        let before = self.files.len();
-        self.files.retain(|path, _| known.contains(path));
-        let removed = before - self.files.len();
-
+    /// Rebuild `symbols`, `ranks` and `dependents`, or leave them alone.
+    ///
+    /// A refresh that found nothing the graph is built from leaves all three
+    /// maps exactly as they were: not "equal after a rebuild", the previous
+    /// values, untouched.
+    fn finish(&mut self, graph_recomputed: bool) {
+        if !graph_recomputed {
+            return;
+        }
         self.index_symbols();
         let (ranks, dependents) = graph::rank(&self.files, &self.symbols);
         self.ranks = ranks;
         self.dependents = dependents;
-        Ok(RefreshStats {
-            parsed,
-            removed,
-            total: self.files.len(),
-            content_unchanged,
-        })
     }
 
     /// Resolves each file's candidate identifiers against the symbols the
@@ -241,18 +336,7 @@ impl Genome {
         let mut usage: HashMap<String, HashSet<String>> = HashMap::new();
         let mut resolved: Vec<(String, Vec<String>)> = Vec::with_capacity(self.files.len());
         for (path, record) in &self.files {
-            let own: HashSet<&str> = record.exports.iter().map(String::as_str).collect();
-            let used: Vec<String> = record
-                .used_symbols
-                .iter()
-                .filter(|name| {
-                    symbols
-                        .get(*name)
-                        .is_some_and(|symbol| symbol.files.len() <= MAX_DEFINERS)
-                        && !own.contains(name.as_str())
-                })
-                .cloned()
-                .collect();
+            let used = resolve(&record.used_symbols, &record.exports, &symbols);
             for name in &used {
                 usage.entry(name.clone()).or_default().insert(path.clone());
             }
@@ -370,4 +454,29 @@ fn parse_one(
         },
         true,
     )
+}
+
+/// The identifiers of `refs` that can be edges: exported by exactly one known
+/// file, and not by this one.
+///
+/// Resolution is by name alone, so a name several files export — `is_empty`,
+/// `new`, `len` — cannot say which definition a mention refers to. Those names
+/// are ambiguous and carry no edges, and a file's own exports are definitions,
+/// not uses of itself. Shared by [`Genome::index_symbols`], which applies it
+/// to every file when the graph is rebuilt, and by [`Genome::absorb`], which
+/// applies it to one re-parse to ask whether the graph would even move.
+fn resolve(
+    refs: &[String],
+    own_exports: &[String],
+    symbols: &HashMap<String, SymbolRecord>,
+) -> Vec<String> {
+    refs.iter()
+        .filter(|name| {
+            symbols
+                .get(*name)
+                .is_some_and(|record| record.files.len() <= MAX_DEFINERS)
+                && !own_exports.contains(name)
+        })
+        .cloned()
+        .collect()
 }
