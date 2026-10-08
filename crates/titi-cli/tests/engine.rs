@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use titi_cli::engine::{
-    default_registry_config, merge_registry_config, parse_approval, prefer_available_models,
+    NO_PRICE_MODELS, default_registry_config, merge_registry_config, parse_approval,
+    prefer_available_models,
 };
 use titi_engine::{
     CredentialSource, HttpTransportFactory, ProviderDescriptor, ProviderRegistry,
@@ -214,4 +215,90 @@ fn settings_value_overrides_default_catalog() {
     let parsed = ProviderRegistryConfig::from_settings_value(&value).unwrap();
     assert_eq!(parsed.models[0].id, "local/llama");
     assert_eq!(parsed.providers[0].id, "local");
+}
+
+/// Adding a built-in model forces a decision: a price on its descriptor, or
+/// a line on the explicit no-price list. Without this, a new model could
+/// ship silently unpriced and the money would simply never appear for it.
+#[test]
+fn every_builtin_model_is_priced_or_on_the_no_price_list() {
+    let config = default_registry_config();
+    for model in &config.models {
+        let id = model.id.as_str();
+        let listed = NO_PRICE_MODELS.contains(&id);
+        match (model.price, listed) {
+            (Some(_), false) | (None, true) => {}
+            (Some(price), true) => panic!(
+                "{id} is priced at {price:?} and also on the no-price list; \
+                 drop one"
+            ),
+            (None, false) => panic!(
+                "{id} has no price and is not on NO_PRICE_MODELS; give it a \
+                 price and a source, or list it as unpriced on purpose"
+            ),
+        }
+    }
+}
+
+/// The no-price list names built-in models and nothing else: an id left
+/// behind after a model is dropped would hide the next gap.
+#[test]
+fn the_no_price_list_names_only_builtin_models() {
+    let config = default_registry_config();
+    for id in NO_PRICE_MODELS {
+        assert!(
+            config.models.iter().any(|model| model.id == *id),
+            "{id} is on the no-price list but is not a built-in model"
+        );
+    }
+}
+
+/// The built-in table ships empty-but-typed: no descriptor carries a price and
+/// no id is guessed at, but the machinery is reachable — a user who knows a
+/// price writes one into settings and the merged descriptor carries it.
+#[test]
+fn a_price_in_the_settings_reaches_the_descriptor() {
+    let builtin = default_registry_config();
+    let sonnet = builtin
+        .models
+        .iter()
+        .find(|model| model.id.as_str() == "anthropic/claude-sonnet-4-5")
+        .expect("the built-in catalog names sonnet");
+    assert_eq!(
+        sonnet.price, None,
+        "nothing in this tree states sonnet's output price, so it ships unpriced"
+    );
+
+    let value = serde_json::json!({
+        "providers": [{
+            "id": "anthropic",
+            "api": "anthropic-messages",
+            "base_url": "https://api.anthropic.com",
+            "credential_env": "ANTHROPIC_API_KEY",
+            "credential_required": true
+        }],
+        "models": [{
+            "id": "anthropic/claude-sonnet-4-5",
+            "provider": "anthropic",
+            "wire_model": "claude-sonnet-4-5",
+            "price": {
+                "input": 3_000_000,
+                "output": 15_000_000,
+                "cached_input": 300_000
+            }
+        }]
+    });
+    let overlay = ProviderRegistryConfig::from_settings_value(&value).expect("settings parse");
+    let merged = merge_registry_config(default_registry_config(), overlay);
+    let priced = merged
+        .models
+        .iter()
+        .find(|model| model.id.as_str() == "anthropic/claude-sonnet-4-5")
+        .expect("sonnet survives the merge");
+    let price = priced.price.expect("the user's price is on the descriptor");
+    assert_eq!(price.input, 3_000_000);
+    assert_eq!(price.output, 15_000_000);
+    assert_eq!(price.cached_input, Some(300_000));
+    // $3/MTok in, $15/MTok out, $0.30/MTok cached read: one turn's bill.
+    assert_eq!(price.cost_micro_usd(1_000, 800, 250), 4_590);
 }

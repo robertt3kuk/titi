@@ -219,6 +219,60 @@ fn codex_models() -> Vec<ModelDescriptor> {
         .collect()
 }
 
+/// Every built-in model whose price this repo cannot state, and why.
+///
+/// The catalogue above is a list of ids, never a price list: titi fetches no
+/// price at build or run time (no network on either path), and no note in the
+/// tree covers these models. The one price note there is —
+/// `docs/research/prompt-cache.md` — states Anthropic's Sonnet 4.5 *input*
+/// ($3/MTok) and cached-*read* ($0.30/MTok) rates but not its output rate,
+/// and output is most of a coding turn's bill; half a price would understate
+/// every figure the footer printed, so `anthropic/claude-sonnet-4-5` is named
+/// here too. Every id below ships unpriced, and unpriced is not free: the
+/// surfaces omit the money rather than print `$0.000`, and `/budget $2` is
+/// refused instead of converted at a rate nobody stated.
+///
+/// This list is the table's anti-rot pin. A price belongs on the descriptor
+/// ([`ModelDescriptor::price`]) and an id with no source belongs here; the
+/// test `every_builtin_model_is_priced_or_on_the_no_price_list` walks
+/// `default_registry_config()` and refuses an id that is neither, so adding a
+/// model forces the decision instead of shipping a silent gap.
+///
+/// A user who knows a price can supply it: a `models` entry in the settings
+/// merges over the descriptor built here (same id, whole descriptor) and the
+/// money appears in the footer and in `/usage` from the next turn on.
+pub const NO_PRICE_MODELS: &[&str] = &[
+    // Metered, but priced by nobody whose numbers are in this tree.
+    "openai/gpt-4.1",
+    "openrouter/gpt-4.1",
+    "anthropic/claude-sonnet-4-5",
+    // Subscription and gateway backends: flat-rate plans, so no per-token
+    // price exists for this repo to write down.
+    "opencode-go/glm-5.3-flash",
+    "opencode-go/deepseek-v4-flash",
+    "clinepass/glm-5.3",
+    "clinepass/deepseek-v4-flash",
+    "clinepass/deepseek-v4-pro",
+    "bai/glm-5.3-flash",
+    "bai/qwen3.8-flash",
+    "bai/qwen3.8-max",
+    "openai-codex/gpt-5.5",
+    "openai-codex/gpt-5.6",
+    "openai-codex/gpt-5.6-luna",
+    "openai-codex/gpt-5.6-sol",
+    "openai-codex/gpt-5.6-terra",
+    "openai-codex/gpt-6-astra",
+    "openai-codex/gpt-6-astra-wm",
+    "openai-codex/gpt-6-sol",
+    "openai-codex/gpt-6-sol-wm",
+    "openai-codex/gpt-6-luna",
+    "openai-codex/gpt-6-luna-wm",
+    "openai-codex/gpt-daybreak-blue-latest",
+    "openai-codex/gpt-daybreak-blue-latest-wm",
+    "openai-codex/gpt-daybreak-red-latest",
+    "openai-codex/gpt-daybreak-red-latest-wm",
+];
+
 /// Keeps the models that `available` accepts, in their original order.
 ///
 /// An empty acceptance returns `models` unchanged, so a machine with no keys
