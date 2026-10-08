@@ -576,9 +576,12 @@ impl Details {
                 if !is_mode_word(first) {
                     return None;
                 }
-                for section in
-                    [Section::Thinking, Section::Tools, Section::Subagents, Section::Activity]
-                {
+                for section in [
+                    Section::Thinking,
+                    Section::Tools,
+                    Section::Subagents,
+                    Section::Activity,
+                ] {
                     self.apply_to(section, first);
                 }
                 apply_mode(&mut self.folded, first);
@@ -594,10 +597,7 @@ impl Details {
     fn list(&self) -> String {
         let parts: Vec<String> = ["thinking", "tools", "subagents", "activity", FOLDED_SECTION]
             .iter()
-            .filter_map(|name| {
-                self.mode_label(name)
-                    .map(|mode| format!("{name} {mode}"))
-            })
+            .filter_map(|name| self.mode_label(name).map(|mode| format!("{name} {mode}")))
             .collect();
         format!("details: {}", parts.join(" · "))
     }
@@ -1916,10 +1916,7 @@ impl Chat {
                 // expanded`. Both numbers come from this payload — the count
                 // and the tokens the engine held when it folded — because the
                 // transcript cannot know either by looking at itself.
-                self.push(
-                    LineKind::Fold,
-                    fold_divider_label(folded, tokens_before),
-                );
+                self.push(LineKind::Fold, fold_divider_label(folded, tokens_before));
                 Applied::none()
             }
             EngineEvent::ContextBreakdown { parts, window } => {
@@ -6373,7 +6370,9 @@ fn session_label(index: &titi_core::session::SessionIndex, session_id: &str) -> 
 
 /// When a session's file was last written, seconds since the epoch.
 fn session_written_at(agent_dir: &Path, session_id: &str) -> Option<u64> {
-    let path = agent_dir.join("sessions").join(format!("{session_id}.jsonl"));
+    let path = agent_dir
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     Some(
         modified
@@ -6434,7 +6433,9 @@ fn session_search_panel(chat: &Chat, total: u16) -> PanelView {
     if let Some(reason) = &search.broken {
         return panel_view(
             Some(format!("sessions · {}", search.query)),
-            vec![PanelLine::Heading(format!("the index could not be read: {reason}"))],
+            vec![PanelLine::Heading(format!(
+                "the index could not be read: {reason}"
+            ))],
             None,
             panel_body(total),
         );
@@ -8076,8 +8077,7 @@ fn transcript(
         // Air where the writer changes, and nowhere else: one turn's own
         // blocks — its text, its tool chips, the diffs under them, its notes —
         // stay one body, and a wrapped row is not a block of its own.
-        let changes_writer =
-            last_role.is_some_and(|role| role != line.kind.block_role());
+        let changes_writer = last_role.is_some_and(|role| role != line.kind.block_role());
         if changes_writer && !rows.is_empty() {
             rows.push(TranscriptRow::Text(Line::from("")));
         }
@@ -8091,7 +8091,10 @@ fn transcript(
         } else if line.kind == LineKind::Fold {
             // The divider carries the fold's own chevron, which the state
             // above — not the line — decides.
-            (vec![fold_divider(&line.text, folded, theme, inner)], Vec::new())
+            (
+                vec![fold_divider(&line.text, folded, theme, inner)],
+                Vec::new(),
+            )
         } else {
             message_rows(line, inner, theme)
         };
@@ -8408,14 +8411,10 @@ fn section_header(section: Section, count: usize, theme: &Theme, width: usize) -
     } else {
         format!("{} ({count})", section_name(section))
     };
-    chip(
-        ("▸", ThemeColor::Dim, label, ThemeColor::Dim),
-        theme,
-        width,
-    )
-    .into_iter()
-    .next()
-    .unwrap_or_default()
+    chip(("▸", ThemeColor::Dim, label, ThemeColor::Dim), theme, width)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// The rows of one transcript line, plus every row that carries a URL.
@@ -8469,7 +8468,12 @@ fn message_rows(
         // The mode-less reading of a divider, for a caller that has no
         // `Details` at hand: the live frame asks [`fold_divider`] directly with
         // the fold's own mode.
-        LineKind::Fold => vec![fold_divider(&line.text, SectionMode::Collapsed, theme, width)],
+        LineKind::Fold => vec![fold_divider(
+            &line.text,
+            SectionMode::Collapsed,
+            theme,
+            width,
+        )],
     };
     (rows, Vec::new())
 }
@@ -15653,19 +15657,28 @@ mod tests {
         // The frame draws the marker whole — and none of the wall.
         let frame = frame_text(&mut chat);
         assert!(frame.contains("[Paste #1 · 8 lines]"), "{frame}");
-        assert!(!frame.contains("frame 5"), "the body is not on screen: {frame}");
+        assert!(
+            !frame.contains("frame 5"),
+            "the body is not on screen: {frame}"
+        );
     }
 
     /// The boundary the collapse turns on: the threshold sits between the two.
     #[test]
     fn a_paste_at_the_threshold_stays_inline() {
-        let six = (1..=6).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let six = (1..=6)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut chat = chat();
         chat.paste(&six);
         assert_eq!(chat.input, six, "six lines are still a draft");
 
         let mut chat = chat_with_theme(test_theme());
-        let seven = (1..=7).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let seven = (1..=7)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         chat.paste(&seven);
         assert_eq!(chat.input, "[Paste #1 · 7 lines]");
     }
@@ -15682,7 +15695,8 @@ mod tests {
 
         let text = sent_text(&applied).expect("the prompt goes out");
         assert_eq!(
-            text, "what is this trace?   at frame 1 (module.rs:1)\n  at frame 2 (module.rs:2)\n  at frame 3 (module.rs:3)\n  at frame 4 (module.rs:4)\n  at frame 5 (module.rs:5)\n  at frame 6 (module.rs:6)\n  at frame 7 (module.rs:7)\n  at frame 8 (module.rs:8)",
+            text,
+            "what is this trace?   at frame 1 (module.rs:1)\n  at frame 2 (module.rs:2)\n  at frame 3 (module.rs:3)\n  at frame 4 (module.rs:4)\n  at frame 5 (module.rs:5)\n  at frame 6 (module.rs:6)\n  at frame 7 (module.rs:7)\n  at frame 8 (module.rs:8)",
             "the whole paste is sent"
         );
         let log = applied.log.expect("the prompt is recorded");
@@ -15694,7 +15708,10 @@ mod tests {
 
         // The transcript echo is the marker, and no line of the wall follows.
         let frame = frame_text(&mut chat);
-        assert!(frame.contains("what is this trace? [Paste #1 · 8 lines]"), "{frame}");
+        assert!(
+            frame.contains("what is this trace? [Paste #1 · 8 lines]"),
+            "{frame}"
+        );
         assert!(!frame.contains("frame 4"), "{frame}");
     }
 
@@ -16556,7 +16573,10 @@ mod tests {
         command(&mut chat, "/details tools expanded");
         let frame = frame_text(&mut chat);
         assert!(frame.contains("read src/main.rs"), "{frame}");
-        assert!(!frame.contains("tools (2)"), "no header when expanded: {frame}");
+        assert!(
+            !frame.contains("tools (2)"),
+            "no header when expanded: {frame}"
+        );
     }
 
     /// The conversation is not a section: no `/details` word takes the user's
@@ -16716,7 +16736,9 @@ mod tests {
         let buffer = frame_buffer(&mut chat, 80, 24);
         assert_eq!(
             buffer[(x, y)].fg,
-            fg(&test_theme(), ThemeColor::Dim).fg.unwrap_or(Color::Reset),
+            fg(&test_theme(), ThemeColor::Dim)
+                .fg
+                .unwrap_or(Color::Reset),
             "the divider is drawn as the furniture it is"
         );
 
@@ -18533,8 +18555,16 @@ mod tests {
     #[test]
     fn sessions_query_finds_the_matching_line_and_enter_switches() {
         let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
-        let kafka = seed_session(dir.path(), "kafka-talk", "how do we size the kafka consumers");
-        seed_session(dir.path(), "postgres-talk", "which postgres index does the planner pick");
+        let kafka = seed_session(
+            dir.path(),
+            "kafka-talk",
+            "how do we size the kafka consumers",
+        );
+        seed_session(
+            dir.path(),
+            "postgres-talk",
+            "which postgres index does the planner pick",
+        );
 
         command(&mut chat, "/sessions kafka");
         let frame = frame_text(&mut chat);
@@ -18553,7 +18583,10 @@ mod tests {
         );
 
         let applied = chat.on_key(Key::Enter, Instant::now());
-        assert_eq!(chat.session_id, kafka, "Enter switches to the hit's session");
+        assert_eq!(
+            chat.session_id, kafka,
+            "Enter switches to the hit's session"
+        );
         assert!(
             matches!(
                 applied.effect,
