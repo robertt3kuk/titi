@@ -754,5 +754,4 @@ mod tests {
         s.handle_input("\x0e"); // Ctrl+N
         assert_eq!(s.into_action(), Some(SessionAction::New));
     }
-
 }
