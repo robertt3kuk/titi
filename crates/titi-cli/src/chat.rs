@@ -1608,6 +1608,7 @@ impl Chat {
             "compact" => self.compact(args),
             "details" => self.details(args),
             "help" => self.help(),
+            "hotkeys" => self.hotkeys(),
             "login" => self.login(args),
             "logout" => self.logout(args),
             "keys" | "whoami" => self.keys(),
@@ -2085,6 +2086,16 @@ impl Chat {
                 LineKind::Note,
                 format!("/{}  {}", command.name, command.about),
             );
+        }
+        Applied::none()
+    }
+
+    /// `/hotkeys`: every key the screen answers, grouped, one row each. The
+    /// table is `keys.rs`'s, beside the `on_key` that answers those keys, so
+    /// the listing and the screen cannot be written twice (`hotkey_lines`).
+    fn hotkeys(&mut self) -> Applied {
+        for line in hotkey_lines() {
+            self.push(LineKind::Note, line);
         }
         Applied::none()
     }
@@ -10520,6 +10531,7 @@ mod tests {
             "context",
             "goal",
             "help",
+            "hotkeys",
             "keys",
             "usage",
             "login",
@@ -10609,6 +10621,226 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    /// Every row of the table reaches the screen through `/hotkeys`: a heading
+    /// per group, then each binding spelled with its keys and what they do. The
+    /// listing is the table's own, so nothing about the keys is written twice.
+    #[test]
+    fn hotkeys_lists_the_bindings_by_group() {
+        let mut chat = chat();
+        command(&mut chat, "/hotkeys");
+        let rows: Vec<String> = chat.lines.iter().map(|line| line.text.clone()).collect();
+
+        for group in HotkeyGroup::ALL {
+            let heading = format!("hotkeys · {}", group.title());
+            assert!(
+                rows.iter().any(|row| row.trim() == heading),
+                "no heading for {}: {rows:#?}",
+                group.title()
+            );
+        }
+        for row in HOTKEYS {
+            assert!(
+                rows.iter()
+                    .any(|line| line.contains(row.keys) && line.contains(row.what)),
+                "{} — {} never reached the screen: {rows:#?}",
+                row.keys,
+                row.what
+            );
+        }
+    }
+
+    /// Every key a terminal can hand the screen: `map_key` over the printable
+    /// characters and the named codes, under each modifier set a crossterm
+    /// event carries. The guard below walks what a person can press, not what
+    /// the `Key` enum happens to hold.
+    fn pressable_keys() -> Vec<Key> {
+        let mut codes: Vec<KeyCode> = (' '..='~').map(KeyCode::Char).collect();
+        codes.extend([
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::F(1),
+            KeyCode::Null,
+        ]);
+        let mods = [
+            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ];
+        let mut keys: Vec<Key> = Vec::new();
+        for code in codes {
+            for modifiers in mods {
+                let Some(key) = map_key(code, modifiers) else {
+                    continue;
+                };
+                // One printable character stands for them all: the listing
+                // names typing once, as "any character".
+                if matches!(key, Key::Char(_))
+                    && keys.iter().any(|seen| matches!(seen, Key::Char(_)))
+                {
+                    continue;
+                }
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys
+    }
+
+    /// The states `on_key` branches on, one fresh chat each: a bare composer, a
+    /// draft, the `/` list, a running turn, a tool call waiting on yes and the
+    /// open pickers.
+    fn probe_chats() -> Vec<(&'static str, Chat)> {
+        let mut draft = chat();
+        draft.input = "two words".to_owned();
+        draft.scroll_offset = 3;
+        draft.last_transcript_height = 10;
+
+        let mut list = chat();
+        list.input = "/hel".to_owned();
+
+        let mut turn = chat();
+        turn.turn_active = true;
+
+        let mut approval = chat();
+        approval.approval = Some(PendingApproval {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            detail: Some("echo hi".to_owned()),
+        });
+
+        let mut model = chat();
+        model.open_model_picker();
+
+        let mut history = chat();
+        history.history_picker = Some(HistoryPicker::open(vec!["a prompt".to_owned()]));
+
+        let mut sessions = chat();
+        sessions.session_picker = Some(0);
+
+        vec![
+            ("bare", chat()),
+            ("draft", draft),
+            ("list", list),
+            ("turn", turn),
+            ("approval", approval),
+            ("model picker", model),
+            ("history", history),
+            ("session picker", sessions),
+        ]
+    }
+
+    /// Everything a key can move, as one string: the panel on screen — which
+    /// carries every open picker's own state, its cursor and its query — the
+    /// draft, the scroll, the hint, the two two-press timers, the transcript,
+    /// the approval and the model in use.
+    fn key_fingerprint(chat: &Chat) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            panel_view_for(chat, 30, 80),
+            chat.lines.len(),
+            chat.input,
+            chat.scroll_offset,
+            chat.hint,
+            chat.quit_armed.is_some(),
+            chat.esc_armed.is_some(),
+            chat.picker_hidden,
+            chat.selection.is_some(),
+            chat.turn_active,
+            chat.approval.is_some(),
+            chat.model,
+        )
+    }
+
+    /// How `/hotkeys` spells a key in its keys column. The match is exhaustive:
+    /// a new `Key` variant does not compile until it is spelled here, so the
+    /// guard below cannot quietly skip one.
+    ///
+    /// `PageDownHalf` has no spelling because no terminal can press it:
+    /// `map_key` maps ctrl+d to quit before its later half-page arm is reached.
+    fn hotkey_spelling(key: Key) -> Option<&'static str> {
+        Some(match key {
+            Key::Char(_) => "any character",
+            Key::Backspace => "backspace",
+            Key::Enter => "enter",
+            Key::Esc => "esc",
+            Key::Tab => "tab",
+            Key::Up => "↑",
+            Key::Down => "↓",
+            Key::PageUp => "page up",
+            Key::PageDown => "page down",
+            Key::PageUpHalf => "ctrl+u",
+            Key::DeleteWord => "alt+backspace",
+            Key::CtrlC => "ctrl+c",
+            Key::CtrlD => "ctrl+d",
+            Key::CtrlX => "ctrl+x",
+            Key::CtrlR => "ctrl+r",
+            Key::AltM => "alt+m",
+            Key::PageDownHalf => return None,
+        })
+    }
+
+    /// Whether the listing names `label` as one of the keys of a row: the keys
+    /// column of a `/hotkeys` line is what stands before the two spaces that
+    /// open its description, and `·` separates the alternatives in it.
+    fn hotkeys_name(lines: &[String], label: &str) -> bool {
+        lines.iter().any(|line| {
+            line.trim_start()
+                .split("  ")
+                .next()
+                .is_some_and(|keys| keys.split('·').any(|cell| cell.trim() == label))
+        })
+    }
+
+    /// The guard: a key the screen answers, in any state it branches on, is a
+    /// key `/hotkeys` names. A binding added to `on_key` — or to the mapper
+    /// above it — fails this until the table in `keys.rs` carries it, so the
+    /// listing cannot go stale in silence.
+    ///
+    /// It is a key-level guard: which words a modal state uses for a key that is
+    /// already named (the approval prompt's `y`, say) is not machine-checked,
+    /// and neither are the chord, the mouse and the paste rows, which are no
+    /// single `Key` a probe can press.
+    #[test]
+    fn every_key_the_screen_answers_is_named_in_the_hotkeys_listing() {
+        let listing = hotkey_lines();
+        let now = Instant::now();
+        let mut unlisted: Vec<String> = Vec::new();
+        for key in pressable_keys() {
+            let Some(spelling) = hotkey_spelling(key) else {
+                continue;
+            };
+            for (state, mut chat) in probe_chats() {
+                let before = key_fingerprint(&chat);
+                let applied = chat.on_key(key, now);
+                let answered = key_fingerprint(&chat) != before || applied.effect.is_some();
+                if answered && !hotkeys_name(&listing, spelling) {
+                    unlisted.push(format!("{spelling} ({key:?}) in the {state} state"));
+                }
+            }
+        }
+        assert!(
+            unlisted.is_empty(),
+            "answered but not in the `/hotkeys` listing (crates/titi-cli/src/keys.rs): {unlisted:#?}"
+        );
     }
 
     /// The badge is the engine's answer, not the keystroke: a mode the

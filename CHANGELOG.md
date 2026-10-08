@@ -28,6 +28,7 @@ All notable user-facing changes to titi, newest first.
 - `/usage` counts what the provider reported for prompt, completion and cached tokens instead of an estimate; `/budget` no longer says "estimated".
 - Cancelled or failed turns still report their token usage, so `/usage` and the budget do not lose a paid round.
 - Model switches in headless JSONL now answer `ModelSwitched`, so a client can switch a model before a turn.
+- `/hotkeys` lists the keys the screen answers, grouped — composer, lists & pickers, transcript & mouse, turn control, session — one row per binding and what it does. The table sits beside the `on_key` that answers those keys, and a test walks every key `map_key` can produce through every state `on_key` branches on, so a binding missing from the listing fails the suite rather than going unadvertised.
 
 ### Fixed
 

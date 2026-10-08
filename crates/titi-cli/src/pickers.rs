@@ -66,6 +66,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "list these commands",
     },
     Command {
+        name: "hotkeys",
+        about: "list the keys the screen answers",
+    },
+    Command {
         name: "keys",
         about: "which providers have a key or a sign-in",
     },

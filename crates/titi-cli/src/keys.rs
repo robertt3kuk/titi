@@ -137,6 +137,227 @@ const PASTE_MARKER_HEAD: &str = "[Paste #";
 const CTRL_C_HINT: &str = "ctrl-c again to quit";
 const EXIT_HINT: &str = "press Enter again to quit";
 
+// ---------------------------------------------------------------------------
+// What `/hotkeys` lists
+// ---------------------------------------------------------------------------
+//
+// One table, beside the `map_key` above that turns a crossterm event into a
+// key and the `on_key` below that answers it. `/hotkeys` renders this table and
+// nothing else, so the listing and the screen cannot be written twice: the test
+// `every_key_the_screen_answers_is_named_in_the_hotkeys_listing` walks every
+// key `map_key` can produce through every state `on_key` branches on, and a key
+// the screen answers that this table does not name fails the suite.
+
+/// A group of bindings, in the order `/hotkeys` prints them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotkeyGroup {
+    Composer,
+    Lists,
+    Transcript,
+    Turn,
+    Session,
+}
+
+impl HotkeyGroup {
+    /// Every group, in listing order.
+    pub(crate) const ALL: [HotkeyGroup; 5] = [
+        HotkeyGroup::Composer,
+        HotkeyGroup::Lists,
+        HotkeyGroup::Transcript,
+        HotkeyGroup::Turn,
+        HotkeyGroup::Session,
+    ];
+
+    /// The heading this group prints under.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            HotkeyGroup::Composer => "composer",
+            HotkeyGroup::Lists => "lists & pickers",
+            HotkeyGroup::Transcript => "transcript & mouse",
+            HotkeyGroup::Turn => "turn control",
+            HotkeyGroup::Session => "session",
+        }
+    }
+}
+
+/// One row of `/hotkeys`.
+pub(crate) struct Hotkey {
+    pub(crate) group: HotkeyGroup,
+    /// The keys as a person presses them, `·` between alternatives — the
+    /// spelling the drift guard in `chat.rs` reads the listing back by.
+    pub(crate) keys: &'static str,
+    /// What the screen does with them.
+    pub(crate) what: &'static str,
+}
+
+/// Every binding the live screen answers, grouped the way `/hotkeys` prints
+/// them.
+///
+/// A row is here when `on_key` — or the state it hands the key to, an open list
+/// or the approval prompt — answers it. Only keys a terminal can actually
+/// produce are listed: `ctrl+d` is quit, never the half-page-down the mapper's
+/// later arm would give it.
+pub(crate) const HOTKEYS: &[Hotkey] = &[
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "any character",
+        what: "type into the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "backspace",
+        what: "delete the character before the caret",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "alt+backspace · ctrl+w",
+        what: "delete the word before the caret",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "enter",
+        what: "send the draft; a highlighted command runs first",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "esc",
+        what: "clear the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "esc esc",
+        what: "rewind the last turn, on an empty draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "paste",
+        what: "insert what was pasted; a long paste becomes a marker",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "↑ · ↓",
+        what: "move the highlight of the open list",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "tab",
+        what: "apply the highlighted row to the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "enter",
+        what: "run the highlighted command",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "esc",
+        what: "hide the list and keep the draft; close a picker",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "any character",
+        what: "narrow the list's query",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "backspace",
+        what: "take the last character back out of the query",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "y · n",
+        what: "allow or refuse the tool call waiting on you",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "ctrl+r",
+        what: "browse this session's own prompts",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "↑",
+        what: "browse this session's own prompts, from an empty draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "alt+m",
+        what: "pick a model",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "↑ · ↓",
+        what: "scroll the transcript a row, with text in the draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "page up · page down",
+        what: "scroll the transcript a page",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "ctrl+u",
+        what: "scroll half a page up",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "drag",
+        what: "select transcript text",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "release",
+        what: "copy the selection",
+    },
+    Hotkey {
+        group: HotkeyGroup::Transcript,
+        keys: "wheel",
+        what: "scroll the transcript, or move an open list's highlight",
+    },
+    Hotkey {
+        group: HotkeyGroup::Turn,
+        keys: "ctrl+c",
+        what: "stop the running turn",
+    },
+    Hotkey {
+        group: HotkeyGroup::Session,
+        keys: "ctrl+x",
+        what: "switch sessions",
+    },
+    Hotkey {
+        group: HotkeyGroup::Session,
+        keys: "ctrl+c ctrl+c",
+        what: "quit — the same key twice inside 2 s",
+    },
+    Hotkey {
+        group: HotkeyGroup::Session,
+        keys: "ctrl+d",
+        what: "quit when the draft is empty",
+    },
+];
+
+/// The `/hotkeys` listing: one heading per group, one row per binding, the keys
+/// padded into a column. The screen pushes each line as a note, the way
+/// `/help` lists the commands.
+pub(crate) fn hotkey_lines() -> Vec<String> {
+    let room = HOTKEYS
+        .iter()
+        .map(|row| row.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for group in HotkeyGroup::ALL {
+        lines.push(format!("hotkeys · {}", group.title()));
+        for row in HOTKEYS.iter().filter(|row| row.group == group) {
+            lines.push(format!(
+                "  {keys:<room$}  {what}",
+                keys = row.keys,
+                what = row.what
+            ));
+        }
+    }
+    lines
+}
+
 impl Chat {
     // ---- Mouse selection -------------------------------------------------
     //
