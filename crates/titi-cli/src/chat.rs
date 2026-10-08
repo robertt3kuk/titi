@@ -917,6 +917,19 @@ pub struct Chat {
     /// Whether the running turn's request carried a non-empty history. Read
     /// once at the turn's start (see [`Chat::begin_usage_ledger`]).
     turn_history: bool,
+    /// What the running turn has cost, in micro-dollars, when its model has a
+    /// price. Kept beside `turn_usage` because the money is a fact about that
+    /// same report; `None` for an unpriced model, whose footer then states no
+    /// figure at all.
+    turn_cost_micro: Option<u64>,
+    /// What this screen's priced turns have cost, in micro-dollars. `None`
+    /// until a priced turn reports: a session whose models are all unpriced
+    /// has no total, and `$0.00` would be a number pretending to be a fact.
+    session_cost_micro: Option<u64>,
+    /// Some turn in this session went unpriced, so the total above is a floor
+    /// and not the bill. A session that switches from a priced model to a
+    /// local one says so rather than quietly dropping the earlier turns.
+    session_cost_partial: bool,
     /// The running turn ended in a failure the screen showed. It holds until
     /// the next turn starts, so the tab title says the turn broke rather than
     /// that it is your turn.
@@ -1045,6 +1058,9 @@ impl Chat {
             intro: None,
             turn_usage: None,
             turn_history: false,
+            turn_cost_micro: None,
+            session_cost_micro: None,
+            session_cost_partial: false,
             turn_failed: false,
             last_title: None,
             terminal: TerminalFeatures::default(),
@@ -1998,6 +2014,23 @@ impl Chat {
                 // The running turn's own ledger, for the footer under its
                 // answer; the totals below outlive it.
                 self.turn_usage = Some((prompt_tokens, cached_tokens, completion_tokens));
+                // Money is a property of the model the turn ran on, so it is
+                // read here, where the turn's tokens and the current model are
+                // both in hand. An unpriced model costs nothing to state: the
+                // footer drops the figure rather than inventing one, and the
+                // session total says it is a floor.
+                match self.catalog.price(&self.model) {
+                    Some(price) => {
+                        let cost =
+                            price.cost_micro_usd(prompt_tokens, cached_tokens, completion_tokens);
+                        self.turn_cost_micro = Some(cost);
+                        self.session_cost_micro = Some(self.session_cost_micro.unwrap_or(0) + cost);
+                    }
+                    None => {
+                        self.turn_cost_micro = None;
+                        self.session_cost_partial = true;
+                    }
+                }
                 self.session_prompt_tokens += prompt_tokens;
                 self.session_completion_tokens += completion_tokens;
                 self.session_cached_tokens += cached_tokens;
@@ -2299,6 +2332,7 @@ impl Chat {
     /// cache there is a provider's norm and not a miss worth naming.
     fn begin_usage_ledger(&mut self) {
         self.turn_usage = None;
+        self.turn_cost_micro = None;
         self.turn_failed = false;
         self.turn_history = self.session_prompt_tokens > 0
             || self
@@ -2559,16 +2593,41 @@ impl Chat {
             }
         };
         let text = format!(
-            "Turn: {} prompt{} + {} completion. Session: {}{} / {}.",
+            "Turn: {} prompt{} + {} completion. Session: {}{} / {}{}.",
             self.last_prompt_tokens,
             cached(self.last_cached_tokens),
             self.last_completion_tokens,
             self.session_prompt_tokens,
             cached(self.session_cached_tokens),
-            self.session_completion_tokens
+            self.session_completion_tokens,
+            self.session_cost()
         );
         self.push(LineKind::Note, text);
         Applied::none()
+    }
+
+    /// The money that joins `/usage`'s token totals, or nothing.
+    ///
+    /// Nothing is the answer for a session whose models have no price: no
+    /// figure was ever computed, and `$0.00` would state one that was. An
+    /// exact zero — a model priced at zero — is a figure, so it prints.
+    ///
+    /// A session that mixed a priced model with an unpriced one has a floor
+    /// and not a bill, and says so: the turns it could not price are not in
+    /// the number, so the number is the least it spent.
+    fn session_cost(&self) -> String {
+        match self.session_cost_micro {
+            Some(micro) if micro > 0 || !self.session_cost_partial => {
+                let total =
+                    titi_tui::status::format_usd(micro, titi_tui::status::SESSION_COST_DECIMALS);
+                if self.session_cost_partial {
+                    format!(" · session total {total}+ (unpriced turns excluded)")
+                } else {
+                    format!(" · session total {total}")
+                }
+            }
+            _ => String::new(),
+        }
     }
     fn memory(&mut self, args: &str) -> Applied {
         if args.is_empty() || args == "list" {
@@ -4729,6 +4788,9 @@ impl Chat {
                 // history" was read at the turn's start from what it had
                 // already reported (`begin_usage_ledger`).
                 cache_miss: cached_tokens == 0 && self.turn_history,
+                // `None` for an unpriced model: the row states no money rather
+                // than `$0.000`, which would read as free.
+                cost_micro_usd: self.turn_cost_micro,
             };
             self.push(LineKind::Usage, footer.row());
         }
@@ -5737,7 +5799,10 @@ impl std::fmt::Display for BudgetArgError {
                 "budget: no price table, so a cap in money cannot be enforced — cap tokens instead (e.g. /budget 200k)",
             ),
             Self::Unreadable(word) => {
-                write!(f, "budget: {word} is not an amount (200000, 200k, 1.5m, off)")
+                write!(
+                    f,
+                    "budget: {word} is not an amount (200000, 200k, 1.5m, off)"
+                )
             }
             Self::Zero => f.write_str("budget: the cap must be at least one token"),
         }
@@ -9621,6 +9686,29 @@ mod tests {
         (dir, chat)
     }
 
+    /// $3/MTok in, $15/MTok out, $0.30/MTok cached read — the shape of a
+    /// price the engine's descriptor carries.
+    fn test_price() -> titi_engine::ModelPrice {
+        titi_engine::ModelPrice {
+            input: 3_000_000,
+            output: 15_000_000,
+            cached_input: Some(300_000),
+        }
+    }
+
+    /// A chat whose current model is priced. No built-in model ships with a
+    /// price (`NO_PRICE_MODELS`), so the money paths are driven with one
+    /// written in by hand — the same route a user's `models` settings entry
+    /// takes.
+    fn priced_chat() -> Chat {
+        let mut chat = chat();
+        chat.catalog = crate::engine::ModelCatalog::fixed_priced(
+            vec![chat.model.clone()],
+            vec![(chat.model.clone(), test_price())],
+        );
+        chat
+    }
+
     /// The transcript's model confirmations, in the order they landed.
     fn confirmations(chat: &Chat) -> Vec<String> {
         chat.lines
@@ -12431,6 +12519,71 @@ mod tests {
         });
         let second = last_footer(&chat).unwrap_or_default();
         assert!(second.ends_with("cache miss"), "{second}");
+    }
+
+    /// A priced model states the turn's cost at the end of the footer row, and
+    /// the frame draws it: the money is part of the same dim row, not a line
+    /// of its own.
+    #[test]
+    fn a_priced_turn_states_its_cost_in_the_footer() {
+        let mut chat = priced_chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now() - Duration::from_millis(1_400));
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "answer".into(),
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 250,
+            cached_tokens: 800,
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+
+        // 200 in x $3/MTok + 800 cached x $0.30/MTok + 250 out x $15/MTok
+        // = $0.00459, rounded to four places.
+        let footer = last_footer(&chat).unwrap_or_default();
+        assert!(
+            footer.ends_with("1k prompt (800 cached) · 250 out · $0.0046"),
+            "{footer}"
+        );
+
+        // The row reaches the screen, money and all.
+        let rows = frame_rows(&mut chat, 80, 24);
+        assert!(
+            rows.join("").contains("· $0.0046"),
+            "the money is on the frame: {rows:?}"
+        );
+    }
+
+    /// An unpriced model's footer has no money part at all: the screen says
+    /// nothing rather than `$0.000`, which would read as free.
+    #[test]
+    fn an_unpriced_turn_states_no_cost() {
+        let mut chat = chat();
+        chat.turn_active = true;
+        chat.turn_started = Some(Instant::now());
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 250,
+            cached_tokens: 800,
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        let footer = last_footer(&chat).unwrap_or_default();
+        assert!(
+            footer.ends_with("1k prompt (800 cached) · 250 out"),
+            "{footer}"
+        );
+        assert!(!footer.contains('$'), "no price, no figure: {footer}");
+        assert!(!frame_text(&mut chat).contains("$0.000"), "no dollar zero");
     }
 
     /// A turn that reported no usage has no footer: a cancelled turn before
@@ -15915,6 +16068,71 @@ mod tests {
         assert!(
             view.contains("Turn: 100 prompt + 50 completion. Session: 100 / 50."),
             "View: {view}"
+        );
+        // An unpriced model has no total to state, and `$0.00` is not it.
+        assert!(!view.contains("session total"), "View: {view}");
+    }
+
+    /// A priced model puts the session's cost next to its token totals,
+    /// rounded to cents.
+    #[test]
+    fn usage_states_the_session_cost_when_the_model_is_priced() {
+        let mut chat = priced_chat();
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 100_000,
+            completion_tokens: 5_000,
+            cached_tokens: 0,
+        });
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(2),
+            prompt_tokens: 1_200,
+            completion_tokens: 40,
+            cached_tokens: 1_000,
+        });
+        type_text(&mut chat, "/usage");
+        chat.on_key(Key::Enter, Instant::now());
+        // $0.375 for the first turn, $0.0015 for the second: $0.37650.
+        assert_eq!(
+            chat.lines.last().map(|line| line.text.clone()).as_deref(),
+            Some(
+                "Turn: 1200 prompt (1000 cached) + 40 completion. \
+                 Session: 101200 (1000 cached) / 5040 · session total $0.38."
+            )
+        );
+    }
+
+    /// A session that switched from a priced model to an unpriced one states
+    /// its total as a floor: the turns it could not price are named, not
+    /// silently dropped.
+    #[test]
+    fn usage_marks_a_total_that_leaves_turns_out() {
+        let mut chat = priced_chat();
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 100_000,
+            completion_tokens: 5_000,
+            cached_tokens: 0,
+        });
+        // The switch a `/model ollama/qwen3` makes: the next turn has no
+        // price to read.
+        chat.model = "ollama/qwen3".to_owned();
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(2),
+            prompt_tokens: 500,
+            completion_tokens: 20,
+            cached_tokens: 0,
+        });
+        type_text(&mut chat, "/usage");
+        chat.on_key(Key::Enter, Instant::now());
+        let said = chat
+            .lines
+            .last()
+            .map(|line| line.text.clone())
+            .unwrap_or_default();
+        assert!(
+            said.ends_with("· session total $0.38+ (unpriced turns excluded)."),
+            "{said}"
         );
     }
 

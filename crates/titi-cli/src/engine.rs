@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use titi_engine::protocol::SessionMode;
 use titi_engine::{
     Engine, EngineConfig, EngineRuntime, HttpTransportFactory, LayeredCredentialSource,
-    ModelDescriptor, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig, TrajectorySink,
+    ModelDescriptor, ModelPrice, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig,
+    TrajectorySink,
 };
 use titi_providers::ApiKind;
 use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_interrupt};
@@ -300,6 +302,10 @@ pub struct ModelCatalog {
     /// them (tests, embedded). A real catalog reads the registry's own list
     /// live, because discovery answers long after this is built.
     failures: Vec<titi_providers::DiscoveryError>,
+    /// Prices a catalog with no registry behind it carries. A live catalog
+    /// asks the registry instead — it holds the descriptors the settings
+    /// merged over the built-ins, so a price the user wrote is found there.
+    prices: BTreeMap<String, ModelPrice>,
 }
 
 impl ModelCatalog {
@@ -308,6 +314,7 @@ impl ModelCatalog {
             startup,
             registry: Some(registry),
             failures: Vec::new(),
+            prices: BTreeMap::new(),
         }
     }
 
@@ -317,6 +324,23 @@ impl ModelCatalog {
             startup: models,
             registry: None,
             failures: Vec::new(),
+            prices: BTreeMap::new(),
+        }
+    }
+
+    /// A fixed catalog that also states what its models cost: for a surface
+    /// with no registry behind it.
+    ///
+    /// A model absent from `prices` is *unpriced*, which is not free: the
+    /// money is omitted wherever it would have been printed. The tests that
+    /// drive the footer and `/usage` money paths build one of these, because
+    /// no built-in model ships with a price ([`NO_PRICE_MODELS`]).
+    pub fn fixed_priced(models: Vec<String>, prices: Vec<(String, ModelPrice)>) -> Self {
+        Self {
+            startup: models,
+            registry: None,
+            failures: Vec::new(),
+            prices: prices.into_iter().collect(),
         }
     }
 
@@ -329,7 +353,22 @@ impl ModelCatalog {
             startup: models,
             registry: None,
             failures,
+            prices: BTreeMap::new(),
         }
+    }
+
+    /// What the named model costs, when anything here knows.
+    ///
+    /// `None` is *unpriced*: a local server's tag, a subscription backend, or
+    /// a model whose price nobody wrote down. It must never be read as a
+    /// price of zero, so a surface that prints money omits it instead.
+    pub fn price(&self, id: &str) -> Option<ModelPrice> {
+        if let Some(price) = self.prices.get(id) {
+            return Some(*price);
+        }
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.price(id))
     }
 
     /// Read when a picker opens or a command runs, never per frame: it takes

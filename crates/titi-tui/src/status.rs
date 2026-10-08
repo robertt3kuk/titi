@@ -105,15 +105,32 @@ pub struct TurnFooter {
     /// The turn's request carried history and the provider served none of it
     /// from cache, so the prefix was paid for again.
     pub cache_miss: bool,
+    /// What the turn cost, in micro-dollars, when the model has a price.
+    ///
+    /// `None` for an unpriced model — a local one, a subscription backend, or
+    /// a price nobody wrote down. The row then omits the money entirely:
+    /// `$0.000` would read as free, and unpriced is not free.
+    pub cost_micro_usd: Option<u64>,
 }
 
+/// Decimals on one turn's cost: a turn is small, so the figure is a
+/// ten-thousandth of a dollar deep. A session's total is rounded to cents
+/// ([`SESSION_COST_DECIMALS`]).
+pub const TURN_COST_DECIMALS: usize = 4;
+
+/// Decimals on a session's total: a session is a day's work, and cents are
+/// what a user reads.
+pub const SESSION_COST_DECIMALS: usize = 2;
+
 impl TurnFooter {
-    /// The row: `1.4s · 3.4k prompt (2.9k cached) · 250 out`, with a trailing
-    /// `· cache miss` when the request re-paid for its own history.
+    /// The row: `1.4s · 3.4k prompt (2.9k cached) · 250 out`, a trailing
+    /// `· $0.004` when the model has a price, and a `· cache miss` when the
+    /// request re-paid for its own history.
     ///
     /// The cached share is named only when there is one: `(0 cached)` would be
     /// a zero dressed as data, and the miss marker already says the honest
-    /// thing about a cold request.
+    /// thing about a cold request. The money is the same rule — a descriptor
+    /// without a price prints no figure at all.
     pub fn row(&self) -> String {
         let prompt = if self.cached_tokens > 0 {
             format!(
@@ -132,8 +149,55 @@ impl TurnFooter {
         if self.cache_miss {
             parts.push("cache miss".to_owned());
         }
+        if let Some(cost) = self.cost_micro_usd {
+            parts.push(format_usd(cost, TURN_COST_DECIMALS));
+        }
         parts.join(" · ")
     }
+}
+
+/// The most decimals a money figure may grow to before it counts as zero: one
+/// micro-dollar, the unit the engine's cost arithmetic keeps.
+const MAX_COST_DECIMALS: usize = 6;
+
+/// `micro_usd` rounded to `decimals` places, in units of `10^-decimals`
+/// dollars. Integer arithmetic, so the rounding is the decimal one a reader
+/// would do — never a float's nearest binary neighbour.
+fn scaled_usd(micro_usd: u64, decimals: usize) -> u128 {
+    let scale = 10u128.pow(decimals as u32);
+    (u128::from(micro_usd) * scale + 500_000) / 1_000_000
+}
+
+/// A cost as the screen prints it: `$0.004`, `$0.38`, `$1.20`.
+///
+/// `decimals` is the figure's own precision — four on one turn's cost
+/// ([`TURN_COST_DECIMALS`]), two on a session's total
+/// ([`SESSION_COST_DECIMALS`]). Two rules sit on top of it, both about not
+/// lying with zeros:
+///
+/// - trailing zeros are dropped, down to two places at the least, because a
+///   fourth decimal that is `0` says nothing — but `$0.50` never reads
+///   `$0.5`;
+/// - **a fraction of a cent is never printed as `$0.00`.** An amount that
+///   rounds to zero at the asked-for precision takes more digits instead,
+///   until it shows what it is (at most [`MAX_COST_DECIMALS`], one
+///   micro-dollar). Only an exact zero reads `$0.00`.
+pub fn format_usd(micro_usd: u64, decimals: usize) -> String {
+    let mut digits = decimals.max(2);
+    let scaled = loop {
+        let scaled = scaled_usd(micro_usd, digits);
+        if scaled > 0 || micro_usd == 0 || digits >= MAX_COST_DECIMALS {
+            break scaled;
+        }
+        digits += 1;
+    };
+    let unit = 10u128.pow(digits as u32);
+    let whole = scaled / unit;
+    let mut fraction = format!("{:0width$}", scaled % unit, width = digits);
+    while fraction.len() > 2 && fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("${whole}.{fraction}")
 }
 
 /// A turn's wall time: one decimal deep below a minute (`1.4s`), the status
@@ -704,6 +768,7 @@ mod tests {
             cached_tokens: 2_900,
             completion_tokens: 250,
             cache_miss: false,
+            cost_micro_usd: None,
         };
         assert_eq!(footer.row(), "1.4s · 3.4k prompt (2.9k cached) · 250 out");
     }
@@ -716,6 +781,7 @@ mod tests {
             cached_tokens: 0,
             completion_tokens: 40,
             cache_miss: false,
+            cost_micro_usd: None,
         };
         assert_eq!(footer.row(), "0.9s · 900 prompt · 40 out");
     }
@@ -728,6 +794,7 @@ mod tests {
             cached_tokens: 12,
             completion_tokens: 7,
             cache_miss: false,
+            cost_micro_usd: None,
         };
         assert_eq!(footer.row(), "1m 15s · 999 prompt (12 cached) · 7 out");
     }
@@ -740,12 +807,85 @@ mod tests {
             cached_tokens: 0,
             completion_tokens: 80,
             cache_miss: true,
+            cost_micro_usd: None,
         };
         assert_eq!(
             footer.row(),
             "1.2s · 12k prompt · 80 out · cache miss",
             "the miss is named, and no zero is dressed as data"
         );
+    }
+
+    /// A priced model puts the turn's cost at the end of the row, rounded to
+    /// four places.
+    #[test]
+    fn turn_footer_states_the_cost_of_a_priced_turn() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(1_400),
+            prompt_tokens: 3_400,
+            cached_tokens: 2_900,
+            completion_tokens: 250,
+            cache_miss: false,
+            cost_micro_usd: Some(4_500),
+        };
+        assert_eq!(
+            footer.row(),
+            "1.4s · 3.4k prompt (2.9k cached) · 250 out · $0.0045"
+        );
+
+        // The same turn with a cold cache keeps every part, money last.
+        let cold = TurnFooter {
+            cache_miss: true,
+            ..footer
+        };
+        assert_eq!(
+            cold.row(),
+            "1.4s · 3.4k prompt (2.9k cached) · 250 out · cache miss · $0.0045"
+        );
+    }
+
+    /// An unpriced model has no figure at all: `$0.000` would read as free,
+    /// and a local model was never free — its price is simply unknown.
+    #[test]
+    fn turn_footer_says_nothing_about_money_without_a_price() {
+        let footer = TurnFooter {
+            elapsed: Duration::from_millis(900),
+            prompt_tokens: 900,
+            cached_tokens: 0,
+            completion_tokens: 40,
+            cache_miss: false,
+            cost_micro_usd: None,
+        };
+        let row = footer.row();
+        assert_eq!(row, "0.9s · 900 prompt · 40 out");
+        assert!(!row.contains('$'), "no price, no figure: {row}");
+    }
+
+    /// Money is rounded to the places the figure carries, trailing zeros
+    /// dropped but never below cents.
+    #[test]
+    fn usd_rounds_to_its_own_precision() {
+        assert_eq!(format_usd(4_500, TURN_COST_DECIMALS), "$0.0045");
+        assert_eq!(format_usd(4_000, TURN_COST_DECIMALS), "$0.004");
+        assert_eq!(format_usd(830_000, SESSION_COST_DECIMALS), "$0.83");
+        assert_eq!(format_usd(500_000, SESSION_COST_DECIMALS), "$0.50");
+        assert_eq!(format_usd(1_200_000, TURN_COST_DECIMALS), "$1.20");
+        assert_eq!(format_usd(375_000_000, SESSION_COST_DECIMALS), "$375.00");
+    }
+
+    /// A fraction of a cent is never printed as `$0.00`: the figure takes more
+    /// digits rather than rounding a real cost away. Only an exact zero — a
+    /// model priced at zero — reads `$0.00`.
+    #[test]
+    fn usd_never_prints_a_real_fraction_as_zero() {
+        assert_eq!(format_usd(0, SESSION_COST_DECIMALS), "$0.00");
+        assert_eq!(format_usd(0, TURN_COST_DECIMALS), "$0.00");
+        // Three tenths of a cent: two places would say `$0.00`.
+        assert_eq!(format_usd(3_000, SESSION_COST_DECIMALS), "$0.003");
+        assert_eq!(format_usd(30, TURN_COST_DECIMALS), "$0.00003");
+        assert_eq!(format_usd(3, TURN_COST_DECIMALS), "$0.000003");
+        // Half a cent rounds up at two places, so it is not a zero case.
+        assert_eq!(format_usd(5_000, SESSION_COST_DECIMALS), "$0.01");
     }
 
     #[test]
