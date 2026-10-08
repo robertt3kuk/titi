@@ -69,19 +69,29 @@ TypeScript, Python, Go, Java, C, Cpp, CSharp, Ruby, Kotlin, Swift, Php. The
 `rs`; `ts tsx js jsx mjs cjs`; `py`; `go`; `java`; `c h`;
 `cpp cc cxx hpp hh hxx`; `cs`; `rb`; `kt kts`; `swift`; `php`.
 
-- **Imports and symbols** (file edges and symbol edges): Rust (`use`, `mod`),
-  TS/JS (relative `from '…'` / `import '…'`), Python (relative
-  `from .x import`), Go (block and line `import`, resolved by package path
-  suffix), Java and C# (shared `parse_path_imports`, resolved by suffix),
-  Kotlin, PHP, Ruby (`require` / `require_relative`), C/C++
-  (`#include "…"` relative to the file).
+- **Imports and symbols** (file edges and symbol edges): Rust (`use`, `mod`,
+  read from the syntax tree), TS/JS (relative `from '…'` / `import '…'`),
+  Python (relative `from .x import`), Go (block and line `import`, resolved
+  by package path suffix), Java and C# (shared `parse_path_imports`,
+  resolved by suffix), Kotlin, PHP, Ruby (`require` / `require_relative`),
+  C/C++ (`#include "…"` relative to the file).
 - **Symbols only:** Swift — `finish(source, swift_exports(source), Vec::new())`
   parses no imports. That is why the README says "eleven languages": eleven
   produce import edges.
 
 Symbol edges (`used_symbols`) come to every language through `finish()` →
-`collect_refs()`; Swift simply lacks the file-edge half. Parsing is regex
-heuristics; tree-sitter is not there yet.
+`collect_refs()`; Swift simply lacks the file-edge half.
+
+Rust symbols, Rust `use`/`mod` items and the syntax-error count come from
+tree-sitter; every other language is still regex heuristics. A Rust import
+resolves against the module its declaration sits in — the file's directory
+plus every enclosing inline `mod` — so `crate::`, `super::`, `self::`, a
+glob, and `mod x;` beside a `mod.rs` all land on a file. A bare path is an
+external crate, not a workspace lookup, and a path that resolves to the
+importing file is a self-edge and is dropped. `syntax_errors` counts
+`ERROR` nodes from a parse with the pinned grammar's `&raw` token ambiguity
+neutralised, so borrowing an ordinary identifier named `raw` is not
+reported as a syntax error — a file that genuinely does not parse still is.
 
 ### How the map reaches the prompt
 
