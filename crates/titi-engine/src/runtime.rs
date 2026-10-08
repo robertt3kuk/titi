@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::StreamExt;
 use smol_str::SmolStr;
-use titi_genome::SharedGenome;
+use titi_genome::GenomeHandle;
+use titi_genome::live::Request as IndexRequest;
 use titi_providers::{
     ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, TokenUsage, Transport,
     TransportError, WireRequest,
@@ -133,38 +134,59 @@ async fn recalled_memory(agent_dir: Option<PathBuf>, touched: &TouchedSink) -> O
     .await
 }
 
-/// Refresh the live index off the async threads and render this turn's map.
+/// How long a turn waits for the index before it names the backlog instead.
+const GENOME_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Point the index at this turn's files and render the map from what it
+/// publishes.
 ///
-/// The genome is a published handle, not a lock over a genome: the writer is
-/// the tool loop, which folds every file a tool wrote into the same handle
-/// before that tool returns, so by the time this runs the graph already knows
-/// the turn's own writes. This call is the **fallback walk**, and it is kept
-/// because a turn can run an arbitrary command — a formatter, a `git checkout`
-/// — that changes files no tool named. It cannot silently serve a graph that
-/// is behind, because nothing else writes: with one writer, synchronous inside
-/// the call that caused it, the snapshot is current by construction. What that
-/// does *not* cover is a writer outside this process (phase 3's watcher) and a
-/// concurrent one (phase 4); today the only other writer is another process,
-/// whose edits this walk picks up at the start of the next turn.
+/// The turn no longer walks the tree itself. It hands the indexer the files
+/// this session touched as the parse priority and asks for a resync of the
+/// paths no tool named, then waits at most `quiesce` for that window to land.
+/// When it lands, the map is what the old synchronous walk produced. When it
+/// does not, the map is the **previous consistent graph** with its header
+/// naming how much is outstanding — `<genome pending="3">` — so the model
+/// reading it knows the map may be one batch behind and can re-read a file
+/// instead of trusting it. A silent stale map is the one outcome the contract
+/// forbids, and blocking until the walk finished is the latency this phase
+/// exists to remove; the header is the honest middle.
 ///
-/// The files this session touched are parsed first, most recent first, so the
-/// one the agent is working in is handed out at the front of the batch.
+/// `quiesce` is a parameter so a test can drive the not-caught-up branch
+/// exactly rather than by racing a real walk; the turn passes
+/// [`GENOME_QUIESCE`].
 async fn genome_map(
     root: Option<PathBuf>,
     limit: usize,
-    genome: &SharedGenome,
+    genome: Option<&GenomeHandle>,
     touched: &TouchedSink,
+    quiesce: std::time::Duration,
 ) -> Option<SmolStr> {
-    let root = root?;
-    let genome = genome.clone();
+    // The root is the guard here, not a path this function reads — the
+    // handle was built from it. A turn whose config has none renders no map:
+    // duck mode clears the root on its own clone and must stay repo-blind. A
+    // root whose index could not be built has no handle either, which is the
+    // same answer for the same reason.
+    let genome = genome.filter(|_| root.is_some())?.clone();
     let touched = Arc::clone(touched);
     run_off_thread(move || {
         let touched: Vec<String> = touched.blocking_lock().snapshot();
         let mut urgent = touched.clone();
         urgent.reverse();
-        genome.refresh_urgent(&root, &urgent).ok()?;
+        genome.request(IndexRequest::Priority(urgent));
+        genome.request(IndexRequest::Resync);
+        // Wait, but do not decide on the wait's own answer. A wait that timed
+        // out a microsecond before the batch landed would report a backlog
+        // that is gone, and a batch that *failed* to apply reports nothing at
+        // all through it. The count is the contract; the wait is the courtesy
+        // that keeps the common case — and so the header — at zero.
+        genome.quiesce(quiesce);
+        // Read the backlog before the graph: a count that is still moving
+        // means the batch had not landed when the snapshot was taken, and
+        // over-reporting staleness costs a re-read, never a wrong answer.
+        let pending = genome.pending();
+        let (snapshot, _generation) = genome.snapshot();
         Some(SmolStr::from(
-            genome.read(|index| index.project_with(limit, &touched)),
+            snapshot.project_with_pending(limit, &touched, pending),
         ))
     })
     .await
@@ -246,6 +268,83 @@ mod tests {
     async fn a_successful_run_passes_the_map_through() {
         let map = run_off_thread(|| Some(SmolStr::new_inline("<genome>\n</genome>"))).await;
         assert_eq!(map.as_deref(), Some("<genome>\n</genome>"));
+    }
+
+    /// A turn whose index cannot catch up **names the backlog** instead of
+    /// rendering a graph it knows may be behind.
+    ///
+    /// The deadline is a parameter so this drives the branch exactly: the turn
+    /// passes [`GENOME_QUIESCE`] (40 ms), the test passes 1 ms and gives the
+    /// index a tree whose first walk is far slower than that, so the outcome
+    /// does not depend on racing a walk that happens to be quick. What is
+    /// under test is the outcome — the model must see that the map it is
+    /// reading is behind.
+    #[tokio::test]
+    async fn a_turn_that_cannot_wait_names_the_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The handle is spawned over an empty tree and the tree arrives after,
+        // so the first walk is the slow one and the spawn itself is not.
+        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        for index in 0..150 {
+            let mut body = String::new();
+            for line in 0..120 {
+                body.push_str(&format!("    let value_{line} = {line}_u64;\n"));
+            }
+            std::fs::write(
+                root.join(format!("src_{index}.rs")),
+                format!("pub fn f_{index}() {{\n{body}}}\n"),
+            )
+            .unwrap();
+        }
+        let touched = TouchedSink::default();
+
+        let behind = genome_map(
+            Some(root.to_path_buf()),
+            8,
+            Some(&genome),
+            &touched,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("a map");
+        assert!(
+            behind.contains("<genome pending=\""),
+            "a map that could not be brought current must say so: {behind}"
+        );
+
+        // Given time, the same call renders the graph the batch landed in.
+        let settled = genome_map(
+            Some(root.to_path_buf()),
+            8,
+            Some(&genome),
+            &touched,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("a map");
+        assert!(!settled.contains("pending="), "{settled}");
+        assert!(settled.contains("src_0.rs"), "{settled}");
+    }
+
+    /// No root, no map — the guard the duck mode relies on.
+    #[tokio::test]
+    async fn a_turn_without_a_root_renders_no_map() {
+        let touched = TouchedSink::default();
+        assert!(
+            genome_map(None, 8, None, &touched, GENOME_QUIESCE)
+                .await
+                .is_none()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
+        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        assert!(
+            genome_map(None, 8, Some(&genome), &touched, GENOME_QUIESCE)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -775,9 +874,12 @@ pub struct EngineRuntime {
     tools: ToolRegistry,
     approval_waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
-    /// Live index: written by the tool loop as it runs, and re-walked from
-    /// `config.genome_root` before each turn.
-    genome: SharedGenome,
+    /// The session's live index and the background worker behind it, when a
+    /// root is configured. Written by the tool loop as it runs — synchronously,
+    /// so a turn's own prompt is current by construction — and fed a resync per
+    /// turn through the worker, whose backlog the map names when it cannot
+    /// catch up inside [`GENOME_QUIESCE`].
+    genome: Option<GenomeHandle>,
     /// Files this session read or edited; boosts their rank in the projection.
     touched: TouchedSink,
     /// Per-file write claims shared by every agent in this runtime.
@@ -952,6 +1054,16 @@ impl EngineRuntime {
                 findings.clone(),
             )
         });
+        // The index is built once, here, and its worker started behind it: a
+        // root that cannot be read leaves the session without a map, which is
+        // the same degradation the per-turn refresh already had, and a cold
+        // start is a full walk either way — doing it now rather than inside
+        // the first turn is what lets the first turn's map be a snapshot
+        // instead of a walk.
+        let genome = config
+            .genome_root
+            .as_ref()
+            .and_then(|root| GenomeHandle::spawn(root, titi_genome::live::Options::default()).ok());
         let runtime = Self {
             mode: config.mode,
             config,
@@ -963,7 +1075,7 @@ impl EngineRuntime {
             tools,
             approval_waiters: ApprovalWaiters::default(),
             trajectory,
-            genome: SharedGenome::default(),
+            genome,
             touched,
             claims: claims.clone(),
             steering: Steering::default(),
@@ -1599,8 +1711,9 @@ impl EngineRuntime {
         genome_map(
             self.config.genome_root.clone(),
             self.config.genome_limit,
-            &self.genome,
+            self.genome.as_ref(),
             &self.touched,
+            GENOME_QUIESCE,
         )
         .await
     }
@@ -1975,7 +2088,7 @@ async fn run_turn(
     waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
     touched: TouchedSink,
-    genome: SharedGenome,
+    genome: Option<GenomeHandle>,
     claims: Claims,
     steering: Steering,
     // Session-wide token meter the turn adds its own spend to.
@@ -2012,8 +2125,9 @@ async fn run_turn(
     let genome_text = genome_map(
         config.genome_root.clone(),
         config.genome_limit,
-        &genome,
+        genome.as_ref(),
         &touched,
+        GENOME_QUIESCE,
     )
     .await;
     let contextual_prompt = prompt_with_context(
@@ -2190,9 +2304,15 @@ async fn run_turn(
                                 &trajectory,
                                 &touched,
                                 // No genome root means no index to feed: a
-                                // write has nowhere to go, and the handle is
-                                // still an empty one.
-                                config.genome_root.is_some().then_some(&genome),
+                                // write has nowhere to go. The handle's
+                                // publish point is handed over rather than
+                                // the handle, because the tool loop folds the
+                                // write in synchronously — the turn's own
+                                // prompt must see it.
+                                genome
+                                    .as_ref()
+                                    .filter(|_| config.genome_root.is_some())
+                                    .map(GenomeHandle::shared),
                                 &claims,
                                 &MAIN_AGENT,
                                 config.mask_ips,
