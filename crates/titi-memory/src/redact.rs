@@ -360,8 +360,16 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // PEM blocks and JWTs.
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
         r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
-        // An assignment whose value is long enough to be a token.
-        r#"(?i)\b(?:api[_-]?key|token|secret|password|passwd)\b\s*[:=]\s*['"]?[A-Za-z0-9_\-\./+]{12,}"#,
+        // An assignment whose value is long enough to be a token. The key
+        // name may be quoted (`"api_key": "…"`), and the credential word may
+        // be embedded in a longer identifier (`client_secret`,
+        // `AWS_SECRET_ACCESS_KEY`): `\b` never crosses `_`, so the keyword is
+        // matched inside it and the trailing identifier part is folded into
+        // the match. A short value (`let token_count = 1`) still cannot
+        // reach the 12-character floor.
+        r#"(?i)['"]?[A-Za-z0-9_\-]*(?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_\-]*['"]?\s*[:=]\s*['"]?[A-Za-z0-9_\-\./+]{12,}"#,
+        // An Authorization bearer header; the value is opaque by design.
+        r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=+/]{16,}",
     ]
     .into_iter()
     .map(|p| Regex::new(p).expect("secret pattern compiles"))
@@ -372,12 +380,12 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 ///
 /// In [`PATTERNS`] order, and deliberately looser than the pattern each one
 /// stands for: the prefilter may say "maybe" and pay for the regex, it may
-/// never say "no" to text a pattern would have matched. The last pattern is
-/// `(?i)`, so its markers are also listed in [`CASELESS_MARKERS`] — `TOKEN=…`
-/// is the same secret as `token=…`. They are kept in both lists because
-/// lowercase is the ordinary spelling and `str::contains` is much cheaper
-/// than folding case byte by byte.
-const MARKERS: [&str; 15] = [
+/// never say "no" to text a pattern would have matched. The last two patterns
+/// are `(?i)`, so their markers are also listed in [`CASELESS_MARKERS`] —
+/// `TOKEN=…` is the same secret as `token=…`. They are kept in both lists
+/// because lowercase is the ordinary spelling and `str::contains` is much
+/// cheaper than folding case byte by byte.
+const MARKERS: [&str; 16] = [
     // sk-… and sk-ant-…
     "sk-",
     // gh[pousr]_…
@@ -397,13 +405,15 @@ const MARKERS: [&str; 15] = [
     "-----BEGIN ",
     // A JWT header always starts as base64 of `{"`.
     "eyJ",
-    // Covers api_key, api-key and apikey.
+    // Covers api_key, api-key, apikey and Bearer (`bearer` contains no
+    // caseless marker itself, so it rides in MARKERS).
     "api",
+    "bearer",
     "token",
 ];
 
 /// The tail of [`MARKERS`] that is matched case-insensitively, because the
-/// pattern needing it is `(?i)`. Kept lowercase: [`contains_ignore_ascii_case`]
+/// patterns needing them are `(?i)`. Kept lowercase: [`contains_ignore_ascii_case`]
 /// lowercases only the text it compares against.
 const CASELESS_MARKERS: [&str; 4] = ["api", "token", "secret", "passw"];
 
@@ -645,6 +655,73 @@ mod tests {
     #[test]
     fn prose_about_tokens_passes() {
         let redacted = redact("the token check uses < not <=");
+        assert_eq!(redacted.removed, 0);
+    }
+
+    #[test]
+    fn a_quoted_json_key_is_masked() {
+        let redacted = redact(r#"{"api_key": "sk-test-0123456789abc", "model": "gpt-4"}"#);
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert!(
+            !redacted.text.contains("sk-test-0123456789abc"),
+            "{}",
+            redacted.text
+        );
+        assert!(redacted.text.contains(r#""model": "gpt-4""#), "{}", redacted.text);
+    }
+
+    #[test]
+    fn a_prefixed_identifier_is_masked() {
+        for text in [
+            "client_secret = s3cr3t-value-000000",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIfake",
+        ] {
+            let redacted = redact(text);
+            assert_eq!(redacted.removed, 1, "{text} -> {}", redacted.text);
+            assert_ne!(redacted.text, text, "{text} -> {}", redacted.text);
+        }
+    }
+
+    #[test]
+    fn a_quoted_password_value_is_masked() {
+        let redacted = redact(r#""password": "hunter2-hunter2""#);
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert!(!redacted.text.contains("hunter2-hunter2"), "{}", redacted.text);
+        assert!(redacted.text.contains(r#""password""#), "{}", redacted.text);
+    }
+
+    #[test]
+    fn a_bare_passwd_assign_is_masked() {
+        let redacted = redact("passwd=topsecretval123");
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert!(!redacted.text.contains("topsecretval123"), "{}", redacted.text);
+    }
+
+    #[test]
+    fn a_bearer_authorization_is_masked() {
+        let redacted = redact("Authorization: Bearer bXktb3BhcXVlLXRva2VuLXZhbHVl");
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert!(
+            !redacted.text.contains("bXktb3BhcXVlLXRva2VuLXZhbHVl"),
+            "{}",
+            redacted.text
+        );
+        assert!(redacted.text.contains("Authorization:"), "{}", redacted.text);
+    }
+
+    #[test]
+    fn ordinary_code_and_hashes_are_not_masked() {
+        for text in [
+            "let token_count = 1;",
+            "// password handling stays somewhere else",
+            "updated the toolchain to mind the 40-char hash",
+        ] {
+            let redacted = redact(text);
+            assert_eq!(redacted.removed, 0, "{text} -> {}", redacted.text);
+        }
+        let hash = "9a2b48c1f0fe71ad356bc7d9e2a41cb83f0a6d77";
+        let redacted = redact(&format!("rebased onto {hash}"));
+        assert!(redacted.text.contains(hash), "{}", redacted.text);
         assert_eq!(redacted.removed, 0);
     }
 }
