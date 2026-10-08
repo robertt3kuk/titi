@@ -11337,10 +11337,6 @@ mod tests {
         );
     }
 
-    /// When the model does have a price, the refusal states it: the user can
-    /// see that the price is known and that the missing piece is the engine's
-    /// tally, not a number this screen failed to look up.
-    #[test]
     /// Hitting the cap pauses: the next prompt is held instead of sent.
     #[test]
     fn a_reached_budget_pauses_the_screen() {
