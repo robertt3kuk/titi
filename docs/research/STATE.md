@@ -424,10 +424,15 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
 - [ ] `low` five direct dependencies are unused or over-declared —
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
-- [ ] `low` a module-wide `#![allow(clippy::expect_used)]` hides a
+- [x] `low` ~~a module-wide `#![allow(clippy::expect_used)]` hides a
   caller-supplied pattern — `crates/titi-genome/src/lang/mod.rs:17` (the file
-  the audit named, `src/parse.rs:3,553`, became `lang/` in `714824d`); scope it
-  to the items whose pattern is a compile-time literal.
+  the audit named, `src/parse.rs:3,553`, became `lang/` in `714824d`)~~ fixed
+  2026-10-09 in `1cf904a`: the four regex literals now call one
+  `support::literal_regex`, which is the single place a literal pattern is
+  compiled and the single **item-level** allow, with the why on the allow line
+  (a pattern written in this source has no input that can make it fail). The
+  invariant is held by a test that parses a file through each module holding a
+  pattern.
 - [x] `low` ~~the lenient JSONL reader launders mid-file corruption into
   missing entries — `crates/titi-core/src/session/store.rs:434-438`~~ fixed
   2026-10-08 in ffb447d (a corrupt middle line is surfaced, not dropped).
@@ -537,12 +542,13 @@ next, and the two worker notes it could not see yet.
   predates. The store also records the process working directory when its
   caller names no workspace, which is what makes the field live in production
   rather than a value only callers could fill.
-- [ ] `low` `bash.autoBackground.thresholdMs` is not a setting yet: the
-  threshold is `titi_tools::BACKGROUND_AFTER` (60 s) or
-  `TITI_BASH_BACKGROUND_MS`, with `EngineConfig::background_after` as the
-  programmatic override — and nothing in `crates/titi-cli/src/engine.rs` sets
-  that field, so a user cannot move it from `config.yml`. Wire the key the way
-  the other `titi-config` settings are read.
+- [x] `low` ~~`bash.autoBackground.thresholdMs` is not a setting yet~~ landed
+  2026-10-09 in `16753dd`: the key is declared in `titi-config` beside the
+  others and read in `titi-cli::engine`, with precedence **environment over
+  setting over the 60 000 ms default** — the engine passes it through
+  `titi_tools::background_after_with`, which keeps the environment check first,
+  so a value already exported for a machine or a test is never overridden by a
+  config layer.
 - [ ] `low` no `/tree` view of a tree that is already stored: `parent_id`,
   `fork` and `walk` are in `titi-core` and `/fork` exists, but the picker is
   flat. A `/tree` over `store.load` is file-only work, no schema change.
@@ -556,11 +562,15 @@ next, and the two worker notes it could not see yet.
   `every_key_the_screen_answers_is_named_in_the_hotkeys_listing` drives every key
   `map_key` can produce through every state `on_key` branches on, so a binding
   missing from the listing fails the suite rather than going unadvertised.
-- [ ] `low` `chat.rs` is this project's serializer: 17.2k lines, one writer,
+- [x] `low` ~~`chat.rs` is this project's serializer: 17.2k lines, one writer,
   and every UI item above ends in it — which is why they cannot be
-  parallelized, and the review calls the split a finding of its own. A plan for
-  it (sections, views and pickers as modules behind a thin `Chat`) is worth more
-  than any single item in this list.
+  parallelized~~ split 2026-10-09, the review's structural finding taken first:
+  `1d4f354` moved the transcript renderer out (1570 lines), `a5779d1` the
+  pickers (2103), `9b49145` the key path (583) and `24e51ef` the composer (237),
+  each into its own module with `lib.rs` declaring it — about 4,900 lines out.
+  `chat.rs` is 14,991 lines after that, still the largest file in the tree, so
+  the split is a start rather than a finished story: what remains there is the
+  session, the loop and the binding core, and splitting those is its own item.
 - [x] `low` ~~the README's first paragraph links the placeholder
   `https://reference-product.com` (`README.md:3` and the verify block), which
   404s for the first stranger who reads it, and there is no `CHANGELOG.md` at
@@ -576,15 +586,16 @@ next, and the two worker notes it could not see yet.
   writes it and the turn-start walk re-reads it), so the snapshot type phase 0
   built has a production reader. `runtime.rs:117`'s
   `type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>` is gone.
-- [ ] `medium` Taimyr phases 3–5, per `docs/research/genome-incremental.md` §6
-  (phases 1 and 2 landed 2026-10-09: `eac8a9c`, `3a7aafa`, `b4b1401`). **Phase
-  3 — the watcher and its debounce — is blocked on the owner's word about
-  `notify`**: the decision is written as phase 3's in §4, and adding the
-  dependency goes through the `dependency-update` procedure; its health is
-  **unverified offline**, which is why nothing was added. Phases 4 (background
-  worker, `pending`/`quiesce`) and 5 (LSP `didOpen`/`didChange`) need no
-  dependency and can be taken first — 4 first also gives the watcher a worker
-  that already coalesces.
+- [ ] `medium` Taimyr **phase 3 — the watcher and its debounce — is the only
+  phase left**, and it stays blocked on the owner's word about `notify` (per
+  `docs/research/genome-incremental.md` §4 and §6): adding the dependency goes
+  through the `dependency-update` procedure and its health is **unverified
+  offline**, which is why nothing was added. Everything else landed on
+  2026-10-09 — phase 1 (`eac8a9c`, `3a7aafa`, `b4b1401`), phase 2 (`a4716a6`,
+  `aede977`), phase 4 (`5d8d9a7` the background indexer, `dcd962e` the
+  `sent`/`applied` pending, `4f455ec` the retried window, `ef304a9` the bounded
+  turn wait) and phase 5 (`0a5a8ea`, the LSP's buffer overlay) — and phase 3 now
+  has a worker to feed rather than a design to invent.
 - [ ] `low` a `micro_usd` on `SetBudget` plus a cost accumulated from
   `TurnUsage` in `Runtime::over_budget`: the money this wave shipped states what
   a turn and a session cost, but the *cap* is still token-only
@@ -592,11 +603,14 @@ next, and the two worker notes it could not see yet.
   `SetBudget` carries a token count). The review's "so `/budget $2` becomes
   possible" is **not** delivered — the mechanism is. `/budget`'s refusal now
   says exactly that, and names the model's own rate when it has one.
-- [ ] `low` subagents have no genome handle: `tool_agent.rs:199-202` passes
-  `None` where the tool loop passes its `SharedGenome` (documented there: a
-  subagent runs under the CLI's runner, which is built before the session's
-  index exists), so a subagent's writes reach the index at the session's next
-  turn walk instead of inline.
+- [x] `low` ~~subagents have no genome handle: `tool_agent.rs:199-202` passes
+  `None` where the tool loop passes its `SharedGenome`~~ landed 2026-10-09 in
+  `6cdb2af`: `ToolAgentRunner` carries the session's handle (`with_genome`) and
+  hands its publish point to `execute_tools`, exactly as the runtime does for
+  the main loop, so a file a subagent writes is folded in as that call returns
+  instead of at the next turn's walk. The runtime builds the index before the
+  runner — the same cold start, just earlier. `None` stays the honest value for
+  a caller with no root: the write still happens, only the fold is skipped.
 - [ ] `low` a deleted import target does not re-parse its importers: removing a
   file drops its symbols and edges, and an importer that named it keeps the
   import it had. The next turn's walk fixes it, not the change itself.
@@ -907,3 +921,78 @@ harness ran a binary built from a checkout that no longer exists, whose baked
 freed 6.2 GiB of artifacts from the `/tmp/titi-baseline` and `/tmp/titi-head`
 checkouts that share this target directory). A `NotFound` on a file that is
 present means the *binary* is not yours.
+
+The background-indexer and split wave (2026-10-09) finished Taimyr's phases 4
+and 5 and took the review's structural finding first. The index is no longer
+built inside the turn: `GenomeHandle` is one long-lived thread fed by an mpsc
+channel that coalesces a burst of saves into a single parse, and a `Quiesce`
+whose reply is the generation that was published (`5d8d9a7`); the turn sends the
+files it touched as the parse priority plus a resync for the paths no tool
+named, waits at most `GENOME_QUIESCE` = 40 ms and renders from a snapshot
+(`ef304a9`, `titi-engine/src/runtime.rs:138`), so the map is current by
+construction when the worker has caught up and says so when it has not. `pending`
+is `sent > applied` — two monotonic counters, the handle bumping `sent` before
+it sends — rather than the count of whatever window the worker happens to hold,
+which is what made a request already in the channel invisible and let a turn
+render a map missing the changes it had just handed over (`dcd962e`). A window
+that fails keeps its queue (`paths`, `urgent` and the walk flag survive; only
+the window flag clears) and is applied with whatever arrived since, so a failure
+is retried instead of forgotten by the next empty window (`4f455ec`). A subagent
+carries the session's handle now (`6cdb2af`), so its writes are folded in as the
+call returns like the main loop's, and `None` stays the honest value for a
+caller with no root. Phase 5 makes the LSP follow the editor: the server
+advertises full sync, folds a buffer's text in as that file's content
+(`Genome::overlay`, a map separate from `files` so the record and the disk read
+agree), and holds the invariant that one query is answered from one text — the
+record is parsed from the overlay and the identifier a position points at is read
+through it too, so a cursor on an edited line cannot locate a name in text the
+user can no longer see; `didClose` drops the overlay and re-stats the path
+(`0a5a8ea`). **Phase 3 — the watcher and its debounce — is the only phase left**,
+still blocked on the owner's word about `notify`, and it now has a worker to feed
+rather than a design to invent.
+
+The honest limits, as the workers wrote them: on a big tree the per-turn resync
+can outlast the 40 ms wait — the ordinary case rather than a rare one — which is
+exactly what `pending` names, and the number shown is the window's item count
+with a floor of one because outstanding work is worth naming even when the window
+has no paths yet; a **failed window is invisible to logs and events** (the
+backlog survives and is retried, and only `pending` says so); and a **path-only
+window failure is unexercised** by a test, the case the old comment assumed away
+by claiming the next walk would cover the same tree.
+
+`chat.rs` — 17,154 lines at the review's last look, one writer, the reason every
+UI item in this file serialized — was split: the transcript renderer into
+`transcript.rs` (`1d4f354`), the pickers into `pickers.rs` (`a5779d1`), the key
+path into `keys.rs` (`9b49145`) and the composer into `composer.rs` (`24e51ef`),
+each with `lib.rs` declaring it. About 4,900 lines left the file; what remains is
+14,991 lines of session, loop and binding core, still the largest file in the
+tree, so the next split is its own item rather than a finished story. The slash
+completion got its two fixes (`132760f` runs the highlighted command on Enter
+instead of inserting its name; `d1bc5b8` lets Esc close the command list and keep
+the draft). `/hotkeys` landed (`7a7e7bc`, recorded above). The bash background
+threshold became a setting (`16753dd`): `bash.autoBackground.thresholdMs`, with
+precedence **environment over setting over the 60 000 ms default**, passed
+through `titi_tools::background_after_with` so a value already exported is never
+overridden by a config layer. The turn footer's three parts can be switched off
+(`ada4032`: `display.turnFooter.time`, `.tokens`, `.cacheMiss`, unset means on,
+read with the same `settings::switch_off` as the notify and progress keys). And
+the two allowance cleanups: `1cf904a` narrowed `lang/mod.rs`'s module-wide
+`#![allow(clippy::expect_used)]` to one `support::literal_regex` with an
+item-level allow and the why on it, and `3f06121` gave `redact.rs`'s four
+`Regex::new` sites the same treatment — each with the reason a source-literal
+pattern has no input that can make it fail. The skill that came out of the last
+round's artifact hunt is recorded where an agent will read it: `46a539a` adds to
+`ci-and-tests` that a target directory must never be shared between checkouts.
+
+The suite went 1879 → 1907 passed (77 targets, 0 failed): genome
+`tests/check.rs` +3 (the LSP tests), genome `tests/index.rs` +1, `titi-cli` unit
++6, `titi-config` unit +1 (the threshold key), `titi-engine` unit +3,
+`titi-genome` unit +11 (the live worker and the overlay), `titi-tools` unit +1
+and `titi-tui` unit +2 (the footer switches). The `unwrap`/`expect` headers went
+13 → **9** of 98 `warning:` lines — `titi-genome/src/shared.rs` 5 (the deliberate
+poisoned-lock panics), `titi-genome/src/refs.rs` 3 (the kept regex literals) and
+`titi-tui/src/theme/mod.rs` 1 — because `3f06121` moved the four redaction
+expects and `1cf904a` the language table's behind item-level allowances that say
+why. All three gates ran in a **clean detached worktree** of this commit with its
+own target directory (`git worktree add --detach`), so nothing in the dirty tree
+was staged, formatted, or built against the shared `target/`.
