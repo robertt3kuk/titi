@@ -281,13 +281,34 @@ impl Genome {
     /// inputs moved: a path appeared or vanished, or a re-parse changed some
     /// file's `(exports, imports, used_symbols)`. [`RefreshStats`] reports
     /// which happened.
+    ///
+    /// This is [`Self::refresh_urgent`] with nothing urgent: the walk's own
+    /// order is the parse order.
     pub fn refresh(&mut self, root: impl AsRef<Path>) -> std::io::Result<RefreshStats> {
+        self.refresh_urgent(root, &[])
+    }
+
+    /// [`Self::refresh`], parsing `urgent` first.
+    ///
+    /// `urgent` names the files the caller is working in, in the order it
+    /// wants them parsed — the engine's touched set, most recent first. The
+    /// walk's order is otherwise kept, so the files it did not name come
+    /// after. Parsing is spread over the cores in list order, so this hands
+    /// the urgent files to the first threads instead of to whichever one
+    /// happens to hold them. That is the whole of what order buys here: the
+    /// threads run concurrently, and *finishing* first is theirs to decide,
+    /// not the list's.
+    pub fn refresh_urgent(
+        &mut self,
+        root: impl AsRef<Path>,
+        urgent: &[String],
+    ) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
         self.root = root.to_path_buf();
         let listed = scan::list_files(root)?;
         let known: HashSet<String> = listed.iter().map(|file| file.path.clone()).collect();
 
-        let absorbed = self.absorb(&listed, &known);
+        let absorbed = self.absorb(&listed, &known, urgent);
         let gone: Vec<String> = self
             .files
             .keys()
@@ -324,6 +345,10 @@ impl Genome {
     /// file this index carries — deleted, or never a source file — is dropped
     /// from the index; every other path is left alone, whether or not it
     /// changed, because the caller did not name it.
+    ///
+    /// The order of `paths` is the parse priority: the caller puts the files
+    /// it is working in first. See [`Self::refresh_urgent`] for what that
+    /// buys and what it does not.
     pub fn apply_changes(&mut self, paths: &[String]) -> std::io::Result<RefreshStats> {
         let mut listed = Vec::new();
         let mut removed = 0;
@@ -348,7 +373,7 @@ impl Genome {
             .chain(listed.iter().map(|file| file.path.clone()))
             .collect();
 
-        let absorbed = self.absorb(&listed, &known);
+        let absorbed = self.absorb(&listed, &known, paths);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
@@ -373,6 +398,7 @@ impl Genome {
         &mut self,
         listed: &[scan::ListedFile],
         known: &HashSet<String>,
+        urgent: &[String],
     ) -> Absorption {
         // Every path this update adds. It is the only way a specifier that
         // named nothing can come to name something — the candidates a specifier
@@ -391,6 +417,7 @@ impl Genome {
                     .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
             })
             .collect();
+        let stale = prioritize(stale, urgent);
         let records = parse_batch(&stale, known, &self.files);
 
         // A parse can only move the graph by changing the tuple the graph is
@@ -701,6 +728,35 @@ impl Genome {
     }
 }
 
+/// The files to parse, the caller's urgent ones first.
+///
+/// `urgent` is a priority order, not a set: the urgent files lead the batch in
+/// the order the caller gave, and everything else keeps the order the walk or
+/// the caller's path list had. The list is what [`parse_batch`] chunks, and
+/// the chunks go to the threads in order, so urgent files are handed out at
+/// the front of the batch. That is the whole of it: the threads run
+/// concurrently and finish in whatever order the scheduler and the parser
+/// decide, so this orders the *work handed out*, not the work completed. With
+/// one file, or one core, it is the parse order.
+fn prioritize<'a>(
+    stale: Vec<&'a scan::ListedFile>,
+    urgent: &[String],
+) -> Vec<&'a scan::ListedFile> {
+    if urgent.is_empty() {
+        return stale;
+    }
+    let rank: HashMap<&str, usize> = urgent
+        .iter()
+        .enumerate()
+        .map(|(position, path)| (path.as_str(), position))
+        .collect();
+    let mut stale = stale;
+    // Every urgent file sorts by where the caller put it; the rest share one
+    // key and a stable sort leaves them in the order they came in.
+    stale.sort_by_key(|file| rank.get(file.path.as_str()).copied().unwrap_or(usize::MAX));
+    stale
+}
+
 /// Reads and parses the stale files, spreading them over the available cores.
 ///
 /// Parsing is the only expensive step of a refresh and every file is
@@ -817,4 +873,58 @@ fn resolve(
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use super::{prioritize, scan};
+
+    fn listed(path: &str) -> scan::ListedFile {
+        scan::ListedFile {
+            path: path.to_owned(),
+            abs: PathBuf::from(path),
+            size: 1,
+            mtime: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn order(files: Vec<&scan::ListedFile>) -> Vec<String> {
+        files.into_iter().map(|file| file.path.clone()).collect()
+    }
+
+    /// The urgent files lead the batch in the caller's order, and the rest
+    /// keep the order they came in: an engine that touched `d` last gets `d`
+    /// handed to a thread before `b`, and both before the untouched tail.
+    #[test]
+    fn priority_leads_with_the_urgent_files_in_the_callers_order() {
+        let stale = [
+            listed("a.rs"),
+            listed("b.rs"),
+            listed("c.rs"),
+            listed("d.rs"),
+        ];
+        let urgent = vec!["d.rs".to_owned(), "b.rs".to_owned()];
+        let ordered = prioritize(stale.iter().collect(), &urgent);
+        assert_eq!(order(ordered), vec!["d.rs", "b.rs", "a.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn without_an_urgent_file_the_list_is_left_alone() {
+        let stale = [listed("a.rs"), listed("b.rs")];
+        let ordered = prioritize(stale.iter().collect(), &[]);
+        assert_eq!(order(ordered), vec!["a.rs", "b.rs"]);
+    }
+
+    /// A name the caller names but the batch does not contain — a path that
+    /// vanished between the touch and the walk — does not disturb the rest.
+    #[test]
+    fn an_urgent_path_outside_the_batch_is_harmless() {
+        let stale = [listed("a.rs"), listed("b.rs")];
+        let urgent = vec!["gone.rs".to_owned(), "b.rs".to_owned()];
+        let ordered = prioritize(stale.iter().collect(), &urgent);
+        assert_eq!(order(ordered), vec!["b.rs", "a.rs"]);
+    }
 }
