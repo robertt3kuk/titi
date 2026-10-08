@@ -189,7 +189,12 @@ impl SessionIndex {
         Ok(())
     }
 
-    /// Full-text search over indexed entries, optionally isolated to one bot.
+    /// Full-text search over indexed entries, optionally isolated to one bot
+    /// and to one workspace.
+    ///
+    /// `None` for either leaves that dimension unfiltered — including
+    /// sessions that have no bot, and sessions whose workspace was never
+    /// recorded, so an old session is searchable rather than invisible.
     ///
     /// The raw query is wrapped as an FTS5 phrase, so user input can never
     /// alter the query grammar.
@@ -197,6 +202,7 @@ impl SessionIndex {
         &self,
         query: &str,
         bot_id: Option<&str>,
+        workspace: Option<&str>,
     ) -> Result<Vec<SearchHit>, SessionError> {
         let phrase = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = self
@@ -204,12 +210,14 @@ impl SessionIndex {
             .prepare(
                 "SELECT entries_fts.entry_id, entries_fts.session_id, entries_fts.text
                  FROM entries_fts JOIN sessions ON sessions.id = entries_fts.session_id
-                 WHERE entries_fts MATCH ?1 AND (?2 IS NULL OR sessions.bot_id = ?2)
+                 WHERE entries_fts MATCH ?1
+                   AND (?2 IS NULL OR sessions.bot_id = ?2)
+                   AND (?3 IS NULL OR sessions.cwd = ?3)
                  ORDER BY rank",
             )
             .map_err(SessionError::Db)?;
         let hits = stmt
-            .query_map(params![phrase, bot_id], |row| {
+            .query_map(params![phrase, bot_id, workspace], |row| {
                 Ok(SearchHit {
                     entry_id: row.get(0)?,
                     session_id: row.get(1)?,
@@ -254,6 +262,32 @@ impl SessionIndex {
             )
             .optional()
             .map_err(SessionError::Db)
+    }
+
+    /// Session ids, newest first, optionally only those started in
+    /// `workspace`.
+    ///
+    /// `Some(root)` keeps the sessions whose recorded workspace is exactly
+    /// that root. A session that never recorded one is *not* one of them —
+    /// there is nothing to match — so it is absent from the scoped list and
+    /// present in the unfiltered one, which is the fallback its caller takes
+    /// when the scoped list comes back empty. That is what keeps an old
+    /// session reachable rather than hidden behind a filter it predates.
+    pub fn sessions_in(&self, workspace: Option<&str>) -> Result<Vec<String>, SessionError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM sessions
+                 WHERE ?1 IS NULL OR cwd = ?1
+                 ORDER BY created_at DESC, rowid DESC",
+            )
+            .map_err(SessionError::Db)?;
+        let ids = stmt
+            .query_map(params![workspace], |row| row.get(0))
+            .map_err(SessionError::Db)?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(SessionError::Db)?;
+        Ok(ids)
     }
 
     /// The session's title, if it has one.
@@ -461,7 +495,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
 
         let hits = index
-            .search("kafka", None)
+            .search("kafka", None, None)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry_id, e.id);
@@ -469,13 +503,13 @@ mod tests {
         // Phrase matches only the exact token sequence, not arbitrary text.
         assert!(
             index
-                .search("kafka deploy", None)
+                .search("kafka deploy", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .is_empty()
         );
         assert!(
             index
-                .search("deploy kafka", None)
+                .search("deploy kafka", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .len()
                 == 1
@@ -495,7 +529,7 @@ mod tests {
         // Raw FTS5 grammar in user input must not error or escape the phrase.
         assert!(
             index
-                .search("safe\" OR (1=1) AND \"", None)
+                .search("safe\" OR (1=1) AND \"", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .is_empty()
         );
@@ -653,5 +687,74 @@ mod tests {
             Err(other) => panic!("expected a newer-schema refusal, got {other}"),
             Ok(_) => panic!("a file from a newer release was opened instead of refused"),
         }
+    }
+
+    /// The scoped listing is exactly the sessions of one workspace, while the
+    /// unscoped one still holds every session — the old one included, which
+    /// is what keeps it reachable.
+    #[test]
+    fn listing_scopes_to_a_workspace_without_hiding_old_sessions() {
+        let (_dir, index) = tmp_index();
+        index
+            .insert_session("a", 100, &meta_in(None, "/work/a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        index
+            .insert_session("b", 200, &meta_in(None, "/work/b"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // A session from before workspaces were recorded.
+        index
+            .insert_session("legacy", 300, &meta(None))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert_eq!(
+            index
+                .sessions_in(Some("/work/a"))
+                .unwrap_or_else(|e| panic!("{e}")),
+            vec!["a".to_owned()]
+        );
+        assert_eq!(
+            index
+                .sessions_in(Some("/work/c"))
+                .unwrap_or_else(|e| panic!("{e}")),
+            Vec::<String>::new()
+        );
+        // Newest first, and the session with no workspace is among them.
+        assert_eq!(
+            index.sessions_in(None).unwrap_or_else(|e| panic!("{e}")),
+            vec!["legacy".to_owned(), "b".to_owned(), "a".to_owned()]
+        );
+    }
+
+    /// Search takes the same filter: one workspace is one project's
+    /// transcripts, and leaving it off searches everything there is.
+    #[test]
+    fn search_scopes_to_a_workspace_without_hiding_old_sessions() {
+        let (_dir, index) = tmp_index();
+        let here = Entry::new(None, super::super::Role::User, "shared kafka note");
+        let there = Entry::new(None, super::super::Role::User, "shared kafka note");
+        let legacy = Entry::new(None, super::super::Role::User, "shared kafka note");
+        for (id, ts, meta, entry) in [
+            ("here", 100, meta_in(None, "/work/a"), &here),
+            ("there", 200, meta_in(None, "/work/b"), &there),
+            ("legacy", 300, meta(None), &legacy),
+        ] {
+            index
+                .insert_session(id, ts, &meta)
+                .unwrap_or_else(|e| panic!("{e}"));
+            index
+                .index_entry(id, entry)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        let scoped = index
+            .search("kafka", None, Some("/work/a"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, "here");
+
+        let all = index
+            .search("kafka", None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(all.len(), 3, "every session is still searchable");
     }
 }

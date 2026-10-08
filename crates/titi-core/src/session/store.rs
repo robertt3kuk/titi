@@ -308,13 +308,24 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Full-text search over indexed entries, optionally scoped to one bot.
+    /// Session ids, newest first, optionally only those started in
+    /// `workspace`; see [`SessionIndex::sessions_in`] for what the filter
+    /// keeps and what it deliberately leaves to the unfiltered listing.
+    pub fn sessions_in(&self, workspace: Option<&str>) -> Result<Vec<String>, SessionError> {
+        self.index.sessions_in(workspace)
+    }
+
+    /// Full-text search over indexed entries, optionally scoped to one bot
+    /// and to one workspace. `None` leaves that dimension unfiltered, which
+    /// is the only way an entry of a session with no recorded workspace can
+    /// be found.
     pub fn search(
         &self,
         query: &str,
         bot_id: Option<&str>,
+        workspace: Option<&str>,
     ) -> Result<Vec<SearchHit>, SessionError> {
-        self.index.search(query, bot_id)
+        self.index.search(query, bot_id, workspace)
     }
 
     /// Catalog metadata recorded for a session.
@@ -709,7 +720,9 @@ mod tests {
         let e = s
             .append(&sid, Role::User, "deploy kafka cluster")
             .unwrap_or_else(|e| panic!("{e}"));
-        let hits = s.search("kafka", None).unwrap_or_else(|e| panic!("{e}"));
+        let hits = s
+            .search("kafka", None, None)
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry_id, e.id);
         assert_eq!(hits[0].session_id, sid);
@@ -728,20 +741,20 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
 
         let for_a = s
-            .search("secret", Some("bot-a"))
+            .search("secret", Some("bot-a"), None)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].entry_id, ea.id);
         assert_ne!(for_a[0].session_id, sb);
 
         let for_b = s
-            .search("secret", Some("bot-b"))
+            .search("secret", Some("bot-b"), None)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(for_b.len(), 1);
         assert_eq!(for_b[0].entry_id, eb.id);
 
         assert_eq!(
-            s.search("secret", None)
+            s.search("secret", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .len(),
             2
@@ -1094,7 +1107,7 @@ mod tests {
         s.append(&sid, Role::Assistant, "retracted fact")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            s.search("retracted", None)
+            s.search("retracted", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .len(),
             1
@@ -1103,13 +1116,13 @@ mod tests {
         s.rewind(&sid, &checkpoint)
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(
-            s.search("retracted", None)
+            s.search("retracted", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .is_empty(),
             "a rewound entry must not be searchable"
         );
         assert_eq!(
-            s.search("durable", None)
+            s.search("durable", None, None)
                 .unwrap_or_else(|e| panic!("{e}"))
                 .len(),
             1
@@ -1429,5 +1442,49 @@ mod tests {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}")),
             jsonl
         );
+    }
+
+    /// The store's listing takes the workspace filter through, and the
+    /// unfiltered one still holds every session — including the two written
+    /// before workspaces were recorded.
+    #[test]
+    fn the_listing_scopes_to_a_workspace_and_keeps_old_sessions() {
+        let (_dir, s) = store();
+        let here = s
+            .create(SessionMeta {
+                cwd: Some("/work/here".into()),
+                ..meta("a")
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let there = s
+            .create(SessionMeta {
+                cwd: Some("/work/there".into()),
+                ..meta("a")
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Rows the way the release before this field wrote them.
+        for (id, ts) in [("legacy-1", 1), ("legacy-2", 2)] {
+            s.index
+                .insert_session(id, ts, &SessionMeta::default())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        assert_eq!(
+            s.sessions_in(Some("/work/here"))
+                .unwrap_or_else(|e| panic!("{e}")),
+            vec![here.clone()]
+        );
+        assert_eq!(
+            s.sessions_in(Some("/work/nowhere"))
+                .unwrap_or_else(|e| panic!("{e}")),
+            Vec::<String>::new()
+        );
+        let all = s.sessions_in(None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(all.len(), 4);
+        for id in [&here, &there] {
+            assert!(all.contains(id));
+        }
+        assert!(all.contains(&"legacy-1".to_owned()));
+        assert!(all.contains(&"legacy-2".to_owned()));
     }
 }
