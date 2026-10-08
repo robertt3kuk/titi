@@ -843,8 +843,14 @@ impl Chat {
             return;
         }
         let start = byte_offset_back(&self.input, self.caret(), trailing + word);
-        self.input.replace_range(start..self.caret(), "");
-        self.caret = start;
+        // A marker holds spaces, so a word taken out of the draft can be a
+        // piece of one: the cut is widened to the whole marker (and to nothing
+        // else — the spaces before it are not part of the word the caret is
+        // in).
+        let (start, end) = self.whole_markers(start, self.caret());
+        self.input.replace_range(start..end, "");
+        self.set_caret(start);
+        self.forget_cut_markers();
     }
 
     /// Puts the caret at `at`, clamped to the draft by [`Chat::caret`].
@@ -904,6 +910,44 @@ impl Chat {
         at
     }
 
+    /// Widens a range that is about to be cut so it never cuts a paste marker
+    /// in half: a marker stands for a body, and half a marker is text that
+    /// stands for nothing — [`Chat::expand_pastes`] would no longer find it,
+    /// and the half would be what the model is sent.
+    ///
+    /// Every path that takes text out of the draft goes through this — the
+    /// character, the word, the whole prefix — so the rule is stated once. A
+    /// range that merely *touches* a marker (ends where it begins, begins
+    /// where it ends) is left alone: it cuts nothing of it.
+    fn whole_markers(&self, start: usize, end: usize) -> (usize, usize) {
+        let mut start = start;
+        let mut end = end;
+        for (at, to) in self.marker_spans() {
+            if start < to && at < end {
+                start = start.min(at);
+                end = end.max(to);
+            }
+        }
+        (start, end)
+    }
+
+    /// Forgets the registered bodies whose markers the draft no longer holds.
+    ///
+    /// A marker that was cut away stands for nothing, so its body goes with
+    /// it: a paste that is gone from the screen must not stay alive in the
+    /// registry of a draft that can no longer expand it.
+    fn forget_cut_markers(&mut self) {
+        let gone: Vec<String> = self
+            .pastes
+            .keys()
+            .filter(|marker| !self.input.contains(marker.as_str()))
+            .cloned()
+            .collect();
+        for marker in gone {
+            self.pastes.remove(&marker);
+        }
+    }
+
     /// Moves the caret one character, skipping a paste marker whole: entering
     /// one from either side lands on its far end.
     pub(crate) fn move_caret(&mut self, delta: isize) {
@@ -956,47 +1000,40 @@ impl Chat {
     /// Removes the character before the caret — or the whole paste marker the
     /// caret sits after, because a marker is one unit.
     pub(crate) fn backspace(&mut self) {
-        if let Some((start, end)) = self
-            .marker_spans()
-            .into_iter()
-            .find(|(_, end)| *end == self.caret())
-        {
-            self.input.replace_range(start..end, "");
-            self.caret = start;
-            return;
-        }
         if let Some(at) = self.input[..self.caret()]
             .char_indices()
             .next_back()
             .map(|(at, _)| at)
         {
-            self.input.replace_range(at..self.caret(), "");
-            self.caret = at;
+            // The character behind the caret — or the whole marker it is part
+            // of, when that character is inside one.
+            let (start, end) = self.whole_markers(at, self.caret());
+            self.input.replace_range(start..end, "");
+            self.set_caret(start);
+            self.forget_cut_markers();
         }
     }
 
     /// Removes the character after the caret — or the whole marker the caret
     /// sits before.
     pub(crate) fn delete_forward(&mut self) {
-        if let Some((start, end)) = self
-            .marker_spans()
-            .into_iter()
-            .find(|(start, _)| *start == self.caret())
-        {
-            self.input.replace_range(start..end, "");
-            return;
-        }
         if let Some(ch) = self.input[self.caret()..].chars().next() {
-            self.input
-                .replace_range(self.caret()..self.caret() + ch.len_utf8(), "");
+            // The character ahead of the caret — or the whole marker it is part
+            // of, when that character is inside one.
+            let (start, end) = self.whole_markers(self.caret(), self.caret() + ch.len_utf8());
+            self.input.replace_range(start..end, "");
+            self.set_caret(start);
+            self.forget_cut_markers();
         }
     }
 
     /// Removes everything before the caret: ctrl+u, `deleteToLineStart` in the
     /// crate's own keybinding table.
     pub(crate) fn delete_to_start(&mut self) {
-        self.input.replace_range(..self.caret(), "");
-        self.caret = 0;
+        let (start, end) = self.whole_markers(0, self.caret());
+        self.input.replace_range(start..end, "");
+        self.set_caret(start);
+        self.forget_cut_markers();
     }
 
     // ---- Prompt history ---------------------------------------------------
@@ -15328,6 +15365,87 @@ mod tests {
             frame.contains("▍xxx"),
             "the caret is in the middle: {frame}"
         );
+    }
+
+    /// A word delete takes a paste marker whole: a marker holds spaces, so a
+    /// word taken out of the draft can be a piece of one — and half a marker
+    /// stands for nothing.
+    #[test]
+    fn a_word_delete_keeps_a_paste_marker_whole() {
+        let mut chat = chat();
+        type_text(&mut chat, "see ");
+        chat.paste(&stack_trace());
+        assert_eq!(chat.input, "see [Paste #1 · 8 lines]");
+        assert_eq!(chat.pastes.len(), 1);
+
+        // The caret is after the marker, so the word it is in is the marker's
+        // own `lines]`: ctrl+w takes the marker whole and leaves the spaces
+        // before it, which are not part of that word.
+        chat.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(chat.input, "see ");
+        assert!(chat.pastes.is_empty(), "the body went with its marker");
+        assert!(!chat.input.contains("[Paste"), "no half marker is left");
+
+        // A marker in the middle of a word run goes whole too: the word is
+        // `lines]bbb`, and the cut widens to the marker it runs through.
+        let mut glued = chat_with_theme(test_theme());
+        type_text(&mut glued, "aaa");
+        glued.paste(&stack_trace());
+        type_text(&mut glued, "bbb");
+        assert_eq!(glued.input, "aaa[Paste #1 · 8 lines]bbb");
+        glued.on_key(Key::DeleteWord, Instant::now());
+        assert_eq!(glued.input, "aaa");
+        assert!(!glued.input.contains("[Paste"), "no half marker is left");
+        assert!(glued.pastes.is_empty());
+    }
+
+    /// The same rule for every other cut: backspace and delete take the marker
+    /// the character belongs to, and ctrl+u takes every marker it covers —
+    /// bodies and all.
+    #[test]
+    fn every_cut_takes_a_marker_whole() {
+        // Backspace from the end: the `]` is inside the marker.
+        let mut chat = chat();
+        chat.paste(&stack_trace());
+        chat.on_key(Key::Backspace, Instant::now());
+        assert_eq!(chat.input, "");
+        assert!(chat.pastes.is_empty());
+
+        // Delete from the front: the `[` is inside the marker.
+        let mut front = chat_with_theme(test_theme());
+        front.paste(&stack_trace());
+        front.on_key(Key::Home, Instant::now());
+        front.on_key(Key::Delete, Instant::now());
+        assert_eq!(front.input, "");
+        assert!(front.pastes.is_empty());
+
+        // ctrl+u takes everything before the caret, and the bodies of the
+        // markers it took go with them.
+        let mut kept = chat_with_theme(test_theme());
+        type_text(&mut kept, "keep ");
+        kept.paste(&stack_trace());
+        type_text(&mut kept, " and this");
+        kept.on_key(Key::End, Instant::now());
+        kept.on_key(Key::DeleteToStart, Instant::now());
+        assert_eq!(kept.input, "");
+        assert!(kept.pastes.is_empty());
+    }
+
+    /// A completion cannot cut a marker: a marker opens with `[`, which is not
+    /// a name character, so no `/token` or `:query` ever spans one.
+    #[test]
+    fn a_completion_never_cuts_a_paste_marker() {
+        let mut chat = chat();
+        type_text(&mut chat, "/he");
+        chat.paste(&stack_trace());
+        assert_eq!(chat.input, "/he[Paste #1 · 8 lines]");
+        assert!(
+            !chat.picking(),
+            "a token that would span the marker is not a token"
+        );
+        chat.on_key(Key::Tab, Instant::now());
+        assert_eq!(chat.input, "/he[Paste #1 · 8 lines]", "nothing was cut");
+        assert_eq!(chat.pastes.len(), 1, "and the body is still registered");
     }
 
     /// The browser lists the session's prompts, not the screen's lines: a note
