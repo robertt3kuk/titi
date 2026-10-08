@@ -105,6 +105,10 @@ impl SessionStore {
             .map_err(SessionError::Io)?;
         let line = serde_json::to_string(&e).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
+        // The entry has to be on the platter before the leaf moves to it, or
+        // a crash between the two leaves the leaf naming an entry the file
+        // never got, and the next append chains onto a missing parent.
+        file.sync_all().map_err(SessionError::Io)?;
         self.set_leaf(session_id, &e.id)?;
         self.index.index_entry(session_id, &e)?;
         Ok(e)
@@ -188,6 +192,10 @@ impl SessionStore {
             .map_err(SessionError::Io)?;
         let line = serde_json::to_string(&checkpoint).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
+        // A checkpoint is the promise that a rewind point exists, and the git
+        // commit is recorded against it right after: it cannot still be in the
+        // page cache when the caller is told it was taken.
+        file.sync_all().map_err(SessionError::Io)?;
         Ok(checkpoint)
     }
 
@@ -212,7 +220,7 @@ impl SessionStore {
         let line = serde_json::to_string(&checkpoint).map_err(SessionError::Json)?;
         rewritten.push_str(&line);
         rewritten.push('\n');
-        std::fs::write(&path, rewritten).map_err(SessionError::Io)
+        write_atomic(&path, rewritten.as_bytes())
     }
 
     /// Checkpoints recorded for a session, oldest first.
@@ -259,7 +267,7 @@ impl SessionStore {
             body.push_str(&serde_json::to_string(entry).map_err(SessionError::Json)?);
             body.push('\n');
         }
-        fs::write(self.session_file(session_id), body).map_err(SessionError::Io)?;
+        write_atomic(&self.session_file(session_id), body.as_bytes())?;
 
         match &checkpoint.entry_id {
             Some(id) => self.set_leaf(session_id, id)?,
@@ -278,7 +286,7 @@ impl SessionStore {
             body.push_str(&serde_json::to_string(candidate).map_err(SessionError::Json)?);
             body.push('\n');
         }
-        fs::write(self.checkpoint_file(session_id), body).map_err(SessionError::Io)?;
+        write_atomic(&self.checkpoint_file(session_id), body.as_bytes())?;
 
         self.index.reindex_session(session_id, kept)?;
         Ok(())
@@ -416,7 +424,7 @@ impl SessionStore {
     }
 
     fn set_leaf(&self, session_id: &str, entry_id: &str) -> Result<(), SessionError> {
-        fs::write(self.leaf_file(session_id), entry_id).map_err(SessionError::Io)
+        write_atomic(&self.leaf_file(session_id), entry_id.as_bytes())
     }
 
     fn load(&self, session_id: &str) -> Result<Vec<Entry>, SessionError> {
@@ -439,6 +447,38 @@ impl SessionStore {
         }
         Ok(out)
     }
+}
+
+/// Replaces `path` with `bytes` in one step.
+///
+/// The bytes go to a sibling temp file that reaches the platter before it is
+/// renamed over the target, so a reader sees the whole old file or the whole
+/// new one. `fs::write` truncates first, and a crash — or a full disk — in
+/// that window leaves a truncated session behind.
+///
+/// The temp file must be a *sibling*: `rename(2)` replaces atomically only
+/// within one filesystem, and a temp under `std::env::temp_dir()` can be a
+/// different mount, where the rename degrades into a copy that a crash can
+/// catch halfway and leaves the target truncated after all.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
+    let tmp = tmp_path(path);
+    let mut file = File::create(&tmp).map_err(SessionError::Io)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        // The target is still the old file, so the half-written temp is only
+        // litter and goes now rather than being renamed later.
+        let _ = fs::remove_file(&tmp);
+        return Err(SessionError::Io(e));
+    }
+    fs::rename(&tmp, path).map_err(SessionError::Io)
+}
+
+/// `<file>.tmp` beside `file`, so the rename stays inside one directory.
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -636,6 +676,75 @@ mod tests {
             .append(&sid, Role::Assistant, "after crash")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(b.parent_id.as_deref(), Some(a.id.as_str()));
+    }
+
+    /// The write must not touch the target it is replacing until the
+    /// replacement exists. An in-place `fs::write` would truncate the session
+    /// first and then succeed despite the occupied staging name; this fails
+    /// with the session still holding its previous bytes.
+    #[test]
+    fn a_rewrite_that_cannot_be_staged_leaves_the_session_untouched() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let a = s
+            .append(&sid, Role::User, "keep me")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let checkpoint = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "drop me")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let path = s.session_file(&sid);
+        let before = fs::read(&path).unwrap_or_else(|e| panic!("{e}"));
+        // Litter a crash could leave: a directory where the staging file goes,
+        // so even a fresh `File::create` cannot open it.
+        let staging = tmp_path(&path);
+        fs::create_dir(&staging).unwrap_or_else(|e| panic!("{e}"));
+
+        let err = s.rewind(&sid, &checkpoint).unwrap_err();
+        assert!(matches!(err, SessionError::Io(_)), "{err}");
+        assert_eq!(
+            fs::read(&path).unwrap_or_else(|e| panic!("{e}")),
+            before,
+            "a failed rewrite must leave the previous bytes in place"
+        );
+
+        // With the stage free the same rewind lands, so the failure was the
+        // staging file and not the rewind itself.
+        fs::remove_dir(&staging).unwrap_or_else(|e| panic!("{e}"));
+        s.rewind(&sid, &checkpoint)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.open(&sid).unwrap_or_else(|e| panic!("{e}")), vec![a]);
+    }
+
+    /// Same invariant from the other side: a landing rewrite got there by
+    /// replacing the file, not by overwriting it. An in-place truncate keeps
+    /// the inode; the rename that follows a successful `sync_all` does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewrite_replaces_the_file_instead_of_truncating_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let a = s
+            .append(&sid, Role::User, "keep me")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let checkpoint = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "drop me")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let path = s.session_file(&sid);
+        let ino = |p: &std::path::Path| fs::metadata(p).unwrap_or_else(|e| panic!("{e}")).ino();
+        let before = ino(&path);
+
+        s.rewind(&sid, &checkpoint)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(ino(&path), before, "the file was replaced, not overwritten");
+        assert_eq!(s.open(&sid).unwrap_or_else(|e| panic!("{e}")), vec![a]);
+        assert!(
+            !tmp_path(&path).exists(),
+            "the staging file is gone once its rename landed"
+        );
     }
 
     #[test]
