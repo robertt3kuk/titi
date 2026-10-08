@@ -11193,12 +11193,69 @@ mod tests {
         assert!(chat.lines.iter().any(|line| line.text.contains("recap")));
     }
 
+    /// The row the arrows are on is the choice, not the word under the caret:
+    /// `/paseo` names a skill of its own *and* starts `/paseo-advisor`, so
+    /// Enter used to send the typed word and leave the highlighted row alone.
+    /// A pre-fix run dispatched `SubmitPrompt("/paseo")` here.
+    #[test]
+    fn enter_runs_the_highlighted_row_over_an_exact_word() {
+        let mut chat = chat_with_prefix_skills();
+        type_text(&mut chat, "/paseo");
+        assert!(
+            chat.picking(),
+            "the list has the typed skill and the longer one"
+        );
+        chat.on_key(Key::Down, Instant::now());
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt {
+                text: "/paseo-advisor".into(),
+            })),
+            "the highlighted row is what Enter sends"
+        );
+    }
+
+    /// The other half of the same rule: when the highlight already is the
+    /// typed word there is nothing to apply, so a sentence that names a skill
+    /// exactly still sends on one Enter rather than finishing the token first.
+    #[test]
+    fn enter_keeps_the_typed_word_when_the_highlight_is_on_it() {
+        let mut chat = chat_with_skills();
+        type_text(&mut chat, "please run /code-review");
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SubmitPrompt {
+                text: "please run /code-review".into(),
+            })),
+            "the highlighted row is the typed word, so it sent as typed"
+        );
+    }
+
     fn chat_with_skills() -> Chat {
         let mut chat = chat();
         chat.skills = vec![SkillRow {
             name: "code-review".to_owned(),
             about: "check a diff".to_owned(),
         }];
+        chat
+    }
+
+    /// Two skills of the shape the command list has in `/checkpoint` and
+    /// `/checkpoints`: one name is a whole row and a prefix of the next.
+    fn chat_with_prefix_skills() -> Chat {
+        let mut chat = chat();
+        chat.skills = vec![
+            SkillRow {
+                name: "paseo".to_owned(),
+                about: "a group of skills".to_owned(),
+            },
+            SkillRow {
+                name: "paseo-advisor".to_owned(),
+                about: "a second opinion".to_owned(),
+            },
+        ];
         chat
     }
 

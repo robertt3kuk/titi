@@ -294,9 +294,18 @@ impl Chat {
                     if at_line_start && name.is_empty() {
                         return Applied::none();
                     }
+                    // The row the arrows are on is the choice, not the word
+                    // under the caret: a word that names a row as well as
+                    // starting others (`/checkpoint` beside `/checkpoints`)
+                    // must not shadow the highlighted one. A word that is
+                    // already the highlighted row is still sent as typed, so
+                    // one Enter keeps running a complete command — and keeps
+                    // sending a sentence that names a skill exactly.
                     let rows = picker_rows(self);
-                    let exact = rows.iter().any(|row| self.row_name(row) == name);
-                    if !exact && !rows.is_empty() {
+                    let chosen_is_typed = rows
+                        .get(self.picker % rows.len().max(1))
+                        .is_some_and(|row| self.row_name(row) == name.as_str());
+                    if !rows.is_empty() && !chosen_is_typed {
                         self.accept_picker();
                         // Mid-sentence the message is not finished: complete
                         // the token and let the next Enter send it.

@@ -51,5 +51,7 @@ binary run real HTTP turns without a key.
 
 | Word delete in the composer (alt+backspace, ctrl+w) | pass | 2026-10-08 | PTY via `scripts/pty-drive.py` (pyte 80×24), debug build, scripted local SSE server, `TITI_NO_GENOME=1` | PTY check, not visual. `fix the parser now` + `\x1b\x7f` (alt+backspace) leaves `fix the parser `, a second one leaves `fix the `, and ctrl+w over `now   ` takes the spaces with the word. The primitive is `titi_tui::space_hold::delete_before_cursor` (omp's `deleteBeforeCursor`), counted in characters so a wide or multi-byte character is one character. |
 
+| Composer `/` list: Enter runs the highlighted row | pass | 2026-10-09 | PTY via `scripts/pty-drive.py` (pyte 90×26), debug build of the fix, cwd a scratch git repo, a fresh `TITI_AGENT_DIR`, `TITI_NO_GENOME=1` | PTY check, not visual. `/checkpoint` opens `▶ /checkpoint` over `/checkpoints`; Down moves the marker to `/checkpoints` and Enter prints `· checkpoints: none` (pre-fix the same keys printed `· checkpoint: 0 entries · git …`, the typed word); with the marker left on the typed word, Enter still prints `· checkpoint: 0 entries · git 820c878`. `process: exited status=0`, `restore: True True`. |
+
 Status values: `pass`, `fail` (link the issue or commit), `partial`,
 `unverified`.
