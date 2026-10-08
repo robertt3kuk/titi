@@ -107,7 +107,7 @@ impl SessionStore {
             .map_err(SessionError::Io)?;
         // A torn line from the previous crash goes before the new one, so the
         // fragment cannot swallow this append.
-        truncate_torn_tail(&mut file)?;
+        truncate_torn_tail(&mut file).map_err(SessionError::Io)?;
         let line = serde_json::to_string(&e).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
         // The entry has to be on the platter before the leaf moves to it, or
@@ -196,7 +196,7 @@ impl SessionStore {
             .append(true)
             .open(self.checkpoint_file(session_id))
             .map_err(SessionError::Io)?;
-        truncate_torn_tail(&mut file)?;
+        truncate_torn_tail(&mut file).map_err(SessionError::Io)?;
         let line = serde_json::to_string(&checkpoint).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
         // A checkpoint is the promise that a rewind point exists, and the git
@@ -481,43 +481,38 @@ fn parse_lines<T: serde::de::DeserializeOwned>(lines: &[String]) -> Result<Vec<T
 /// Skipping a torn final line is only safe while nothing is written after it:
 /// an append lands on the same physical line as the fragment, so the reader
 /// sees one unparsable line where two entries should be and drops the second
-/// with it. From then on the fragment is a corrupt *middle* line, which the
-/// reader must refuse. Running this before every append keeps the file a
-/// sequence of whole lines, at the cost of one read of its last byte.
-fn truncate_torn_tail(file: &mut File) -> Result<(), SessionError> {
-    let len = file.metadata().map_err(SessionError::Io)?.len();
+/// with it — silently, until a further append turns the fragment into a
+/// corrupt *middle* line the reader must refuse. The session files, the
+/// checkpoint sidecar and the trajectory run this before every append, so what
+/// is on disk goes back to being a sequence of whole lines. The check is one
+/// read of the last byte; only a real tear pays for the walk back.
+pub(crate) fn truncate_torn_tail(file: &mut File) -> std::io::Result<()> {
+    let len = file.metadata()?.len();
     if len == 0 {
         return Ok(());
     }
     let mut byte = [0u8; 1];
-    file.seek(SeekFrom::Start(len - 1))
-        .map_err(SessionError::Io)?;
-    file.read_exact(&mut byte).map_err(SessionError::Io)?;
+    file.seek(SeekFrom::Start(len - 1))?;
+    file.read_exact(&mut byte)?;
     if byte[0] == b'\n' {
         return Ok(());
     }
-    // Rare: only a crash between a write and its `sync_all` gets here. Walk
-    // back a block at a time for the boundary the fragment hangs off, so the
-    // cost stays proportional to the fragment.
+    // Rare: only a crash between a write and its sync gets here. Walk back a
+    // block at a time for the boundary the fragment hangs off, so the cost
+    // stays proportional to the fragment.
     const BLOCK: u64 = 4096;
     let mut block = vec![0u8; BLOCK as usize];
     let mut end = len;
     loop {
         let start = end.saturating_sub(BLOCK);
         let want = (end - start) as usize;
-        file.seek(SeekFrom::Start(start))
-            .map_err(SessionError::Io)?;
-        file.read_exact(&mut block[..want])
-            .map_err(SessionError::Io)?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut block[..want])?;
         match block[..want].iter().rposition(|byte| *byte == b'\n') {
-            Some(at) => {
-                return file
-                    .set_len(start + at as u64 + 1)
-                    .map_err(SessionError::Io);
-            }
+            Some(at) => return file.set_len(start + at as u64 + 1),
             // The whole file is one unterminated line; nothing in it is a
             // complete entry.
-            None if start == 0 => return file.set_len(0).map_err(SessionError::Io),
+            None if start == 0 => return file.set_len(0),
             None => end = start,
         }
     }

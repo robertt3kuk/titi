@@ -119,7 +119,9 @@ impl TrajectoryRecorder {
         };
         let next_seq = events.last().map_or(1, |e| e.seq + 1);
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        // `read` is for the torn-tail scan below; appends still land at the
+        // end regardless of the read position.
+        options.read(true).create(true).append(true);
         // A trajectory repeats the session's tool calls and arguments, so it
         // is as private as the session file. The umask can only clear bits a
         // `0o600` request does not carry, so this is 0600 on create.
@@ -129,6 +131,12 @@ impl TrajectoryRecorder {
             options.mode(0o600);
         }
         let file = options.open(&path).map_err(TrajectoryError::Io)?;
+        let mut file = file;
+        // The same repair the session files get: replay tolerates a torn final
+        // line, but only while nothing is written after it — the next event
+        // would join the fragment, be dropped with it on the next replay, and
+        // leave a corrupt line behind for the one after that.
+        crate::session::store::truncate_torn_tail(&mut file).map_err(TrajectoryError::Io)?;
         // `mode` is only consulted at creation: a file an earlier build made
         // 0644 keeps those bits until someone says otherwise.
         #[cfg(unix)]
@@ -486,6 +494,47 @@ mod tests {
             tool_call_digest("bash", &json!({"a": 1})),
             tool_call_digest("bash", &json!({"a": 2}))
         );
+    }
+
+    /// A torn final line is tolerated on replay, but the next event must not
+    /// be written after it: it would join the fragment and be lost with it on
+    /// the following replay, leaving a corrupt line for the event after that.
+    #[test]
+    fn a_torn_line_is_dropped_before_the_next_event_lands() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        {
+            let mut r = open(dir.path());
+            r.record(EventKind::UserMessage { text: "one".into() })
+                .unwrap_or_else(|e| panic!("record: {e}"));
+            r.record(EventKind::TurnEnd)
+                .unwrap_or_else(|e| panic!("record: {e}"));
+            r.flush().unwrap_or_else(|e| panic!("flush: {e}"));
+
+            // Simulate a crash mid-write: a partial JSON line, no newline.
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(r.path())
+                .unwrap_or_else(|e| panic!("append: {e}"));
+            write!(f, r#"{{"ts":123,"seq""#).unwrap_or_else(|e| panic!("write: {e}"));
+        }
+
+        // Replay tolerates it and hands the sequence on.
+        let mut r = open(dir.path());
+        assert_eq!(r.len(), 2);
+        r.record(EventKind::UserMessage { text: "two".into() })
+            .unwrap_or_else(|e| panic!("record: {e}"));
+        r.record(EventKind::TurnEnd)
+            .unwrap_or_else(|e| panic!("record: {e}"));
+        drop(r);
+
+        // Both events are there and the file reads cleanly: the fragment did
+        // not swallow the new one and did not become a corrupt middle line.
+        let replay = open(dir.path());
+        assert_eq!(replay.len(), 4);
+        assert!(matches!(
+            &replay.tail(2)[0].kind,
+            EventKind::UserMessage { text } if text == "two"
+        ));
     }
 
     /// A trajectory repeats the session's tool calls, so it is as private as
