@@ -54,8 +54,23 @@ fn first_frame_paints_banner_and_starting_status_before_ready() {
     assert_eq!(app.queue_len(), 1);
     assert_eq!(app.delivered(), 0);
 
-    // time-to-first-frame is well under the 150 ms budget.
-    assert!(ttff < Duration::from_millis(150), "ttff = {ttff:?}");
+    // Time-to-first-frame is well under the 150 ms budget.
+    //
+    // The assertion is the *best* of a few paints, because one wall-clock
+    // sample on a shared runner measures the runner too: a descheduled thread
+    // makes any single sample slow without the code being slow. A frame that
+    // waited for something — the provider, a config read, a git call — is slow
+    // in every sample, which is what this catches; a busy machine only makes
+    // one of them slow. Both numbers ride in the message so a real regression
+    // is readable rather than a mystery.
+    let mut best = ttff;
+    for _ in 0..4 {
+        best = best.min(app.first_frame(80).1);
+    }
+    assert!(
+        best < Duration::from_millis(150),
+        "best ttff = {best:?}, first = {ttff:?}"
+    );
 }
 
 #[test]
