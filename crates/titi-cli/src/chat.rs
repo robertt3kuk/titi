@@ -15130,6 +15130,86 @@ mod tests {
         );
     }
 
+    /// A pasted body lands in the workspace, and it must not be something
+    /// `git add -A` would commit: the directory writes its own `.gitignore`
+    /// first, so `git status` never sees the paste.
+    #[test]
+    fn an_attached_paste_keeps_itself_out_of_git() {
+        let dir = tempfile::tempdir().expect("temp");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init");
+
+        let mut chat = chat();
+        chat.workspace = dir.path().to_path_buf();
+        chat.paste(&long_paste(120));
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.input, ".titi/pastes/paste-1.txt");
+
+        let ignore = std::fs::read_to_string(dir.path().join(".titi/pastes/.gitignore"))
+            .expect("the directory ignores itself");
+        assert_eq!(ignore.trim(), "*");
+        let status =
+            String::from_utf8(git(&["status", "--porcelain"]).stdout).expect("git writes utf-8");
+        assert!(status.trim().is_empty(), "git sees the paste: {status:?}");
+
+        // A directory that already carries one keeps it: the file is titi's
+        // only while there is none.
+        std::fs::write(dir.path().join(".titi/pastes/.gitignore"), "# mine\n").expect("theirs");
+        chat.paste(&long_paste(120));
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".titi/pastes/.gitignore")).expect("read"),
+            "# mine\n"
+        );
+    }
+
+    /// A directory that will not take the ignore file fails the attach: the
+    /// paste stays its marker, nothing is written, and the reason is said —
+    /// never a paste file sitting un-ignored.
+    #[test]
+    fn a_paste_that_cannot_ignore_itself_is_not_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let pastes = dir.path().join(".titi/pastes");
+        std::fs::create_dir_all(&pastes).expect("pastes");
+        let mut read_only = std::fs::metadata(&pastes).expect("meta").permissions();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&pastes, read_only).expect("chmod");
+
+        let mut chat = chat();
+        chat.workspace = dir.path().to_path_buf();
+        chat.paste(&long_paste(120));
+        chat.on_key(Key::Down, Instant::now());
+        chat.on_key(Key::Enter, Instant::now());
+
+        assert_eq!(chat.input, "[Paste #1 · 120 lines]", "the marker stays");
+        assert!(
+            !pastes.join("paste-1.txt").exists(),
+            "no paste file was left behind"
+        );
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.starts_with("paste: not written")),
+            "{:?}",
+            chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        // Leave the directory writable so the temp dir can be removed.
+        let mut writable = std::fs::metadata(&pastes).expect("meta").permissions();
+        writable.set_mode(0o755);
+        std::fs::set_permissions(&pastes, writable).expect("restore");
+    }
+
     /// Every row attaches what it says it does. Adding a row to `PasteMenu::ROWS`
     /// without teaching `accept_paste_menu` about it fails here.
     #[test]

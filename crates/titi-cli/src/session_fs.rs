@@ -361,10 +361,20 @@ pub fn branch_at(
 /// point is that the model can read it in ranges instead of paying for it in
 /// every request. The directory is titi's own (the one the project layer
 /// already uses), so a project that ignores `.titi/` ignores these too.
+///
+/// It also ignores *itself*: a pasted log, config or stack trace often carries
+/// a secret, and `git add -A` in the workspace must not sweep one in. The
+/// `.gitignore` is written first and only when there is none — the repository's
+/// own `.gitignore` is never touched — and a directory that will not take it
+/// fails the attach rather than leaving a paste file un-ignored.
 pub fn write_paste(workspace: &std::path::Path, seq: u32, body: &str) -> Result<String, String> {
     let name = format!("paste-{seq}.txt");
     let dir = workspace.join(".titi").join("pastes");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "*\n").map_err(|e| format!(".gitignore: {e}"))?;
+    }
     std::fs::write(dir.join(&name), body).map_err(|e| e.to_string())?;
     Ok(format!(".titi/pastes/{name}"))
 }
