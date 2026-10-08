@@ -33,6 +33,11 @@
 //!   inline code or a fence, a `$` with a backslash in front of it, and any
 //!   span without a matching closer all stay literal: money is never eaten.
 //!   A `$$…$$` in the middle of a sentence renders in this inline form too.
+//! - Display math (`$$…$$` owning its line) — a centred block of `latex`
+//!   display rows in `ThemeColor::MdCodeBlock` (the fraction rule in
+//!   `ThemeColor::MdCodeBlockBorder`), with a blank row before and after like
+//!   a code block; when the layout cannot fit the pane the flat inline form
+//!   is wrapped instead, so a row never crosses the frame
 //! - Paragraphs — wrapped to `width`
 //!
 //! # Section visibility
@@ -209,6 +214,20 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16) -> Vec<String> {
             continue;
         }
 
+        // Display math: `$$…$$` that owns its line(s) becomes a centred
+        // block.  A `$$` span inside a sentence is prose, and is handled by
+        // the inline pipeline instead.
+        if let Some((body, used)) = parse_display_math(&source[idx..]) {
+            // A display block opens like a code block: a blank row above it.
+            if lines.last().is_some_and(|l| !l.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.append(&mut render_display_block(&body, theme, w));
+            lines.push(String::new());
+            i = idx + used;
+            continue;
+        }
+
         let trimmed = raw.trim();
 
         // Horizontal rule.
@@ -360,6 +379,133 @@ fn render_code_block(code: &[&str], lang: &str, theme: &Theme, w: usize) -> Vec<
 // ---------------------------------------------------------------------------
 // Math
 // ---------------------------------------------------------------------------
+
+/// True when `text` carries maths the renderer would convert — the predicate a
+/// caller needs to route an answer through markdown at all.
+///
+/// The guards are the inline pipeline's own, so a price is not maths here
+/// either, and a `$` inside a fenced block or an inline code span is code.
+pub fn has_math(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut fenced = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().starts_with("```") {
+            fenced = !fenced;
+            i += 1;
+            continue;
+        }
+        if !fenced && (parse_display_math(&lines[i..]).is_some() || line_has_math(lines[i])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Maths on one line, outside any inline code span: the earlier marker wins,
+/// exactly as it does in the inline pipeline, so a `$` inside `` `…` `` is
+/// never reached.
+fn line_has_math(line: &str) -> bool {
+    let mut rest = line;
+    while !rest.is_empty() {
+        let code = rest.find('`');
+        let math = inline_math_open(rest);
+        if let Some(math) = math {
+            if code.is_none_or(|code| math < code) {
+                return true;
+            }
+        }
+        match code {
+            Some(code) => match rest[code + 1..].find('`') {
+                Some(end) => rest = &rest[code + 1 + end + 1..],
+                None => return false,
+            },
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Longest run of source rows one `$$…$$` block may cover; a longer run of
+/// `$$` lines is left literal rather than swallowed.
+const MAX_DISPLAY_LINES: usize = 64;
+
+/// A display-math block at the head of `source`: `$$…$$` that owns its line.
+///
+/// Returns the fragment's body and how many source rows it used.  Recognised
+/// shapes are `$$body$$` (one row) and `$$` opening a run that ends on a row
+/// whose text ends in `$$`.  Anything else — an unclosed `$$`, a nested `$$`,
+/// an empty body, more than [`MAX_DISPLAY_LINES`] rows — returns `None`, so the
+/// characters stay literal instead of one of them vanishing.
+fn parse_display_math(source: &[&str]) -> Option<(String, usize)> {
+    let first = source.first()?.trim();
+    let rest = first.strip_prefix("$$")?;
+    if !rest.is_empty() {
+        let body = rest.strip_suffix("$$")?;
+        if body.is_empty() || body.contains("$$") {
+            return None;
+        }
+        return Some((body.trim().to_owned(), 1));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for (row, line) in source.iter().enumerate().skip(1).take(MAX_DISPLAY_LINES) {
+        let text = line.trim();
+        if text.starts_with("$$") {
+            return None; // a second opener before the closer: not one block
+        }
+        if let Some(head) = text.strip_suffix("$$") {
+            if !head.trim().is_empty() {
+                parts.push(head.trim().to_owned());
+            }
+            let body = parts.join(" ");
+            if body.is_empty() {
+                return None;
+            }
+            return Some((body, row + 1));
+        }
+        parts.push(text.to_owned());
+    }
+    None
+}
+
+/// A display-math block: the laid-out rows, centred in the pane and painted
+/// with the code-block pair (the rule row takes the border token).
+///
+/// `latex::display_rows` returns a single flat row when the stacked layout is
+/// wider than the pane; wrapping that row here is what keeps every emitted row
+/// inside `w`.
+fn render_display_block(body: &str, theme: &Theme, w: usize) -> Vec<String> {
+    let mut rows: Vec<(String, bool)> = Vec::new();
+    for row in latex::display_rows(body, w) {
+        let rule = math_rule_row(&row);
+        for line in wrap_text_with_ansi(&row, w.max(1)) {
+            rows.push((line, rule));
+        }
+    }
+    let block = rows
+        .iter()
+        .map(|(row, _)| visible_width(row))
+        .max()
+        .unwrap_or(0);
+    let pad = w.saturating_sub(block) / 2;
+    rows.into_iter()
+        .map(|(row, rule)| {
+            let colour = if rule {
+                ThemeColor::MdCodeBlockBorder
+            } else {
+                ThemeColor::MdCodeBlock
+            };
+            theme.fg(colour, &format!("{}{row}", " ".repeat(pad)))
+        })
+        .collect()
+}
+
+/// True for a layout row that is a rule (the fraction bar or a radical's
+/// overline) rather than maths: it is drawn in the border token.
+fn math_rule_row(row: &str) -> bool {
+    !row.is_empty() && row.chars().all(|c| c == '─' || c == ' ')
+}
 
 /// An inline math span at the head of `text`: `$…$`, `$$…$$` or `\(…\)`.
 ///
@@ -1943,6 +2089,45 @@ Done in `AGENTS.md`.";
         );
     }
 
+    /// The predicate a caller routes on: maths it would convert, but not money,
+    /// not an escaped dollar, and not a `$` inside a fence or a code span.
+    ///
+    /// This is the contract the chat screen's `has_markdown` gate depends on,
+    /// so every guard has a case that only that guard can save: drop one and
+    /// one of these lines turns true.
+    #[test]
+    fn has_math_knows_maths_from_money_and_code() {
+        assert!(has_math("the bound is $O(n)$ here"));
+        assert!(has_math("$$\\sum_i i$$"));
+        assert!(has_math("$$\\sum_{i=1}^{n} i$$\n"));
+        assert!(has_math("a \\(x+1\\) b"));
+        assert!(has_math("The bound is $$n^2$$ exactly."));
+        assert!(has_math("$x$ and `code`"));
+        // Money: the opener is followed by a digit, and the closer by one.
+        assert!(!has_math("it costs $5 and $6"));
+        assert!(!has_math("$5"));
+        // The digit guard alone (the closer here is otherwise valid).
+        assert!(!has_math("$5x$"));
+        // A lone dollar has no partner.
+        assert!(!has_math("a lone $ sign"));
+        assert!(!has_math("$ and $"));
+        // A closer followed by a digit is not a closer.
+        assert!(!has_math("$x$5"));
+        // A closer preceded by a space is not a closer.
+        assert!(!has_math("$x $"));
+        // An escaped dollar is not an opener.
+        assert!(!has_math("costs \\$5 today"));
+        assert!(!has_math("costs \\$x$ today"));
+        // ... and a dollar escaped on the closing side is not a closer.
+        assert!(!has_math("$x\\$ today"));
+        assert!(!has_math("plain words only"));
+        // A `$` inside a fence is code, not maths.
+        assert!(!has_math("```sh\necho $HOME\n```"));
+        assert!(!has_math("```\na = $x$ and $y$\n```"));
+        // ... and so is one inside an inline code span.
+        assert!(!has_math("print `$x$` literally"));
+    }
+
     // ---- LaTeX math -------------------------------------------------------
 
     /// Inline maths reaches a heading, a bullet and a quote as Unicode: the
@@ -2003,5 +2188,81 @@ Done in `AGENTS.md`.";
                 "left literal: {line:?}"
             );
         }
+    }
+
+    /// `$$…$$` in the middle of a sentence is prose: it renders in the inline
+    /// form instead of owning rows it does not have.
+    #[test]
+    fn display_delimiters_in_a_sentence_render_inline() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown(
+                "The bound is $$n^2$$ exactly.",
+                &theme,
+                40
+            )),
+            vec!["The bound is n² exactly."]
+        );
+    }
+
+    /// A `$$` block with no closer is not a block: both rows stay literal, so
+    /// the text after the stray opener is never swallowed.
+    #[test]
+    fn unclosed_display_block_stays_literal() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown("$$\nx^2\nand more text", &theme, 40)),
+            vec!["$$", "x^2", "and more text"]
+        );
+    }
+
+    /// A display block is centred, opens and closes with a blank row, and never
+    /// crosses the pane — at any width, however long the formula.
+    #[test]
+    fn display_block_is_centred_and_fits() {
+        let theme = colored_theme();
+        let md = "Before.\n$$\\sum_{i=1}^{n} i$$";
+        let rows = plain(&render_markdown(md, &theme, 30));
+        // Block width 5 in a 30-column pane: centred with 12 columns of margin,
+        // the limits stacked over and under the symbol, blank rows on both sides.
+        assert_eq!(
+            rows,
+            vec![
+                "Before.",
+                "",
+                "             n",
+                "             ∑  i",
+                "            i=1",
+                "",
+            ]
+        );
+        for width in [80u16, 40, 20, 8, 4, 1] {
+            for row in render_markdown(md, &theme, width) {
+                assert!(
+                    visible_width(&row) <= usize::from(width),
+                    "width {width}: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A fraction inline stays flat and parenthesised where it must be; in
+    /// display style it stacks over a rule.
+    #[test]
+    fn fraction_flat_inline_and_stacked_in_display() {
+        let theme = colored_theme();
+        assert_eq!(
+            plain(&render_markdown("rate $\\frac{1}{1-x}$ now", &theme, 40)),
+            vec!["rate 1/(1-x) now"]
+        );
+        assert_eq!(
+            plain(&render_markdown("$$\\frac{1}{1-x}$$", &theme, 40)),
+            vec![
+                "                   1",
+                "                  ───",
+                "                  1-x",
+                "",
+            ]
+        );
     }
 }
