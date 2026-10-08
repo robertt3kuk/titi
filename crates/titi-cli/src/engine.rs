@@ -423,6 +423,39 @@ pub fn load_registry_config() -> ProviderRegistryConfig {
 /// point they crowd the request without informing the next one.
 pub const MAX_RESTORED_MESSAGES: usize = 40;
 
+/// The session this launch runs on, and the history it replays.
+///
+/// `resume` is `--continue`, or `session.autoResume` in the settings. When
+/// either asks for it, the newest session the agent directory holds is
+/// reopened with its conversation — the same listing Ctrl+X and `/sessions`
+/// show, so the session a launch continues is the first row of the picker.
+/// When neither asks, the launch starts blank even though the directory is
+/// full of sessions: a continued conversation is always one the user asked
+/// for, and one they did not stays untouched on disk.
+///
+/// Split from [`start_engine_with`] so the rule is testable without a
+/// provider registry; the wiring is the same either way.
+pub fn launch_session(
+    agent_dir: &std::path::Path,
+    resume: bool,
+) -> (String, Vec<titi_providers::ChatMessage>) {
+    let Ok(store) = titi_core::session::store::SessionStore::new(agent_dir) else {
+        return ("session".into(), Vec::new());
+    };
+    if resume && let Some(id) = crate::session_fs::newest_session(agent_dir) {
+        let history = crate::session_fs::session_history(agent_dir, &id).unwrap_or_default();
+        return (id, history);
+    }
+    let id = store
+        .create(titi_core::session::SessionMeta {
+            title: Some("titi".into()),
+            source: Some("cli".into()),
+            ..Default::default()
+        })
+        .unwrap_or_else(|_| "session".into());
+    (id, Vec::new())
+}
+
 /// Trims a replayed conversation to at most `limit` messages, cutting only
 /// where no tool round is split.
 ///
@@ -554,6 +587,30 @@ pub fn genome_enabled_from(settings: &titi_config::settings::Settings) -> bool {
     }
 }
 
+/// Whether a launch resumes the newest session without being asked to;
+/// `session.autoResume` as a boolean.
+///
+/// Missing key → false (default off). JSON bool → that. String
+/// `on`/`true`/`yes` → true, `off`/`false`/`no` → false (ascii
+/// case-insensitive). Anything else — a number, an array, a typo — → false,
+/// because a key that cannot be read must not turn a blank launch into a
+/// resumed one. This key only says *whether* to continue; which session that
+/// is belongs to [`launch_session`].
+pub fn session_auto_resume_from(settings: &titi_config::settings::Settings) -> bool {
+    match settings.get(titi_config::settings::SESSION_AUTO_RESUME_KEY) {
+        None => false,
+        Some(value) => {
+            if let Some(b) = value.as_bool() {
+                b
+            } else if let Some(s) = value.as_str() {
+                matches!(s.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// The status note `/genome` prints: the four facts as plain lines.
 ///
 /// One formatter is shared by the chat and `titi genome`, so a note cannot
@@ -600,7 +657,7 @@ pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
 
 /// Starts the engine with the default approval policy, in agent mode.
 pub fn start_engine() -> Result<(Engine, ModelCatalog, String), String> {
-    start_engine_with(ApprovalMode::Write, SessionMode::Agent)
+    start_engine_with(ApprovalMode::Write, SessionMode::Agent, false)
 }
 
 /// Starts the engine with an explicit approval policy and session mode.
@@ -613,9 +670,15 @@ pub fn start_engine() -> Result<(Engine, ModelCatalog, String), String> {
 ///
 /// `mode` is what `--mode plan|duck` starts the session in; the surface can
 /// change it later with `SetMode`.
+///
+/// `resume` is `--continue` on the command line. `session.autoResume` is read
+/// here, from the same settings load the rest of the config uses, so the flag
+/// and the key share one decision; see [`launch_session`] for which session
+/// each one continues.
 pub fn start_engine_with(
     approval_mode: ApprovalMode,
     mode: SessionMode,
+    resume: bool,
 ) -> Result<(Engine, ModelCatalog, String), String> {
     let config = load_registry_config();
     let models: Vec<String> = config
@@ -754,27 +817,11 @@ pub fn start_engine_with(
             .and_then(|v| v.as_str().map(str::to_owned))
             .filter(|s| !s.is_empty() && s != "local");
     }
-    // Resume the newest session and replay its history into the engine;
-    // otherwise start a fresh one.
-    let mut restored = Vec::new();
-    let session_id = match titi_core::session::store::SessionStore::new(&agent_dir) {
-        Ok(store) => match store.restore_latest() {
-            Ok(Some((id, _))) => {
-                // One place builds the replayed history, so `/rewind` and
-                // startup cannot disagree about what the model sees.
-                restored = crate::session_fs::session_history(&agent_dir, &id).unwrap_or_default();
-                id
-            }
-            _ => store
-                .create(titi_core::session::SessionMeta {
-                    title: Some("titi".into()),
-                    source: Some("cli".into()),
-                    ..Default::default()
-                })
-                .unwrap_or_else(|_| "session".into()),
-        },
-        Err(_) => "session".into(),
-    };
+    // The flag is the user's word for this run; the key is standing consent.
+    // Either one asks for the same thing, and `launch_session` decides which
+    // session that is; with neither, a launch starts blank.
+    let resume = resume || settings.as_ref().is_some_and(session_auto_resume_from);
+    let (session_id, restored) = launch_session(&agent_dir, resume);
     engine_config.restored_messages = restored;
     // The engine names this session once the first turn finishes; without the
     // id it has nothing to name.

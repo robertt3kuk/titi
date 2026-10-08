@@ -20,12 +20,20 @@ usage: titi [options]
   --record <path.ompcast>     record this session's events to a cast file
   --replay <path.ompcast>     play a recorded session and exit; no model runs
   --replay-fast               with --replay: no pauses between records
+  --continue, -c              resume the newest session in this agent
+                              directory instead of starting blank; with
+                              nothing to resume, start fresh and say so
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
   --list-keys                 list stored providers, kind and lifetime (never the keys)
   --login [provider]          sign in to a provider with OAuth; no argument lists them
   --device                    with --login: use the device code, no callback server
   --help, -h                  this text
+
+session.autoResume in the agent config.yml or the project .titi/config.yml
+(project wins) resumes the newest stored session at every launch; unset
+means off. Either way the session continued is the newest one the agent
+directory holds.
 
   titi genome [on|off|limit <n>|check|lsp]
                               manage the prompt map build: on, off, or a file cap
@@ -80,6 +88,8 @@ fn main() -> io::Result<()> {
     let mut record: Option<std::path::PathBuf> = None;
     let mut replay: Option<std::path::PathBuf> = None;
     let mut replay_fast = false;
+    // `--continue` is a Rust keyword, so the flag's own name is not.
+    let mut continue_session = false;
     let mut approval = titi_tools::ApprovalMode::Write;
     let mut mode = titi_engine::protocol::SessionMode::Agent;
     let mut theme: Option<String> = None;
@@ -102,6 +112,8 @@ fn main() -> io::Result<()> {
             }
         } else if arg == "--headless" || arg == "-p" {
             headless = true;
+        } else if arg == "--continue" || arg == "-c" {
+            continue_session = true;
         } else if arg == "--prompt" {
             let Some(text) = args.next() else {
                 eprintln!("usage: titi --prompt <text>");
@@ -297,8 +309,17 @@ fn main() -> io::Result<()> {
         .map_err(io::Error::other)?;
     let _enter = runtime.enter();
 
+    // `--continue` with nothing to continue is a fresh start, not a failure,
+    // and the run says which of the two happened. The screen carries the note
+    // (`chat::run`): the alternate screen would hide a line written here. A
+    // headless run has no screen and keeps the line. Read before the engine
+    // starts, because starting is what creates the fresh session.
+    let continue_note = (continue_session
+        && titi_cli::session_fs::newest_session(&titi_config::agent_dir()).is_none())
+    .then(|| "continue: no session to resume · starting fresh".to_owned());
     let (engine, models, session_id) =
-        titi_cli::engine::start_engine_with(approval, mode).map_err(io::Error::other)?;
+        titi_cli::engine::start_engine_with(approval, mode, continue_session)
+            .map_err(io::Error::other)?;
     let session_log =
         titi_cli::session_log::SessionLog::open(&titi_config::agent_dir(), &session_id);
     if session_log.is_none() {
@@ -312,6 +333,9 @@ fn main() -> io::Result<()> {
         );
     }
     if headless {
+        if let Some(note) = &continue_note {
+            eprintln!("{note}");
+        }
         let code = match (goal, prompt) {
             (Some(text), _) => {
                 runtime.block_on(titi_cli::headless::run_goal(engine, session_log, &text))?
@@ -339,7 +363,15 @@ fn main() -> io::Result<()> {
         },
         None => None,
     };
-    titi_cli::chat::run(engine, session_log, models, session_id, cast, theme)
+    titi_cli::chat::run(
+        engine,
+        session_log,
+        models,
+        session_id,
+        cast,
+        theme,
+        continue_note,
+    )
 }
 
 /// Installed before the screen opens, so a panic is reported rather than

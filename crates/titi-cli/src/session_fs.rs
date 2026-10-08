@@ -84,6 +84,18 @@ pub fn list_sessions() -> Vec<String> {
     list_sessions_from(&titi_config::agent_dir())
 }
 
+/// The session a `--continue` or `session.autoResume` launch resumes: the
+/// newest the agent directory holds, which is the first row Ctrl+X lists.
+///
+/// `None` means there is nothing to resume. There is no narrower scope to pick
+/// from: a session records no workspace — `SessionMeta` carries a title,
+/// a bot and a source, and its entries are the conversation — so "the newest
+/// session in this workspace" is, for the store that exists, the newest in the
+/// agent directory, the same scope `/sessions` and the switcher read.
+pub fn newest_session(agent_dir: &std::path::Path) -> Option<String> {
+    list_sessions_from(agent_dir).into_iter().next()
+}
+
 /// Delete a session's JSONL file.  Callers must gate this behind an
 /// approval prompt — Esc never reaches here.
 pub fn delete_session_from(agent_dir: &std::path::Path, id: &str) -> Result<(), String> {

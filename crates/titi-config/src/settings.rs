@@ -135,6 +135,17 @@ pub const STATUS_LINE_PRESET_KEY: &str = "statusLine.preset";
 /// over. See [`STATUS_LINE_PRESET_KEY`]: this crate owns the name only.
 pub const STATUS_LINE_CONTEXT_LINE_KEY: &str = "statusLine.contextLine";
 
+/// Whether a launch resumes the newest stored session.
+///
+/// Unset means off: without this key (and without `--continue`) a launch
+/// starts blank even when the agent directory holds sessions, so a resumed
+/// conversation is always something the user asked for. A truthy value is
+/// `true`, `on` or `yes`, case-insensitively; anything else — including a
+/// typo — is off, because a key that cannot be read must not change what the
+/// screen does. This crate owns the name only; the listing the resume picks
+/// from is `titi_cli::session_fs`.
+pub const SESSION_AUTO_RESUME_KEY: &str = "session.autoResume";
+
 impl Settings {
     /// Discover and load all layers.
     ///

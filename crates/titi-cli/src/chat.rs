@@ -4439,6 +4439,7 @@ pub fn run(
     session_id: String,
     mut cast: Option<crate::ompcast::CastWriter>,
     theme_name: Option<String>,
+    startup_note: Option<String>,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -4488,6 +4489,11 @@ pub fn run(
     chat.session_label = stored_session_title(&chat.agent_dir, &session_id);
     // The engine resumed this session's history; the screen shows the same.
     chat.show_stored_history();
+    // `--continue` that found nothing: the screen says so rather than opening
+    // on a welcome that reads as a resume which quietly did nothing.
+    if let Some(note) = startup_note {
+        chat.push(LineKind::Note, note);
+    }
     chat.catalog = catalog;
     chat.skills = discovered_skills(&chat.agent_dir);
     let detect = titi_tui::image::PlaceholderDetect::from_env();
