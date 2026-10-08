@@ -54,7 +54,10 @@ fn main() -> std::io::Result<()> {
         "the graph inputs did not move, so the ranking was left in place"
     );
     assert_eq!(genome.files[&target].exports, exports_before);
-    assert_ne!(genome.files[&target].mtime, before, "the record took the clock");
+    assert_ne!(
+        genome.files[&target].mtime, before,
+        "the record took the clock"
+    );
     println!("// {target}: content-unchanged, graph not recomputed");
     Ok(())
 }

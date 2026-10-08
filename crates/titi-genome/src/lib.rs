@@ -306,8 +306,7 @@ impl Genome {
                 continue;
             }
             match self.files.get(&record.path) {
-                Some(old)
-                    if old.exports == record.exports && old.imports == record.imports => {}
+                Some(old) if old.exports == record.exports && old.imports == record.imports => {}
                 _ => graph_moved = true,
             }
         }
@@ -387,7 +386,10 @@ impl Genome {
                 entry.files.push(path.clone());
             }
         }
-        if !symbols.values().any(|record| record.files.len() <= MAX_DEFINERS) {
+        if !symbols
+            .values()
+            .any(|record| record.files.len() <= MAX_DEFINERS)
+        {
             self.symbols = symbols;
             for record in self.files.values_mut() {
                 record.used_symbols.clear();

@@ -546,17 +546,27 @@ fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
     write(root, "src/hub.rs", "pub fn hub() {}\n");
     write(root, "src/leaf.rs", "pub fn leaf() { hub(); }\n");
     let mut genome = Genome::index(root).unwrap();
-    assert_eq!(genome.dependents["src/hub.rs"], 1, "the fixture has an edge");
+    assert_eq!(
+        genome.dependents["src/hub.rs"], 1,
+        "the fixture has an edge"
+    );
 
     genome.ranks.insert("src/hub.rs".to_owned(), 123.5);
     genome.dependents.insert("src/leaf.rs".to_owned(), 9);
 
-    write(root, "src/leaf.rs", "// a comment\npub fn leaf() { hub(); }\n");
+    write(
+        root,
+        "src/leaf.rs",
+        "// a comment\npub fn leaf() { hub(); }\n",
+    );
     let stats = genome.refresh(root).unwrap();
 
     assert_eq!(stats.parsed, 1, "the bytes changed");
     assert_eq!(stats.content_unchanged, 0, "…and they did change");
-    assert!(!stats.graph_recomputed, "nothing the graph is built from moved");
+    assert!(
+        !stats.graph_recomputed,
+        "nothing the graph is built from moved"
+    );
     assert_eq!(genome.ranks["src/hub.rs"], 123.5, "ranks untouched");
     assert_eq!(genome.dependents["src/leaf.rs"], 9, "dependents untouched");
     assert_eq!(

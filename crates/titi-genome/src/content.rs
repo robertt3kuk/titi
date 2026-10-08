@@ -38,11 +38,20 @@ mod tests {
 
     #[test]
     fn identical_bytes_share_a_fingerprint_and_edits_do_not() {
-        assert_eq!(fingerprint(b"pub fn a() {}\n"), fingerprint(b"pub fn a() {}\n"));
-        assert_ne!(fingerprint(b"pub fn a() {}\n"), fingerprint(b"pub fn a() {}\n\n"));
+        assert_eq!(
+            fingerprint(b"pub fn a() {}\n"),
+            fingerprint(b"pub fn a() {}\n")
+        );
+        assert_ne!(
+            fingerprint(b"pub fn a() {}\n"),
+            fingerprint(b"pub fn a() {}\n\n")
+        );
         // Same length, one character apart: the case the content hash exists
         // for, since size alone cannot tell these apart.
-        assert_ne!(fingerprint(b"pub fn aa() {}\n"), fingerprint(b"pub fn ab() {}\n"));
+        assert_ne!(
+            fingerprint(b"pub fn aa() {}\n"),
+            fingerprint(b"pub fn ab() {}\n")
+        );
         // Reordering lines keeps every byte, so a byte-multiset hash would
         // call these equal; FNV-1a does not.
         assert_ne!(fingerprint(b"one\ntwo\n"), fingerprint(b"two\none\n"));

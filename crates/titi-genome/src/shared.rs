@@ -123,10 +123,12 @@ mod tests {
                 .dependents
                 .keys()
                 .all(|path| genome.files.contains_key(path))
-            && genome
-                .symbols
-                .values()
-                .all(|symbol| symbol.files.iter().all(|file| genome.files.contains_key(file)))
+            && genome.symbols.values().all(|symbol| {
+                symbol
+                    .files
+                    .iter()
+                    .all(|file| genome.files.contains_key(file))
+            })
     }
 
     /// A reader loop over a writer's updates sees only whole graphs.
