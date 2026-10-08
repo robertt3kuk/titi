@@ -39,9 +39,11 @@ pub fn redact(text: &str) -> Redaction {
         let mut count = 0;
         // The borrow of `out` has to end before `out` is reassigned, so the
         // replacement is reduced to an owned `Option` here and not inlined.
-        let replaced = match pattern.replace_all(&out, |_: &Captures<'_>| {
+        let replaced = match pattern.regex.replace_all(&out, |caps: &Captures<'_>| {
             count += 1;
-            MASK
+            let mut kept = String::with_capacity(pattern.replacement.len() + 32);
+            caps.expand(pattern.replacement, &mut kept);
+            kept
         }) {
             Cow::Owned(replaced) => Some(replaced),
             Cow::Borrowed(_) => None,
@@ -358,20 +360,26 @@ fn agent_dir() -> PathBuf {
 // Every entry is a fixed literal, so a compile error is a source bug, not a
 // runtime condition; the tests below compile them.
 #[allow(clippy::expect_used)]
-static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
     [
         // OpenAI, Anthropic, GitHub (classic + fine-grained), Slack, Stripe.
-        r"\bsk-[A-Za-z0-9_\-]{16,}",
-        r"\bsk-ant-[A-Za-z0-9_\-]{16,}",
-        r"\bgh[pousr]_[A-Za-z0-9]{20,}",
-        r"\bgithub_pat_[A-Za-z0-9_]{16,}",
-        r"\bxox[baprs]-[A-Za-z0-9\-]{10,}",
-        r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
+        (r"\bsk-[A-Za-z0-9_\-]{16,}", MASK),
+        (r"\bsk-ant-[A-Za-z0-9_\-]{16,}", MASK),
+        (r"\bgh[pousr]_[A-Za-z0-9]{20,}", MASK),
+        (r"\bgithub_pat_[A-Za-z0-9_]{16,}", MASK),
+        (r"\bxox[baprs]-[A-Za-z0-9\-]{10,}", MASK),
+        (r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}", MASK),
         // AWS access key id.
-        r"\bAKIA[0-9A-Z]{16}",
+        (r"\bAKIA[0-9A-Z]{16}", MASK),
         // PEM blocks and JWTs.
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
-        r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+        (
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            MASK,
+        ),
+        (
+            r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
+            MASK,
+        ),
         // An assignment whose value is long enough to be a token. The key
         // name may be quoted (`"api_key": "…"`), and the credential word may
         // be embedded in a longer identifier (`client_secret`,
@@ -379,14 +387,36 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // matched inside it and the trailing identifier part is folded into
         // the match. A short value (`let token_count = 1`) still cannot
         // reach the 12-character floor.
-        r#"(?i)['"]?[A-Za-z0-9_\-]*(?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_\-]*['"]?\s*[:=]\s*['"]?[A-Za-z0-9_\-\./+]{12,}"#,
+        //
+        // The `key` group is what the replacement keeps: the *name* of what
+        // was removed is the part a reader needs, and `"password": [redacted]`
+        // says more than `[redacted]"` does. The value's closing quote is part
+        // of the match so it goes with the value.
+        (
+            r#"(?i)(?P<key>['"]?[A-Za-z0-9_\-]*(?:api[_-]?key|token|secret|password|passwd)[A-Za-z0-9_\-]*['"]?\s*[:=]\s*)['"]?[A-Za-z0-9_\-\./+]{12,}['"]?"#,
+            "$key[redacted]",
+        ),
         // An Authorization bearer header; the value is opaque by design.
-        r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=+/]{16,}",
+        (r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=+/]{16,}", MASK),
     ]
     .into_iter()
-    .map(|p| Regex::new(p).expect("secret pattern compiles"))
+    .map(|(pattern, replacement)| Pattern {
+        regex: Regex::new(pattern).expect("secret pattern compiles"),
+        replacement,
+    })
     .collect()
 });
+
+/// One entry of [`PATTERNS`]: the shape and what its match is replaced with.
+///
+/// The replacement is a `regex` template, so an entry whose pattern names a
+/// capture can keep it: `$key[redacted]` leaves the assignment's key in place
+/// and masks the value. A bare token has no key worth keeping, so its
+/// replacement is the mask alone.
+struct Pattern {
+    regex: Regex,
+    replacement: &'static str,
+}
 
 /// Literals no [`PATTERNS`] entry can match without.
 ///
@@ -708,12 +738,50 @@ mod tests {
             "{}",
             redacted.text
         );
-        // The mask replaces the whole match, so the key name goes with the
-        // value and this input comes out as `[redacted]"`. Keeping the key
-        // would need a capture-based replacement template per pattern, and
-        // Rust's regex has no lookbehind that could leave it outside the
-        // match — a mechanism this crate does not have. The safety property
-        // is the value being gone, which is what the two assertions above pin.
+        // The key survives and the value does not: the name is the part a
+        // reader needs ("the password was rotated"), and the mask says what
+        // happened to the rest. It used to come out as `[redacted]"`, with
+        // the key consumed and the value's closing quote left dangling.
+        assert_eq!(redacted.text, r#""password": [redacted]"#);
+    }
+
+    /// The key survives whatever shape it was written in: an embedded word
+    /// (`client_secret`), an upper-case name, and a key without quotes all
+    /// keep their own text and lose only the value.
+    #[test]
+    fn an_assignment_keeps_its_key_whatever_shape_it_is_written_in() {
+        for (input, kept) in [
+            ("client_secret=abcdefghijklmnop", "client_secret="),
+            (
+                "AWS_SECRET_ACCESS_KEY=abcdefghijklmnop",
+                "AWS_SECRET_ACCESS_KEY=",
+            ),
+            ("api_key: abcdefghijklmnop", "api_key: "),
+            ("token = abcdefghijklmnop", "token = "),
+        ] {
+            let redacted = redact(input);
+            assert_eq!(redacted.removed, 1, "{input}: {}", redacted.text);
+            assert!(
+                !redacted.text.contains("abcdefghijklmnop"),
+                "{input}: {}",
+                redacted.text
+            );
+            assert!(
+                redacted.text.starts_with(kept),
+                "{input} lost its key: {}",
+                redacted.text
+            );
+            assert!(redacted.text.ends_with("[redacted]"), "{}", redacted.text);
+        }
+    }
+
+    /// A bare token has no key to keep, so the mask is the whole match and
+    /// nothing of the secret's own text is left.
+    #[test]
+    fn a_bare_token_is_masked_whole() {
+        let redacted = redact("sk-abcdefghijklmnopqrst");
+        assert_eq!(redacted.removed, 1, "{}", redacted.text);
+        assert_eq!(redacted.text, "[redacted]");
     }
 
     #[test]
