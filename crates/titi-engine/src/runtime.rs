@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::claims::Claims;
 use crate::findings::Findings;
 use crate::protocol::{ContextPart, EngineCommand, EngineEvent, TurnId};
-use crate::registry::{RefreshOutcome, RegistryError, ResolvedModel};
+use crate::registry::{ModelPrice, RefreshOutcome, RegistryError, ResolvedModel};
 use crate::steering::Steering;
 use crate::tool_loop::{
     ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools,
@@ -529,6 +529,17 @@ mod tests {
 pub trait TransportResolver: Send + Sync + 'static {
     fn resolve(&self, model: &str) -> Result<ResolvedModel, RegistryError>;
 
+    /// What the named model costs, when the resolver knows.
+    ///
+    /// `None` is *unpriced*: a local model, a subscription backend, a model
+    /// the registry discovered, or a price nobody wrote down. It is not a
+    /// price of zero, and a caller that prints or enforces money must treat
+    /// the two differently. The default is `None`, because a resolver that
+    /// only maps ids to transports knows nothing about money.
+    fn price(&self, _model: &str) -> Option<ModelPrice> {
+        None
+    }
+
     /// Renew the OAuth credentials a turn is about to resolve, in front of the
     /// first resolve. The default resolver owns no credential store.
     ///
@@ -912,6 +923,20 @@ pub struct EngineRuntime {
     /// The cap has already been reported as reached, so the surface is not
     /// told again for every prompt that is refused afterwards.
     budget_tripped: bool,
+    /// Micro-dollars this session's priced turns have cost, summed by the same
+    /// turns that report their tokens — one figure, one place, so a footer and
+    /// this ledger cannot disagree.
+    spent_micro_usd: Arc<AtomicU64>,
+    /// The money cap, in micro-dollars, if any. Independent of the token cap:
+    /// a session may have either, both, or neither.
+    money_budget: Option<u64>,
+    /// As [`Self::budget_tripped`], for the money cap.
+    money_tripped: bool,
+    /// A turn has already run on a model this session cannot price while a
+    /// money cap was in force, and the surface has been told. Set by the turn
+    /// that found out — it is the one holding the model — and cleared when a
+    /// new cap is set, because a new cap is a fresh start.
+    money_unpriced_said: Arc<AtomicBool>,
     /// What the next turns are allowed to do.
     mode: crate::protocol::SessionMode,
 }
@@ -1094,6 +1119,10 @@ impl EngineRuntime {
             spent: Arc::new(AtomicU64::new(0)),
             budget: None,
             budget_tripped: false,
+            spent_micro_usd: Arc::new(AtomicU64::new(0)),
+            money_budget: None,
+            money_tripped: false,
+            money_unpriced_said: Arc::new(AtomicBool::new(false)),
         };
         tokio::spawn(runtime.run());
         Engine {
@@ -1298,6 +1327,28 @@ impl EngineRuntime {
                                 }
                             }
                         }
+                        EngineCommand::SetMoneyBudget { micro_usd } => {
+                            // A cap the engine cannot enforce is refused, and
+                            // the refusal names the model: an unpriced model
+                            // is not a free one, so accepting the cap would
+                            // promise a bound whose spend is invisible.
+                            if micro_usd.is_some()
+                                && self.resolver.price(&primary_model).is_none()
+                            {
+                                let _ = self.events.send(EngineEvent::MoneyBudgetUnpriced { model: primary_model.clone() }).await;
+                                continue;
+                            }
+                            self.money_budget = micro_usd;
+                            self.money_tripped = false;
+                            self.money_unpriced_said.store(false, Ordering::SeqCst);
+                            let spent_micro_usd = self.spent_micro_usd.load(Ordering::SeqCst);
+                            let _ = self.events.send(EngineEvent::MoneyBudgetUpdated { spent_micro_usd, limit_micro_usd: self.money_budget }).await;
+                            if self.over_budget().await {
+                                while let Some(text) = queued.pop_front() {
+                                    let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
+                                }
+                            }
+                        }
                         EngineCommand::SetMode { mode } => {
                             // The running turn keeps the tools it started
                             // with; the mode picks the tools of the next one.
@@ -1406,6 +1457,8 @@ impl EngineRuntime {
                         }
                         let spent = self.spent.load(Ordering::SeqCst);
                         let _ = self.events.send(EngineEvent::BudgetUpdated { spent, limit: self.budget }).await;
+                        let spent_micro_usd = self.spent_micro_usd.load(Ordering::SeqCst);
+                        let _ = self.events.send(EngineEvent::MoneyBudgetUpdated { spent_micro_usd, limit_micro_usd: self.money_budget }).await;
                         if self.over_budget().await {
                             // What was waiting behind this turn is handed
                             // back rather than run: the cap is reached, and
@@ -1424,24 +1477,45 @@ impl EngineRuntime {
         }
     }
 
-    /// Whether the session has spent its cap, reporting the first time it
-    /// has. A capless session is never over budget.
+    /// Whether the session has spent a cap, reporting the first time it has.
+    /// A capless session is never over budget.
+    ///
+    /// Two caps, one place: the token cap as it was, and the money cap beside
+    /// it. Either one reaching its limit stops the next turn, and each reports
+    /// its own event once — the token event's shape carries tokens, so the
+    /// money cap has its own rather than a number wearing the wrong unit.
     async fn over_budget(&mut self) -> bool {
-        let Some(limit) = self.budget else {
-            return false;
-        };
-        let spent = self.spent.load(Ordering::SeqCst);
-        if spent < limit {
-            return false;
+        let mut tripped = false;
+        if let Some(limit) = self.budget {
+            let spent = self.spent.load(Ordering::SeqCst);
+            if spent >= limit {
+                if !self.budget_tripped {
+                    self.budget_tripped = true;
+                    let _ = self
+                        .events
+                        .send(EngineEvent::BudgetExceeded { spent, limit })
+                        .await;
+                }
+                tripped = true;
+            }
         }
-        if !self.budget_tripped {
-            self.budget_tripped = true;
-            let _ = self
-                .events
-                .send(EngineEvent::BudgetExceeded { spent, limit })
-                .await;
+        if let Some(limit) = self.money_budget {
+            let spent_micro_usd = self.spent_micro_usd.load(Ordering::SeqCst);
+            if spent_micro_usd >= limit {
+                if !self.money_tripped {
+                    self.money_tripped = true;
+                    let _ = self
+                        .events
+                        .send(EngineEvent::MoneyBudgetExceeded {
+                            spent_micro_usd,
+                            limit_micro_usd: limit,
+                        })
+                        .await;
+                }
+                tripped = true;
+            }
         }
-        true
+        tripped
     }
 
     /// Starts a background loop and reports it, or refuses it.
@@ -1798,6 +1872,15 @@ impl EngineRuntime {
         let claims = self.claims.clone();
         let steering = self.steering.clone();
         let spent = Arc::clone(&self.spent);
+        let money = MoneyLedger {
+            spent_micro_usd: Arc::clone(&self.spent_micro_usd),
+            unpriced_said: Arc::clone(&self.money_unpriced_said),
+        };
+        // Whether a money cap is in force when the turn starts. The cap can
+        // move mid-turn, but what a turn needs it for is whether to say that
+        // it cannot be measured — and the next turn says it again if the cap
+        // arrived late.
+        let money_bounded = self.money_budget.is_some();
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -1816,6 +1899,8 @@ impl EngineRuntime {
                 claims,
                 steering,
                 spent,
+                money,
+                money_bounded,
             )
             .await;
             let _ = done
@@ -2101,6 +2186,10 @@ async fn run_turn(
     steering: Steering,
     // Session-wide token meter the turn adds its own spend to.
     spent: Arc<AtomicU64>,
+    // Session-wide money ledger, and whether a cap is over it: see
+    // `MoneyLedger`.
+    money: MoneyLedger,
+    money_bounded: bool,
 ) -> Option<Vec<ChatMessage>> {
     // In front of the resolve below, and outside the synchronous ladder: a
     // subscription token that expires between turns would otherwise fail the
@@ -2146,7 +2235,7 @@ async fn run_turn(
     );
 
     // Per turn, not per model: rounds a fallback leaves behind were paid for.
-    let mut meter = TurnMeter::new(&spent);
+    let mut meter = TurnMeter::new(&spent, &money);
     let history = async {
         // What the last model to give up said, for the failure that ends the
         // turn when every model has: "unavailable" alone does not say why.
@@ -2181,6 +2270,21 @@ async fn run_turn(
             let credential = resolved.credential;
             let wire_model = resolved.wire_model;
             let transport = resolved.transport;
+            // The price of *this* model: a fallback is a different price, not
+            // the same one, and the meter charges each round at its own rate.
+            let price = resolver.price(&model);
+            if price.is_none() && money_bounded && !money.unpriced_said.swap(true, Ordering::SeqCst)
+            {
+                // The cap stays in force; what changes is that the engine can
+                // no longer measure against it, and says so rather than
+                // letting the bound look enforced.
+                let _ = events
+                    .send(EngineEvent::MoneyBudgetUnpriced {
+                        model: model.clone(),
+                    })
+                    .await;
+            }
+            meter.for_model(price);
             let _ = events
                 .send(EngineEvent::TurnStarted {
                     turn_id,
@@ -2411,6 +2515,21 @@ async fn back_off(delay: std::time::Duration, aborted: &AtomicBool) -> bool {
     }
 }
 
+/// The session's money, shared with the turns that spend it.
+///
+/// `spent_micro_usd` is summed by the turns from the same per-turn figure they
+/// put on [`EngineEvent::TurnUsage`], so the ledger and a footer read one
+/// number rather than two computations of it. `unpriced_said` is the
+/// transition flag for [`EngineEvent::MoneyBudgetUnpriced`]: the turn that
+/// finds out sets it, and only the first one reports, because a session that
+/// keeps running on an unpriced model under a money cap does not need telling
+/// every turn.
+#[derive(Clone, Default)]
+struct MoneyLedger {
+    spent_micro_usd: Arc<AtomicU64>,
+    unpriced_said: Arc<AtomicBool>,
+}
+
 /// What one turn has spent, round by round. A tool round re-sends the whole
 /// conversation and is paid for like any other request, so the turn's usage
 /// is the sum of its rounds; each round also goes on the session's meter,
@@ -2420,19 +2539,40 @@ struct TurnMeter<'a> {
     prompt: u64,
     completion: u64,
     cached: u64,
+    /// The session's money ledger, which this turn adds to as it reports.
+    money: &'a MoneyLedger,
+    /// The price of the model the current attempt is running on. `None` is
+    /// *unpriced*: the turn's money is then not a zero, it is unknown.
+    price: Option<ModelPrice>,
+    /// What the turn has cost so far, in micro-dollars, over the rounds that
+    /// had a price.
+    turn_micro_usd: u64,
+    /// A round ran on a model with no price, so the figure above is not the
+    /// turn's whole cost and must not be presented as if it were.
+    unpriced: bool,
     /// The turn's usage went out. It goes out once, however the turn ends.
     reported: bool,
 }
 
 impl<'a> TurnMeter<'a> {
-    fn new(session: &'a Arc<AtomicU64>) -> Self {
+    fn new(session: &'a Arc<AtomicU64>, money: &'a MoneyLedger) -> Self {
         Self {
             session,
             prompt: 0,
             completion: 0,
             cached: 0,
+            money,
+            price: None,
+            turn_micro_usd: 0,
+            unpriced: false,
             reported: false,
         }
+    }
+
+    /// The price of the model the next round runs on, which the turn sets per
+    /// attempt: a fallback model is a different price, not the same one.
+    fn for_model(&mut self, price: Option<ModelPrice>) {
+        self.price = price;
     }
 
     /// The turn's usage, which counts as reported from here on.
@@ -2443,6 +2583,9 @@ impl<'a> TurnMeter<'a> {
             prompt_tokens: u32::try_from(self.prompt).unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(self.completion).unwrap_or(u32::MAX),
             cached_tokens: u32::try_from(self.cached).unwrap_or(u32::MAX),
+            // A turn any of whose rounds went unpriced has no complete figure
+            // to state, and a partial one would read as the whole of it.
+            cost_micro_usd: (!self.unpriced).then_some(self.turn_micro_usd),
         }
     }
 
@@ -2461,6 +2604,24 @@ impl<'a> TurnMeter<'a> {
         self.completion = self.completion.saturating_add(completion);
         self.session
             .fetch_add(prompt.saturating_add(completion), Ordering::SeqCst);
+        // The money is the same arithmetic a footer does, over the same three
+        // counts, from the one place a price can come from. An unpriced round
+        // adds nothing and says so rather than adding a zero: the session's
+        // figure stays a floor and the turn reports no figure at all.
+        match self.price {
+            Some(price) => {
+                let micro = price.cost_micro_usd(
+                    u32::try_from(prompt).unwrap_or(u32::MAX),
+                    u32::try_from(cached).unwrap_or(u32::MAX),
+                    u32::try_from(completion).unwrap_or(u32::MAX),
+                );
+                self.turn_micro_usd = self.turn_micro_usd.saturating_add(micro);
+                self.money
+                    .spent_micro_usd
+                    .fetch_add(micro, Ordering::SeqCst);
+            }
+            None => self.unpriced = true,
+        }
     }
 }
 

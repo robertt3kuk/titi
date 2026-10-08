@@ -691,6 +691,13 @@ impl crate::runtime::TransportResolver for ProviderRegistry {
         ProviderRegistry::resolve(self, model)
     }
 
+    /// The descriptor's price, which is the same one a surface reads through
+    /// [`ProviderRegistry::price`]: the engine and the footer cannot disagree
+    /// about what a model costs when there is one place to ask.
+    fn price(&self, model: &str) -> Option<ModelPrice> {
+        ProviderRegistry::price(self, model)
+    }
+
     fn refresh_due(&self) -> Pin<Box<dyn Future<Output = Vec<RefreshOutcome>> + Send + '_>> {
         Box::pin(async move {
             // The client is built once per process, on the first turn that
