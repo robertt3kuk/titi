@@ -478,3 +478,54 @@ fn an_unreadable_root_is_an_error_but_an_unreadable_child_is_skipped() {
         genome.files.keys()
     );
 }
+
+/// A `touch` moves the clock, not the bytes. The size/mtime pre-filter cannot
+/// tell that from a real edit, so the file is read — and the content hash
+/// settles it without paying for a parse.
+#[test]
+fn a_no_op_mtime_touch_does_not_reparse() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn a() {}\n");
+    write(root, "src/b.rs", "pub fn b() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+
+    // Untouched tree: the pre-filter skips every file, so nothing is read.
+    let quiet = genome.refresh(root).unwrap();
+    assert_eq!(quiet.parsed, 0);
+    assert_eq!(quiet.content_unchanged, 0, "not read, not counted");
+
+    let before = fs::metadata(root.join("src/a.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(root.join("src/a.rs"))
+        .unwrap()
+        .set_modified(before + Duration::from_secs(1))
+        .unwrap();
+
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 0, "same bytes, no re-parse");
+    assert_eq!(stats.content_unchanged, 1, "read, and settled by hash");
+    assert_eq!(stats.total, 2);
+    assert_eq!(genome.files["src/a.rs"].exports, vec!["a".to_owned()]);
+    assert_ne!(genome.files["src/a.rs"].mtime, before, "the clock moved");
+}
+
+/// The same length is not the same file: `size` cannot clear a rewrite, so the
+/// bytes are read and the hash disagrees.
+#[test]
+fn an_edit_that_keeps_the_length_is_still_reparsed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn aa() {}\n");
+    let mut genome = Genome::index(root).unwrap();
+
+    write(root, "src/a.rs", "pub fn ab() {}\n");
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 1, "same length, different bytes");
+    assert_eq!(stats.content_unchanged, 0);
+    assert!(genome.files["src/a.rs"].exports.contains(&"ab".to_owned()));
+}

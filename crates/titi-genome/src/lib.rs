@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 pub mod ast_edit;
 
+mod content;
 mod graph;
 mod lang;
 mod lsp;
@@ -86,6 +87,14 @@ pub struct FileRecord {
     pub used_symbols: Vec<String>,
     pub size: u64,
     pub mtime: SystemTime,
+    /// FNV-1a of the bytes this record was parsed from.
+    ///
+    /// `size` and `mtime` are the cheap pre-filter; this is the confirmation
+    /// that costs a read. A file whose `size` and `hash` both match the
+    /// previous record is the same file even when `mtime` moved, so `refresh`
+    /// keeps the record — new `mtime`, same parse — instead of re-parsing.
+    /// It is not a security digest and must not be used as one.
+    pub hash: u64,
 }
 
 /// A name exported by more than this many files is ambiguous under name-only
@@ -113,12 +122,21 @@ impl SymbolRecord {
 /// What one [`Genome::refresh`] actually did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RefreshStats {
-    /// Files re-read and re-parsed (new or changed).
+    /// Files re-read **and re-parsed**: new, or changed in content.
     pub parsed: usize,
     /// Files dropped because they vanished from disk.
     pub removed: usize,
     /// Files in the index afterwards.
     pub total: usize,
+    /// Files whose content was read and found identical to the recorded
+    /// bytes, despite `size` or `mtime` having moved.
+    ///
+    /// These passed the pre-filter — the `stat` disagreed — and the content
+    /// hash settled it. They cost a read each and saved a parse each. A file
+    /// the pre-filter skipped without reading is in none of these counts: it
+    /// was not examined, so calling it "unchanged" would claim more evidence
+    /// than a `stat` gives.
+    pub content_unchanged: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,8 +157,16 @@ impl Genome {
         Ok(genome)
     }
 
-    /// Re-walk `root` and re-parse only the files whose size or mtime moved.
-    /// Removed files drop out; ranks are recomputed every time (it is cheap
+    /// Re-walk `root` and re-parse only the files that moved.
+    ///
+    /// The **fallback** path: it walks the tree, so it catches files no caller
+    /// mentioned, and it is what the engine's per-turn call uses. A file is
+    /// examined only when its `size` or `mtime` differs from the recorded one
+    /// — a `stat` per file and no read — and a file that passes that gate is
+    /// read, hashed and, if the bytes match, kept without being parsed; see
+    /// [`FileRecord::hash`].
+    ///
+    /// `ranks`, `dependents` and `symbols` are rebuilt every time (it is cheap
     /// relative to parsing).
     pub fn refresh(&mut self, root: impl AsRef<Path>) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
@@ -157,9 +183,14 @@ impl Genome {
             })
             .collect();
         let mut parsed = 0;
-        for record in parse_batch(&stale, &known) {
+        let mut content_unchanged = 0;
+        for (record, was_parsed) in parse_batch(&stale, &known, &self.files) {
+            if was_parsed {
+                parsed += 1;
+            } else {
+                content_unchanged += 1;
+            }
             self.files.insert(record.path.clone(), record);
-            parsed += 1;
         }
 
         let before = self.files.len();
@@ -174,6 +205,7 @@ impl Genome {
             parsed,
             removed,
             total: self.files.len(),
+            content_unchanged,
         })
     }
 
@@ -196,12 +228,7 @@ impl Genome {
                 entry.files.push(path.clone());
             }
         }
-        let definers: HashSet<String> = symbols
-            .iter()
-            .filter(|(_, record)| record.files.len() <= MAX_DEFINERS)
-            .map(|(name, _)| name.clone())
-            .collect();
-        if definers.is_empty() {
+        if !symbols.values().any(|record| record.files.len() <= MAX_DEFINERS) {
             self.symbols = symbols;
             for record in self.files.values_mut() {
                 record.used_symbols.clear();
@@ -218,7 +245,12 @@ impl Genome {
             let used: Vec<String> = record
                 .used_symbols
                 .iter()
-                .filter(|name| definers.contains(*name) && !own.contains(name.as_str()))
+                .filter(|name| {
+                    symbols
+                        .get(*name)
+                        .is_some_and(|symbol| symbol.files.len() <= MAX_DEFINERS)
+                        && !own.contains(name.as_str())
+                })
                 .cloned()
                 .collect();
             for name in &used {
@@ -252,19 +284,30 @@ impl Genome {
     }
 }
 
-/// Parses the stale files, spreading them over the available cores.
+/// Reads and parses the stale files, spreading them over the available cores.
 ///
 /// Parsing is the only expensive step of a refresh and every file is
 /// independent of the others — they share nothing but the read-only set of
-/// known paths — so the work splits cleanly. A refresh that touches one file
-/// stays on the calling thread.
-fn parse_batch(stale: &[&scan::ListedFile], known: &HashSet<String>) -> Vec<FileRecord> {
+/// known paths and the records they are compared against — so the work splits
+/// cleanly. A refresh that touches one file stays on the calling thread.
+///
+/// Each entry is the record and whether it was *re-parsed*: a read whose bytes
+/// match the previous record and whose size is unchanged is returned as that
+/// record with the new `mtime`, and no parser runs.
+fn parse_batch(
+    stale: &[&scan::ListedFile],
+    known: &HashSet<String>,
+    previous: &HashMap<String, FileRecord>,
+) -> Vec<(FileRecord, bool)> {
     let workers = std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
         .min(stale.len());
     if workers <= 1 {
-        return stale.iter().map(|file| parse_one(file, known)).collect();
+        return stale
+            .iter()
+            .map(|file| parse_one(file, known, previous.get(&file.path)))
+            .collect();
     }
     let chunk = stale.len().div_ceil(workers);
     std::thread::scope(|scope| {
@@ -274,7 +317,7 @@ fn parse_batch(stale: &[&scan::ListedFile], known: &HashSet<String>) -> Vec<File
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|file| parse_one(file, known))
+                        .map(|file| parse_one(file, known, previous.get(&file.path)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -291,20 +334,40 @@ fn parse_batch(stale: &[&scan::ListedFile], known: &HashSet<String>) -> Vec<File
     })
 }
 
-fn parse_one(file: &scan::ListedFile, known: &HashSet<String>) -> FileRecord {
+fn parse_one(
+    file: &scan::ListedFile,
+    known: &HashSet<String>,
+    previous: Option<&FileRecord>,
+) -> (FileRecord, bool) {
     let source = fs::read_to_string(&file.abs).unwrap_or_default();
-    let result = lang::parse(&file.path, &source, known);
-    FileRecord {
-        language: Language::from_path(&file.path),
-        path: file.path.clone(),
-        exports: result.exports,
-        export_sites: result.export_sites,
-        imports: result.imports,
-        unresolved_imports: result.unresolved_imports,
-        syntax_errors: result.syntax_errors,
-        // Resolved against the whole repo once every file has been parsed.
-        used_symbols: result.refs,
-        size: file.size,
-        mtime: file.mtime,
+    let hash = content::fingerprint(source.as_bytes());
+    if let Some(old) = previous {
+        // The pre-filter already said size or mtime moved. Equal size and
+        // equal bytes is the case it cannot tell from a real edit: keep the
+        // parse, move the clock.
+        if old.size == file.size && old.hash == hash {
+            let mut record = old.clone();
+            record.mtime = file.mtime;
+            return (record, false);
+        }
     }
+    let result = lang::parse(&file.path, &source, known);
+    (
+        FileRecord {
+            language: Language::from_path(&file.path),
+            path: file.path.clone(),
+            exports: result.exports,
+            export_sites: result.export_sites,
+            imports: result.imports,
+            unresolved_imports: result.unresolved_imports,
+            syntax_errors: result.syntax_errors,
+            // Raw candidate identifiers; resolved against the whole repo once
+            // every file has been parsed.
+            used_symbols: result.refs,
+            size: file.size,
+            mtime: file.mtime,
+            hash,
+        },
+        true,
+    )
 }
