@@ -23,6 +23,7 @@ the real binary and the real HTTP stack:
   "think"         reasoning deltas, then markdown
   "markdown table"  a GFM table: alignment colons, a bold and an inline-code
                   cell, a CJK cell, and a wide cell that must wrap
+  "latex math"    inline `$O(\log n)$` plus a display `$$…$$` block
   "wide text"     CJK and emoji
   "fail401" / "fail429" / "fail500"   that HTTP status with an error body
   a tool result   "tool said: <first line of the result>"
@@ -144,6 +145,18 @@ def script(last: dict) -> list[tuple[dict, float]]:
             "| gamma | 7ms | one two three four five six seven |\n"
         )
         return words(table, 0.01) + [(chunk({}, "stop"), 0)]
+    if "latex math" in content:
+    # NOTE: the reply of the "latex math" keyword carries `**bold**` as well as the
+    # formulas, because the chat screen only takes the markdown path when an answer
+    # carries a markdown marker it knows (`has_markdown` in crates/titi-cli/src/chat.rs
+    # does not recognise `$`/`$$` yet). Drop the bold once that gate knows about
+    # maths and this keyword still exercises the same renderer.
+        answer = (
+            "**Binary search** is $O(\\log n)$ and the harmonic sum is:\n\n"
+            "$$\\sum_{i=1}^{n} \\frac{i}{i+1}$$\n\n"
+            "with $\\alpha \\le \\beta$ as the bound.\n"
+        )
+        return words(answer, 0.01) + [(chunk({}, "stop"), 0)]
     if "wide text" in content:
         parts = ["日本語のテキスト ", "and emoji 🎉🚀 ", "mixed 中文 text ", "done."]
         return [(chunk({"content": p}), 0) for p in parts] + [(chunk({}, "stop"), 0)]
