@@ -25,7 +25,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
@@ -38,6 +38,7 @@ use titi_tui::theme::appearance::{self, Appearance, AppearanceEvent, AppearanceI
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::composer::*;
 use crate::herdr::{self, AgentState};
 use crate::hub::{HubSession, HubUpdate};
 use crate::keys::*;
@@ -339,12 +340,12 @@ impl WorkPhase {
 ///
 /// The flow itself is a task; this is only the two ends the render loop
 /// holds, so a frame never waits on a browser, a socket or a person.
-struct OAuthLogin {
+pub(crate) struct OAuthLogin {
     provider: &'static OAuthProvider,
     flow: LoginFlow,
     /// How this provider is being signed in. The device grant has no code to
     /// paste back, so the composer must not ask for one.
-    method: LoginMethod,
+    pub(crate) method: LoginMethod,
 }
 
 /// Conversation on screen. No terminal, no session file.
@@ -376,8 +377,8 @@ pub struct Chat {
     pub(crate) session_id: String,
     session_label: String,
     pub(crate) agent_dir: PathBuf,
-    paused: bool,
-    context_percent: Option<u8>,
+    pub(crate) paused: bool,
+    pub(crate) context_percent: Option<u8>,
     /// The model's context window in tokens, as the engine reported it with the
     /// percentage. The gauge is drawn from it, so `None` — before any turn has
     /// stated one — is what keeps the line between the groups blank.
@@ -416,7 +417,7 @@ pub struct Chat {
     pub(crate) login_for: Option<String>,
     /// The OAuth login behind `login_for`, when the provider is signed in
     /// through a browser rather than with a pasted key.
-    oauth: Option<OAuthLogin>,
+    pub(crate) oauth: Option<OAuthLogin>,
     /// Where a login is started. Production builds the terminal driver on
     /// first use; tests inject one so no socket, browser or provider is
     /// involved.
@@ -4143,7 +4144,7 @@ pub(crate) fn page(theme: &Theme) -> Style {
 /// The composer's own surface: the theme's raised panel colour with body text
 /// on it. `userMessageBg` belongs to the user's own block and is not spent
 /// here.
-fn surface(theme: &Theme) -> Style {
+pub(crate) fn surface(theme: &Theme) -> Style {
     Style::default()
         .bg(bg(theme, ThemeBg::CustomMessageBg))
         .fg(rgb(&theme.get_color_hex(ThemeColor::Text)))
@@ -5095,199 +5096,6 @@ fn empty_state(chat: &Chat, width: u16, height: u16, theme: &Theme) -> Paragraph
     Paragraph::new(lines).style(page(theme))
 }
 
-fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
-    let (border, caption_color) = if chat.approval.is_some() || chat.login_for.is_some() {
-        (ThemeColor::Warning, ThemeColor::Warning)
-    } else if chat.turn_active {
-        (ThemeColor::Accent, ThemeColor::Accent)
-    } else {
-        (ThemeColor::Border, ThemeColor::Dim)
-    };
-    let caption = titi_tui::width::truncate_to_width(
-        &composer_caption(chat),
-        (width as usize).saturating_sub(4),
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(fg(theme, border))
-        .title_bottom(
-            Line::from(Span::styled(
-                format!(" {caption} "),
-                fg(theme, caption_color),
-            ))
-            .centered(),
-        )
-        .padding(Padding::horizontal(1))
-        .style(surface(theme));
-    let inner = (width as usize).saturating_sub(6).max(4);
-    let line = if let Some(pending) = &chat.approval {
-        const KEYS: &str = "   y allow    n refuse";
-        let room = inner.saturating_sub(titi_tui::width::visible_width(KEYS));
-        // A cut command says so: an approval must not read as the whole
-        // command when it is only its head.
-        let subject = ellipsis_label(pending.subject(), room.max(1));
-        Line::from(Span::styled(
-            titi_tui::width::truncate_to_width(&format!("{subject}{KEYS}"), inner),
-            fg(theme, ThemeColor::Warning).add_modifier(Modifier::BOLD),
-        ))
-    } else if let Some(provider) = &chat.login_for {
-        let device = chat
-            .oauth
-            .as_ref()
-            .is_some_and(|login| login.method == LoginMethod::Device);
-        let shown = if !chat.input.is_empty() {
-            "•".repeat(chat.input.chars().count().min(32))
-        } else if device {
-            "waiting for the device code".to_owned()
-        } else if chat.oauth.is_some() {
-            "paste the code or the redirect URL".to_owned()
-        } else {
-            format!("paste the {provider} key")
-        };
-        let color = if chat.input.is_empty() {
-            ThemeColor::Dim
-        } else {
-            ThemeColor::Text
-        };
-        Line::from(vec![
-            Span::styled("› ", fg(theme, ThemeColor::Accent)),
-            Span::styled(shown, fg(theme, color)),
-        ])
-    } else if chat.input.is_empty() {
-        let placeholder = if chat.paused {
-            "paused…"
-        } else if chat.turn_active {
-            "steer this turn…"
-        } else {
-            "ask titi…"
-        };
-        Line::from(vec![
-            Span::styled("› ", fg(theme, ThemeColor::Accent)),
-            Span::styled(placeholder, fg(theme, ThemeColor::Dim)),
-        ])
-    } else {
-        let room = inner.saturating_sub(4).max(1);
-        Line::from(vec![
-            Span::styled("› ", fg(theme, ThemeColor::Accent)),
-            Span::styled(
-                fit_tail(&composer_view(&chat.input), room),
-                fg(theme, ThemeColor::Text),
-            ),
-            Span::styled("▍", fg(theme, ThemeColor::Accent)),
-        ])
-    };
-    Paragraph::new(line).block(block)
-}
-
-fn composer_caption(chat: &Chat) -> String {
-    let ctx = match chat.context_percent {
-        Some(percent) => format!("{percent}%  ·  "),
-        None => String::new(),
-    };
-    let keys = if chat.approval.is_some() {
-        "y allow  ·  n refuse"
-    } else if chat.emoji_picker.is_visible() {
-        "↑↓ move  ·  tab takes  ·  esc closes"
-    } else if chat.model_picker.is_some() {
-        "↑↓ move  ·  enter switches  ·  esc clears or closes"
-    } else if chat
-        .oauth
-        .as_ref()
-        .is_some_and(|login| login.method == LoginMethod::Device)
-    {
-        // The device grant finishes in the browser: there is nothing to
-        // submit here, only the way out.
-        "esc cancels"
-    } else if chat.login_for.is_some() && chat.oauth.is_some() {
-        "enter submits  ·  esc cancels"
-    } else if chat.login_for.is_some() {
-        "enter stores  ·  esc cancels"
-    } else if chat.paused {
-        "/pause resumes"
-    } else if !chat.hint.is_empty() {
-        chat.hint.as_str()
-    } else if chat.turn_active {
-        "enter steers  ·  ctrl-c stops"
-    } else {
-        "enter sends  ·  /model  ·  ctrl-c quits"
-    };
-    format!("{ctx}{keys}")
-}
-
-pub(crate) fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = Vec::new();
-    // A cell holding a tab is drawn as nothing, so pasted indentation is
-    // spelled out before the text is measured.
-    let text = text.replace('\t', "    ");
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            rows.push(String::new());
-            continue;
-        }
-        let chars: Vec<char> = paragraph.chars().collect();
-        let mut index = 0;
-        while index < chars.len() {
-            let mut col = 0usize;
-            let mut last_space = None;
-            let mut end = index;
-            while end < chars.len() {
-                let cell = titi_tui::width::visible_width(&chars[end].to_string());
-                if col + cell > width && end > index {
-                    break;
-                }
-                if chars[end] == ' ' {
-                    last_space = Some(end);
-                }
-                col += cell;
-                end += 1;
-            }
-            let cut = if end < chars.len() {
-                last_space.filter(|at| *at > index).unwrap_or(end)
-            } else {
-                end
-            };
-            let piece: String = chars[index..cut].iter().collect();
-            rows.push(piece.trim_end().to_owned());
-            index = cut;
-            while index < chars.len() && chars[index] == ' ' {
-                index += 1;
-            }
-        }
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
-/// The composer's one row: a pasted line break is shown as `↵` and a tab as
-/// four spaces, so a multi-line paste reads as what it is without the box
-/// growing. The input itself keeps both.
-fn composer_view(input: &str) -> String {
-    input.replace('\n', "↵").replace('\t', "    ")
-}
-
-fn fit_tail(text: &str, width: usize) -> String {
-    if titi_tui::width::visible_width(text) <= width {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let mut end = chars.len();
-    let mut col = 0usize;
-    let room = width.saturating_sub(1);
-    while end > 0 {
-        let cell = titi_tui::width::visible_width(&chars[end - 1].to_string());
-        if col + cell > room {
-            break;
-        }
-        col += cell;
-        end -= 1;
-    }
-    format!("…{}", chars[end..].iter().collect::<String>())
-}
-
 /// The name a session already has, read once at startup.
 ///
 /// The engine announces a name it has just made and nothing else, so a session
@@ -5303,36 +5111,6 @@ fn stored_session_title(agent_dir: &Path, session_id: &str) -> String {
         return String::new();
     }
     index.title(session_id).ok().flatten().unwrap_or_default()
-}
-
-pub(crate) fn one_line(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut count = 0;
-    for ch in text.chars() {
-        if count >= max {
-            out.push('…');
-            break;
-        }
-        if ch.is_control() {
-            if !out.ends_with(' ') {
-                out.push(' ');
-                count += 1;
-            }
-        } else {
-            out.push(ch);
-            count += 1;
-        }
-    }
-    out
-}
-
-fn tail_chars(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        text.to_owned()
-    } else {
-        chars[chars.len() - max..].iter().collect()
-    }
 }
 
 /// Polls the keyboard and the engine once. `Ok(true)` means the user quit.

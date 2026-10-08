@@ -23,7 +23,8 @@ use ratatui::widgets::Paragraph;
 use titi_tui::markdown::{Section, SectionMode, SectionVisibility};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 
-use crate::chat::{Chat, TOOL_PREVIEW, bg, fg, one_line, page, wrap_plain};
+use crate::chat::{Chat, TOOL_PREVIEW, bg, fg, page};
+use crate::composer::{one_line, wrap_plain};
 
 // ---------------------------------------------------------------------------
 // The transcript's geometry

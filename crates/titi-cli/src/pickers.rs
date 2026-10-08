@@ -20,6 +20,7 @@ use ratatui::widgets::Paragraph;
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 
 use crate::chat::*;
+use crate::composer::one_line;
 use crate::login::OAuthProvider;
 use crate::transcript::*;
 use titi_engine::EngineCommand;
