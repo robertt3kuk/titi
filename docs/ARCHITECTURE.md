@@ -74,24 +74,32 @@ adding a language is one module and one row, not four lists to keep in step.
 
 Every `Language` has a **level**, which is what a user sees when they ask:
 
-- **`Full`** — exports come from a real syntax tree (`lang::rust`,
-  `lang::typescript`, `lang::python`). Rust, TypeScript, JavaScript, Python.
-  JS/JSX parse with the TSX grammar; `.ts`/`.mts`/`.cts` with the TypeScript
-  one, the only extension-dependent grammar in the table.
-- **`Heuristic`** — patterns over the text: comments are blanked first (Go,
-  Java, C#, C/C++, Ruby, Kotlin, Swift, PHP), so a commented-out declaration
-  is not one, but a declaration the patterns do not recognise is missed, and
-  a declaration inside a multi-line string is still a gap. Exports and
-  imports can be wrong.
-- **`Unsupported`** — `Language::Unsupported`, the catch-all for a path no row
-  claims (`a.txt`). It is never indexed, and it contributes no symbols.
+- **`Full`** — exports come from a real syntax tree. This is every language
+  the table recognises, and by construction: a row's `grammar` is `Some(..)`
+  exactly when the row is `Full`, which the table's own test asserts. Some
+  rows use more than one grammar — `.tsx`/`.js`/`.jsx`/`.mjs`/`.cjs` parse with
+  the TSX grammar and `.ts`/`.mts`/`.cts` with the TypeScript one, and a `.h`
+  the C grammar cannot read is retried with the C++ grammar — and each row's
+  `note` says what its parser reads.
+- **`Heuristic`** — patterns over the text, which is exactly what a row with
+  `grammar: None` means. **No row is in this state today.** It is the honest
+  word for a language added without a grammar: such a row declares
+  `grammar: None` and must claim this level instead of `Full`, and the table's
+  test fails when a row becomes non-`Full`, so the step is deliberate rather
+  than a silent downgrade of what the index claims.
+- **`Unsupported`** — a path indexed for reads that contributes no symbols.
+  Its live instance is `Language::Unsupported`, the catch-all for a path no row
+  claims (`a.txt`): never indexed, and it contributes nothing if it were. The
+  variant is the word for a language the index reads but cannot parse, of
+  which "unknown extension" is the current instance.
 
 The level is surfaced where a user asks for it, never in the findings.
 `Genome::capabilities()` returns one entry per language — its level, its
 extensions and its note — and it is a property of the build rather than of
 the workspace, so it answers without indexing anything. `titi genome
 capabilities` prints it as a table (`rust  Full  .rs  exported items and
-use/mod paths come from a syntax tree`) and `titi genome lsp` reports the
+use/mod paths come from a syntax tree`, then `13 languages: 13 full,
+0 heuristic`) and `titi genome lsp` reports the
 same roster in `initialize`'s `experimental.titiGenome.languages`. `titi
 genome check` reports findings only, so a tree with nothing wrong still
 answers `genome: clean`, and the per-file LSP `diagnostic` reply never

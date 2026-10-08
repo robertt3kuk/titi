@@ -59,18 +59,34 @@ pub struct ParsedFile {
 
 /// How well a language is understood: what its exports and imports rest on.
 ///
-/// This is a property of the language, not of one file, and every row in
-/// [`LANGS`] states it. It is what lets a user tell a language read off a
-/// syntax tree from one whose exports are still a guess.
+/// A property of the language, not of one file, and every row in [`LANGS`]
+/// states it. It is the field that stops a row from overstating itself, and
+/// what a user reads in `titi genome capabilities` and in the LSP handshake.
+///
+/// Every row in this build is `Full`; the other two variants each name a
+/// state a row can be in, and `grammar` is the field that decides which.
+///
+/// - `Heuristic` — a row that reads the text with patterns instead of a
+///   syntax tree, which is exactly what `grammar: None` means. **No row is in
+///   this state today.** It becomes reachable by adding a language with no
+///   grammar, whose row must then claim this level rather than `Full`, and
+///   `no_row_is_heuristic_yet_and_unparsed_paths_say_unsupported` fails when
+///   that happens, so becoming heuristic is a deliberate act rather than a
+///   silent downgrade of the claim.
+/// - `Unsupported` — a path indexed for reads that contributes no symbols.
+///   That has a live instance today: it is the level of
+///   [`Language::Unsupported`], the catch-all for a path no row claims
+///   (`a.txt`). "Unknown extension" is only the current instance of it — the
+///   variant is the word for a language the index reads but cannot parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
     /// Read off a real syntax tree: the grammar's own nodes name every
     /// declaration this crate reports, so a commented-out declaration is not
     /// one and an indented method still is.
     Full,
-    /// Patterns over the source text: imports may not resolve because nothing
-    /// indexes the language's module system, and a declaration the patterns do
-    /// not recognise is missed. Exports and imports can be wrong.
+    /// Patterns over the source text: a declaration the patterns do not
+    /// recognise is missed, and an import may not resolve because nothing
+    /// indexes the language's module system. Exports and imports can be wrong.
     Heuristic,
     /// No parser and no patterns: the file is indexed for reads like any other
     /// file, and contributes no symbols at all.
@@ -486,6 +502,41 @@ mod tests {
             );
         }
         assert_eq!(rust.level.as_str(), "Full");
+    }
+
+    /// No row is heuristic today: every language this build recognises reads a
+    /// syntax tree. `Heuristic` is still the honest word for a row with no
+    /// grammar, so this is the gate on becoming one — flipping a language back
+    /// to patterns has to change this line and the note in its row, which is
+    /// the point.
+    #[test]
+    fn no_row_is_heuristic_yet_and_unparsed_paths_say_unsupported() {
+        let roster = capabilities();
+        let not_full: Vec<&str> = roster
+            .iter()
+            .filter(|capability| capability.level != Level::Full)
+            .map(|capability| capability.language)
+            .collect();
+        assert!(
+            not_full.is_empty(),
+            "a row without a grammar is `Heuristic` and must say so here: {not_full:?}"
+        );
+        for row in LANGS {
+            assert_eq!(
+                row.grammar.is_some(),
+                row.level == Level::Full,
+                "`{}` claims a level its grammar field does not support",
+                row.name
+            );
+        }
+
+        // The third level is not unused: it is the catch-all's, which is how a
+        // path the index reads but cannot parse is described.
+        assert_eq!(Language::Unsupported.level(), Level::Unsupported);
+        assert_eq!(Language::Unsupported.name(), "unsupported");
+        assert_eq!(Language::from_path("a.txt"), Language::Unsupported);
+        assert!(!is_source_file("a.txt"));
+        assert_eq!(Level::Unsupported.as_str(), "Unsupported");
     }
 
     #[test]
