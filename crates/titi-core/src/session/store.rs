@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::Checkpoint;
@@ -59,7 +59,8 @@ impl SessionStore {
 
     /// Loads every parseable entry of a session, oldest first.
     ///
-    /// Lenient by design: a torn final line left by a crash is skipped.
+    /// A torn final line left by a crash is skipped; a line that does not
+    /// parse and is *not* last is [`SessionError::Corrupt`]. See `load`.
     pub fn open(&self, session_id: &str) -> Result<Vec<Entry>, SessionError> {
         self.load(session_id)
     }
@@ -100,9 +101,13 @@ impl SessionStore {
             ..entry
         };
         let mut file = OpenOptions::new()
+            .read(true)
             .append(true)
-            .open(self.session_file(session_id))
+            .open(&self.session_file(session_id))
             .map_err(SessionError::Io)?;
+        // A torn line from the previous crash goes before the new one, so the
+        // fragment cannot swallow this append.
+        truncate_torn_tail(&mut file)?;
         let line = serde_json::to_string(&e).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
         // The entry has to be on the platter before the leaf moves to it, or
@@ -186,10 +191,12 @@ impl SessionStore {
             git_commit: None,
         };
         let mut file = OpenOptions::new()
+            .read(true)
             .create(true)
             .append(true)
             .open(self.checkpoint_file(session_id))
             .map_err(SessionError::Io)?;
+        truncate_torn_tail(&mut file)?;
         let line = serde_json::to_string(&checkpoint).map_err(SessionError::Json)?;
         writeln!(file, "{line}").map_err(SessionError::Io)?;
         // A checkpoint is the promise that a rewind point exists, and the git
@@ -224,24 +231,15 @@ impl SessionStore {
     }
 
     /// Checkpoints recorded for a session, oldest first.
+    ///
+    /// Same contract as the session file: a torn final line (a crash between
+    /// the append and its sync) is skipped, damage in the middle is named.
     pub fn checkpoints(&self, session_id: &str) -> Result<Vec<Checkpoint>, SessionError> {
         let file = self.checkpoint_file(session_id);
         if !file.exists() {
             return Ok(Vec::new());
         }
-        let f = File::open(&file).map_err(SessionError::Io)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines() {
-            let line = line.map_err(SessionError::Io)?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(line) {
-                out.push(checkpoint);
-            }
-        }
-        Ok(out)
+        parse_lines(&read_lines(&file)?)
     }
 
     /// Rewinds a session to `checkpoint`: the session file keeps its first
@@ -427,25 +425,101 @@ impl SessionStore {
         write_atomic(&self.leaf_file(session_id), entry_id.as_bytes())
     }
 
+    /// Reads a session's entries, oldest first, under [`parse_lines`]'
+    /// contract: a torn final line is skipped, corruption elsewhere is named.
     fn load(&self, session_id: &str) -> Result<Vec<Entry>, SessionError> {
         let file = self.session_file(session_id);
         if !file.exists() {
             return Err(SessionError::NotFound(session_id.into()));
         }
-        let f = File::open(&file).map_err(SessionError::Io)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines() {
-            let line = line.map_err(SessionError::Io)?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // Lenient: a torn final line after a crash is skipped, not fatal.
-            if let Ok(e) = serde_json::from_str::<Entry>(line) {
-                out.push(e);
+        parse_lines(&read_lines(&file)?)
+    }
+}
+
+/// Every line of a JSONL file, in order.
+fn read_lines(path: &Path) -> Result<Vec<String>, SessionError> {
+    let file = File::open(path).map_err(SessionError::Io)?;
+    BufReader::new(file)
+        .lines()
+        .collect::<std::result::Result<_, _>>()
+        .map_err(SessionError::Io)
+}
+
+/// Parses JSONL lines under the store's reader contract.
+///
+/// A line that does not parse is tolerated only when it is the *last*
+/// non-empty line, which is all a crash mid-append can tear; anything earlier
+/// comes back as [`SessionError::Corrupt`] naming it. Reading on would turn a
+/// damaged session into a silently shorter one — the entries after the damage
+/// are indistinguishable from entries that were never written — and a caller
+/// cannot offer to recover from a gap it was never told about.
+fn parse_lines<T: serde::de::DeserializeOwned>(lines: &[String]) -> Result<Vec<T>, SessionError> {
+    // 1-based index of the last line that holds anything, `None` for none.
+    let last = lines.iter().rposition(|line| !line.trim().is_empty());
+    let mut out = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<T>(line) {
+            Ok(value) => out.push(value),
+            Err(_) if last == Some(index) => break,
+            Err(source) => {
+                return Err(SessionError::Corrupt {
+                    line: index + 1,
+                    source,
+                });
             }
         }
-        Ok(out)
+    }
+    Ok(out)
+}
+
+/// Drops a trailing fragment that was never closed with a newline.
+///
+/// Skipping a torn final line is only safe while nothing is written after it:
+/// an append lands on the same physical line as the fragment, so the reader
+/// sees one unparsable line where two entries should be and drops the second
+/// with it. From then on the fragment is a corrupt *middle* line, which the
+/// reader must refuse. Running this before every append keeps the file a
+/// sequence of whole lines, at the cost of one read of its last byte.
+fn truncate_torn_tail(file: &mut File) -> Result<(), SessionError> {
+    let len = file.metadata().map_err(SessionError::Io)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1))
+        .map_err(SessionError::Io)?;
+    file.read_exact(&mut byte).map_err(SessionError::Io)?;
+    if byte[0] == b'\n' {
+        return Ok(());
+    }
+    // Rare: only a crash between a write and its `sync_all` gets here. Walk
+    // back a block at a time for the boundary the fragment hangs off, so the
+    // cost stays proportional to the fragment.
+    const BLOCK: u64 = 4096;
+    let mut block = vec![0u8; BLOCK as usize];
+    let mut end = len;
+    loop {
+        let start = end.saturating_sub(BLOCK);
+        let want = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))
+            .map_err(SessionError::Io)?;
+        file.read_exact(&mut block[..want])
+            .map_err(SessionError::Io)?;
+        match block[..want].iter().rposition(|byte| *byte == b'\n') {
+            Some(at) => {
+                return file
+                    .set_len(start + at as u64 + 1)
+                    .map_err(SessionError::Io);
+            }
+            // The whole file is one unterminated line; nothing in it is a
+            // complete entry.
+            None if start == 0 => return file.set_len(0).map_err(SessionError::Io),
+            None => end = start,
+        }
     }
 }
 
@@ -676,6 +750,122 @@ mod tests {
             .append(&sid, Role::Assistant, "after crash")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(b.parent_id.as_deref(), Some(a.id.as_str()));
+    }
+
+    /// Tolerating a torn tail is only safe while nothing lands after it: the
+    /// fragment has no newline, so an append would join it and the reader would
+    /// see one unparsable line where two entries should be — losing the new
+    /// entry, then turning the fragment into a corrupt middle line.
+    #[test]
+    fn appending_after_a_torn_line_keeps_the_old_and_the_new_entry() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        let a = s
+            .append(&sid, Role::User, "intact")
+            .unwrap_or_else(|e| panic!("{e}"));
+        tear(&s.session_file(&sid));
+        // Last line, so still tolerated.
+        assert_eq!(
+            s.open(&sid).unwrap_or_else(|e| panic!("{e}")),
+            vec![a.clone()]
+        );
+
+        let b = s
+            .append(&sid, Role::Assistant, "after the crash")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(b.parent_id.as_deref(), Some(a.id.as_str()));
+        // Both entries survive a fresh read, and no error is raised: the
+        // fragment was dropped rather than left to swallow the append.
+        assert_eq!(s.open(&sid).unwrap_or_else(|e| panic!("{e}")), vec![a, b]);
+    }
+
+    /// The checkpoint sidecar is appended to the same way, so it gets the same
+    /// repair, and a fragment that is *not* last is damage like any other.
+    #[test]
+    fn a_torn_checkpoint_line_is_dropped_before_the_next_append() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "one")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let first = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        tear(&s.checkpoint_file(&sid));
+        assert_eq!(
+            s.checkpoints(&sid).unwrap_or_else(|e| panic!("{e}")),
+            vec![first.clone()]
+        );
+
+        s.append(&sid, Role::Assistant, "two")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let second = s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            s.checkpoints(&sid).unwrap_or_else(|e| panic!("{e}")),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn a_corrupt_checkpoint_line_before_the_end_is_an_error_naming_it() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "one")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+        s.checkpoint(&sid).unwrap_or_else(|e| panic!("{e}"));
+
+        let path = s.checkpoint_file(&sid);
+        let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+        lines[0] = "{\"entries\":".to_owned();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(matches!(
+            s.checkpoints(&sid),
+            Err(SessionError::Corrupt { line: 1, .. })
+        ));
+    }
+
+    /// Simulates a crash mid-append: a partial JSON line with no newline.
+    fn tear(path: &std::path::Path) {
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("{e}"));
+        write!(f, "{{\"id\":\"torn").unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Distinguishable from the torn tail above: that one is not an error at
+    /// all, this one names the damaged line instead of reading past it.
+    #[test]
+    fn a_corrupt_line_before_the_end_is_an_error_naming_it() {
+        let (_dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "intact")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::Assistant, "second")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "third")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // Garbled second line, with a valid third line after it.
+        let path = s.session_file(&sid);
+        let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+        lines[1] = "{\"id\":\"garbled\"".to_owned();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap_or_else(|e| panic!("{e}"));
+
+        match s.open(&sid) {
+            Err(SessionError::Corrupt { line, .. }) => assert_eq!(line, 2, "1-based line number"),
+            other => panic!("expected a corrupt-line error, got {other:?}"),
+        }
+        // Every reader that replays the tree hits it, not just `open`.
+        assert!(matches!(
+            s.walk(&sid, None),
+            Err(SessionError::Corrupt { line: 2, .. })
+        ));
+        assert!(matches!(
+            s.entry(&sid, "anything"),
+            Err(SessionError::Corrupt { line: 2, .. })
+        ));
     }
 
     /// The write must not touch the target it is replacing until the
