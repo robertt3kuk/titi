@@ -19,8 +19,8 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, first_known, mask_comments, record, resolve_python_relative,
-    resolve_suffix, root_segment,
+    Comments, Placement, finish, first_known, literal_regex, mask_comments, record,
+    resolve_python_relative, resolve_suffix, root_segment,
 };
 use crate::symbols::{self, Grammar, push_site, text};
 use crate::{Candidate, UnresolvedImport};
@@ -31,11 +31,12 @@ const EXTS: &[&str] = &["py"];
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     static FROM: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?ms)^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)")
-            .expect("py from imports")
+        literal_regex(
+            r"(?ms)^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+(\([^)]*\)|[^\n]*)",
+        )
     });
     static IMPORT: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^[ \t]*import[ \t]+([^\n]+)").expect("py imports"));
+        LazyLock::new(|| literal_regex(r"(?m)^[ \t]*import[ \t]+([^\n]+)"));
     let Some(tree) = symbols::parse(Grammar::Python, source) else {
         return ParsedFile {
             syntax_errors: 1,

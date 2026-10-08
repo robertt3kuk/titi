@@ -12,10 +12,6 @@
 //! heuristic language honest: only a row with a grammar may claim exports that
 //! came from a syntax tree.
 
-// Every pattern in the language modules is a compile-time literal: a bad one
-// is a bug the tests catch, not a runtime condition to thread through callers.
-#![allow(clippy::expect_used)]
-
 mod c_family;
 mod csharp;
 mod go;
@@ -445,6 +441,39 @@ mod tests {
             assert!(exports(&path, "anything").is_none(), "{path}");
         }
         assert!(exports("README.md", "# title").is_none());
+    }
+
+    /// Every literal pattern a language module holds compiles.
+    ///
+    /// The patterns live in `LazyLock`s, so nothing compiles them until a parse
+    /// reaches them, and a broken one would first be seen in a user's session.
+    /// This parses a file through each module that has one: the import scan
+    /// derefs every pattern the module holds in one pass, so reaching it is
+    /// what compiles them, and the assertion is that the scan ran at all.
+    ///
+    /// The known-file set is not incidental. A specifier whose first segment
+    /// names no directory in the workspace is a std or third-party package and
+    /// is deliberately not recorded, so an empty set would reach the patterns
+    /// and still find nothing.
+    #[test]
+    fn the_literal_patterns_compile() {
+        let files: HashSet<String> = ["app/service.py", "app/service.ts"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for (path, source) in [
+            ("app/service.py", "from app.missing import x\nimport app\n"),
+            (
+                "app/service.ts",
+                "import { a } from './missing'\nconst c = require('./gone')\n",
+            ),
+        ] {
+            let parsed = parse(path, source, &files);
+            assert!(
+                !parsed.imports.is_empty() || !parsed.unresolved_imports.is_empty(),
+                "{path} reached no pattern: {parsed:?}"
+            );
+        }
     }
 
     /// The rows that share a language must agree about it: a note or a level

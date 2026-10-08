@@ -22,7 +22,8 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, internal, mask_comments, record, resolve_relative, resolve_suffix,
+    Comments, Placement, finish, internal, literal_regex, mask_comments, record, resolve_relative,
+    resolve_suffix,
 };
 
 use crate::UnresolvedImport;
@@ -32,12 +33,10 @@ use crate::symbols::{self, has_child_kind, push_field, push_site, text};
 const EXTS: &[&str] = &["ts", "tsx", "js", "jsx"];
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
-    static FROM: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?m)(?:^|\s)(?:from|import)\s+['"]([^'"]+)['"]"#).expect("ts from")
-    });
-    static CALL: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]"#).expect("ts require")
-    });
+    static FROM: LazyLock<Regex> =
+        LazyLock::new(|| literal_regex(r#"(?m)(?:^|\s)(?:from|import)\s+['"]([^'"]+)['"]"#));
+    static CALL: LazyLock<Regex> =
+        LazyLock::new(|| literal_regex(r#"\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]"#));
     let Some(grammar) = super::grammar_for(path) else {
         return ParsedFile::default();
     };
