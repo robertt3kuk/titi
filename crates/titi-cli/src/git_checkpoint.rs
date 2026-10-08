@@ -8,6 +8,21 @@
 use std::path::Path;
 use std::process::Command;
 
+use titi_tools::SensitivePolicy;
+
+/// The credential policy the checkpoint answers to: the same user settings
+/// the runtime tools read with, or the built-in list when settings cannot
+/// load — a checkpoint is a commit, so it deserves no looser gate.
+fn policy_for(workspace: &Path) -> SensitivePolicy {
+    let settings = titi_config::settings::Settings::load(
+        &titi_config::agent_dir(),
+        workspace,
+        &[],
+    )
+    .unwrap_or_default();
+    crate::engine::privacy_policy(&settings).0
+}
+
 /// A commit that captures the workspace, or why one could not be made.
 ///
 /// Commits only what is already staged. `git add -A` here would sweep up
@@ -15,6 +30,16 @@ use std::process::Command;
 /// the session's own uncommitted work — and it would clobber an index the
 /// user was in the middle of building.
 pub fn snapshot(workspace: &Path, label: &str) -> Result<String, String> {
+    snapshot_with_policy(workspace, label, &policy_for(workspace))
+}
+
+/// `snapshot` with the policy made explicit: tests pass a built-in one, so
+/// they do not depend on what the developer's own settings allow.
+pub fn snapshot_with_policy(
+    workspace: &Path,
+    label: &str,
+    policy: &SensitivePolicy,
+) -> Result<String, String> {
     if !is_repo(workspace) {
         return Err("not a git repository".into());
     }
@@ -23,6 +48,22 @@ pub fn snapshot(workspace: &Path, label: &str) -> Result<String, String> {
         // Nothing staged: the tree already matches the index, so HEAD is the
         // snapshot. Unstaged work is left untouched on purpose.
         return run(workspace, &["rev-parse", "HEAD"]);
+    }
+    // The policy the read-tier tools answer to gates the checkpoint too: it
+    // is a commit, so a staged `.env` would ride it into history and a later
+    // push would publish it. It refuses rather than unstages in the user's
+    // place — hooking `git restore --staged` would rewrite an index the user
+    // was building, under the cover of a "checkpoint" — and names the file,
+    // so the user can unstage it, or allow-list it if it really is not a
+    // credential.
+    for name in staged.lines() {
+        if policy.blocks(Path::new(name)) {
+            return Err(format!(
+                "checkpoint not written: {name} is staged and holds credentials — \
+                 titi does not commit it; `git restore --staged {name}` to leave it out, \
+                 or allow-list it in privacy.allow first"
+            ));
+        }
     }
     run(
         workspace,
@@ -150,5 +191,84 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = snapshot(dir.path(), "x").unwrap_err();
         assert!(error.contains("not a git repository"), "{error}");
+    }
+
+    /// A staged credential must not ride into the checkpoint's own history:
+    /// assert on the commit's tree, not on a message the next commit could
+    /// duplicate by accident. The policy is given explicitly, so the tests do
+    /// not depend on what the developer's own settings allow-list.
+    #[test]
+    fn a_staged_credential_file_is_not_checkpointed() {
+        let dir = repo();
+        // An initial commit, so HEAD has a tree to compare against.
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "base"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .unwrap();
+        let head_before = run(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "keep\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        stage(dir.path(), "a.txt");
+        stage(dir.path(), ".env");
+
+        let error = snapshot_with_policy(dir.path(), "with secret", &SensitivePolicy::default())
+            .unwrap_err();
+        assert!(error.contains(".env"), "{error}");
+        assert!(error.contains("restore --staged"), "{error}");
+
+        // The refusal names one file at a time comes after all names are
+        // checked for the first hit; the index is untouched either way.
+        assert!(
+            Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout
+                .starts_with(b".env"),
+            "staging was rewritten"
+        );
+        // No commit was written: HEAD still points at the base one.
+        let head_after = run(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            head_after, head_before,
+            "the refusal left a commit behind"
+        );
+
+        // Allowed next: once the credential is out of the index, the rest of
+        // the staged work still checkpoints.
+        assert!(
+            Command::new("git")
+                .args(["restore", "--staged", ".env"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let commit =
+            snapshot_with_policy(dir.path(), "clean", &SensitivePolicy::default()).unwrap();
+        let tree = run(dir.path(), &["ls-tree", "-r", "--name-only", &commit]).unwrap();
+        assert_eq!(tree, "a.txt", "checkpoint committed more than staged: {tree}");
+    }
+
+    #[test]
+    fn ordinary_staged_work_still_checkpoints() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "first\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        stage(dir.path(), "a.txt");
+        stage(dir.path(), "src/main.rs");
+
+        let commit = snapshot_with_policy(dir.path(), "ordinary", &SensitivePolicy::default())
+            .unwrap();
+        let status = run(dir.path(), &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "commit failed: {status}");
+        let tree = run(dir.path(), &["ls-tree", "-r", "--name-only", &commit]).unwrap();
+        assert_eq!(tree, "a.txt\nsrc/main.rs", "{tree}");
     }
 }
