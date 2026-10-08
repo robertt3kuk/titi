@@ -12,8 +12,9 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{finish, internal, join, parent, record};
+use super::support::{finish, first_known, internal, join, parent, record};
 use crate::symbols::{self, Grammar, has_child_kind, push_field, text};
+use crate::{Candidate, UnresolvedImport};
 
 /// One Rust import site, flattened to the path it names.
 ///
@@ -49,7 +50,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     let mut mods = Vec::new();
     collect_rust_imports(tree.root_node(), bytes, &mut mods, &mut rust_imports);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     for item in &rust_imports {
         // A bare path is an external crate or a std path — `serde_json::json`,
         // `std::collections::HashMap` — not a workspace lookup. Only the three
@@ -63,8 +64,8 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         {
             continue;
         }
-        let resolved = resolve_rust_import(path, item, files);
-        if resolved.as_deref() == Some(path) {
+        let candidates = rust_import_candidates(path, item, files);
+        if first_known(&candidates, files).as_deref() == Some(path) {
             // `use super::*` inside an inline `mod` names the file's own
             // module. That is a self-edge, not a dependency, and reporting it
             // unresolved would claim a problem with a file that has none.
@@ -72,7 +73,8 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         }
         record(
             &item.segments.join("::"),
-            internal(resolved),
+            internal(candidates),
+            files,
             &mut imports,
             &mut unresolved,
         );
@@ -111,17 +113,26 @@ fn rust_errors(tree: &tree_sitter::Tree, source: &str) -> u32 {
 /// `super::` at that module's parent. A bare path (`use regex::Regex`) is an
 /// external crate or a std path, exactly as before: only those three prefixes
 /// are workspace lookups. A `mod x;` is a child of the module that declares it.
-fn resolve_rust_import(from: &str, item: &RustImport, files: &HashSet<String>) -> Option<String> {
+fn rust_import_candidates(
+    from: &str,
+    item: &RustImport,
+    files: &HashSet<String>,
+) -> Vec<Candidate> {
     let mut dir = module_children_dir(from);
     for name in &item.mods {
         dir = join(&dir, name);
     }
     if item.is_mod {
-        let name = item.segments.first()?;
-        return resolve_module_path(&dir, &[name], files);
+        let Some(name) = item.segments.first() else {
+            return Vec::new();
+        };
+        return module_path_candidates(&dir, &[name]);
     }
+    let Some(first) = item.segments.first().map(String::as_str) else {
+        return Vec::new();
+    };
     let mut rest = &item.segments[1..];
-    match item.segments.first().map(String::as_str)? {
+    match first {
         "crate" => dir = crate_root(from, files),
         "self" => {}
         "super" => {
@@ -132,13 +143,16 @@ fn resolve_rust_import(from: &str, item: &RustImport, files: &HashSet<String>) -
                 rest = &rest[1..];
             }
             for _ in 0..depth {
-                dir = parent(&dir)?.to_owned();
+                let Some(up) = parent(&dir) else {
+                    return Vec::new();
+                };
+                dir = up.to_owned();
             }
         }
-        _ => return None,
+        _ => return Vec::new(),
     }
     let segments: Vec<&str> = rest.iter().map(String::as_str).collect();
-    resolve_use_path(&dir, &segments, files)
+    use_path_candidates(&dir, &segments)
 }
 
 /// The directory a Rust module's child modules live in. `foo/mod.rs` and a
@@ -155,23 +169,21 @@ fn module_children_dir(path: &str) -> String {
     }
 }
 
-/// The file that defines the module whose children live in `dir`.
-fn module_file(dir: &str, files: &HashSet<String>) -> Option<String> {
-    for name in ["mod.rs", "lib.rs", "main.rs"] {
-        let candidate = join(dir, name);
-        if files.contains(&candidate) {
-            return Some(candidate);
-        }
-    }
-    let sibling = format!("{dir}.rs");
-    files.contains(&sibling).then_some(sibling)
+/// The files that can define the module whose children live in `dir`.
+fn module_file_candidates(dir: &str) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = ["mod.rs", "lib.rs", "main.rs"]
+        .into_iter()
+        .map(|name| Candidate::Exact(join(dir, name)))
+        .collect();
+    candidates.push(Candidate::Exact(format!("{dir}.rs")));
+    candidates
 }
 
-/// Resolves a path whose every segment must name a module. The empty path is
-/// the module that lives in `dir` itself.
-fn resolve_module_path(dir: &str, segments: &[&str], files: &HashSet<String>) -> Option<String> {
+/// The files a path whose every segment must name a module can land on. The
+/// empty path is the module that lives in `dir` itself.
+fn module_path_candidates(dir: &str, segments: &[&str]) -> Vec<Candidate> {
     if segments.is_empty() {
-        return module_file(dir, files);
+        return module_file_candidates(dir);
     }
     let joined = segments.join("/");
     let rel = if dir.is_empty() {
@@ -179,32 +191,33 @@ fn resolve_module_path(dir: &str, segments: &[&str], files: &HashSet<String>) ->
     } else {
         format!("{dir}/{joined}")
     };
-    [format!("{rel}.rs"), format!("{rel}/mod.rs")]
-        .into_iter()
-        .find(|candidate| files.contains(candidate))
+    vec![
+        Candidate::Exact(format!("{rel}.rs")),
+        Candidate::Exact(format!("{rel}/mod.rs")),
+    ]
 }
 
-/// Resolves a `use` path: the longest prefix that names a module decides the
-/// file, so only the trailing segments may be items. A one-segment path may be
-/// an item of `dir`'s own module (`use crate::Genome` at the crate root), which
-/// no prefix can name as a file; a longer path whose module prefix is missing
-/// (`use crate::missing::Thing`) stays unresolved.
-fn resolve_use_path(dir: &str, segments: &[&str], files: &HashSet<String>) -> Option<String> {
+/// The files a `use` path can land on: the longest prefix that names a module
+/// decides the file, so only the trailing segments may be items. A one-segment
+/// path may be an item of `dir`'s own module (`use crate::Genome` at the crate
+/// root), which no prefix can name as a file, so that module's own files are
+/// the last resort; a longer path whose module prefix is missing
+/// (`use crate::missing::Thing`) names none of them.
+fn use_path_candidates(dir: &str, segments: &[&str]) -> Vec<Candidate> {
     if segments.is_empty() {
-        return module_file(dir, files);
+        return module_file_candidates(dir);
     }
     if segments.last() == Some(&"*") {
-        return resolve_module_path(dir, &segments[..segments.len() - 1], files);
+        return module_path_candidates(dir, &segments[..segments.len() - 1]);
     }
+    let mut candidates = Vec::new();
     for take in (1..=segments.len()).rev() {
-        if let Some(file) = resolve_module_path(dir, &segments[..take], files) {
-            return Some(file);
-        }
+        candidates.extend(module_path_candidates(dir, &segments[..take]));
     }
     if segments.len() == 1 {
-        return module_file(dir, files);
+        candidates.extend(module_file_candidates(dir));
     }
-    None
+    candidates
 }
 
 fn crate_root(from: &str, files: &HashSet<String>) -> String {

@@ -11,6 +11,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+use lang::support::first_known;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -71,6 +72,47 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// One path an import specifier may name, before the known-file set decides.
+///
+/// Resolution used to happen once, inside the parse, and only the answer
+/// survived: a specifier that named no file left a string behind and nothing
+/// else, so the only way to ask again was to read and parse the file that
+/// wrote it. Splitting the answer into a candidate list and a membership test
+/// makes "does this specifier name that file now" a question about the index
+/// — the candidates depend on the specifier and the importing file, not on
+/// which files exist — and it is what [`FileRecord::unresolved_candidates`]
+/// keeps.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Candidate {
+    /// Exactly this path.
+    Exact(String),
+    /// Any known path ending with `/{path}`: the file may live under a root
+    /// prefix the import omitted, which is how a Go package path or a Ruby
+    /// gem-style `require` is spelled.
+    Suffix(String),
+}
+
+impl Candidate {
+    /// Whether `path` is a file this candidate names.
+    pub fn identifies(&self, path: &str) -> bool {
+        match self {
+            Self::Exact(candidate) => candidate == path,
+            Self::Suffix(candidate) => {
+                path == candidate || path.ends_with(&format!("/{candidate}"))
+            }
+        }
+    }
+}
+
+/// One specifier that named no known file, and the paths it would have named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedImport {
+    /// The specifier as written, which is what a diagnostic quotes.
+    pub spec: String,
+    /// The paths this specifier would name, in priority order.
+    pub candidates: Vec<Candidate>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileRecord {
     pub path: String,
@@ -81,6 +123,15 @@ pub struct FileRecord {
     pub imports: Vec<String>,
     /// Specifiers that did not resolve to a known file. Not graph edges.
     pub unresolved_imports: Vec<String>,
+    /// The same specifiers, each with the paths it would have named.
+    ///
+    /// Kept beside the diagnostic list because it is the only evidence a
+    /// later update can re-ask the question with: the candidates depend on
+    /// the specifier and the importing file, not on which files exist, so a
+    /// file appearing later is a membership test over this list instead of a
+    /// read and a parse of the file that wrote it. Bounded by the file's own
+    /// import count, and empty when every specifier resolved.
+    pub unresolved_candidates: Vec<UnresolvedImport>,
     /// Tree-sitter `ERROR` nodes. Zero for languages without a grammar.
     /// A grammar that refuses the file counts as 1.
     pub syntax_errors: u32,
@@ -323,6 +374,14 @@ impl Genome {
         listed: &[scan::ListedFile],
         known: &HashSet<String>,
     ) -> Absorption {
+        // Every path this update adds. It is the only way a specifier that
+        // named nothing can come to name something — the candidates a specifier
+        // carries do not move, only the file set does.
+        let appeared: HashSet<String> = listed
+            .iter()
+            .filter(|file| !self.files.contains_key(&file.path))
+            .map(|file| file.path.clone())
+            .collect();
         let stale: Vec<&scan::ListedFile> = listed
             .iter()
             .filter(|file| {
@@ -402,6 +461,10 @@ impl Genome {
             self.files.insert(path.clone(), record);
             self.learn_refs(&path, &raw_refs);
         }
+        // A specifier that named no file can name one now: this update added
+        // it. The candidates the specifier was parsed with answer whether,
+        // without reading the file that wrote it.
+        graph_moved |= self.resolve_new_imports(&appeared, known);
         Absorption {
             parsed,
             content_unchanged,
@@ -446,6 +509,63 @@ impl Genome {
                 self.ref_index.remove(name);
             }
         }
+    }
+
+    /// Resolve the imports this update's arrivals have made resolvable.
+    ///
+    /// A specifier that named no file when it was parsed kept the paths it
+    /// would have named, so "does it name that file now" is set membership
+    /// over the index: no read, no parse, no second walk. The file that wrote
+    /// it is not re-parsed, its `imports` simply gains the edge and its
+    /// diagnostic goes away. Returns whether any file moved, which the caller
+    /// needs because a changed `imports` list is a changed graph input.
+    ///
+    /// One case this does not reach: an import that *resolved* when it was
+    /// parsed and whose target was later deleted keeps the edge in `imports`
+    /// (the ranker drops it, since the path is no longer a node) and keeps no
+    /// specifier to restore the diagnostic from. Only re-parsing that file
+    /// fixes its record; the graph is right either way.
+    fn resolve_new_imports(&mut self, appeared: &HashSet<String>, known: &HashSet<String>) -> bool {
+        if appeared.is_empty() {
+            return false;
+        }
+        let mut moved = false;
+        for record in self.files.values_mut() {
+            if record.unresolved_candidates.is_empty() {
+                continue;
+            }
+            let pending = std::mem::take(&mut record.unresolved_candidates);
+            let mut still = Vec::with_capacity(pending.len());
+            for import in pending {
+                // The membership test first: only a candidate that names a
+                // path this update added can have changed answer, and asking
+                // the known set instead would be a lookup per stored
+                // specifier on every update.
+                let arrived = import
+                    .candidates
+                    .iter()
+                    .any(|candidate| appeared.iter().any(|path| candidate.identifies(path)));
+                match arrived
+                    .then(|| first_known(&import.candidates, known))
+                    .flatten()
+                {
+                    Some(path) => {
+                        record.imports.push(path);
+                        moved = true;
+                    }
+                    None => still.push(import),
+                }
+            }
+            record.unresolved_candidates = still;
+            record.unresolved_imports = record
+                .unresolved_candidates
+                .iter()
+                .map(|import| import.spec.clone())
+                .collect();
+            record.imports.sort();
+            record.imports.dedup();
+        }
+        moved
     }
 
     /// Rebuild `symbols`, `ranks` and `dependents`, or leave them alone.
@@ -657,6 +777,7 @@ fn parse_one(
             export_sites: result.export_sites,
             imports: result.imports,
             unresolved_imports: result.unresolved_imports,
+            unresolved_candidates: result.unresolved_candidates,
             syntax_errors: result.syntax_errors,
             // Resolved against the workspace's exports by `index_symbols`,
             // once the batch is in — a name is only an edge when exactly one

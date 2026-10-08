@@ -20,6 +20,7 @@ use tree_sitter::Node;
 use super::ParsedFile;
 use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
 
+use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_field, push_site, text};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -36,7 +37,7 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
     let own = package_name(tree.root_node(), bytes);
     let own = own.as_deref().map(root_segment);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     kotlin_imports(
         tree.root_node(),
         bytes,
@@ -120,7 +121,7 @@ fn kotlin_imports(
     own: Option<&str>,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     let mut cursor = root.walk();
     for import in root.named_children(&mut cursor) {
@@ -137,13 +138,13 @@ fn kotlin_imports(
         let Some(spec) = text(name, source) else {
             continue;
         };
-        let resolved = resolve_suffix(&spec.replace('.', "/"), &["kt", "kts"], files);
-        let placement = match resolved {
-            Some(path) => Placement::Resolved(path),
-            // A specifier under another root is a library, not a missing file.
-            None if is_workspace_spec(root_segment(&spec), own) => Placement::Missing,
-            None => Placement::External,
+        let candidates = resolve_suffix(&spec.replace('.', "/"), &["kt", "kts"]);
+        // A specifier under another root is a library, not a missing file.
+        let placement = if is_workspace_spec(root_segment(&spec), own) {
+            Placement::Candidates(candidates)
+        } else {
+            Placement::Optional(candidates)
         };
-        record(&spec, placement, imports, unresolved);
+        record(&spec, placement, files, imports, unresolved);
     }
 }

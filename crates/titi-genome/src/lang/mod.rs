@@ -25,7 +25,7 @@ mod php;
 mod python;
 mod ruby;
 mod rust;
-mod support;
+pub(crate) mod support;
 mod swift;
 mod typescript;
 
@@ -48,6 +48,10 @@ pub struct ParsedFile {
     /// dependency, a gem — are not here: they are not this crate's business
     /// and reporting them would put a warning on every file that uses one.
     pub unresolved_imports: Vec<String>,
+    /// The same specifiers, each with the paths it would have named, so an
+    /// update that adds a file can re-ask without re-parsing this one. See
+    /// [`crate::FileRecord::unresolved_candidates`].
+    pub unresolved_candidates: Vec<crate::UnresolvedImport>,
     /// Distinct identifiers this file mentions, minus its own exports and
     /// keywords. Resolved against the repo's exports to become the
     /// symbol-level half of the graph.

@@ -19,6 +19,7 @@ use super::ParsedFile;
 use super::support::{Placement, finish, record, resolve_suffix};
 
 use crate::symbols::{self, Grammar, push_field, push_site, text};
+use crate::{Candidate, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Swift, source) else {
@@ -32,7 +33,7 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
     swift_items(tree.root_node(), bytes, &mut sites);
 
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     swift_imports(
         tree.root_node(),
         bytes,
@@ -104,15 +105,17 @@ fn swift_imports(
     source: &[u8],
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if node.kind() == "import_declaration" {
         if let Some(module) = first_identifier(node, source) {
-            let placement = match resolve_module(&module, files) {
-                Some(path) => Placement::Resolved(path),
-                None => Placement::External,
-            };
-            record(&module, placement, imports, unresolved);
+            record(
+                &module,
+                Placement::Optional(module_candidates(&module)),
+                files,
+                imports,
+                unresolved,
+            );
         }
         return;
     }
@@ -133,16 +136,19 @@ fn first_identifier(node: Node, source: &[u8]) -> Option<String> {
         .find_map(|child| first_identifier(child, source))
 }
 
-/// The module-file convention: a resolved path named after the module
-/// (`MyLib.swift`, or `MyLib/MyLib.swift`). Anything else this finds is not
-/// the module's own file, so it is not claimed as one.
-fn resolve_module(module: &str, files: &HashSet<String>) -> Option<String> {
-    let path = resolve_suffix(module, &["swift"], files)?;
+/// The module-file convention: the path that names the module is named after
+/// it (`MyLib.swift`, or `MyLib/MyLib.swift`). Anything else a suffix match
+/// would find is not the module's own file, so it is not a candidate, and an
+/// `import` of the module names no file when only those exist.
+fn module_candidates(module: &str) -> Vec<Candidate> {
     let sibling = format!("/{module}/{module}.swift");
     let primary = format!("{module}.swift");
-    if path.ends_with(&sibling) || path.ends_with(&primary) {
-        Some(path)
-    } else {
-        None
-    }
+    resolve_suffix(module, &["swift"])
+        .into_iter()
+        .filter(|candidate| match candidate {
+            Candidate::Exact(path) | Candidate::Suffix(path) => {
+                path.ends_with(&sibling) || path.ends_with(&primary)
+            }
+        })
+        .collect()
 }

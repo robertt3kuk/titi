@@ -19,10 +19,11 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, mask_comments, record, resolve_python_relative, resolve_suffix,
-    root_segment,
+    Comments, Placement, finish, first_known, mask_comments, record, resolve_python_relative,
+    resolve_suffix, root_segment,
 };
 use crate::symbols::{self, Grammar, push_site, text};
+use crate::{Candidate, UnresolvedImport};
 
 /// The files a Python module path can land on: a module is a `.py` file, or a
 /// package's `__init__.py`.
@@ -45,7 +46,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     python_module(tree.root_node(), source.as_bytes(), &mut sites);
     let masked = mask_comments(source, Comments::Hash);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     for cap in FROM.captures_iter(&masked) {
         let module = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let names = cap
@@ -80,19 +81,21 @@ fn from_clause(
     names: &[String],
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if module.is_empty() {
         return;
     }
     let dotted_only = module.chars().all(|c| c == '.');
     if !dotted_only {
-        if let Some(resolved) = resolve_module(path, module, files) {
-            record(module, Placement::Resolved(resolved), imports, unresolved);
+        let candidates = module_candidates(path, module);
+        if let Some(resolved) = first_known(&candidates, files) {
+            imports.push(resolved);
             return;
         }
     }
     let mut resolved_any = false;
+    let mut missed: Vec<(String, Vec<Candidate>)> = Vec::new();
     for name in names {
         // A dotted-only module already ends in its dot: `from . import x` is
         // `.x`, not `..x`.
@@ -101,9 +104,13 @@ fn from_clause(
         } else {
             format!("{module}.{name}")
         };
-        if let Some(resolved) = resolve_module(path, &spec, files) {
-            record(&spec, Placement::Resolved(resolved), imports, unresolved);
-            resolved_any = true;
+        let candidates = module_candidates(path, &spec);
+        match first_known(&candidates, files) {
+            Some(resolved) => {
+                imports.push(resolved);
+                resolved_any = true;
+            }
+            None => missed.push((spec, candidates)),
         }
     }
     if resolved_any {
@@ -113,16 +120,25 @@ fn from_clause(
         // Nothing but dots names no file of its own; the names after `import`
         // are the submodules, and a bare `from . import x` names `.x`.
         if names.is_empty() {
-            record(module, Placement::Missing, imports, unresolved);
+            unresolved.push(UnresolvedImport {
+                spec: module.to_owned(),
+                candidates: module_candidates(path, module),
+            });
         } else {
-            for name in names {
-                let spec = format!("{module}{name}");
-                record(&spec, Placement::Missing, imports, unresolved);
+            for (spec, candidates) in missed {
+                unresolved.push(UnresolvedImport { spec, candidates });
             }
         }
         return;
     }
-    record(module, placement(module, files), imports, unresolved);
+    let candidates = resolve_absolute(module);
+    record(
+        module,
+        placement(module, candidates, files),
+        files,
+        imports,
+        unresolved,
+    );
 }
 
 /// A plain `import a.b`: always absolute, so a specifier that names no file is
@@ -132,35 +148,38 @@ fn import_module(
     spec: &str,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
-    let placement = match resolve_absolute(spec, files) {
-        Some(resolved) => Placement::Resolved(resolved),
-        None => placement(spec, files),
+    let candidates = resolve_absolute(spec);
+    let placement = if first_known(&candidates, files).is_some() {
+        Placement::Candidates(candidates)
+    } else {
+        placement(spec, candidates, files)
     };
-    record(spec, placement, imports, unresolved);
+    record(spec, placement, files, imports, unresolved);
 }
 
 /// Where a dotted module path lands: a relative path walks the file's own
 /// package, an absolute one is looked up by its trailing module path.
-fn resolve_module(path: &str, spec: &str, files: &HashSet<String>) -> Option<String> {
+fn module_candidates(path: &str, spec: &str) -> Vec<Candidate> {
     if spec.starts_with('.') {
-        return resolve_python_relative(path, spec, files);
+        return resolve_python_relative(path, spec);
     }
-    resolve_absolute(spec, files)
+    resolve_absolute(spec)
 }
 
-/// `app.util` → the workspace file for `app/util`.
-fn resolve_absolute(spec: &str, files: &HashSet<String>) -> Option<String> {
-    resolve_suffix(&spec.replace('.', "/"), EXTS, files)
+/// `app.util` → the workspace files for `app/util`.
+fn resolve_absolute(spec: &str) -> Vec<Candidate> {
+    resolve_suffix(&spec.replace('.', "/"), EXTS)
 }
 
 /// A specifier that resolved to nothing: the first segment decides. When the
 /// workspace holds a directory of that name the import is workspace-shaped and
 /// its target is genuinely missing; when it does not, the specifier names a
 /// std or third-party package and is not this workspace's business. Probing
-/// the file set costs one pass per unresolved import.
-fn placement(spec: &str, files: &HashSet<String>) -> Placement {
+/// the file set costs one pass per unresolved import, which is why it only
+/// runs once the candidates have all missed.
+fn placement(spec: &str, candidates: Vec<Candidate>, files: &HashSet<String>) -> Placement {
     let root = root_segment(spec);
     if root.is_empty() {
         return Placement::External;
@@ -171,7 +190,7 @@ fn placement(spec: &str, files: &HashSet<String>) -> Placement {
         .iter()
         .any(|known| known.starts_with(&top) || known.contains(&nested))
     {
-        Placement::Missing
+        Placement::Candidates(candidates)
     } else {
         Placement::External
     }

@@ -20,6 +20,7 @@ use tree_sitter::Node;
 use super::ParsedFile;
 use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
 
+use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_field, text};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -36,7 +37,7 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
     let own = namespace_name(tree.root_node(), bytes);
     let own = own.as_deref().map(root_segment);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     php_imports(
         tree.root_node(),
         bytes,
@@ -103,7 +104,7 @@ fn php_imports(
     own: Option<&str>,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if node.kind() == "namespace_use_declaration" {
         let prefix = {
@@ -166,13 +167,15 @@ fn place(
     own: Option<&str>,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
-    let resolved = resolve_suffix(&spec.replace('\\', "/"), &["php"], files);
-    let placement = match resolved {
-        Some(path) => Placement::Resolved(path),
-        None if is_workspace_spec(root_segment(spec), own) => Placement::Missing,
-        None => Placement::External,
+    let candidates = resolve_suffix(&spec.replace('\\', "/"), &["php"]);
+    // A specifier under another root is a library, not a missing file; a miss
+    // of this workspace's own shape is.
+    let placement = if is_workspace_spec(root_segment(spec), own) {
+        Placement::Candidates(candidates)
+    } else {
+        Placement::Optional(candidates)
     };
-    record(spec, placement, imports, unresolved);
+    record(spec, placement, files, imports, unresolved);
 }

@@ -29,6 +29,7 @@ use super::ParsedFile;
 use super::support::{finish, internal, normalize_join, parent, record};
 
 use crate::symbols::{self, Grammar, push_site, text};
+use crate::{Candidate, UnresolvedImport};
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(grammar) = super::grammar_for(path) else {
@@ -46,7 +47,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
 
     let from_dir = parent(path).unwrap_or("");
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     c_includes(
         tree.root_node(),
         bytes,
@@ -186,7 +187,7 @@ fn c_includes(
     from_dir: &str,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if node.kind() == "preproc_include" {
         if let Some(path) = node.child_by_field_name("path")
@@ -199,9 +200,10 @@ fn c_includes(
             } else {
                 format!("{from_dir}/{spec}")
             };
-            let resolved =
-                normalize_join("", &joined).filter(|candidate| files.contains(candidate));
-            record(spec, internal(resolved), imports, unresolved);
+            let candidates = normalize_join("", &joined)
+                .map(|joined| vec![Candidate::Exact(joined)])
+                .unwrap_or_default();
+            record(spec, internal(candidates), files, imports, unresolved);
         }
         return;
     }

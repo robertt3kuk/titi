@@ -20,6 +20,7 @@ use tree_sitter::Node;
 use super::ParsedFile;
 use super::support::{Placement, finish, internal, record, resolve_relative, resolve_suffix};
 
+use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_site, text};
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -32,7 +33,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     let bytes = source.as_bytes();
     let mut sites = Vec::new();
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     ruby_items(
         tree.root_node(),
         bytes,
@@ -61,7 +62,7 @@ fn ruby_items(
     files: &HashSet<String>,
     sites: &mut Vec<crate::ExportSite>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -105,7 +106,7 @@ fn ruby_call(
     files: &HashSet<String>,
     sites: &mut Vec<crate::ExportSite>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     let Some(method) = node.child_by_field_name("method") else {
         return;
@@ -142,17 +143,14 @@ fn ruby_call(
                 return;
             };
             if name == "require_relative" {
-                let resolved = resolve_relative(path, &spec, files, &["rb"]);
-                record(&spec, internal(resolved), imports, unresolved);
+                let candidates = resolve_relative(path, &spec, &["rb"]);
+                record(&spec, internal(candidates), files, imports, unresolved);
             } else {
                 let stem = spec.strip_suffix(".rb").unwrap_or(&spec);
                 // Nothing found means a gem or a `-I` directory, not a
                 // missing file.
-                let placement = match resolve_suffix(stem, &["rb"], files) {
-                    Some(found) => Placement::Resolved(found),
-                    None => Placement::External,
-                };
-                record(&spec, placement, imports, unresolved);
+                let placement = Placement::Optional(resolve_suffix(stem, &["rb"]));
+                record(&spec, placement, files, imports, unresolved);
             }
         }
         _ => {}

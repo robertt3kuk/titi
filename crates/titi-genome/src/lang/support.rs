@@ -8,8 +8,29 @@
 use std::collections::HashSet;
 
 use crate::refs;
+use crate::{Candidate, UnresolvedImport};
 
 use super::ParsedFile;
+
+/// The first candidate `files` can satisfy, in the order it was emitted.
+///
+/// This is the half of resolution that needs the known-file set; the candidate
+/// list itself does not, which is what makes the question re-askable (see
+/// [`Candidate`]). `None` means every candidate named a file this workspace
+/// does not have.
+pub(crate) fn first_known(candidates: &[Candidate], files: &HashSet<String>) -> Option<String> {
+    candidates.iter().find_map(|candidate| match candidate {
+        Candidate::Exact(path) => files.contains(path).then(|| path.clone()),
+        Candidate::Suffix(path) => {
+            if files.contains(path) {
+                return Some(path.clone());
+            }
+            // The file may live under a root prefix the specifier omitted.
+            let needle = format!("/{path}");
+            files.iter().find(|known| known.ends_with(&needle)).cloned()
+        }
+    })
+}
 
 /// Sorts, dedups and attaches the identifier set every parser ends up needing.
 ///
@@ -19,7 +40,7 @@ pub(crate) fn finish(
     source: &str,
     mut sites: Vec<crate::ExportSite>,
     mut imports: Vec<String>,
-    mut unresolved: Vec<String>,
+    mut unresolved: Vec<UnresolvedImport>,
     syntax_errors: u32,
 ) -> ParsedFile {
     let mut seen = HashSet::new();
@@ -29,60 +50,98 @@ pub(crate) fn finish(
     exports.dedup();
     imports.sort();
     imports.dedup();
-    unresolved.sort();
-    unresolved.dedup();
+    unresolved.sort_by(|left, right| left.spec.cmp(&right.spec));
+    unresolved
+        .dedup_by(|left, right| left.spec == right.spec && left.candidates == right.candidates);
+    let unresolved_imports = specs(&unresolved);
     let refs = refs::collect_refs(source, &exports);
     ParsedFile {
         exports,
         export_sites: sites,
         imports,
-        unresolved_imports: unresolved,
+        unresolved_imports,
+        unresolved_candidates: unresolved,
         refs,
         syntax_errors,
     }
 }
 
-/// Where an import's specifier landed.
+/// The distinct specifiers of `unresolved`, which is what a diagnostic quotes.
+fn specs(unresolved: &[UnresolvedImport]) -> Vec<String> {
+    let mut specs: Vec<String> = unresolved
+        .iter()
+        .map(|import| import.spec.clone())
+        .collect();
+    specs.sort();
+    specs.dedup();
+    specs
+}
+
+/// Where an import's specifier landed, or the paths it would have to land on.
 ///
 /// The distinction is the honest part of a heuristic import: a specifier that
 /// names something outside the workspace (`java.util.List`, `Foundation`,
 /// `fmt`) is not a missing file, and reporting it as one would put a warning
-/// on every file that uses a library. Only [`Placement::Missing`] — workspace
-/// shaped, and no file to show for it — becomes a diagnostic.
+/// on every file that uses a library. Only a miss in the first variant becomes
+/// a diagnostic.
 pub(crate) enum Placement {
-    /// The workspace file the specifier names.
-    Resolved(String),
-    /// A specifier of this workspace's own shape that names no file.
-    Missing,
-    /// Not this workspace's business: a std module, a dependency, a gem.
+    /// Workspace-shaped: a specifier of this workspace's own shape that names
+    /// no known file is a missing file, and a warning.
+    Candidates(Vec<Candidate>),
+    /// Any file this names belongs to the workspace, and a miss belongs to
+    /// the outside world: a bare specifier that resolves to nothing is a
+    /// dependency (`node_modules`, a gem), not a missing file. A miss is
+    /// dropped, and nothing is kept, because there was nothing to diagnose.
+    Optional(Vec<Candidate>),
+    /// Not this workspace's business at all, with no path of its own to try.
     External,
 }
 
 pub(crate) fn record(
     spec: &str,
     placement: Placement,
+    files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if spec.is_empty() {
         return;
     }
     match placement {
-        Placement::Resolved(path) => imports.push(path),
-        Placement::Missing => unresolved.push(spec.to_owned()),
+        Placement::Candidates(candidates) => match first_known(&candidates, files) {
+            Some(path) => imports.push(path),
+            None => unresolved.push(UnresolvedImport {
+                spec: spec.to_owned(),
+                candidates,
+            }),
+        },
+        Placement::Optional(candidates) => {
+            if let Some(path) = first_known(&candidates, files) {
+                imports.push(path);
+            }
+        }
         Placement::External => {}
     }
+}
+
+/// The placement of a specifier this language resolves itself, where there is
+/// no outside world to speak of: `use super::x` in Rust, a `require_relative`
+/// in Ruby. An empty candidate list means the specifier named nothing this
+/// workspace could have.
+pub(crate) fn internal(candidates: Vec<Candidate>) -> Placement {
+    Placement::Candidates(candidates)
 }
 
 /// Resolves a module/package path to a known file by trying the path itself
 /// and then every trailing suffix of it. That covers Go and Ruby, where the
 /// import string is module-qualified and the repo has no module index yet.
-pub(crate) fn resolve_suffix(spec: &str, exts: &[&str], files: &HashSet<String>) -> Option<String> {
+pub(crate) fn resolve_suffix(spec: &str, exts: &[&str]) -> Vec<Candidate> {
     let spec = spec.trim_matches('/');
     if spec.is_empty() {
-        return None;
+        return Vec::new();
     }
     let segments: Vec<&str> = spec.split('/').filter(|s| !s.is_empty()).collect();
+    let mut candidates = Vec::new();
     // Longest suffix first: the most specific match wins.
     for start in 0..segments.len() {
         let candidate = segments[start..].join("/");
@@ -93,33 +152,25 @@ pub(crate) fn resolve_suffix(spec: &str, exts: &[&str], files: &HashSet<String>)
                 format!("{candidate}/mod.{ext}"),
                 format!("{candidate}/__init__.{ext}"),
             ] {
-                if files.contains(&path) {
-                    return Some(path);
-                }
+                candidates.push(Candidate::Exact(path.clone()));
                 // The file may live under a root prefix the import omitted.
-                let needle = format!("/{path}");
-                if let Some(hit) = files.iter().find(|known| known.ends_with(&needle)) {
-                    return Some(hit.clone());
-                }
+                candidates.push(Candidate::Suffix(path));
             }
         }
     }
-    None
+    candidates
 }
 
-pub(crate) fn resolve_from_dir(
-    dir: &str,
-    segs: &[&str],
-    files: &HashSet<String>,
-) -> Option<String> {
+pub(crate) fn resolve_from_dir(dir: &str, segs: &[&str]) -> Vec<Candidate> {
     if segs.is_empty() {
-        return None;
+        return Vec::new();
     }
     let mut parts: Vec<&str> = segs
         .iter()
         .copied()
         .filter(|seg| !seg.is_empty() && *seg != "*")
         .collect();
+    let mut candidates = Vec::new();
     while !parts.is_empty() {
         let rel = if dir.is_empty() {
             parts.join("/")
@@ -136,44 +187,28 @@ pub(crate) fn resolve_from_dir(
             format!("{rel}.py"),
             format!("{rel}/__init__.py"),
         ] {
-            if files.contains(&candidate) {
-                return Some(candidate);
-            }
+            candidates.push(Candidate::Exact(candidate));
         }
         parts.pop();
     }
-    None
+    candidates
 }
 
-pub(crate) fn resolve_relative(
-    from: &str,
-    spec: &str,
-    files: &HashSet<String>,
-    exts: &[&str],
-) -> Option<String> {
+pub(crate) fn resolve_relative(from: &str, spec: &str, exts: &[&str]) -> Vec<Candidate> {
     let from_dir = parent(from).unwrap_or("");
-    let joined = normalize_join(from_dir, spec)?;
+    let Some(joined) = normalize_join(from_dir, spec) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
     for ext in exts {
-        let file = format!("{joined}.{ext}");
-        if files.contains(&file) {
-            return Some(file);
-        }
-        let index = format!("{joined}/index.{ext}");
-        if files.contains(&index) {
-            return Some(index);
-        }
+        candidates.push(Candidate::Exact(format!("{joined}.{ext}")));
+        candidates.push(Candidate::Exact(format!("{joined}/index.{ext}")));
     }
-    if files.contains(&joined) {
-        return Some(joined);
-    }
-    None
+    candidates.push(Candidate::Exact(joined));
+    candidates
 }
 
-pub(crate) fn resolve_python_relative(
-    from: &str,
-    spec: &str,
-    files: &HashSet<String>,
-) -> Option<String> {
+pub(crate) fn resolve_python_relative(from: &str, spec: &str) -> Vec<Candidate> {
     let mut rest = spec;
     let mut dir = parent(from).unwrap_or("");
     while rest.starts_with('.') {
@@ -183,10 +218,10 @@ pub(crate) fn resolve_python_relative(
         }
     }
     if rest.is_empty() {
-        return None;
+        return Vec::new();
     }
     let segs: Vec<&str> = rest.split('.').collect();
-    resolve_from_dir(dir, &segs, files)
+    resolve_from_dir(dir, &segs)
 }
 
 pub(crate) fn parent(path: &str) -> Option<&str> {
@@ -217,16 +252,6 @@ pub(crate) fn normalize_join(dir: &str, spec: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
-}
-
-/// The placement of a specifier this language resolves itself, where there is
-/// no outside world to speak of: `use super::x` in Rust, a `require_relative`
-/// in Ruby. `None` means the workspace-shaped specifier named no file.
-pub(crate) fn internal(resolved: Option<String>) -> Placement {
-    match resolved {
-        Some(path) => Placement::Resolved(path),
-        None => Placement::Missing,
-    }
 }
 
 /// Whether a specifier names something of this workspace's own shape.

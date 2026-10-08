@@ -25,6 +25,7 @@ use super::support::{
     Comments, Placement, finish, internal, mask_comments, record, resolve_relative, resolve_suffix,
 };
 
+use crate::UnresolvedImport;
 use crate::symbols::{self, has_child_kind, push_field, push_site, text};
 
 /// The files a specifier can land on, relative or resolved by module path.
@@ -50,13 +51,14 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     ts_module(tree.root_node(), source.as_bytes(), &mut sites);
     let masked = mask_comments(source, Comments::Slashes);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     for re in [&*FROM, &*CALL] {
         for cap in re.captures_iter(&masked) {
             let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             record(
                 spec,
-                placement(path, spec, files),
+                placement(path, spec),
+                files,
                 &mut imports,
                 &mut unresolved,
             );
@@ -74,14 +76,11 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
 /// A relative specifier is resolved against the importing file and a miss is a
 /// warning; a bare or alias specifier is resolved by module path and a miss
 /// means it belongs to node_modules, not to this workspace.
-fn placement(path: &str, spec: &str, files: &HashSet<String>) -> Placement {
+fn placement(path: &str, spec: &str) -> Placement {
     if spec.starts_with('.') {
-        return internal(resolve_relative(path, spec, files, EXTS));
+        return internal(resolve_relative(path, spec, EXTS));
     }
-    match resolve_suffix(spec, EXTS, files) {
-        Some(resolved) => Placement::Resolved(resolved),
-        None => Placement::External,
-    }
+    Placement::Optional(resolve_suffix(spec, EXTS))
 }
 
 /// TypeScript and JavaScript: what an `export` publishes, plus the public

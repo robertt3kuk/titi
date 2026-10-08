@@ -738,3 +738,45 @@ fn an_export_change_reresolves_only_the_files_that_mention_the_name() {
     assert_eq!(genome.symbols["fresh_export"].users, 1);
 }
 
+/// A specifier that named no file is answered from the index when a file
+/// appears: the importer is not read and not parsed.
+///
+/// The specifier kept the paths it would have named (`src/missing.ts` among
+/// them), so the new file is a membership test. Nothing in `src/app.ts` moves
+/// except its `imports`, which is the edge the graph was missing.
+#[test]
+fn a_specifier_that_now_resolves_is_found_without_reparsing_the_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/app.ts",
+        "import { helper } from \"./missing\";\n",
+    );
+
+    let mut genome = Genome::index(root).unwrap();
+    assert!(genome.files["src/app.ts"].imports.is_empty());
+    assert_eq!(
+        genome.files["src/app.ts"].unresolved_imports,
+        vec!["./missing".to_owned()]
+    );
+
+    write(root, "src/missing.ts", "export function helper() {}\n");
+    let stats = genome
+        .apply_changes(&["src/missing.ts".to_owned()])
+        .unwrap();
+    assert_eq!(stats.parsed, 1, "only the new file is read");
+    assert!(
+        stats.graph_recomputed,
+        "a path appeared and an edge with it"
+    );
+
+    assert_eq!(
+        genome.files["src/app.ts"].imports,
+        vec!["src/missing.ts".to_owned()],
+        "the importer was fixed without being re-parsed"
+    );
+    assert!(genome.files["src/app.ts"].unresolved_imports.is_empty());
+    assert_eq!(genome.ranks.len(), 2, "the new file is ranked");
+    assert_eq!(genome.dependents["src/missing.ts"], 1, "the edge ranks");
+}

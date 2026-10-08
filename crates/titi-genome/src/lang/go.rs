@@ -21,6 +21,7 @@ use tree_sitter::Node;
 use super::ParsedFile;
 use super::support::{Placement, finish, record, resolve_suffix};
 
+use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_site, text};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
@@ -34,7 +35,7 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
     let mut sites = Vec::new();
     go_decls(tree.root_node(), bytes, &mut sites);
     let mut imports = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved: Vec<UnresolvedImport> = Vec::new();
     collect_go_imports(
         tree.root_node(),
         bytes,
@@ -120,7 +121,7 @@ fn collect_go_imports(
     source: &[u8],
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     if node.kind() == "import_spec" {
         if let Some(path) = node.child_by_field_name("path")
@@ -145,16 +146,16 @@ fn place(
     spec: &str,
     files: &HashSet<String>,
     imports: &mut Vec<String>,
-    unresolved: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedImport>,
 ) {
     let last = spec.rsplit('/').next().unwrap_or(spec);
-    let resolved = resolve_suffix(&format!("{last}/{last}"), &["go"], files)
-        .or_else(|| resolve_suffix(last, &["go"], files));
+    let mut candidates = resolve_suffix(&format!("{last}/{last}"), &["go"]);
+    candidates.extend(resolve_suffix(last, &["go"]));
     let module_shaped = spec.split('/').next().unwrap_or(spec).contains('.');
-    let placement = match resolved {
-        Some(path) => Placement::Resolved(path),
-        None if module_shaped => Placement::Missing,
-        None => Placement::External,
+    let placement = if module_shaped {
+        Placement::Candidates(candidates)
+    } else {
+        Placement::Optional(candidates)
     };
-    record(spec, placement, imports, unresolved);
+    record(spec, placement, files, imports, unresolved);
 }
