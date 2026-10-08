@@ -6,9 +6,10 @@
 //! span comes out of the grammar, so a target either resolves to exactly one
 //! declaration node or the edit is refused and nothing changes.
 //!
-//! The languages are the genome's: Rust, TypeScript/JavaScript, Python.
-//! Anything else is [`AstEditError::UnsupportedLanguage`] — guessing with a
-//! foreign grammar would be worse than refusing.
+//! The languages are the genome's: Rust, TypeScript/JavaScript, Python — and
+//! only those. A grammar the symbol map links without an edit mapping here is
+//! [`AstEditError::UnsupportedLanguage`]; guessing its node shapes would be
+//! worse than refusing.
 //!
 //! This is a library capability. Input is `(path, source, target, replacement)`
 //! and output is the new source; nothing here touches the filesystem.
@@ -176,9 +177,11 @@ impl AstEditError {
 ///
 /// Errors exactly as [`apply`] does, minus [`AstEditError::BrokenResult`].
 pub fn find(path: &str, source: &str, target: &Target) -> Result<Span, AstEditError> {
-    let grammar = grammar_for(path).ok_or_else(|| AstEditError::UnsupportedLanguage {
-        path: path.to_owned(),
-    })?;
+    let grammar = grammar_for(path)
+        .filter(|grammar| EDIT_GRAMMARS.contains(grammar))
+        .ok_or_else(|| AstEditError::UnsupportedLanguage {
+            path: path.to_owned(),
+        })?;
     let tree = parse(grammar, source).ok_or_else(|| AstEditError::Unparsable {
         path: path.to_owned(),
     })?;
@@ -289,6 +292,20 @@ fn declares(node: Node, source: &[u8], grammar: Grammar, target: &Target) -> boo
         .is_some_and(|name| name == target.name)
 }
 
+/// The grammars `ast-edit` edits, in the order its error names them.
+///
+/// The symbol map links more grammars than this: a language whose walker has
+/// landed is understood for the index without being editable, because a
+/// body/whole edit needs that grammar's own node kinds pinned in [`kinds`]
+/// and its shapes tested. A path in a linked grammar that is missing here is
+/// refused up front, exactly like an unknown language.
+const EDIT_GRAMMARS: &[Grammar] = &[
+    Grammar::Rust,
+    Grammar::TypeScript,
+    Grammar::Tsx,
+    Grammar::Python,
+];
+
 /// The node kinds each grammar uses for a kind of declaration.
 fn kinds(grammar: Grammar, kind: ItemKind) -> &'static [&'static str] {
     match (grammar, kind) {
@@ -315,5 +332,8 @@ fn kinds(grammar: Grammar, kind: ItemKind) -> &'static [&'static str] {
         ],
         (Grammar::Python, ItemKind::Function) => &["function_definition"],
         (Grammar::Python, ItemKind::Type) => &["class_definition"],
+        // Unreachable: `find` refuses a grammar outside [`EDIT_GRAMMARS`]
+        // before a walk starts. The arm keeps the match total as grammars land.
+        _ => &[],
     }
 }

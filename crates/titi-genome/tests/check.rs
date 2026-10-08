@@ -334,7 +334,10 @@ fn the_roster_needs_no_workspace() {
         .filter(|cap| cap.level == Level::Full)
         .map(|cap| cap.language)
         .collect();
-    assert_eq!(full, vec!["javascript", "python", "rust", "typescript"]);
+    assert_eq!(
+        full,
+        vec!["go", "javascript", "python", "rust", "typescript"]
+    );
     let heuristic = roster
         .iter()
         .filter(|cap| cap.level == Level::Heuristic)

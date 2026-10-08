@@ -44,7 +44,13 @@ import "example.com/proj/internal/ghost"
 
 func Main() {
 	fmt.Println(st.Open)
+	var Local = 1
+	_ = Local
 }
+
+const Snippet = `
+func Quoted() {}
+`
 
 func helper() {}
 
@@ -100,6 +106,17 @@ fn go_exports_come_from_single_lines_and_groups() {
         assert!(
             !main.exports.contains(&private.to_owned()),
             "`{private}` must not be an export of cmd/app/main.go: {:?}",
+            main.exports
+        );
+    }
+
+    // Text that only looks like a declaration is not one: a `func` inside a
+    // raw string literal and a `var` local to a function are not exports of
+    // the package, though the old line patterns read both.
+    for not_exported in ["Quoted", "Local"] {
+        assert!(
+            !main.exports.contains(&not_exported.to_owned()),
+            "`{not_exported}` is not a package-level declaration: {:?}",
             main.exports
         );
     }
@@ -187,6 +204,6 @@ fn go_imports_resolve_and_std_paths_stay_quiet() {
         .into_iter()
         .find(|capability| capability.language == "go")
         .expect("a go capability");
-    assert_eq!(go.level, Level::Heuristic);
+    assert_eq!(go.level, Level::Full, "{}", go.note);
     assert!(go.extensions.contains(&"go"), "{:?}", go.extensions);
 }

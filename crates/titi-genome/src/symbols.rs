@@ -27,6 +27,7 @@ pub enum Grammar {
     /// The TSX grammar, which also accepts plain JavaScript and JSX.
     Tsx,
     Python,
+    Go,
 }
 
 impl Grammar {
@@ -36,6 +37,7 @@ impl Grammar {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
         }
     }
 }
@@ -46,6 +48,7 @@ struct Parsers {
     typescript: Option<Parser>,
     tsx: Option<Parser>,
     python: Option<Parser>,
+    go: Option<Parser>,
 }
 
 impl Parsers {
@@ -55,6 +58,7 @@ impl Parsers {
             Grammar::TypeScript => &mut self.typescript,
             Grammar::Tsx => &mut self.tsx,
             Grammar::Python => &mut self.python,
+            Grammar::Go => &mut self.go,
         }
     }
 }
@@ -146,6 +150,7 @@ mod tests {
             Grammar::TypeScript,
             Grammar::Tsx,
             Grammar::Python,
+            Grammar::Go,
         ] {
             assert!(grammar_available(grammar), "{grammar:?} failed to load");
         }

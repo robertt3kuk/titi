@@ -136,10 +136,10 @@ pub(crate) struct Lang {
     pub parse: fn(&str, &str, &HashSet<String>) -> ParsedFile,
 }
 
-/// The grammar that would turn a heuristic language into a parsed one, as
-/// researched on 2026-10-08. None of them is linked yet: a row whose grammar
-/// column would be filled in says `Heuristic` today rather than claiming a
-/// syntax tree it does not have.
+/// The grammar that turns a heuristic language into a parsed one, as
+/// researched on 2026-10-08. A row that has been linked carries a grammar and
+/// says `Full`; a language the table below still lists as `Heuristic` has
+/// nothing linked yet rather than claiming a syntax tree it does not have.
 ///
 /// `ABI` is the `LANGUAGE_VERSION` the grammar's own `parser.c` defines. The
 /// workspace's tree-sitter 0.24 accepts 14, so a row is only addable when its
@@ -213,11 +213,11 @@ pub(crate) const LANGS: &[Lang] = &[
     },
     Lang {
         language: Language::Go,
-        level: Level::Heuristic,
+        level: Level::Full,
         name: "go",
-        note: "exported identifiers and import paths are matched by pattern; an unusual layout can hide one",
+        note: "exported identifiers come from a syntax tree; import paths are resolved by package suffix",
         extensions: &["go"],
-        grammar: None,
+        grammar: Some(Grammar::Go),
         parse: go::parse,
     },
     Lang {
@@ -416,8 +416,14 @@ mod tests {
     use crate::lang::test_support::exports;
 
     #[test]
-    fn a_language_without_a_grammar_is_not_claimed() {
-        assert!(exports("main.go", "func Handler() {}").is_none());
+    fn a_path_with_no_grammar_is_not_claimed() {
+        // A language the table still lists without a grammar has nothing to
+        // read a symbol off, so the helper answers `None` for it. As the
+        // grammars land this loop empties; only the non-source path is left.
+        for row in LANGS.iter().filter(|row| row.grammar.is_none()) {
+            let path = format!("a.{}", row.extensions[0]);
+            assert!(exports(&path, "anything").is_none(), "{path}");
+        }
         assert!(exports("README.md", "# title").is_none());
     }
 
@@ -469,15 +475,17 @@ mod tests {
             1
         );
 
-        // A parsed language and a pattern language must not read alike.
-        let java = roster.iter().find(|cap| cap.language == "java").unwrap();
-        assert_eq!(java.level, Level::Heuristic);
-        assert!(
-            java.note.contains("pattern"),
-            "the note says what the level costs: {}",
-            java.note
-        );
-        assert!(rust.level.as_str() == "Full" && java.level.as_str() == "Heuristic");
+        // A parsed language and a pattern language must not read alike; a
+        // pattern language's note says what its level costs. Once every
+        // grammar lands there is no pattern row left and this loop empties.
+        for heuristic in roster.iter().filter(|cap| cap.level == Level::Heuristic) {
+            assert!(
+                heuristic.note.contains("pattern"),
+                "the note says what the level costs: {}",
+                heuristic.note
+            );
+        }
+        assert_eq!(rust.level.as_str(), "Full");
     }
 
     #[test]
