@@ -1165,3 +1165,67 @@ single item-level allow whose comment says a literal pattern cannot fail for any
 input. All three gates ran in a clean detached worktree of this head with its
 own target directory, so the shared `target/` in the main checkout was never
 built against.
+
+The caret-and-durability wave (2026-10-09). The composer is no longer
+append-only: `Chat::caret` is a byte offset on a char boundary and every write to
+the draft goes through the helpers beside it (`insert_at_caret`, `backspace`,
+`delete_forward`, `delete_word`, `delete_to_start`, `move_caret`,
+`move_caret_word`), so the offset cannot go stale, and `Chat::caret()` reads it
+clamped, so a draft replaced wholesale (a test, a replay) leaves the caret at its
+end rather than panicking. The keys are the crate's own `tui.editor.*` names its
+keybinding table already spelled — ←/→ a character, alt+←/→ and ctrl+←/→ a word,
+home/end and ctrl+a/ctrl+e the two ends, delete for what follows the caret,
+ctrl+u (`deleteToLineStart`) for everything before it, and
+backspace/alt+backspace/ctrl+w for what is behind it. One honest consequence:
+ctrl+u used to be a half-page scroll, so the half-page keys are now unreachable
+and the keybinding guard says so rather than listing a binding nobody can press.
+This is also the piece vim mode was blocked on, which is why it landed first
+(vim is in flight, below).
+
+`312930c` fixed the paste marker against the new cuts. `delete_word` cut the
+range its own arithmetic found — the run of spaces and then the run of
+non-spaces — and a marker holds spaces, so ctrl+w with the caret after
+`[Paste #1 · 8 lines]` took only `lines]` and left `[Paste #1 · 8 `, which no
+longer matched the registry: `expand_pastes` could not find it and the half
+marker was what the model got. Every path that takes text out of the draft now
+widens its range through one helper, `whole_markers`, beside `skip_markers`: a
+range that intersects a marker is widened to cover all of it, a range that merely
+touches one (ends where it begins, begins where it ends) is left alone because it
+cuts nothing of it, and `backspace`/`delete_forward`/`delete_to_start` use the
+same rule instead of their own edge checks. The registry is pruned with the cut,
+so a marker that was cut away does not keep a body alive in a draft that can no
+longer expand it.
+
+Durability and the stores. `4fffecb` and `b08e3d0` give the two SQLite stores
+the refusal they were missing: each carries `SCHEMA_VERSION = 1` and a
+`check_version` that reads `PRAGMA user_version` **before anything is written**,
+answers `SchemaTooNew { found, supported }` for a file a newer titi wrote ("auth
+store schema N was written by a newer titi; this build understands M"), and
+stamps an unstamped file current. Refusing rather than migrating down is
+deliberate: this build cannot know what a future schema's columns mean, and
+rewriting them under the older reading would lose tokens instead of naming the
+problem. `75a5cb5` replaces `export_to_file`'s in-place write with
+`write_atomic` — a temp takes the target's own permissions, a failed write or a
+failed rename removes the temp and leaves the target untouched, and a symlink is
+followed by hand (`MAX_SYMLINK_HOPS` = 40) rather than with `canonicalize`; the
+parent directory is deliberately still not `fsync`ed, because the rename either
+happened or did not and the extra sync is a network-filesystem cost.
+`35965f1` fixes the mask's dangling quote: the assignment pattern now keeps the
+key (`$key[redacted]`) and matches the closing quote, so `"password": "…"` reads
+`"password": [redacted]` while the value is still gone. `1671dd6` closes the last
+wall-clock test — the first-frame budget is the best of five paints, and the
+queued-prompt test waits on the provider's own flag and asserts a lower bound —
+which is what the BRAIN row now records for all four of the files it named.
+`1f8a2e4` drops the one genuinely unused dependency (`tempfile` in
+`titi-providers`' dev-dependencies).
+
+In flight while this was written: vim mode, in `crates/titi-cli` (`chat.rs`,
+`composer.rs`, `keys.rs`, `pickers.rs`) and `titi-config` — the caret above is the
+piece it needed.
+
+The suite went 1952 → **1972 passed** (78 targets, 0 failed): `titi-cli` unit +10
+(the caret and its keys), `titi-core` unit +4 (`write_atomic` and the export
+path), `titi-memory` unit +4 (the mask and the version refusal), `titi-secrets`
+unit +2 (its own). The `unwrap`/`expect` headers are unchanged at **6** of **95**
+`warning:` lines. All three gates ran in a clean detached worktree of this head
+with its own target directory.
