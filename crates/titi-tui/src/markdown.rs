@@ -583,6 +583,28 @@ fn fit_widths(natural: &[usize], min: &[usize], avail: usize) -> Vec<usize> {
     widths
 }
 
+/// Whether the last SGR in `s` leaves a style in effect.
+///
+/// A cell is assembled from several styled spans, so a cut inside one span can
+/// leave a colour opened by an *earlier* span running; the padding and the
+/// border glyph that follow would inherit it.
+fn style_is_open(s: &str) -> bool {
+    let mut open = false;
+    for span in crate::width::spans(s) {
+        let crate::width::Span::Escape(seq) = span else {
+            continue;
+        };
+        let Some(params) = seq.strip_prefix("\x1b[").and_then(|p| p.strip_suffix('m')) else {
+            continue; // not SGR: an OSC 8, a charset switch, …
+        };
+        if !params.chars().all(|c| c.is_ascii_digit() || c == ';') {
+            continue;
+        }
+        open = !matches!(params, "0" | "39" | "22" | "23" | "24");
+    }
+    open
+}
+
 /// Replace every whitespace-delimited run wider than `width` with a hard cut
 /// plus `…`, so [`wrap_text_with_ansi`] never silently clamps one and the cut
 /// is visible.
@@ -600,6 +622,10 @@ fn cap_long_words(text: &str, width: usize) -> String {
         if visible_width(seg) > width {
             out.push_str(&truncate_to_width(seg, width.saturating_sub(1)));
             out.push('…');
+            // `truncate_to_width` closes only a style it saw in its own input.
+            if style_is_open(&out) {
+                out.push_str("\x1b[39m");
+            }
         } else {
             out.push_str(seg);
         }
@@ -1058,6 +1084,8 @@ mod tests {
         let mut fg = HashMap::new();
         for (k, v) in [
             ("mdHeading", "#ffcc00"),
+            ("mdLink", "#4da6ff"),
+            ("mdLinkUrl", "#7f7f7f"),
             ("mdCode", "#ff7b72"),
             ("mdCodeBlock", "#c9d1d9"),
             ("mdCodeBlockBorder", "#444444"),
@@ -1722,5 +1750,50 @@ Done in `AGENTS.md`.";
         let delim = format!("|{}", "---|".repeat(MAX_TABLE_COLS + 1));
         let rows = plain(&render_markdown(&format!("{header}\n{delim}"), &theme, 200));
         assert_eq!(rows, vec![header, delim], "a row that wide is prose");
+    }
+
+    /// A cut inside a styled cell closes the style it was in.  The link's
+    /// colour is opened by one span and the cut lands in the next one, so the
+    /// padding after the `…` must not still be painted in it.
+    #[test]
+    fn a_cut_cell_closes_its_style() {
+        let theme = colored_theme();
+        let lines = render_markdown(
+            "| Where |\n|-------|\n| see [docs](https://docs.rs/very/long/path) |",
+            &theme,
+            16,
+        );
+        assert_eq!(
+            plain(&lines),
+            vec![
+                "┌──────────────┐",
+                "│ Where        │",
+                "├──────────────┤",
+                "│ see docs     │",
+                "│ (https://do… │",
+                "└──────────────┘",
+            ]
+        );
+        for row in &lines {
+            assert!(visible_width(row) <= 16, "{row:?}");
+        }
+        // The cut cell's text is closed before its padding, so the `…` and the
+        // spaces after it are not left painted in the link's colour.
+        let cut = lines
+            .iter()
+            .find(|row| row.contains('…'))
+            .expect("the cut is drawn");
+        // Everything the row paints between its bars, minus the closing bar's
+        // own colour escape.
+        let content = cut
+            .rsplit_once('│')
+            .and_then(|(head, _)| head.rsplit_once('│'))
+            .map(|(_, content)| content.trim_end())
+            .map(|c| c.strip_suffix("\x1b[38;2;68;68;68m").unwrap_or(c))
+            .expect("a bar on each side");
+        assert!(
+            !style_is_open(content.trim_end()),
+            "the style is closed before the padding: {cut:?}"
+        );
     }
 }
