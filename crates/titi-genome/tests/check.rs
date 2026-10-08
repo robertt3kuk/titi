@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
-use titi_genome::{Genome, serve_lsp};
+use titi_genome::{Genome, Severity, serve_lsp};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -83,6 +83,7 @@ fn a_syntax_error_is_a_diagnostic() {
         .into_iter()
         .find(|item| item.code == "syntax-error")
         .expect("syntax-error");
+    assert_ne!(hit.severity, Severity::Info);
     assert!(hit.message.contains("src/broken.rs"), "{}", hit.message);
     assert!(
         hit.message.contains("1")
@@ -115,6 +116,7 @@ fn ambiguous_session_has_no_definition_and_short_names_stay_quiet() {
         .iter()
         .find(|item| item.code == "ambiguous-symbol" && item.message.contains("Session"))
         .expect("ambiguous-symbol for Session");
+    assert_eq!(hit.severity, Severity::Info, "{}", hit.message);
     assert!(hit.message.contains("src/a.rs"), "{}", hit.message);
     assert!(hit.message.contains("src/b.rs"), "{}", hit.message);
     for quiet in ["`new`", "`get`", "`join`"] {

@@ -65,7 +65,7 @@ impl Genome {
                 path: path.clone(),
                 line: 1,
                 character: 0,
-                severity: Severity::Warning,
+                severity: Severity::Info,
                 code: "ambiguous-symbol".to_owned(),
                 message: format!("`{name}` is defined in {definers}"),
             });

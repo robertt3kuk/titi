@@ -170,7 +170,8 @@ fn titi_no_genome_names_itself_as_the_reason() {
 }
 
 /// A broken import is named with its file, line, code and message, and the
-/// check exits 1. A tree with one valid function is clean at exit 0. Check
+/// check exits 1. An ambiguous-only tree exits 0 with the lines printed: an
+/// ambiguous name is a hint, not a defect. Clean is clean at exit 0. Check
 /// reads the workspace, not the agent config, so neither test writes one.
 #[test]
 fn check_reports_unresolved_imports_and_a_clean_tree_is_clean() {
@@ -199,6 +200,32 @@ fn check_reports_unresolved_imports_and_a_clean_tree_is_clean() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert_eq!(stdout, "genome: clean\n", "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A tree whose only diagnostics are ambiguous symbols prints them and exits
+/// 0: the same name in two files is a hint that name-only resolution cannot
+/// pick one, not a defect. Only a Warning or Error means exit 1.
+#[test]
+fn check_treats_an_ambiguous_only_tree_as_clean() {
+    let dir = tempfile::tempdir().expect("temp tree");
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub mod other;\npub struct Session;\npub fn setup() {}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(src_dir.join("other")).unwrap();
+    std::fs::write(src_dir.join("other/mod.rs"), "pub struct Session;\n").unwrap();
+    let (stdout, stderr, code) = run(dir.path(), dir.path(), &["genome", "check"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "one ambiguous-symbol line for the ambiguous name: {stdout}"
+    );
+    assert!(stdout.lines().all(|line| line.contains("ambiguous-symbol")), "{stdout}");
 }
 
 /// A tree the indexer cannot even walk blames itself, not a clean report.

@@ -78,8 +78,10 @@ fn status(settings: &Option<Settings>, agent_dir: &Path) {
 
 /// `titi genome check`: index the workspace, print one line per diagnostic.
 ///
-/// `path:line: code: message`, one line each; a clean tree says so and exits
-/// 0, any diagnostic exits 1, and an index that cannot even be built blames
+/// `path:line: code: message`, one line each; severity decides the exit: a
+/// clean tree, or one whose only diagnostics are informational (an ambiguous
+/// name is a hint about name-only resolution, not a defect), exits 0; a
+/// Warning or Error exits 1. An index that cannot even be built blames
 /// itself rather than reporting phantom clean trees.
 fn check_cmd(workspace: &Path) {
     let genome = match titi_genome::Genome::index(workspace) {
@@ -100,7 +102,10 @@ fn check_cmd(workspace: &Path) {
             diagnostic.path, diagnostic.line, diagnostic.code, diagnostic.message
         );
     }
-    std::process::exit(1);
+    let has_problem = diagnostics
+        .iter()
+        .any(|item| !matches!(item.severity, titi_genome::Severity::Info));
+    std::process::exit(i32::from(has_problem));
 }
 
 /// Writes the boolean to the agent's own config: the canonical global file,
