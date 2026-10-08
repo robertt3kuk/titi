@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use titi_providers::{ChatMessage, ErrorReason, StopReason};
+// The answer a surface sends back is the same value the `ask` tool renders,
+// so one vocabulary covers both halves: what the tool waits for and what the
+// wire carries are not two enums that could drift apart.
+use titi_tools::AskAnswer;
 
 /// Stable identifier correlating commands and events for one agent turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -149,6 +153,16 @@ pub enum EngineCommand {
     /// advisor is asked about the conversation as a whole.
     Consult {
         question: Option<SmolStr>,
+    },
+    /// Answer the question the model asked — see [`EngineEvent::AskRequested`].
+    ///
+    /// An answer to a question nobody is waiting for is dropped rather than
+    /// refused: the turn it belonged to was cancelled or interrupted, and
+    /// there is no longer anything to unblock. A surface that answers late
+    /// loses the answer, not the session.
+    AnswerAsk {
+        request_id: SmolStr,
+        answer: AskAnswer,
     },
     /// Cap the tokens this session may spend. `None` lifts the cap.
     ///
@@ -422,6 +436,24 @@ pub enum EngineEvent {
     /// per cap: the bound stays in force, and its spend becomes a floor.
     MoneyBudgetUnpriced {
         model: SmolStr,
+    },
+    /// The model asked the user a question and is waiting for the answer.
+    ///
+    /// The turn is stopped until [`EngineCommand::AnswerAsk`] arrives or the
+    /// turn is cancelled, which answers
+    /// [`AskAnswer::Cancelled`] — there is no deadline, because a deadline
+    /// would have to answer on the user's behalf.
+    AskRequested {
+        /// Correlates the answer with this question; a surface echoes it back.
+        request_id: SmolStr,
+        question: SmolStr,
+        /// The choices, in the order to show them. Empty is a question with no
+        /// list, which the user answers in their own words.
+        options: Vec<SmolStr>,
+        /// Whether more than one choice may be taken.
+        multi: bool,
+        /// Whether the user may answer in their own words besides the list.
+        free_text: bool,
     },
     /// The mode the engine is now in. A surface badge follows this, never
     /// its own keypress: the mode that matters is the one the turns run in.

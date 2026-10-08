@@ -16,6 +16,7 @@
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 use titi_providers::{ChatMessage, ErrorReason, Role, StopReason, ToolCallRef};
+use titi_tools::AskAnswer;
 
 /// The variant encodes to exactly `json`, and `json` decodes to exactly it.
 fn command(value: EngineCommand, json: &str) {
@@ -175,6 +176,29 @@ fn every_engine_command_round_trips_through_its_fixture() {
     command(
         EngineCommand::SetBudget { tokens: Some(10) },
         r#"{"SetBudget":{"tokens":10}}"#,
+    );
+    command(
+        EngineCommand::AnswerAsk {
+            request_id: "ask-1".into(),
+            answer: AskAnswer::Chosen(vec!["blue".into()]),
+        },
+        r#"{"AnswerAsk":{"request_id":"ask-1","answer":{"chosen":["blue"]}}}"#,
+    );
+    // The two answers that are not a choice: the user's own words, and the
+    // cancel that stands for no answer at all.
+    command(
+        EngineCommand::AnswerAsk {
+            request_id: "ask-2".into(),
+            answer: AskAnswer::Text("neither, use green".into()),
+        },
+        r#"{"AnswerAsk":{"request_id":"ask-2","answer":{"text":"neither, use green"}}}"#,
+    );
+    command(
+        EngineCommand::AnswerAsk {
+            request_id: "ask-3".into(),
+            answer: AskAnswer::Cancelled,
+        },
+        r#"{"AnswerAsk":{"request_id":"ask-3","answer":"cancelled"}}"#,
     );
     command(
         EngineCommand::SetMoneyBudget {
@@ -459,6 +483,27 @@ fn every_engine_event_round_trips_through_its_fixture() {
             model: "local".into(),
         },
         r#"{"MoneyBudgetUnpriced":{"model":"local"}}"#,
+    );
+    event(
+        EngineEvent::AskRequested {
+            request_id: "ask-1".into(),
+            question: "Which colour?".into(),
+            options: vec!["blue".into(), "red".into()],
+            multi: false,
+            free_text: true,
+        },
+        r#"{"AskRequested":{"request_id":"ask-1","question":"Which colour?","options":["blue","red"],"multi":false,"free_text":true}}"#,
+    );
+    // A question with no list, which the user answers in their own words.
+    event(
+        EngineEvent::AskRequested {
+            request_id: "ask-2".into(),
+            question: "What should it be called?".into(),
+            options: Vec::new(),
+            multi: false,
+            free_text: true,
+        },
+        r#"{"AskRequested":{"request_id":"ask-2","question":"What should it be called?","options":[],"multi":false,"free_text":true}}"#,
     );
     event(
         EngineEvent::ModeChanged {

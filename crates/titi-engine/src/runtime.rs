@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -15,7 +15,7 @@ use titi_providers::{
     TransportError, WireRequest,
 };
 use titi_tools::{ApprovalMode, ApprovalTier, ToolRegistry};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::claims::Claims;
 use crate::findings::Findings;
@@ -879,6 +879,73 @@ fn job_report(id: &str, command: &str, run: &titi_tools::pipe::Run, mask_ips: bo
     crate::tool_loop::cap_output(&crate::tool_loop::mask(&report, mask_ips))
 }
 
+/// The questions the model has asked and nobody has answered yet, by request
+/// id. The turn is parked on the receiving end of one of these; the command
+/// loop holds the sending end.
+pub(crate) type AskWaiters =
+    Arc<tokio::sync::Mutex<HashMap<SmolStr, oneshot::Sender<titi_tools::AskAnswer>>>>;
+
+/// The session's door for the `ask` tool: one question out as an event, one
+/// answer back as a command, and the tool parked in between.
+///
+/// Session-wide rather than per turn, because the tool that holds it is built
+/// with the registry and reached through `&self`. What a turn contributes is
+/// the interrupt: a cancel raises the session's [`titi_tools::Interrupt`], and
+/// this is what turns that into the tool's `Cancelled` answer instead of a wait
+/// that outlives the turn that started it.
+struct SessionAsk {
+    events: mpsc::Sender<EngineEvent>,
+    waiters: AskWaiters,
+    interrupt: titi_tools::Interrupt,
+    /// Numbers the requests. A surface needs an id to answer with, and it has
+    /// to be unique across the session, not merely across a turn.
+    next: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl titi_tools::AskSink for SessionAsk {
+    async fn ask(&self, request: titi_tools::AskRequest) -> titi_tools::AskAnswer {
+        let request_id = SmolStr::from(format!(
+            "ask-{}",
+            self.next.fetch_add(1, Ordering::SeqCst) + 1
+        ));
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().await.insert(request_id.clone(), tx);
+        // Marked before the event goes out: a cancel that lands while the
+        // question is being delivered is still a cancel of this question.
+        let mark = self.interrupt.mark();
+        let _ = self
+            .events
+            .send(EngineEvent::AskRequested {
+                request_id: request_id.clone(),
+                question: request.question.clone().into(),
+                options: request.options.iter().map(SmolStr::from).collect(),
+                multi: request.multi,
+                free_text: request.free_text,
+            })
+            .await;
+        let answer = tokio::select! {
+            answer = rx => answer.unwrap_or(titi_tools::AskAnswer::Cancelled),
+            _ = wait_interrupted(&self.interrupt, mark) => titi_tools::AskAnswer::Cancelled,
+        };
+        // The wait is over either way, so the entry goes: an answer that
+        // arrives afterwards has nothing left to unblock.
+        self.waiters.lock().await.remove(&request_id);
+        answer
+    }
+}
+
+/// Waits until the session's interrupt is raised, or was raised since `mark`.
+///
+/// The same shape as the approval wait's abort poll: there is no channel to
+/// select on for "the user cancelled", only the flag the cancel raises, so the
+/// wait yields and looks again.
+async fn wait_interrupted(interrupt: &titi_tools::Interrupt, mark: u64) {
+    while !interrupt.raised_since(mark) {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// UI-independent command loop and turn scheduler.
 pub struct EngineRuntime {
     config: EngineConfig,
@@ -889,6 +956,9 @@ pub struct EngineRuntime {
     agents: Option<crate::agents::AgentSupervisor>,
     tools: ToolRegistry,
     approval_waiters: ApprovalWaiters,
+    /// The questions the model has asked and nobody has answered yet. See
+    /// [`SessionAsk`].
+    ask_waiters: AskWaiters,
     trajectory: TrajectorySink,
     /// The session's live index and the background worker behind it, when a
     /// root is configured. Written by the tool loop as it runs — synchronously,
@@ -1043,6 +1113,19 @@ impl EngineRuntime {
             .genome_root
             .as_ref()
             .and_then(|root| GenomeHandle::spawn(root, titi_genome::live::Options::default()).ok());
+        // The model's questions reach the surface through this door, and the
+        // answers come back as commands. Installed here because it is the only
+        // place both ends exist at once: the registry that holds the tool, and
+        // the command loop that resolves the answer. The subagent's registry
+        // below is built without it, which is the honest state for a runner
+        // whose events go nowhere.
+        let ask_waiters: AskWaiters = AskWaiters::default();
+        tools.install_ask(Arc::new(SessionAsk {
+            events: event_tx.clone(),
+            waiters: Arc::clone(&ask_waiters),
+            interrupt: config.interrupt.clone(),
+            next: Arc::new(AtomicU64::new(0)),
+        }));
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
@@ -1107,6 +1190,7 @@ impl EngineRuntime {
             agents,
             tools,
             approval_waiters: ApprovalWaiters::default(),
+            ask_waiters,
             trajectory,
             genome,
             touched,
@@ -1312,6 +1396,16 @@ impl EngineRuntime {
                         }
                         EngineCommand::Consult { question } => {
                             self.spawn_consult(question, primary_model.clone());
+                        }
+                        EngineCommand::AnswerAsk { request_id, answer } => {
+                            // The wait is gone when the turn it belonged to is.
+                            // An answer that arrives late — the user cancelled,
+                            // then picked something — has nothing left to
+                            // unblock, and dropping it is what makes the cancel
+                            // final rather than a race with the surface.
+                            if let Some(waiter) = self.ask_waiters.lock().await.remove(&request_id) {
+                                let _ = waiter.send(answer);
+                            }
                         }
                         EngineCommand::SetBudget { tokens } => {
                             self.budget = tokens;

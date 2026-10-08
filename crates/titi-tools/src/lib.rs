@@ -5,6 +5,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ansi;
+pub mod ask;
 pub mod cache;
 pub mod fs;
 pub mod git;
@@ -30,6 +31,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod settings;
 pub mod todo;
 
+pub use ask::{AskAnswer, AskRequest, AskSink, AskTool, MAX_ASK_OPTIONS};
 pub use cache::{READ_CACHE_CAPACITY, ReadCache};
 pub use fs::{
     BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool, workspace_tools,
@@ -153,6 +155,16 @@ pub trait ToolHandler: Send + Sync + 'static {
     fn set_background(&self, sink: Arc<dyn pipe::BackgroundSink>) {
         let _ = sink;
     }
+
+    /// Installs the session's door for asking the user — see
+    /// [`ask::AskSink`]. Only a tool that puts a question to the user has
+    /// anywhere to put one; the default, for every other tool, does nothing.
+    ///
+    /// A registry with no door is a session with no surface, and `ask` says so
+    /// rather than waiting for an answer that cannot come.
+    fn set_ask(&self, sink: Arc<dyn ask::AskSink>) {
+        let _ = sink;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -241,6 +253,17 @@ impl ToolRegistry {
     pub fn install_background(&self, sink: Arc<dyn pipe::BackgroundSink>) {
         for handler in self.tools.values() {
             handler.set_background(Arc::clone(&sink));
+        }
+    }
+
+    /// Hands every tool the session's door for asking the user.
+    ///
+    /// Called once, while the registry is being built: the door belongs to the
+    /// session, and a registry built without one — a subagent's, a headless
+    /// one-shot's — is a session with no surface to ask.
+    pub fn install_ask(&self, sink: Arc<dyn ask::AskSink>) {
+        for handler in self.tools.values() {
+            handler.set_ask(Arc::clone(&sink));
         }
     }
 

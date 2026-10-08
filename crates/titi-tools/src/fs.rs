@@ -1407,6 +1407,9 @@ pub fn workspace_tools_with_interrupt(
             interrupt,
             background: BashBackground::default(),
         }),
+        // The model's own question to the user. Registered everywhere and
+        // answered only where a surface installed a door — see `AskTool`.
+        Box::new(crate::ask::AskTool::new()),
     ];
     tools.extend(crate::git::git_tools(root, policy));
     // The search provider is read here, once per registry: `web_search`
