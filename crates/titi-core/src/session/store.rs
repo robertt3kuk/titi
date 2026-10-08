@@ -419,6 +419,11 @@ impl SessionStore {
     }
 
     /// Writes [`export`](Self::export) to `path`, creating its directory.
+    ///
+    /// The write is [`write_atomic`], so an export that lands on a file
+    /// somebody already has open leaves them the *old* file, complete, rather
+    /// than a truncated one — and a crash mid-export leaves the old file
+    /// rather than half of the new one.
     pub fn export_to_file(
         &self,
         session_id: &str,
@@ -429,7 +434,10 @@ impl SessionStore {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(SessionError::Io)?;
         }
-        fs::write(path, rendered).map_err(SessionError::Io)
+        write_atomic(
+            &export_target(path).map_err(SessionError::Io)?,
+            rendered.as_bytes(),
+        )
     }
 
     fn session_file(&self, session_id: &str) -> PathBuf {
@@ -577,10 +585,68 @@ pub(crate) fn truncate_torn_tail(file: &mut File) -> std::io::Result<()> {
 /// within one filesystem, and a temp under `std::env::temp_dir()` can be a
 /// different mount, where the rename degrades into a copy that a crash can
 /// catch halfway and leaves the target truncated after all.
+/// Most symbolic links one path may be followed through before it is a loop.
+///
+/// The kernel's own limit; a chain that does not settle inside it is an error
+/// rather than a write to whichever link happened to be eighth.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// Where an atomic write to `path` actually lands.
+///
+/// A symlink is followed by hand rather than with `canonicalize`, which needs
+/// its target to exist — a link to a file that is not there yet is exactly the
+/// case a first export hits. Following it is what keeps the write going where
+/// the user pointed it (the link survives, the file behind it changes), and
+/// resolving *before* the temp is made is what keeps the rename on the same
+/// filesystem as the file it replaces.
+fn export_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(meta) = fs::symlink_metadata(&target) else {
+            // Nothing there: the write goes where it says, and the temp beside
+            // it, which is what a new file needs.
+            return Ok(target);
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(target);
+        }
+        let link = fs::read_link(&target)?;
+        target = if link.is_absolute() {
+            link
+        } else {
+            target.parent().unwrap_or_else(|| Path::new(".")).join(link)
+        };
+    }
+    Err(std::io::Error::new(
+        // `ErrorKind::FilesystemLoop` is still unstable, so the kind is the
+        // one an ordinary write would report and the message says which.
+        std::io::ErrorKind::InvalidInput,
+        format!("{}: too many levels of symbolic links", path.display()),
+    ))
+}
+
+/// Writes `bytes` to `path` by writing a sibling and renaming it over the
+/// target, so a reader never sees a half-written file: it reads the old one or
+/// the new one, whichever the rename left it.
+///
+/// The temp is `sync_all`ed before the rename, because a rename is atomic but
+/// not durable on its own — without the sync a crash can leave the *old* file
+/// in place after this returned, which for an append is a message the user
+/// watched being written and lost. The temp takes the target's permissions
+/// when the target has any, so replacing a file the user restricted to `0600`
+/// does not widen it back to the default the temp was created with.
+///
+/// Deliberately not done: `fsync`ing the parent directory after the rename.
+/// That is what makes the *rename* durable, and it is also the call that some
+/// network filesystems refuse with `EINVAL` — a write that fails on a working
+/// filesystem is worse than one that a power cut can roll back.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
     let tmp = tmp_path(path);
     let mut file = File::create(&tmp).map_err(SessionError::Io)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| keep_permissions(path, &tmp));
     drop(file);
     if let Err(e) = written {
         // The target is still the old file, so the half-written temp is only
@@ -588,7 +654,27 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
         let _ = fs::remove_file(&tmp);
         return Err(SessionError::Io(e));
     }
-    fs::rename(&tmp, path).map_err(SessionError::Io)
+    if let Err(e) = fs::rename(&tmp, path) {
+        // A rename either happened or did not, so the target is untouched and
+        // the temp is litter: removed here rather than left beside a file the
+        // caller believes was written.
+        let _ = fs::remove_file(&tmp);
+        return Err(SessionError::Io(e));
+    }
+    Ok(())
+}
+
+/// Gives `tmp` the permissions `path` already had, when it has any.
+///
+/// A file created for the temp carries the process default (`0644` under the
+/// usual umask), so a replace would relax a target the user had tightened. A
+/// target that does not exist yet keeps the default, which is what a new file
+/// gets anyway.
+fn keep_permissions(path: &Path, tmp: &Path) -> std::io::Result<()> {
+    let Ok(existing) = fs::metadata(path) else {
+        return Ok(());
+    };
+    fs::set_permissions(tmp, existing.permissions())
 }
 
 /// `<file>.tmp` beside `file`, so the rename stays inside one directory.
@@ -1442,6 +1528,122 @@ mod tests {
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}")),
             jsonl
         );
+    }
+
+    /// An export **replaces** the file rather than truncating it in place: a
+    /// reader that already has the export open keeps reading the file it
+    /// opened, whole, instead of watching it emptied and refilled.
+    ///
+    /// The open handle is the observable form of that contract — a truncating
+    /// write shows through it, a rename does not — and it is the same handle a
+    /// `tail -f`, a pager or an editor would be holding.
+    #[test]
+    fn an_export_replaces_the_file_rather_than_truncating_it() {
+        let (dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "the first question")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("chat.md");
+        s.export_to_file(&sid, ExportFormat::Markdown, &path)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let mut open = File::open(&path).unwrap_or_else(|e| panic!("{e}"));
+        let mut first = String::new();
+        open.read_to_string(&mut first)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(first.contains("the first question"), "{first}");
+
+        s.append(&sid, Role::Assistant, "the second answer")
+            .unwrap_or_else(|e| panic!("{e}"));
+        s.export_to_file(&sid, ExportFormat::Markdown, &path)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        // The handle still reads what it read: the file it opened was not the
+        // one the new export went into.
+        open.seek(SeekFrom::Start(0))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut again = String::new();
+        open.read_to_string(&mut again)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, first, "the reader's file was rewritten under it");
+        // And the path itself holds the new export.
+        let at_path = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(at_path.contains("the second answer"), "{at_path}");
+    }
+
+    /// An export to a path that is a symlink writes through the link, the way
+    /// an ordinary write does, and leaves the link in place.
+    #[test]
+    fn an_export_writes_through_a_symlink() {
+        let (dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "through the link")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let real = dir.path().join("real.md");
+        let link = dir.path().join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap_or_else(|e| panic!("{e}"));
+
+        s.export_to_file(&sid, ExportFormat::Markdown, &link)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .file_type()
+                .is_symlink(),
+            "the link is still a link"
+        );
+        let written = fs::read_to_string(&real).unwrap_or_else(|e| panic!("{e}"));
+        assert!(written.contains("through the link"), "{written}");
+    }
+
+    /// A replace keeps the permissions the file had: an export the user
+    /// restricted to `0600` must not be widened back by the next one.
+    #[test]
+    fn an_export_keeps_the_permissions_the_file_had() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "private")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("chat.md");
+        s.export_to_file(&sid, ExportFormat::Markdown, &path)
+            .unwrap_or_else(|e| panic!("{e}"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        s.export_to_file(&sid, ExportFormat::Markdown, &path)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the replace widened the file's permissions");
+    }
+
+    /// A write that cannot be renamed into place leaves the target as it was
+    /// and no temporary beside it.
+    #[test]
+    fn a_failed_export_leaves_no_temporary_behind() {
+        let (dir, s) = store();
+        let sid = s.create(meta("a")).unwrap_or_else(|e| panic!("{e}"));
+        s.append(&sid, Role::User, "hello")
+            .unwrap_or_else(|e| panic!("{e}"));
+        // A directory where the export wants a file: the temp is written and
+        // the rename cannot land.
+        let path = dir.path().join("out.md");
+        fs::create_dir(&path).unwrap_or_else(|e| panic!("{e}"));
+
+        let refused = s.export_to_file(&sid, ExportFormat::Markdown, &path);
+        assert!(refused.is_err(), "a directory is not a file to write");
+        assert!(
+            !dir.path().join("out.md.tmp").exists(),
+            "the temp was left beside the target"
+        );
+        assert!(path.is_dir(), "the target was not touched");
     }
 
     /// The store's listing takes the workspace filter through, and the
