@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -116,13 +116,9 @@ fn swift_resolves_module_imports_and_reads_declarations() {
             .all(|item| !item.message.contains("Foundation")),
         "{diagnostics:?}"
     );
-    let capability = diagnostics
-        .iter()
-        .find(|item| item.code == "capability" && item.message.contains("swift"))
-        .expect("a swift capability line");
-    assert!(
-        capability.message.contains("Heuristic"),
-        "{}",
-        capability.message
-    );
+    let swift = Genome::capabilities()
+        .into_iter()
+        .find(|capability| capability.language == "swift")
+        .expect("a swift capability");
+    assert_eq!(swift.level, Level::Heuristic, "{}", swift.note);
 }

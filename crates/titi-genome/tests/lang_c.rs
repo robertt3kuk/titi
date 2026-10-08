@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::{Genome, Severity};
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -233,18 +233,14 @@ fn c_quoted_includes_resolve_and_system_ones_stay_quiet() {
         "a system header must not be reported: {unresolved:?}"
     );
 
-    // Both rows this module serves report themselves as heuristic, through the
-    // surface a user sees.
-    for name in ["c: Heuristic", "c++: Heuristic"] {
-        let capability = diagnostics
-            .iter()
-            .find(|item| item.code == "capability" && item.message.contains(name))
-            .unwrap_or_else(|| panic!("no `{name}` capability line: {diagnostics:?}"));
-        assert_eq!(
-            capability.severity,
-            Severity::Info,
-            "{}",
-            capability.message
-        );
+    // Both rows this module serves are patterns, and the roster a user asks
+    // for says so rather than claiming a syntax tree.
+    for name in ["c", "c++"] {
+        let capability = Genome::capabilities()
+            .into_iter()
+            .find(|capability| capability.language == name)
+            .unwrap_or_else(|| panic!("no `{name}` capability"));
+        assert_eq!(capability.level, Level::Heuristic, "{name}");
+        assert!(capability.note.contains("pattern"), "{}", capability.note);
     }
 }

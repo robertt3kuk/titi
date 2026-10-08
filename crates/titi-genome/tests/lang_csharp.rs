@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::{Genome, Language, Level, Severity};
+use titi_genome::{Genome, Language, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -129,22 +129,12 @@ fn csharp_reports_a_workspace_shaped_import_that_names_no_file() {
 }
 
 #[test]
-fn csharp_capability_line_names_the_language_and_its_level() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    write(root, APP_PATH, APP);
-    write(root, UTIL_PATH, UTIL);
-
-    let genome = Genome::index(root).unwrap();
-    let capabilities: Vec<_> = genome
-        .check()
+fn csharp_reports_its_level_in_the_capability_roster() {
+    let csharp = Genome::capabilities()
         .into_iter()
-        .filter(|item| item.code == "capability")
-        .collect();
-    assert_eq!(capabilities.len(), 1, "{capabilities:?}");
-    let line = &capabilities[0];
-    assert_eq!(line.severity, Severity::Info, "{}", line.message);
-    assert!(line.message.starts_with("c#"), "{}", line.message);
-    assert!(line.message.contains("Heuristic"), "{}", line.message);
+        .find(|capability| capability.language == "c#")
+        .expect("a c# capability");
+    assert_eq!(csharp.level, Level::Heuristic, "{}", csharp.note);
+    assert_eq!(csharp.extensions, vec!["cs"]);
     assert_eq!(Language::CSharp.level(), Level::Heuristic);
 }

@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -116,13 +116,9 @@ fn ruby_exports_singletons_namespaced_types_attrs_and_requires() {
         "{unresolved:?}"
     );
 
-    let capability = diagnostics
-        .iter()
-        .find(|item| item.code == "capability" && item.message.contains("ruby"))
-        .expect("a ruby capability line");
-    assert!(
-        capability.message.contains("Heuristic"),
-        "{}",
-        capability.message
-    );
+    let ruby = Genome::capabilities()
+        .into_iter()
+        .find(|capability| capability.language == "ruby")
+        .expect("a ruby capability");
+    assert_eq!(ruby.level, Level::Heuristic, "{}", ruby.note);
 }

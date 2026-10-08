@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
-use titi_genome::{Genome, Severity, serve_lsp};
+use titi_genome::{Genome, Level, Severity, serve_lsp};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -264,12 +264,12 @@ fn serve_lsp_answers_initialize_and_document_symbol() {
         "unknown method must be method-not-found: {text}"
     );
 }
-
-/// The capability line is the only place a user can find out that the index
-/// did not really parse their language. One line per language present, on the
-/// first file of it, and `Info` so it never decides the exit code.
+/// Capability is reference information, not a finding. `check` reports what is
+/// wrong in the tree — so a tree with nothing wrong stays quiet and a `clean`
+/// answer keeps its meaning — and the levels live behind an accessor a caller
+/// asks for explicitly.
 #[test]
-fn a_capability_line_names_each_language_and_its_level() {
+fn a_healthy_tree_has_no_findings_and_capability_is_not_one() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "src/a.rs", "pub fn a() {}\n");
@@ -279,57 +279,78 @@ fn a_capability_line_names_each_language_and_its_level() {
         "src/App.java",
         "package com.acme;\npublic class App {}\n",
     );
-    write(
-        root,
-        "src/Other.java",
-        "package com.acme;\npublic class Other {}\n",
-    );
     write(root, "cmd/main.go", "package main\n\nfunc Main() {}\n");
 
     let genome = Genome::index(root).unwrap();
-    let capabilities: Vec<_> = genome
-        .check()
-        .into_iter()
-        .filter(|item| item.code == "capability")
-        .collect();
-    // Three languages are present, so three lines — not five, one per file.
-    assert_eq!(capabilities.len(), 3, "{capabilities:?}");
-    for item in &capabilities {
-        assert_eq!(item.severity, Severity::Info, "{}", item.message);
-        assert_eq!(item.line, 1);
-    }
-    let line = |needle: &str| {
-        capabilities
-            .iter()
-            .find(|item| item.message.contains(needle))
-            .unwrap_or_else(|| panic!("no capability line for {needle}: {capabilities:?}"))
-            .clone()
-    };
-    // A parsed language says so, a pattern language says what it can miss, and
-    // the file it rides on is the first of that language.
-    let rust = line("rust");
-    assert_eq!(rust.path, "src/a.rs");
-    assert!(rust.message.contains("Full"), "{}", rust.message);
-    let java = line("java");
-    assert_eq!(java.path, "src/App.java");
-    assert!(java.message.contains("Heuristic"), "{}", java.message);
-    assert!(line("go").message.contains("Heuristic"));
+    assert!(
+        genome.check().is_empty(),
+        "nothing is wrong, so nothing is reported: {:?}",
+        genome.check()
+    );
+
+    // The roster is there for whoever asks.
+    let roster = Genome::capabilities();
+    let names: Vec<&str> = roster.iter().map(|cap| cap.language).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "sorted by language");
+    assert_eq!(
+        names.len(),
+        names.iter().collect::<std::collections::HashSet<_>>().len(),
+        "one entry per language: {names:?}"
+    );
+
+    let rust = roster
+        .iter()
+        .find(|cap| cap.language == "rust")
+        .expect("rust");
+    assert_eq!(rust.level, Level::Full);
+    assert_eq!(rust.extensions, vec!["rs"]);
+
+    let java = roster
+        .iter()
+        .find(|cap| cap.language == "java")
+        .expect("java");
+    assert_eq!(java.level, Level::Heuristic);
+    assert_eq!(java.extensions, vec!["java"]);
+    assert!(java.note.contains("pattern"), "{}", java.note);
+
+    // Two rows parse TypeScript and its `.tsx`, and they are one language.
+    let typescript = roster
+        .iter()
+        .find(|cap| cap.language == "typescript")
+        .expect("typescript");
+    assert_eq!(typescript.extensions, vec!["ts", "mts", "cts", "tsx"]);
 }
 
-/// The per-file LSP diagnostic channel answers "what is wrong with this file".
-/// A constant capability hint in every file is noise there; the level is in
-/// the handshake instead.
+/// The roster is a property of the build, so it answers without a workspace:
+/// no index, no walk, nothing to fail on.
+#[test]
+fn the_roster_needs_no_workspace() {
+    let roster = Genome::capabilities();
+    assert!(roster.len() >= 13, "{} entries", roster.len());
+    let full: Vec<&str> = roster
+        .iter()
+        .filter(|cap| cap.level == Level::Full)
+        .map(|cap| cap.language)
+        .collect();
+    assert_eq!(full, vec!["javascript", "python", "rust", "typescript"]);
+    let heuristic = roster
+        .iter()
+        .filter(|cap| cap.level == Level::Heuristic)
+        .count();
+    assert_eq!(heuristic, roster.len() - full.len());
+}
+
+/// The handshake carries the roster; the per-file reply carries findings and
+/// nothing else. A constant hint about the language in every file would be
+/// noise in an editor, which is why the two channels are different.
 #[test]
 fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "src/lib.rs", "pub struct Widget;\n");
-    write(
-        root,
-        "src/App.java",
-        "package com.acme;\npublic class App {}\n",
-    );
-    let uri = format!("file://{}", root.join("src/App.java").display());
+    let uri = format!("file://{}", root.join("src/lib.rs").display());
     let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let diagnostic = format!(
         r#"{{"jsonrpc":"2.0","id":"diag","method":"textDocument/diagnostic","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
@@ -342,19 +363,18 @@ fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
     serve_lsp(root, Cursor::new(input), &mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
     assert!(
-        text.contains(r#""language":"java""#) && text.contains(r#""level":"Heuristic""#),
-        "the handshake must report the level: {text}"
+        text.contains(r#""language":"java""#)
+            && text.contains(r#""level":"Heuristic""#)
+            && text.contains(r#""language":"rust""#)
+            && text.contains(r#""level":"Full""#),
+        "the handshake must report the roster: {text}"
     );
     assert!(
-        text.contains(r#""language":"rust""#) && text.contains(r#""level":"Full""#),
-        "the handshake must report the level: {text}"
+        text.contains(r#""items":[]"#),
+        "a healthy file answers with no findings: {text}"
     );
     assert!(
-        !text.contains(r#""code":"capability""#),
-        "a capability line must not reach the per-file diagnostic reply: {text}"
-    );
-    assert!(
-        text.contains(r#""kind":"full""#),
-        "the diagnostic reply itself must still be sent: {text}"
+        !text.contains("capability"),
+        "the roster must not ride in the per-file reply: {text}"
     );
 }

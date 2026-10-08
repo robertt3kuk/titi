@@ -34,7 +34,7 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
         }
         let id = id.ok_or_else(|| invalid("missing request id"))?;
         let result = match method {
-            "initialize" => initialize_result(&genome),
+            "initialize" => initialize_result(),
             "shutdown" => Value::Null,
             "textDocument/documentSymbol" => document_symbols(&genome, root, &message),
             "textDocument/definition" => definition(&genome, root, &message),
@@ -70,14 +70,7 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
 /// that ignores it loses nothing. The per-file `diagnostic` reply does not
 /// repeat it — that channel answers "what is wrong with this file", and a
 /// constant hint in every file is noise.
-fn initialize_result(genome: &Genome) -> Value {
-    let mut languages: Vec<(&str, &str)> = genome
-        .files
-        .values()
-        .map(|record| (record.language.name(), record.language.level().as_str()))
-        .collect();
-    languages.sort_unstable();
-    languages.dedup();
+fn initialize_result() -> Value {
     json!({
         "capabilities": {
             "documentSymbolProvider": true,
@@ -88,9 +81,14 @@ fn initialize_result(genome: &Genome) -> Value {
         "serverInfo": { "name": "titi-genome" },
         "experimental": {
             "titiGenome": {
-                "languages": languages
-                    .into_iter()
-                    .map(|(language, level)| json!({ "language": language, "level": level }))
+                "languages": Genome::capabilities()
+                    .iter()
+                    .map(|capability| {
+                        json!({
+                            "language": capability.language,
+                            "level": capability.level.as_str()
+                        })
+                    })
                     .collect::<Vec<Value>>()
             }
         }
@@ -146,7 +144,7 @@ fn diagnostic(genome: &Genome, root: &Path, message: &Value) -> Value {
     let items: Vec<Value> = genome
         .check()
         .into_iter()
-        .filter(|item| item.path == rel && item.code != "capability")
+        .filter(|item| item.path == rel)
         .map(|item| {
             json!({
                 "range": lsp_range(item.line, item.character, 0),

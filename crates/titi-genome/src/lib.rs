@@ -25,7 +25,7 @@ mod refs;
 mod scan;
 mod symbols;
 
-pub use lang::{Language, Level};
+pub use lang::{Capability, Language, Level};
 pub use lsp::serve_lsp;
 pub use project::render;
 pub use scan::list_files;

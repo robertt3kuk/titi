@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -131,35 +131,21 @@ fn typescript_relative_miss_warns_and_a_package_does_not() {
     assert_eq!(warnings, vec!["unresolved import `./missing`".to_owned()]);
 }
 
-/// The level a user sees is the `capability` line `genome check` prints.
+/// The level a user sees comes from the roster, and the two languages this
+/// module serves have separate entries for their separate grammars.
 #[test]
-fn typescript_reports_its_level_through_the_capability_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    write(root, "src/app.ts", APP);
-    write(
-        root,
-        "src/util.ts",
-        "export function helper() {\n  return 1\n}\n",
-    );
-    write(
-        root,
-        "src/widgets/Widget.ts",
-        "export class Widget {\n  send() {\n    return null\n  }\n}\n",
-    );
-    write(
-        root,
-        "src/legacy.js",
-        "module.exports = function legacy() {\n  return 1\n}\n",
-    );
-    write(root, "src/dynamic.ts", "export const value = 42\n");
-
-    let genome = index(root);
-    let line = genome
-        .check()
+fn typescript_reports_its_level_in_the_capability_roster() {
+    let typescript = Genome::capabilities()
         .into_iter()
-        .find(|item| item.code == "capability" && item.message.contains("typescript"))
-        .unwrap_or_else(|| panic!("no typescript capability line"));
-    assert!(line.message.contains("Full"), "{}", line.message);
-    assert_eq!(line.path, "src/app.ts");
+        .find(|capability| capability.language == "typescript")
+        .expect("a typescript capability");
+    assert_eq!(typescript.level, Level::Full, "{}", typescript.note);
+    assert_eq!(typescript.extensions, vec!["ts", "mts", "cts", "tsx"]);
+
+    let javascript = Genome::capabilities()
+        .into_iter()
+        .find(|capability| capability.language == "javascript")
+        .expect("a javascript capability");
+    assert_eq!(javascript.level, Level::Full, "{}", javascript.note);
+    assert_eq!(javascript.extensions, vec!["js", "jsx", "mjs", "cjs"]);
 }

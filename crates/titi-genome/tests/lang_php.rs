@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -161,20 +161,11 @@ fn php_splits_vendor_imports_from_missing_workspace_ones() {
 }
 
 #[test]
-fn php_is_a_heuristic_language_in_check() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    app(root);
-
-    let genome = Genome::index(root).unwrap();
-    let capability = genome
-        .check()
+fn php_is_a_heuristic_language_in_the_capability_roster() {
+    let php = Genome::capabilities()
         .into_iter()
-        .find(|item| item.code == "capability" && item.path.ends_with(".php"))
-        .expect("php capability line");
-    assert!(
-        capability.message.contains("php") && capability.message.contains("Heuristic"),
-        "message: {}",
-        capability.message
-    );
+        .find(|capability| capability.language == "php")
+        .expect("a php capability");
+    assert_eq!(php.level, Level::Heuristic, "{}", php.note);
+    assert_eq!(php.extensions, vec!["php"]);
 }

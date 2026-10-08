@@ -2,49 +2,29 @@ use std::collections::HashSet;
 use std::fs;
 
 use crate::refs;
-use crate::{Diagnostic, ExportSite, Genome, Language, Location, MAX_DEFINERS, Severity};
+use crate::{Diagnostic, ExportSite, Genome, Location, MAX_DEFINERS, Severity};
 
 const CHECK_LIMIT: usize = 32;
 
 impl Genome {
     /// Index diagnostics: syntax first, then unresolved imports, then
-    /// ambiguous symbols, then one line per language saying what its exports
-    /// and imports rest on. Capped so a noisy repo cannot flood a client, and
-    /// the capability lines come last so the cap never hides a real problem.
+    /// ambiguous symbols. Capped so a noisy repo cannot flood a client.
     ///
-    /// The capability line is what lets a user tell that Java's exports are
-    /// guesses while Rust's were read off a syntax tree: it names the
-    /// language, its [`Level`](crate::Level) and one line on what that level
-    /// costs. It is `Info`, so it never decides the exit code.
+    /// Findings only. What the index *understands* — the level each language
+    /// rests on — is reference information about the index rather than
+    /// something wrong with the tree, so it lives on
+    /// [`Self::capabilities`]: a vetter that also narrated its own reach could
+    /// no longer say "clean".
     pub fn check(&self) -> Vec<Diagnostic> {
         let mut paths: Vec<&String> = self.files.keys().collect();
         paths.sort();
 
         let mut syntax = Vec::new();
         let mut imports = Vec::new();
-        let mut capabilities = Vec::new();
-        let mut described: HashSet<Language> = HashSet::new();
         for path in paths {
             let Some(record) = self.files.get(path) else {
                 continue;
             };
-            // Paths are sorted, so a language's line lands on the first file of
-            // it that the index holds. One line per language, not per file.
-            if described.insert(record.language) {
-                capabilities.push(Diagnostic {
-                    path: path.clone(),
-                    line: 1,
-                    character: 0,
-                    severity: Severity::Info,
-                    code: "capability".to_owned(),
-                    message: format!(
-                        "{}: {} — {}",
-                        record.language.name(),
-                        record.language.level().as_str(),
-                        record.language.note(),
-                    ),
-                });
-            }
             if record.syntax_errors > 0 {
                 let plural = if record.syntax_errors == 1 { "" } else { "s" };
                 syntax.push(Diagnostic {
@@ -101,9 +81,19 @@ impl Genome {
         let mut out = syntax;
         out.extend(imports);
         out.extend(ambiguous);
-        out.extend(capabilities);
         out.truncate(CHECK_LIMIT);
         out
+    }
+
+    /// One entry per language this index understands, sorted by language: its
+    /// level, the extensions it answers to, and what that level costs.
+    ///
+    /// A property of the build, not of the workspace, so this walks nothing
+    /// and cannot fail on a root it cannot read — which is why it is an
+    /// associated function and not a method. The reference half of what
+    /// [`Self::check`] deliberately leaves out.
+    pub fn capabilities() -> Vec<crate::Capability> {
+        crate::lang::capabilities()
     }
 
     pub fn document_symbols(&self, path: &str) -> Vec<ExportSite> {

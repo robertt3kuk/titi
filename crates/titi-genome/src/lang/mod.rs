@@ -294,6 +294,46 @@ pub(crate) const LANGS: &[Lang] = &[
     },
 ];
 
+/// What the index knows about one language: the level its exports rest on,
+/// the extensions it is recognised by, and the one line on what that level
+/// costs.
+///
+/// Reference information about the index itself, deliberately not a
+/// diagnostic: see [`capabilities`] and `Genome::capabilities`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capability {
+    /// The lower-case id a user sees: `rust`, `c++`, `c#`.
+    pub language: &'static str,
+    pub level: Level,
+    /// Every extension the language answers to, in table order.
+    pub extensions: Vec<&'static str>,
+    pub note: &'static str,
+}
+
+/// One entry per language this index understands, sorted by language.
+///
+/// Read off [`LANGS`], so it cannot drift from the parsers that report it: a
+/// row whose `grammar` is `Some(..)` says `Full` or the table test fails.
+/// The rows sharing a language (TypeScript's two grammars) merge into one
+/// entry, which is the whole reason a caller wants a list of languages rather
+/// than a list of rows.
+pub fn capabilities() -> Vec<Capability> {
+    let mut roster: Vec<Capability> = Vec::new();
+    for row in LANGS {
+        match roster.iter_mut().find(|cap| cap.language == row.name) {
+            Some(cap) => cap.extensions.extend(row.extensions.iter().copied()),
+            None => roster.push(Capability {
+                language: row.name,
+                level: row.level,
+                extensions: row.extensions.to_vec(),
+                note: row.note,
+            }),
+        }
+    }
+    roster.sort_by_key(|cap| cap.language);
+    roster
+}
+
 impl Language {
     pub fn from_path(path: &str) -> Self {
         row_for_path(path)
@@ -382,8 +422,8 @@ mod tests {
     }
 
     /// The rows that share a language must agree about it: a note or a level
-    /// that drifted between the `.ts` row and the `.tsx` row would be a lie in
-    /// `genome check` whose text depended on which file came first.
+    /// that drifted between the `.ts` row and the `.tsx` row would be a lie
+    /// whose text depended on which file a caller happened to look at first.
     #[test]
     fn rows_sharing_a_language_share_its_level_and_note() {
         for row in LANGS {
@@ -392,6 +432,52 @@ mod tests {
             assert_eq!(row.note, first.note, "{}", row.name);
             assert_eq!(row.name, first.name, "{}", row.name);
         }
+    }
+
+    /// One entry per language, sorted, with every extension of every row that
+    /// claims it — the shape the `capabilities` verb and the LSP print.
+    #[test]
+    fn capabilities_merge_the_rows_of_a_language_and_sort_by_language() {
+        let roster = capabilities();
+        let names: Vec<&str> = roster.iter().map(|cap| cap.language).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "sorted by language");
+        assert_eq!(
+            names.len(),
+            names.iter().collect::<HashSet<_>>().len(),
+            "one entry per language: {names:?}"
+        );
+        assert!(roster.len() >= LANGS.len() - 1, "{names:?}");
+
+        let rust = roster.iter().find(|cap| cap.language == "rust").unwrap();
+        assert_eq!(rust.level, Level::Full);
+        assert_eq!(rust.extensions, vec!["rs"]);
+
+        // TypeScript's two grammars are two rows and one language.
+        let typescript = roster
+            .iter()
+            .find(|cap| cap.language == "typescript")
+            .unwrap();
+        assert_eq!(typescript.level, Level::Full);
+        assert_eq!(typescript.extensions, vec!["ts", "mts", "cts", "tsx"]);
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|cap| cap.language == "typescript")
+                .count(),
+            1
+        );
+
+        // A parsed language and a pattern language must not read alike.
+        let java = roster.iter().find(|cap| cap.language == "java").unwrap();
+        assert_eq!(java.level, Level::Heuristic);
+        assert!(
+            java.note.contains("pattern"),
+            "the note says what the level costs: {}",
+            java.note
+        );
+        assert!(rust.level.as_str() == "Full" && java.level.as_str() == "Heuristic");
     }
 
     #[test]

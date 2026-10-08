@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::{Genome, Severity};
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -183,14 +183,10 @@ fn go_imports_resolve_and_std_paths_stay_quiet() {
         "a commented-out import must not produce a warning: {unresolved:?}"
     );
 
-    let capability = diagnostics
-        .iter()
-        .find(|item| item.code == "capability" && item.message.contains("go: Heuristic"))
-        .unwrap_or_else(|| panic!("no go capability line: {diagnostics:?}"));
-    assert_eq!(
-        capability.severity,
-        Severity::Info,
-        "{}",
-        capability.message
-    );
+    let go = Genome::capabilities()
+        .into_iter()
+        .find(|capability| capability.language == "go")
+        .expect("a go capability");
+    assert_eq!(go.level, Level::Heuristic);
+    assert!(go.extensions.contains(&"go"), "{:?}", go.extensions);
 }

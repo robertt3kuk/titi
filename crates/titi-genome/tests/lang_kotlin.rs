@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -147,20 +147,15 @@ fn kotlin_splits_library_imports_from_missing_workspace_ones() {
 }
 
 #[test]
-fn kotlin_is_a_heuristic_language_in_check() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    app(root);
-
-    let genome = Genome::index(root).unwrap();
-    let capability = genome
-        .check()
+fn kotlin_is_a_heuristic_language_in_the_capability_roster() {
+    let kotlin = Genome::capabilities()
         .into_iter()
-        .find(|item| item.code == "capability" && item.path.ends_with(".kt"))
-        .expect("kotlin capability line");
+        .find(|capability| capability.language == "kotlin")
+        .expect("a kotlin capability");
+    assert_eq!(kotlin.level, Level::Heuristic, "{}", kotlin.note);
     assert!(
-        capability.message.contains("kotlin") && capability.message.contains("Heuristic"),
-        "message: {}",
-        capability.message
+        kotlin.extensions.contains(&"kt") && kotlin.extensions.contains(&"kts"),
+        "{:?}",
+        kotlin.extensions
     );
 }

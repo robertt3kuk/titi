@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, Level};
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -144,9 +144,10 @@ fn python_package_and_dotted_only_imports_reach_the_sibling_module() {
     }
 }
 
-/// The level a user sees is the `capability` line `genome check` prints.
+/// The level a user sees comes from the roster; `check` reports findings only,
+/// so a healthy tree says nothing at all.
 #[test]
-fn python_reports_its_level_through_the_capability_line() {
+fn python_reports_its_level_in_the_capability_roster() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "app/service.py", SERVICE);
@@ -154,13 +155,14 @@ fn python_reports_its_level_through_the_capability_line() {
     write(root, "app/sibling.py", "def pair():\n    return 2\n");
 
     let genome = index(root);
-    let capabilities: Vec<_> = genome
-        .check()
+    assert!(
+        genome.check().iter().all(|item| item.code != "capability"),
+        "{:?}",
+        genome.check()
+    );
+    let python = Genome::capabilities()
         .into_iter()
-        .filter(|item| item.code == "capability")
-        .collect();
-    assert_eq!(capabilities.len(), 1, "{capabilities:?}");
-    let line = &capabilities[0];
-    assert!(line.message.contains("python"), "{}", line.message);
-    assert!(line.message.contains("Full"), "{}", line.message);
+        .find(|capability| capability.language == "python")
+        .expect("a python capability");
+    assert_eq!(python.level, Level::Full, "{}", python.note);
 }

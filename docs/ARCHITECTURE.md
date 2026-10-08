@@ -86,13 +86,17 @@ Every `Language` has a **level**, which is what a user sees when they ask:
 - **`Unsupported`** — `Language::Unsupported`, the catch-all for a path no row
   claims (`a.txt`). It is never indexed, and it contributes no symbols.
 
-The level is surfaced where a user can see it: `titi genome check` prints one
-`capability` line per language present (`src/lib.rs:1: capability: rust: Full
-— exported items and use/mod paths come from a syntax tree`), and `titi genome
-lsp` reports the same roster for the workspace in `initialize`'s
-`experimental.titiGenome.languages`. A capability line is `Info`, so it never
-decides `genome check`'s exit code, and the per-file LSP `diagnostic` reply
-leaves it out: a constant hint in every file is noise.
+The level is surfaced where a user asks for it, never in the findings.
+`Genome::capabilities()` returns one entry per language — its level, its
+extensions and its note — and it is a property of the build rather than of
+the workspace, so it answers without indexing anything. `titi genome
+capabilities` prints it as a table (`rust  Full  .rs  exported items and
+use/mod paths come from a syntax tree`) and `titi genome lsp` reports the
+same roster in `initialize`'s `experimental.titiGenome.languages`. `titi
+genome check` reports findings only, so a tree with nothing wrong still
+answers `genome: clean`, and the per-file LSP `diagnostic` reply never
+carries a capability: a constant hint in every file is noise, and a vetter
+that also narrated its own reach could no longer say "clean".
 
 - **Imports** (file edges): Rust (`use`, `mod`, read from the syntax tree and
   resolved against the module its declaration sits in — `crate::`, `super::`,
@@ -180,6 +184,7 @@ where work is happening — for the cost of one text block.
 cargo run -p titi-genome --example map -- <path> <N>   # defaults: . and 24
 titi-map <path> <N>                                    # prebuilt, skill genome-map
 titi genome check                                      # index diagnostics, exit 1 on any
+titi genome capabilities                               # level and extensions per language
 titi genome lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
 ```
 
@@ -188,10 +193,11 @@ stderr prints `"{files} files, {edges} edges"`, stdout the projection.
 `genome_root` to the cwd only when the variable is unset, and
 `genome_root = None` means no genome at all. `titi genome check` prints
 `path:line: code: message` per diagnostic and exits 1 on any Warning or
-Error (`genome: clean`, exit 0, when there is nothing to say at all). An
-indexed workspace always says something: one `capability` line per language
-present, `Info`, so it does not change the exit code. `titi genome lsp`
-serves those symbols over LSP stdio framing.
+Error (`genome: clean`, exit 0, when there is nothing wrong — an
+`ambiguous-symbol` line is `Info` and does not change the exit code).
+`titi genome capabilities` prints the per-language roster described above
+and needs no workspace at all. `titi genome lsp` serves those symbols over
+LSP stdio framing.
 
 ## Tools and approval
 
