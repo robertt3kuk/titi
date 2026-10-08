@@ -859,6 +859,9 @@ pub struct Chat {
     login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
     session_picker: Option<usize>,
+    /// `/sessions <query>`: the hits over stored sessions, filtered as the
+    /// query is typed; `None` = closed.
+    session_search: Option<SessionSearch>,
     /// `/theme`: the palettes this build carries, filtered by typing.
     theme_picker: Option<ThemePicker>,
     /// The model browser bare `/model` and bare `/switch` open; `None` =
@@ -1018,6 +1021,7 @@ impl Chat {
             picker: 0,
             login_picker: None,
             session_picker: None,
+            session_search: None,
             theme_picker: None,
             model_picker: None,
             emoji_picker: titi_tui::emoji::EmojiPicker::default(),
@@ -1608,6 +1612,9 @@ impl Chat {
         }
         if self.session_picker.is_some() {
             return self.session_picker_key(key, now);
+        }
+        if self.session_search.is_some() {
+            return self.session_search_key(key, now);
         }
         if self.login_picker.is_some() {
             return self.login_picker_key(key, now);
@@ -2490,6 +2497,7 @@ impl Chat {
             "rewind" => self.rewind(args),
             "exit" | "quit" => self.exit_word(Instant::now()),
             "recap" => self.recap(),
+            "sessions" => self.sessions(args),
             "pause" => self.toggle_pause(),
             "fork" => self.fork(),
             "export" => self.export(args),
@@ -3213,6 +3221,115 @@ impl Chat {
         let Some(id) = choice else {
             return Applied::none();
         };
+        self.switch_to_session(id)
+    }
+
+    /// `/sessions [query]`: bare is the same list Ctrl+X opens — the sessions
+    /// this agent directory holds — and a query searches them.
+    ///
+    /// The search is the FTS index `SessionStore::search` exposes, which was
+    /// built and populated on every append with nothing in the CLI reading it.
+    /// The query narrows as it is typed, the way the model, theme and history
+    /// browsers narrow theirs, and Enter takes the row the cursor is on
+    /// through the same switch the Ctrl+X list uses.
+    fn sessions(&mut self, args: &str) -> Applied {
+        let query = args.trim();
+        if query.is_empty() {
+            return self.open_session_picker();
+        }
+        self.session_search = Some(SessionSearch::open(&self.agent_dir, query));
+        Applied::none()
+    }
+
+    /// Typing while the `/sessions <query>` browser is up. Like the model
+    /// browser: arrows move, Enter switches, a printable key widens the query
+    /// (and re-runs it), Backspace takes the last character back, and Esc
+    /// clears the query and closes only on the second press.
+    fn session_search_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::Up => {
+                self.move_session_search(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_session_search(1);
+                Applied::none()
+            }
+            Key::Enter => self.accept_session_search(),
+            Key::Esc => {
+                match self.session_search.as_mut() {
+                    Some(search) if !search.query.is_empty() => {
+                        let dir = self.agent_dir.clone();
+                        search.retype(&dir, String::new());
+                    }
+                    _ => self.session_search = None,
+                }
+                self.disarm();
+                Applied::none()
+            }
+            Key::Backspace
+                if self
+                    .session_search
+                    .as_ref()
+                    .is_some_and(|search| !search.query.is_empty()) =>
+            {
+                let dir = self.agent_dir.clone();
+                if let Some(search) = self.session_search.as_mut() {
+                    let mut query = search.query.clone();
+                    query.pop();
+                    search.retype(&dir, query);
+                }
+                Applied::none()
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                let dir = self.agent_dir.clone();
+                if let Some(search) = self.session_search.as_mut() {
+                    let mut query = search.query.clone();
+                    query.push(ch);
+                    search.retype(&dir, query);
+                }
+                Applied::none()
+            }
+            other => {
+                self.session_search = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    fn move_session_search(&mut self, delta: isize) {
+        let Some(search) = self.session_search.as_mut() else {
+            return;
+        };
+        let len = search.hits.len();
+        if len == 0 {
+            return;
+        }
+        let current = search.selected % len;
+        search.selected = (current as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Enter on a hit: the session the matching line belongs to, through the
+    /// switch the list behind bare `/sessions` already uses. Enter with nothing
+    /// to take says so rather than closing the panel in silence.
+    fn accept_session_search(&mut self) -> Applied {
+        let Some(search) = self.session_search.take() else {
+            return Applied::none();
+        };
+        let Some(id) = search.selected_hit().map(|hit| hit.session_id.clone()) else {
+            self.push(
+                LineKind::Note,
+                format!("sessions: no match for \"{}\"", search.query),
+            );
+            return Applied::none();
+        };
+        self.switch_to_session(id)
+    }
+
+    /// Moves the screen to `id`: its stored history replaces the transcript
+    /// and the engine is told to replay it. The one path both the Ctrl+X list
+    /// and a search hit take, so two ways into a session cannot drift.
+    fn switch_to_session(&mut self, id: String) -> Applied {
         if id == self.session_id {
             return Applied::none();
         }
@@ -5041,6 +5158,10 @@ const COMMANDS: &[Command] = &[
         about: "list background loops, or /jobs cancel <id>",
     },
     Command {
+        name: "sessions",
+        about: "list stored sessions, or search them (usage: /sessions <query>)",
+    },
+    Command {
         name: "recap",
         about: "what this session did",
     },
@@ -6028,6 +6149,9 @@ fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
     if chat.session_picker.is_some() {
         return Some(session_panel(chat, total));
     }
+    if chat.session_search.is_some() {
+        return Some(session_search_panel(chat, total));
+    }
     if chat.login_picker.is_some() {
         return Some(login_panel(chat, total));
     }
@@ -6097,6 +6221,255 @@ fn theme_panel(chat: &Chat, total: u16) -> PanelView {
         Some(title),
         lines,
         Some(picker.selected % matched.len().max(1)),
+        panel_body(total),
+    )
+}
+
+/// One stored session a search matched: the session, when it was last written,
+/// and the entry text that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionHit {
+    session_id: String,
+    /// The session's own name when the index holds a real one, its id when it
+    /// has none: a row is a way to say which session, so it says the name a
+    /// person would use.
+    label: String,
+    /// When the session's file was last written, seconds since the epoch.
+    /// `None` when the file cannot be stat'ed — a hit whose session was
+    /// deleted between the query and the row.
+    at: Option<u64>,
+    /// The matching entry, flattened to the one line a picker row holds.
+    line: String,
+}
+
+/// The `/sessions <query>` browser: the index's hits for the query typed so
+/// far, in the order the index ranked them.
+///
+/// The query lives here and not in the composer — the same shape the model,
+/// theme and history browsers have — so `/sessions` is one command with two
+/// faces: bare lists the stored sessions, and a query searches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSearch {
+    query: String,
+    hits: Vec<SessionHit>,
+    selected: usize,
+    /// Why the search returned nothing, when it was not "nothing matched": an
+    /// unreadable index is a different sentence from no hits.
+    broken: Option<String>,
+}
+
+/// How many matching lines one search shows. A common word can match every
+/// entry of every session, and a picker that becomes the whole screen is not a
+/// picker.
+const SESSION_HITS_MAX: usize = 40;
+
+impl SessionSearch {
+    /// The hits for `query` over the agent directory's index. An index that
+    /// cannot be read is carried as [`SessionSearch::broken`] rather than
+    /// failing: either way the panel is what the user sees, and one says why
+    /// it is empty.
+    fn open(agent_dir: &Path, query: &str) -> Self {
+        let mut search = Self {
+            query: query.to_owned(),
+            hits: Vec::new(),
+            selected: 0,
+            broken: None,
+        };
+        search.retype(agent_dir, query.to_owned());
+        search
+    }
+
+    /// The query as it is typed: the hits are recomputed, and the cursor goes
+    /// back to the top row because the list under it is a different list.
+    fn retype(&mut self, agent_dir: &Path, query: String) {
+        self.query = query;
+        self.selected = 0;
+        match search_sessions(agent_dir, &self.query) {
+            Ok(hits) => {
+                self.hits = hits;
+                self.broken = None;
+            }
+            Err(reason) => {
+                self.hits.clear();
+                self.broken = Some(reason);
+            }
+        }
+    }
+
+    fn selected_hit(&self) -> Option<&SessionHit> {
+        self.hits.get(self.selected % self.hits.len().max(1))
+    }
+}
+
+/// The index's hits for `query`: one row per matching entry, capped at
+/// [`SESSION_HITS_MAX`].
+///
+/// `SessionStore::search` was the capability with no caller — the index is
+/// built and populated on every append, and nothing in the CLI read it. This
+/// is that caller. The session's own time comes from its file, which is what
+/// the session list already sorts by, so a hit row and a list row cannot
+/// disagree about when a session was last written.
+fn search_sessions(agent_dir: &Path, query: &str) -> Result<Vec<SessionHit>, String> {
+    // An empty query is not a search: it is the list every stored session,
+    // which is what the panel shows before a word is typed and what Esc
+    // clears back to.
+    if query.is_empty() {
+        return Ok(all_sessions(agent_dir));
+    }
+    let store = titi_core::session::SessionStore::new(agent_dir).map_err(|why| why.to_string())?;
+    let index = titi_core::session::SessionIndex::open(&agent_dir.join("state.db"))
+        .map_err(|why| why.to_string())?;
+    // Unscoped on both dimensions, which is what the bare list is: this
+    // searches every session the agent directory holds, including one written
+    // before sessions recorded where they were started — a scope the row list
+    // would then disagree with.
+    let hits = store
+        .search(query, None, None)
+        .map_err(|why| why.to_string())?;
+    let mut out = Vec::with_capacity(hits.len().min(SESSION_HITS_MAX));
+    for hit in hits.into_iter().take(SESSION_HITS_MAX) {
+        out.push(SessionHit {
+            label: session_label(&index, &hit.session_id),
+            at: session_written_at(agent_dir, &hit.session_id),
+            line: one_line(hit.text.trim(), 60),
+            session_id: hit.session_id,
+        });
+    }
+    Ok(out)
+}
+
+/// Every stored session, newest first — the list Ctrl+X offers, with the time
+/// each was last written and no matching line, because nothing matched.
+fn all_sessions(agent_dir: &Path) -> Vec<SessionHit> {
+    let index = titi_core::session::SessionIndex::open(&agent_dir.join("state.db")).ok();
+    crate::session_fs::list_sessions_from(agent_dir)
+        .into_iter()
+        .map(|id| SessionHit {
+            label: match &index {
+                Some(index) => session_label(index, &id),
+                None => id.clone(),
+            },
+            at: session_written_at(agent_dir, &id),
+            line: String::new(),
+            session_id: id,
+        })
+        .collect()
+}
+
+/// The name a row offers for a session: the title the index holds when someone
+/// or something gave it one, and the id otherwise.
+///
+/// The same rule [`stored_session_title`] applies to the masthead, except that
+/// a row has to say *something*: an unnamed session is offered by id.
+fn session_label(index: &titi_core::session::SessionIndex, session_id: &str) -> String {
+    if index.needs_auto_title(session_id).unwrap_or(true) {
+        return session_id.to_owned();
+    }
+    match index.title(session_id) {
+        Ok(Some(title)) if !title.trim().is_empty() => title,
+        _ => session_id.to_owned(),
+    }
+}
+
+/// When a session's file was last written, seconds since the epoch.
+fn session_written_at(agent_dir: &Path, session_id: &str) -> Option<u64> {
+    let path = agent_dir.join("sessions").join(format!("{session_id}.jsonl"));
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+/// How long ago a session was last written, in the one-word shape a picker row
+/// can hold: `just now`, `5m ago`, `3h ago`, `4d ago`, `2w ago`.
+///
+/// A clock in the future (a file with a timestamp ahead of this machine) reads
+/// as `just now` rather than as a negative age.
+fn age_label(now: std::time::SystemTime, at: u64) -> String {
+    let seconds = now
+        .duration_since(std::time::UNIX_EPOCH + Duration::from_secs(at))
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let (value, unit) = if seconds < 60 {
+        return "just now".to_owned();
+    } else if seconds < 3_600 {
+        (seconds / 60, "m")
+    } else if seconds < 86_400 {
+        (seconds / 3_600, "h")
+    } else if seconds < 604_800 {
+        (seconds / 86_400, "d")
+    } else {
+        (seconds / 604_800, "w")
+    };
+    format!("{value}{unit} ago")
+}
+
+/// One hit as a row reads: which session, when it was written, and the line
+/// that matched.
+fn session_hit_row(hit: &SessionHit, now: std::time::SystemTime, current: bool) -> String {
+    let when = match hit.at {
+        Some(at) => age_label(now, at),
+        None => "unwritten".to_owned(),
+    };
+    let mut row = format!("{} · {when}", hit.label);
+    if !hit.line.is_empty() {
+        row.push_str(" · ");
+        row.push_str(&hit.line);
+    }
+    if current {
+        row.push_str("  ✓ current");
+    }
+    row
+}
+
+/// The `/sessions <query>` browser: one row per matching line, and one row
+/// that says so when nothing matched.
+fn session_search_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(search) = chat.session_search.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    if let Some(reason) = &search.broken {
+        return panel_view(
+            Some(format!("sessions · {}", search.query)),
+            vec![PanelLine::Heading(format!("the index could not be read: {reason}"))],
+            None,
+            panel_body(total),
+        );
+    }
+    let now = std::time::SystemTime::now();
+    let lines: Vec<PanelLine> = search
+        .hits
+        .iter()
+        .map(|hit| PanelLine::Row {
+            text: session_hit_row(hit, now, hit.session_id == chat.session_id),
+            accent: false,
+        })
+        .collect();
+    // The empty query is the whole list, so its title is the list's: the query
+    // is only worth naming once there is one.
+    let title = if search.query.is_empty() {
+        format!("sessions · {}", lines.len())
+    } else {
+        format!("sessions · {} · {}", lines.len(), search.query)
+    };
+    if lines.is_empty() {
+        return panel_view(
+            Some(title),
+            vec![PanelLine::Heading(format!(
+                "no sessions match \"{}\"",
+                search.query
+            ))],
+            None,
+            panel_body(total),
+        );
+    }
+    panel_view(
+        Some(title),
+        lines,
+        Some(search.selected % search.hits.len()),
         panel_body(total),
     )
 }
@@ -18105,5 +18478,180 @@ mod tests {
         chat.input = "日本 語".to_owned();
         chat.on_key(Key::DeleteWord, Instant::now());
         assert_eq!(chat.input, "日本 ");
+    }
+
+    /// A stored session with one question in it, named the way the index
+    /// remembers a name a person or the namer gave it — a title at creation is
+    /// the placeholder a session is made with, not a name (`needs_auto_title`).
+    fn seed_session(agent_dir: &Path, title: &str, question: &str) -> String {
+        let store = titi_core::session::SessionStore::new(agent_dir).expect("session store");
+
+        let id = store
+            .create(titi_core::session::SessionMeta {
+                title: Some(title.to_owned()),
+                ..Default::default()
+            })
+            .expect("create");
+        store.append(&id, Role::User, question).expect("append");
+        titi_core::session::SessionIndex::open(&agent_dir.join("state.db"))
+            .expect("index")
+            .set_title(&id, title)
+            .expect("title");
+        id
+    }
+
+    /// `/sessions` bare is the list Ctrl+X opens: the same rows, the same
+    /// switch, the same title — one list, two ways in.
+    #[test]
+    fn sessions_bare_opens_the_ctrl_x_list() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let older = seed_session(dir.path(), "older", "older question");
+        let newer = seed_session(dir.path(), "newer", "newer question");
+
+        command(&mut chat, "/sessions");
+        assert!(chat.session_picker.is_some(), "the list is up, as Ctrl+X");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("sessions · 2"), "{frame}");
+        assert!(frame.contains(&older) && frame.contains(&newer), "{frame}");
+        assert!(chat.session_search.is_none(), "the list is not the search");
+
+        // And Enter takes the row the cursor is on through the same switch.
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_ne!(chat.session_id, "session-123", "the screen moved");
+        assert!(
+            matches!(
+                applied.effect,
+                Some(ChatEffect::Send(EngineCommand::RestoreHistory { .. }))
+            ),
+            "and the engine was told to replay it"
+        );
+    }
+
+    /// `/sessions <query>` searches the entries the FTS index holds — the
+    /// capability that had no caller — and a hit row names the session, when it
+    /// was written, and the line that matched.
+    #[test]
+    fn sessions_query_finds_the_matching_line_and_enter_switches() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let kafka = seed_session(dir.path(), "kafka-talk", "how do we size the kafka consumers");
+        seed_session(dir.path(), "postgres-talk", "which postgres index does the planner pick");
+
+        command(&mut chat, "/sessions kafka");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("kafka-talk"), "{frame}");
+        assert!(
+            frame.contains("how do we size the kafka consumers"),
+            "the matching line is the row: {frame}"
+        );
+        assert!(
+            !frame.contains("postgres-talk") && !frame.contains("the planner pick"),
+            "the session that did not match is not offered: {frame}"
+        );
+        assert!(
+            frame.contains("ago") || frame.contains("just now"),
+            "the row says when the session was written: {frame}"
+        );
+
+        let applied = chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(chat.session_id, kafka, "Enter switches to the hit's session");
+        assert!(
+            matches!(
+                applied.effect,
+                Some(ChatEffect::Send(EngineCommand::RestoreHistory { .. }))
+            ),
+            "through the switch the list uses"
+        );
+        assert!(chat.session_search.is_none(), "and the picker closes");
+    }
+
+    /// No hits says so, and a row says the id when the index holds no real
+    /// title for that session.
+    #[test]
+    fn sessions_query_reports_no_hits_and_falls_back_to_the_id() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("session store");
+        let unnamed = store
+            .create(titi_core::session::SessionMeta {
+                title: Some("titi".to_owned()),
+                ..Default::default()
+            })
+            .expect("create");
+        store
+            .append(&unnamed, Role::User, "a shared word about sockets")
+            .expect("append");
+
+        command(&mut chat, "/sessions zzzz-nothing-matches");
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("no sessions match \"zzzz-nothing-matches\""),
+            "{frame}"
+        );
+        // Enter with nothing to take says so instead of closing in silence.
+        chat.on_key(Key::Enter, Instant::now());
+        assert!(chat.session_search.is_none(), "the panel closes");
+        let frame = frame_text(&mut chat);
+        assert!(
+            frame.contains("sessions: no match for \"zzzz-nothing-matches\""),
+            "{frame}"
+        );
+
+        // The session nobody named is offered by its id, not by the product
+        // name it was created with.
+        command(&mut chat, "/sessions sockets");
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains(&unnamed), "the id is the row: {frame}");
+        assert!(
+            !frame.contains("titi ·") && !frame.contains("titi  ✓"),
+            "the placeholder title is not a name: {frame}"
+        );
+    }
+
+    /// The query narrows as it is typed, the way the model, theme and history
+    /// browsers narrow theirs: a character re-runs it, a backspace takes one
+    /// back, the first Esc clears it, the second closes.
+    #[test]
+    fn the_session_query_narrows_as_it_is_typed() {
+        let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+        seed_session(dir.path(), "kafka-talk", "kafka consumer groups");
+        command(&mut chat, "/sessions kafka");
+        assert!(frame_text(&mut chat).contains("kafka-talk"));
+
+        chat.on_key(Key::Char('x'), Instant::now());
+        let frame = frame_text(&mut chat);
+        assert!(frame.contains("no sessions match \"kafkax\""), "{frame}");
+        assert!(!frame.contains("kafka-talk"), "{frame}");
+
+        chat.on_key(Key::Backspace, Instant::now());
+        assert!(
+            frame_text(&mut chat).contains("kafka-talk"),
+            "backspace brings the hit back"
+        );
+
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(
+            chat.session_search.is_some(),
+            "the first Esc clears the query, it does not close"
+        );
+        assert!(
+            frame_text(&mut chat).contains("sessions · 1"),
+            "and the cleared query is the whole list"
+        );
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.session_search.is_none(), "the second Esc closes");
+    }
+
+    /// The age a row carries is computed from the two clocks, so it is testable
+    /// without a wall clock of its own.
+    #[test]
+    fn the_age_label_is_a_shape_not_a_clock() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(age_label(now, 1_000_000), "just now");
+        assert_eq!(age_label(now, 999_941), "just now", "under a minute");
+        assert_eq!(age_label(now, 999_940), "1m ago");
+        assert_eq!(age_label(now, 1_000_000 - 3_600), "1h ago");
+        assert_eq!(age_label(now, 1_000_000 - 86_400), "1d ago");
+        assert_eq!(age_label(now, 1_000_000 - 604_800), "1w ago");
+        // A file stamped ahead of this machine's clock is not a negative age.
+        assert_eq!(age_label(now, 1_000_001), "just now");
     }
 }
