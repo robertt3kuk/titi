@@ -113,6 +113,9 @@ fn mask_ipv4(source: &str) -> (String, usize) {
     (out, removed)
 }
 
+// The pattern is a fixed literal, so a compile error is a source bug, not a
+// runtime condition; the tests below compile it.
+#[allow(clippy::expect_used)]
 static IPV4: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}").expect("ipv4 pattern compiles")
 });
@@ -139,6 +142,9 @@ fn is_address(text: &str, start: usize, end: usize, address: &str) -> bool {
 /// plus an optional zone id (`%en0`). [`parse_ipv6`] decides what is really an
 /// address, so a Rust path (`std::vec::Vec`), a time (`12:34:56`) or a MAC never
 /// masks — the colons are there, the eight-group / `::` structure is not.
+// The pattern is a fixed literal, so a compile error is a source bug, not a
+// runtime condition; the tests below compile it.
+#[allow(clippy::expect_used)]
 static IPV6: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:%[0-9A-Za-z._~-]+)?")
         .expect("ipv6 candidate pattern compiles")
@@ -272,6 +278,9 @@ fn parse_ipv4_bytes(text: &str) -> Option<[u8; 4]> {
 
 /// A hostname token: dot-separated labels, each bounded by an alphanumeric so a
 /// trailing dot or a leading `.` never enters the match.
+// The pattern is a fixed literal, so a compile error is a source bug, not a
+// runtime condition; the tests below compile it.
+#[allow(clippy::expect_used)]
 static HOST_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*",
@@ -346,6 +355,9 @@ fn agent_dir() -> PathBuf {
 ///
 /// A bare hex string is not here: commit hashes and colours look the same.
 /// The patterns require a prefix a person would recognise as a credential.
+// Every entry is a fixed literal, so a compile error is a source bug, not a
+// runtime condition; the tests below compile them.
+#[allow(clippy::expect_used)]
 static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
         // OpenAI, Anthropic, GitHub (classic + fine-grained), Slack, Stripe.
