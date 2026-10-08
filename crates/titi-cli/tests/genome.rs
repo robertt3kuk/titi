@@ -8,6 +8,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+use titi_genome::{Genome, Level};
+
 fn titi(agent_dir: &std::path::Path, cwd: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_titi"));
     cmd.env("TITI_AGENT_DIR", agent_dir).current_dir(cwd);
@@ -319,31 +321,47 @@ fn capabilities_lists_every_language_with_its_level() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert!(stderr.is_empty(), "{stderr}");
 
+    // The expectations are the crate's own roster, not literals this test has
+    // to keep in step: a language added, or flipped from patterns to a
+    // grammar, changes what the binary prints and this test reads the same
+    // table, so it fails only when the two disagree.
+    let roster = Genome::capabilities();
+    assert!(!roster.is_empty(), "the roster is what the verb prints");
     let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        roster.len() + 1,
+        "one line per language plus the summary: {stdout}"
+    );
+    for capability in &roster {
+        let row = lines
+            .iter()
+            .find(|line| line.split_whitespace().next() == Some(capability.language))
+            .unwrap_or_else(|| panic!("no row for {}: {stdout}", capability.language));
+        assert!(row.contains(capability.level.as_str()), "{row}");
+        for extension in &capability.extensions {
+            assert!(row.contains(&format!(".{extension}")), "{row}");
+        }
+        assert!(
+            row.ends_with(capability.note),
+            "the note is the last column, verbatim: {row}"
+        );
+    }
+
+    let full = roster
+        .iter()
+        .filter(|capability| capability.level == Level::Full)
+        .count();
     let summary = lines.last().expect("a summary line");
-    assert!(
-        summary.ends_with("languages: 4 full, 9 heuristic"),
+    assert_eq!(
+        *summary,
+        format!(
+            "{} languages: {full} full, {} heuristic",
+            roster.len(),
+            roster.len() - full
+        ),
         "{stdout}"
     );
-
-    let row = |language: &str| {
-        lines
-            .iter()
-            .find(|line| line.split_whitespace().next() == Some(language))
-            .unwrap_or_else(|| panic!("no row for {language}: {stdout}"))
-    };
-    // A parsed language and a pattern language must not read alike.
-    let rust = row("rust");
-    assert!(rust.contains("Full"), "{rust}");
-    assert!(rust.contains(".rs"), "{rust}");
-    assert!(rust.contains("syntax tree"), "{rust}");
-    let java = row("java");
-    assert!(java.contains("Heuristic"), "{java}");
-    assert!(java.contains(".java"), "{java}");
-    // Every extension of a language is on its one line.
-    assert!(row("typescript").contains(".ts") && row("typescript").contains(".tsx"));
-    assert!(row("c++").contains(".cpp") && row("c++").contains(".hxx"));
-    assert!(row("c#").contains(".cs"));
 
     // The unreadable root that check and lsp refuse is no obstacle here: the
     // roster is a property of the build, not of the workspace.
