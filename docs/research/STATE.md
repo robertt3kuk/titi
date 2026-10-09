@@ -667,13 +667,38 @@ owner can take; none is a code question.
   verbatim). Wiring it into `.github/workflows/ci.yml` needs a decision about
   tolerating advisories that predate a fix, which is why it is here and not in
   the workflow already.
-- [ ] `low` **a `model:` pin setting** — `9234d43` made a config's declared
-  models lead the catalog, so a session starts on the user's first declared
-  model, but nothing pins a model for a project the way omp's `modelRoles`
-  does; `/model` switches and does not persist.
+- [x] `low` ~~**a `model:` pin setting**~~ landed 2026-10-09 in `4495ea4` as
+  omp's own key: `modelRoles.default` (omp's `config/model-roles.ts:56`, where
+  `default` is the chat role) read from the `modelRoles` map titi already had.
+  Unset is what it was; set and available, the session starts on it and the
+  pinned id leads the catalog order, so the masthead and `/model`'s first row
+  cannot disagree; set and unavailable — unknown, or keyless — the session
+  starts on what it would have used anyway and says so by name **once** (a
+  screen note, stderr in a headless run), never a silent fallback.
 - [ ] `low` **GAP's open items** — `docs/research/omp-parity/GAP.md` is the
   list, rolled up in `ee264b3`; whatever it still marks missing is the queue,
   and nothing here duplicates it.
+
+**Agent tracing, queued by the plan (2026-10-09).** Source:
+`docs/research/agent-tracing.md`, which is research + plan with **Phase A part 1
+implemented** (the span model in `titi-core` and the CLI viewer, `feb9e3c`
+through `dd2df78`).
+
+- [x] `medium` ~~**Phase A part 2 — the engine's `SpanSink`** (§7 A2–A5)~~ landed
+  2026-10-09 in `a6e4955`: the engine writes the trace its surfaces read — a
+  sink handed in like the trajectory sink, parents named explicitly, a span per
+  model call over every attempt, a span per tool call under the call that asked
+  for it, a branch per subagent with its own children, retries and folds as
+  events inside their round, `trace.thinking` opt-in, and resumed sessions
+  numbering turns from where they left off. Phase A is complete; B and C below
+  are what remains.
+- [ ] `medium` **Phase B — the thinking analysis** (§3): folding thinking under
+  its LLM span is part of the A viewer, but the *analysis* — including
+  `titi trace --analyze`, which feeds thinking and outcomes to a model — is its
+  own phase and is gated on the owner, because it spends tokens per analysis.
+- [ ] `medium` **Phase C — export** (§5, `OTLP`/Laminar): opt-in only, and the
+  owner's call rather than a code question, because it is a **new egress** —
+  prompts and thinking would leave the machine.
 
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
@@ -1334,3 +1359,133 @@ biggest single block), `titi-config` +3, `titi-tui` +3, and one each in
 `style:` commit (`706e1d0`) before the fmt job would pass; the sha pushed is
 re-gated **after** that fix, so the numbers above are the styled tree's, not the
 hand-wrapped one's.
+
+The wire-and-tracing wave (2026-10-09). Thirty-nine commits: four real bugs on
+the provider wires, the seam suite that closes their class, the first agent
+tracing slice, and the surface items around them.
+
+The bugs, in the order they bit. `4a0467b`: `openai_messages_wire` wrote every
+message as `{role, content}` and never emitted `tool_calls`, so the second
+request of a tool round carried tool results answering calls the provider had
+never been shown — a strict OpenAI-compatible endpoint rejects that, a lenient
+one answers as if the model had called nothing. Confirmed on the real path
+first (the built binary, the scripted provider, one real `bash` round, the body
+the server logged), and the same pair was already being replayed out of a
+resumed history, which is how the naming turn showed it first. `beb6614` is the
+root fix: `ToolCallRef` had no `arguments` and a tool result had no call id, so
+a replayed history showed the model its own past calls as `""` and every builder
+paired results with calls **by position** — fragile the moment results are
+reordered, dropped by a cancel, or two calls share a name. Both fields now
+exist (`#[serde(default)]`, so an old session file still loads), and every
+family emits the real thing: completions the arguments as the JSON string it
+received plus `tool_call_id`, Responses the replayed `function_call` item plus
+its id on the `function_call_output`, Anthropic `tool_use` blocks with the
+parsed arguments, Gemini its own part. `349777f` and `4ba9f25` are the
+thinking half: a Gemini call now echoes its `thoughtSignature`, and an Anthropic
+thinking block keeps its `signature` (and a `redacted_thinking` payload) and is
+replayed **first** in its own turn, ahead of text and `tool_use` blocks — before
+this, thinking was decoded for display and its signature dropped, so a replayed
+thinking turn lost the blocks the API requires back and the next request was
+rejected with thinking on. The family rule has a test: a block is replayed only
+to the family that produced it, and
+`wire::tests::a_thinking_block_is_only_replayed_to_its_own_family` asserts each
+builder sees only its own and that the other's payload appears nowhere.
+`e695e89` honours what a provider asks: a 429's `retry-after` was read by nobody,
+so a provider asking for thirty seconds was retried on the client's own
+500 ms-doubling schedule — `Retryable` now carries `retry_after`, parsed from
+`retry-after-ms`, `retry-after` (seconds or an HTTP-date) and OpenAI's
+`x-ratelimit-reset-*` durations, and a wait past `MAX_RETRY_AFTER` (60 s) fails
+as `Fatal` rather than pausing. `cac1ac5` handles a context-length rejection:
+the history folds **once** (the existing compaction, forced) and the request goes
+again; the window does not change, so a second rejection is the answer and
+`naming_the_window` appends the model's window and says the fold already
+happened, instead of the provider's bare sentence. `1cb085b` followed the new
+fields into the engine's own tests, and its stat carries one source line in
+`tool_loop.rs`, which is what made the test target build again.
+
+`7afb3aa` is the suite that closes the class the two collector bugs came from:
+every layer had unit tests and the **seams** had none. It feeds hand-written SSE
+frames in each decoder's shape through `MockFetch` → `FamilyTransport` (the real
+request builder, SSE reader and per-family decoder) → `EngineRuntime`, with no
+network, one response per family covering thinking or reasoning blocks, text
+before and after tool calls, and two or three calls in one response.
+
+Agent tracing, phase A part 1 (`feb9e3c`, `1f6d718`, `b353ca2`, `9501184`,
+`d377be7`, `dd2df78`, planned in `docs/research/agent-tracing.md`): a turn
+records spans — ids, parent links, kind (turn/llm/tool/agent/event), start and
+end, status and error, an attribute map named the OTel GenAI way (`gen_ai.*`),
+typed token counts including cache and reasoning, cost in micro-dollars and the
+round's thinking text where recorded — as JSONL at
+`<agent_dir>/traces/<session_id>/<turn>.jsonl`, one line per **finished** span
+so a crash can tear at most the last line, 0600 with the trajectory's torn-tail
+repair. `titi trace` opens a turn's tree, `titi trace --search <text> [session]`
+scans names, tool arguments, results, thinking and errors and prints the turn,
+the span path, the field that matched and the line (`--all` prefixes the session
+id; a miss exits 1; contradictory flags are usage errors, not reinterpretations),
+and both views print what the thinking cost. The scan is deliberately flat
+rather than indexed: a trace file is small because tool output and thinking are
+capped where they are recorded.
+
+Features beside them: `modelRoles.default` pins the model a session starts on
+(`4495ea4`) — unset is what it was, set and available leads the catalog order so
+the masthead and `/model` cannot disagree, set and unavailable starts on what it
+would have used anyway and says so by name once, never a silent fallback; a
+configured model may now declare its price (`2b94cbb`, with its registry half in
+`4ba9f25`), which is what makes the money cap reachable for the models most
+sessions actually run; mermaid flowcharts are drawn instead of printed
+(`a1160d0` for `flowchart`/`graph` fences, `dde1c4d` capping a fence and taking
+the panics out); `ee4d2c2` deletes a session's trajectory with it; `31696a3`
+says a stopped child once; and `scripts/commit.sh` (`d25d94e`, pointed at from
+the skill in `cdf1359`) is the commit lock, the pathspec commit and the cached-set
+refusal as one command, because the hand-typed chain went wrong twice while
+QA-driving this checkout.
+
+Attribution, recorded rather than rewritten: `4ba9f25` also carries chat-split's
+registry price half — a directory-pathspec sweep put `crates/titi-engine/src/
+registry.rs`'s plumbing in it, which is why `2b94cbb` is the config half and the
+registry half lands here. `d754c32` ("send the encrypted reasoning back to the
+Responses backend") is a **changelog-only** commit; its code is in `4ba9f25`,
+the same pattern `c1b2260` and the wave before it produced — the changelog line
+in one commit and the feature in another.
+
+Agent tracing phase A is **complete** as of `a6e4955` (engine), on top of the
+part-1 span model and viewer. The engine now writes the trace its surfaces read:
+a `SpanSink` is handed in by the surface exactly as the trajectory sink is, and
+every span names its parent **explicitly** — there is no ambient "current span",
+because a tool round runs its read-tier calls concurrently and a subagent runs in
+its own task, so a shared stack would nest one call's span under another's. A
+turn writes its own span, closed at the one point every path reaches (a
+cancelled turn is a cancelled span; a turn that ran out of models is an errored
+one carrying the failure's words); one span per model call **over every attempt**
+(the OTel rule: a retry does not get a span of its own) with the wire model, the
+round's tokens and cache hits, its cost from the same price the ledger uses, its
+stop reason and how long it spent before the answer began; one span per tool
+call, under the model call that asked for it, with the masked arguments, the
+masked-and-capped result, the call id, its duration (the wait for an approval
+included) and its error; and one span per subagent as a **branch** of the turn,
+with that agent's own model and tool calls nested under it — which is the
+dropped child-tool channel fixed: the subagent's tool loop now gets the session's
+sink, so its calls are recorded while its events still go nowhere (a subagent
+has no tool rail of the parent's to pollute). Retries, model fallbacks and
+context-length folds are events inside their round, so the shape of a turn that
+had to work for its answer is visible rather than inferred. `trace.thinking` is
+an opt-in setting for recording a round's thinking text, and a resumed session
+numbers its turns from where the session left off rather than from one. A sink
+that cannot be written never fails the turn it describes, and without a sink the
+engine behaves exactly as it did before tracing existed — both pinned by tests.
+The worker's own evidence: `titi-engine`'s lib tests 140 passed, `--test trace`
+5 passed, and a real binary against the scripted provider printed
+`turn 1 · 18.5s` over `llm chat scripted`, with `agent alpha`/`agent beta`
+branches each carrying their own `llm` child and `--search README` finding a
+tool's arguments.
+
+Two rendering items chat-split landed in the same range: `6e2c8fc` charts a
+numeric table below it (GAP #25's first slice, in text: one measure across
+categories as horizontal bars, `crates/titi-tui/src/chart.rs` — a plan and a
+drawing, both pure), and `70b9f6b` fixes a **real rendering bug**: `has_markdown`
+only looked for a fence, rule, heading, quote, list marker, inline emphasis or
+maths, and a GFM table has none of those markers, so **an answer that was nothing
+but a table reached the screen as rows of `|`** — the renderer supports tables
+and the table goldens passed, but an answer made of one never got there. The new
+`markdown::has_table` asks the renderer's own `parse_table`, so "is this
+markdown?" and "what does the renderer draw?" cannot disagree.
