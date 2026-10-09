@@ -128,6 +128,29 @@ fn responses_input_wire(req: &WireRequest) -> Vec<Value> {
             Role::Assistant => {
                 pending.clear();
                 pending.extend(m.tool_calls.iter().map(|call| call.call_id.clone()));
+                // A reasoning item goes back before the turn's own items, and
+                // only to this family.
+                for block in m
+                    .thinking
+                    .iter()
+                    .filter(|block| block.api == crate::transport::ApiKind::OpenAiResponses)
+                {
+                    if block.signature.is_empty() {
+                        continue;
+                    }
+                    let mut item = serde_json::json!({
+                        "type": "reasoning",
+                        "encrypted_content": block.signature,
+                    });
+                    if !block.id.is_empty() {
+                        item["id"] = Value::String(block.id.clone());
+                    }
+                    if !block.text.is_empty() {
+                        item["summary"] =
+                            serde_json::json!([{"type": "summary_text", "text": block.text}]);
+                    }
+                    out.push(item);
+                }
                 if !m.content.is_empty() {
                     // A turn that only called tools has no prose, and an empty
                     // easy message is not part of the shape the API documents.
@@ -241,6 +264,27 @@ fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
                 Role::Assistant => {
                     pending.clear();
                     pending.extend(m.tool_calls.iter().map(|call| call.call_id.clone()));
+                    // Thinking blocks come first in the turn that produced
+                    // them, and only ever to this family: another provider
+                    // would not understand an Anthropic signature.
+                    for block in m
+                        .thinking
+                        .iter()
+                        .filter(|block| block.api == crate::transport::ApiKind::AnthropicMessages)
+                    {
+                        if !block.data.is_empty() {
+                            blocks.push(serde_json::json!({
+                                "type": "redacted_thinking",
+                                "data": block.data,
+                            }));
+                        } else if !block.signature.is_empty() {
+                            blocks.push(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": block.text,
+                                "signature": block.signature,
+                            }));
+                        }
+                    }
                     if !m.content.is_empty() {
                         blocks
                             .push(serde_json::json!({"type": "text", "text": m.content.as_str()}));
@@ -1463,6 +1507,55 @@ mod tests {
             serde_json::from_str(r#"{"role":"tool","content":"ok","tool_calls":[]}"#)
                 .expect("an old result loads");
         assert!(tool.tool_call_id.is_none());
+    }
+
+    /// A block is only replayed to the family that signed it: an Anthropic
+    /// signature must never travel to another provider, and vice versa.
+    #[test]
+    fn a_thinking_block_is_only_replayed_to_its_own_family() {
+        let mut req = WireRequest::new("m");
+        req.messages = vec![ChatMessage {
+            role: Role::Assistant,
+            content: "answer".into(),
+            thinking: vec![
+                crate::stream::ThinkingBlock {
+                    text: "anthropic thought".into(),
+                    signature: "anthropic-sig".into(),
+                    api: ApiKind::AnthropicMessages,
+                    ..Default::default()
+                },
+                crate::stream::ThinkingBlock {
+                    text: "responses thought".into(),
+                    signature: "responses-enc".into(),
+                    api: ApiKind::OpenAiResponses,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+
+        let anthropic = body_of(ApiKind::AnthropicMessages, &req);
+        let blocks = anthropic["messages"][0]["content"].as_array().expect("blocks");
+        let types: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block["type"].as_str())
+            .collect();
+        assert!(types.contains(&"thinking"), "{anthropic}");
+        assert!(
+            !anthropic.to_string().contains("responses-enc"),
+            "the Responses payload does not go to Anthropic: {anthropic}"
+        );
+
+        let responses = body_of(ApiKind::OpenAiResponses, &req);
+        let input = responses["input"].as_array().expect("input");
+        assert!(
+            input.iter().any(|item| item["encrypted_content"] == "responses-enc"),
+            "{responses}"
+        );
+        assert!(
+            !responses.to_string().contains("anthropic-sig"),
+            "and the Anthropic signature does not go to Responses: {responses}"
+        );
     }
 
     fn body_of(api: ApiKind, r: &WireRequest) -> Value {

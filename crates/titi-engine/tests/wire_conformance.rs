@@ -367,6 +367,7 @@ fn responses_sink() -> Vec<&'static str> {
     vec![
         r#"data: {"type":"response.created"}"#,
         r#"data: {"type":"response.reasoning_text.delta","delta":"weighing it"}"#,
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"enc-payload","summary":[{"type":"summary_text","text":"weighing it"}]}}"#,
         r#"data: {"type":"response.output_text.delta","delta":"before "}"#,
         r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"read"}}"#,
         r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_a","output_index":0,"delta":"{\"path\":\"a.rs\"}"}"#,
@@ -412,6 +413,24 @@ async fn responses_keeps_every_call_and_its_arguments() {
     assert!(results[0].contains("read called with"), "{results:?}");
     assert!(results[1].contains("grep called with"), "{results:?}");
     assert_eq!(tool_events(&events).len(), 2, "{events:?}");
+
+    // The encrypted reasoning item goes back before the turn's own items —
+    // the Codex backend asks for it with `store: false` and requires it.
+    let items = bodies[1]["input"].as_array().expect("input");
+    let reasoning = items
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("the reasoning item is replayed");
+    assert_eq!(reasoning["encrypted_content"], "enc-payload");
+    assert_eq!(reasoning["id"], "rs_1");
+    assert!(
+        items
+            .iter()
+            .position(|item| item["type"] == "reasoning")
+            .zip(items.iter().position(|item| item["type"] == "function_call"))
+            .is_some_and(|(reasoning, call)| reasoning < call),
+        "before the call it reasoned about: {items:?}"
+    );
 }
 
 // ---- Anthropic messages ----------------------------------------------------
@@ -424,6 +443,8 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
         r#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing it"}}"#,
+        r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-thinking"}}"#,
         r#"event: content_block_stop
 data: {"type":"content_block_stop","index":0}"#,
         r#"event: content_block_start
@@ -479,6 +500,23 @@ async fn anthropic_keeps_every_call_and_its_arguments() {
     let results = tool_messages(&bodies[1], ApiKind::AnthropicMessages);
     assert_eq!(results.len(), 2, "{results:?}");
     assert_eq!(tool_events(&events).len(), 2, "{events:?}");
+
+    // The signed thinking block comes back first in that assistant turn, with
+    // its signature: the API rejects a turn whose blocks lost them.
+    let blocks = bodies[1]["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "assistant")
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        blocks.first().map(|block| block["type"].clone()),
+        Some(Value::String("thinking".to_owned())),
+        "the thinking block leads the turn: {blocks:?}"
+    );
+    assert_eq!(blocks[0]["thinking"], "weighing it");
+    assert_eq!(blocks[0]["signature"], "sig-thinking");
 }
 
 // ---- Gemini generateContent ------------------------------------------------

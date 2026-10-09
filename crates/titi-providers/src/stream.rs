@@ -49,6 +49,37 @@ pub struct ToolCallRef {
     pub thought_signature: SmolStr,
 }
 
+/// A thinking block an assistant turn produced, kept so it can be replayed.
+///
+/// Both families that sign their reasoning require the block *back*, verbatim,
+/// on the next request: Anthropic rejects a turn whose `thinking` blocks lost
+/// their `signature`, and the Responses/Codex backend wants its
+/// `encrypted_content` items again. `text` is the reasoning as the model
+/// streamed it, plain and public, so a trace can read it without knowing
+/// anything about the provider that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ThinkingBlock {
+    /// The reasoning text, as streamed. Empty for a redacted block, whose
+    /// payload the provider never shows.
+    pub text: String,
+    /// What has to be echoed back with the block: Anthropic's `signature`, or
+    /// a Responses reasoning item's `encrypted_content`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+    /// The provider-side id of a Responses reasoning item, which the backend
+    /// expects back with it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Anthropic's `redacted_thinking` payload, which travels as its own
+    /// opaque field rather than as text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    /// Which family produced the block. A block is only ever replayed to the
+    /// family that signed it — another provider must not receive Anthropic
+    /// signatures, and would not understand them.
+    pub api: crate::transport::ApiKind,
+}
+
 /// Why the model finished the turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +179,10 @@ pub enum StreamEvent {
         reason: ErrorReason,
         message: SmolStr,
     },
+    /// One thinking block finished streaming, with everything the provider
+    /// needs echoed back. Emitted at the block's end, so the payload is
+    /// complete.
+    ThinkingBlock { block: ThinkingBlock },
 }
 
 impl StreamEvent {

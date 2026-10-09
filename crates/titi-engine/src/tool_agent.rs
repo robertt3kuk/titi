@@ -211,6 +211,7 @@ impl AgentRunner for ToolAgentRunner {
                 TurnId(0),
                 calls,
                 text.into(),
+                collector.thinking().to_vec(),
                 &self.tools,
                 self.approval_mode,
                 &waiters,

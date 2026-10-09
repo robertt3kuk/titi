@@ -532,6 +532,41 @@ pub fn decode_responses_event(
             let Some(item) = payload.get("item") else {
                 return events;
             };
+            // A reasoning item carries the encrypted payload the Codex backend
+            // requires back with `store: false`, its id, and the summary text
+            // it showed. All three are kept so the turn can be replayed.
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                if !state.started {
+                    state.started = true;
+                    events.push(StreamEvent::Start);
+                }
+                let summary: String = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("");
+                events.push(StreamEvent::ThinkingBlock {
+                    block: crate::stream::ThinkingBlock {
+                        text: summary,
+                        signature: item
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        api: crate::transport::ApiKind::OpenAiResponses,
+                        ..Default::default()
+                    },
+                });
+                return events;
+            }
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                 return events;
             }

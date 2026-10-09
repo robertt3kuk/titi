@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
 /// Endpoint family. Dispatch key for transports and decoders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiKind {
+    #[default]
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
     #[serde(rename = "openai-responses")]
@@ -43,6 +44,15 @@ pub struct ChatMessage {
     pub content: SmolStr,
     /// Tool calls issued by the assistant in this message, if any.
     pub tool_calls: Vec<crate::stream::ToolCallRef>,
+    /// Thinking blocks this assistant turn produced, in order.
+    ///
+    /// Kept so a signed turn can be replayed verbatim — see
+    /// [`ThinkingBlock`](crate::stream::ThinkingBlock). Empty on every message
+    /// that is not an assistant turn, and on a history persisted before this
+    /// field existed. `text` is the reasoning as it streamed, so a trace can
+    /// read it without knowing the provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<crate::stream::ThinkingBlock>,
     /// For a `Tool` message: the call this result answers.
     ///
     /// `None` on a message persisted before this field existed, and on every

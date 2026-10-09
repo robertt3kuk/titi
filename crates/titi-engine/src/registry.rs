@@ -78,6 +78,78 @@ impl ModelPrice {
             + u128::from(completion_tokens) * u128::from(self.output);
         u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
+
+    /// A price as a user writes one in `config.yml`: dollars per million
+    /// tokens.
+    ///
+    /// `3`, `0.15`, `12.5` — the digits are read as integers and scaled, never
+    /// parsed as a float, so a price the user states exactly is the price the
+    /// ledger charges. A sign is not part of an amount and a seventh decimal
+    /// place is finer than the unit the ledger keeps, so both are refused
+    /// rather than rounded or guessed; the refusal names the key. Zero is a
+    /// price, not a missing one: a free model is free.
+    ///
+    /// `input` and `output` are what a price always states. A provider that
+    /// bills a cached read at a rate of its own adds `cachedInput`; one that
+    /// does not leaves it out, and cached tokens then bill as input.
+    pub fn from_dollars_per_mtok(
+        input: &str,
+        output: &str,
+        cached_input: Option<&str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            input: as_micro_dollars(input).map_err(|problem| format!("`input`: {problem}"))?,
+            output: as_micro_dollars(output).map_err(|problem| format!("`output`: {problem}"))?,
+            cached_input: match cached_input {
+                Some(text) => Some(
+                    as_micro_dollars(text).map_err(|problem| format!("`cachedInput`: {problem}"))?,
+                ),
+                None => None,
+            },
+        })
+    }
+}
+
+/// A decimal dollar figure, as micro-dollars.
+///
+/// The unit a price is stated in, and the one the ledger keeps. Digits only:
+/// `3`, `0.15`, `.5`, `12.5`. At most six decimal places, because a seventh
+/// is finer than a micro-dollar and rounding it would charge a rate nobody
+/// wrote down.
+fn as_micro_dollars(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let unreadable = || {
+        format!("{text:?} is not a figure — dollars per million tokens, digits only")
+    };
+    let (whole, fraction) = match text.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (text, ""),
+    };
+    if whole.is_empty() && fraction.is_empty() {
+        return Err(unreadable());
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(unreadable());
+    }
+    if fraction.len() > 6 {
+        return Err(format!(
+            "{text:?} is finer than a micro-dollar — at most six decimal places"
+        ));
+    }
+    let units: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| format!("{text:?} is too large a figure"))?
+    };
+    let part: u64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse().map_err(|_| format!("{text:?} is too large a figure"))?
+    };
+    units
+        .checked_mul(1_000_000)
+        .and_then(|micro| micro.checked_add(part * 10u64.pow(6 - fraction.len() as u32)))
+        .ok_or_else(|| format!("{text:?} is too large a figure"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +191,81 @@ impl ProviderRegistryConfig {
         }
         Some(parsed)
     }
+
+    /// The user's own `providers`/`models`, with any price read the way a user
+    /// writes one.
+    ///
+    /// The shape is [`Self::from_settings_value`]'s, with one thing done
+    /// first: a model may declare `price: { input, output, cachedInput }` in
+    /// dollars per million tokens, which becomes the micro-dollars the
+    /// descriptor holds. The keys are the user's own, the conversion
+    /// [`ModelPrice::from_dollars_per_mtok`]'s.
+    ///
+    /// A price that cannot be read is **refused, not rounded and not
+    /// dropped**: the model is loaded *unpriced* — which the engine already
+    /// treats as "no price is known", never as free — and the problem is
+    /// returned naming the key at fault, so the caller can say which line of
+    /// the file is wrong. Every other model, and the rest of that entry,
+    /// stands.
+    pub fn from_user_settings(value: &serde_json::Value) -> (Option<Self>, Vec<String>) {
+        let mut value = value.clone();
+        let mut problems = Vec::new();
+        if let Some(models) = value
+            .get_mut("models")
+            .and_then(|models| models.as_array_mut())
+        {
+            for (index, model) in models.iter_mut().enumerate() {
+                let Some(entry) = model.as_object_mut() else {
+                    continue;
+                };
+                let Some(price) = entry.remove("price") else {
+                    continue;
+                };
+                match user_price(&price) {
+                    Ok(price) => {
+                        entry.insert(
+                            "price".to_owned(),
+                            serde_json::json!({
+                                "input": price.input,
+                                "output": price.output,
+                                "cached_input": price.cached_input,
+                            }),
+                        );
+                    }
+                    Err(problem) => problems.push(format!("models[{index}].price: {problem}")),
+                }
+            }
+        }
+        (Self::from_settings_value(&value), problems)
+    }
+}
+
+/// A `price:` block as a user writes it, in the descriptor's micro-dollars.
+///
+/// `input` and `output` are required and `cachedInput` is optional; each is a
+/// number (`3`, `0.15`) or a string of digits (`"0.15"`), so a price can be
+/// stated exactly even where a YAML float could not be.
+fn user_price(price: &serde_json::Value) -> Result<ModelPrice, String> {
+    let Some(price) = price.as_object() else {
+        return Err(
+            "expected a mapping with `input` and `output` in dollars per million tokens".to_owned(),
+        );
+    };
+    let term = |key: &str| -> Result<String, String> {
+        match price.get(key) {
+            Some(serde_json::Value::String(text)) => Ok(text.clone()),
+            Some(serde_json::Value::Number(number)) => Ok(number.to_string()),
+            Some(_) => Err(format!("`{key}` is not a number")),
+            None => Err(format!("`{key}` is missing")),
+        }
+    };
+    let input = term("input")?;
+    let output = term("output")?;
+    let cached_input = match price.get("cachedInput") {
+        Some(_) => Some(term("cachedInput")?),
+        None => None,
+    };
+    ModelPrice::from_dollars_per_mtok(&input, &output, cached_input.as_deref())
 }
 
 /// Longest one local server may take to list its models.
@@ -1395,5 +1542,148 @@ mod tests {
         );
         let resolved = registry.resolve("ollama/qwen3").expect("declared model");
         assert_eq!(resolved.wire_model.as_str(), "qwen3-pinned");
+    }
+}
+
+#[cfg(test)]
+mod user_price_tests {
+    use super::*;
+
+    /// One user model, with the price block as written.
+    fn config(price: serde_json::Value) -> (Option<ProviderRegistryConfig>, Vec<String>) {
+        ProviderRegistryConfig::from_user_settings(&serde_json::json!({
+            "providers": [{
+                "id": "fake",
+                "api": "openai-completions",
+                "base_url": "http://127.0.0.1:18999/v1",
+                "credential_required": false,
+            }],
+            "models": [{
+                "id": "fake/scripted",
+                "provider": "fake",
+                "wire_model": "fake",
+                "price": price,
+            }],
+        }))
+    }
+
+    fn price_of(parsed: &Option<ProviderRegistryConfig>) -> Option<ModelPrice> {
+        parsed.as_ref()?.models.first()?.price
+    }
+
+    /// A price written the way every provider publishes one is the price the
+    /// ledger charges, to the micro-dollar.
+    #[test]
+    fn a_price_is_read_in_dollars_per_million_tokens() {
+        let (parsed, problems) = config(serde_json::json!({
+            "input": 3,
+            "output": 15,
+            "cachedInput": 0.3,
+        }));
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(
+            price_of(&parsed),
+            Some(ModelPrice {
+                input: 3_000_000,
+                output: 15_000_000,
+                cached_input: Some(300_000),
+            })
+        );
+    }
+
+    /// A string is read exactly, which is how a rate finer than a YAML float
+    /// can still be stated without a rounding story.
+    #[test]
+    fn a_price_may_be_written_as_a_string() {
+        let (parsed, problems) = config(serde_json::json!({"input": "0.15", "output": "12.5"}));
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(
+            price_of(&parsed),
+            Some(ModelPrice {
+                input: 150_000,
+                output: 12_500_000,
+                cached_input: None,
+            })
+        );
+    }
+
+    /// Zero is a price, not a missing one: a free model is free, and it has
+    /// to be *stated* to be a price of zero rather than an unknown one.
+    #[test]
+    fn a_free_model_is_a_price_of_zero() {
+        let (parsed, problems) = config(serde_json::json!({"input": 0, "output": 0}));
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(
+            price_of(&parsed),
+            Some(ModelPrice {
+                input: 0,
+                output: 0,
+                cached_input: None,
+            })
+        );
+    }
+
+    /// A model with no price is unpriced, exactly as before this key existed.
+    #[test]
+    fn a_model_without_a_price_is_left_unpriced() {
+        let (parsed, problems) = ProviderRegistryConfig::from_user_settings(
+            &serde_json::json!({
+                "providers": [{
+                    "id": "fake",
+                    "api": "openai-completions",
+                    "base_url": "http://127.0.0.1:18999/v1",
+                    "credential_required": false,
+                }],
+                "models": [{"id": "fake/scripted", "provider": "fake", "wire_model": "fake"}],
+            }),
+        );
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(price_of(&parsed), None);
+    }
+
+    /// A rate that cannot be read is refused *by key* — and the model is not
+    /// thrown away with it: it is loaded unpriced, which the engine already
+    /// treats as "no price is known" rather than as free.
+    #[test]
+    fn a_price_that_cannot_be_read_is_refused_by_key() {
+        for (price, expected) in [
+            (
+                serde_json::json!({"input": -2, "output": 15}),
+                "`input`",
+            ),
+            (
+                serde_json::json!({"input": "free", "output": 15}),
+                "`input`",
+            ),
+            (
+                serde_json::json!({"input": 0.0000001, "output": 15}),
+                "`input`",
+            ),
+            (
+                serde_json::json!({"input": 3, "output": 15, "cachedInput": "-1"}),
+                "`cachedInput`",
+            ),
+            (serde_json::json!({"input": 3}), "`output`"),
+            (serde_json::json!({"output": 15}), "`input`"),
+            (serde_json::json!(3), "expected a mapping"),
+            (serde_json::json!({"input": [3], "output": 15}), "not a number"),
+        ] {
+            let (parsed, problems) = config(price.clone());
+            let named = problems.join(" ");
+            assert!(
+                named.contains("models[0].price"),
+                "{price} is not named by its key: {named:?}"
+            );
+            assert!(
+                named.contains(expected),
+                "{price} does not name {expected}: {named:?}"
+            );
+            let model = parsed
+                .as_ref()
+                .and_then(|parsed| parsed.models.first())
+                .expect("the model stands even when its price does not");
+            assert_eq!(model.id.as_str(), "fake/scripted");
+            assert_eq!(model.price, None, "{price} must not become a number");
+        }
     }
 }

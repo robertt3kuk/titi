@@ -14,6 +14,9 @@ pub struct AnthropicStreamState {
     started: bool,
     /// index → open block kind
     open: Vec<BlockKind>,
+    /// index → the thinking block being streamed there, when the open kind is
+    /// `Thinking`. Kept so the block's text and signature can be replayed.
+    thinking: Vec<crate::stream::ThinkingBlock>,
     /// The message's count so far: `message_start` brings the input, the
     /// closing `message_delta` the final output (and, on newer API versions,
     /// the input again).
@@ -108,6 +111,22 @@ pub fn decode_event(
                 _ => BlockKind::Text,
             };
             state.open[index] = kind;
+            while state.thinking.len() <= index {
+                state.thinking.push(Default::default());
+            }
+            if kind == BlockKind::Thinking {
+                state.thinking[index] = crate::stream::ThinkingBlock {
+                    // A `redacted_thinking` block carries its payload whole
+                    // here; a plain one streams its text and signature after.
+                    data: block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    api: crate::transport::ApiKind::AnthropicMessages,
+                    ..Default::default()
+                };
+            }
             match kind {
                 BlockKind::Text => {
                     events.push(StreamEvent::TextStart {
@@ -145,19 +164,29 @@ pub fn decode_event(
             let kind = state.open.get(index).copied();
             let delta = payload.get("delta").cloned().unwrap_or(Value::Null);
             match (kind, delta.get("type").and_then(Value::as_str)) {
+                (Some(BlockKind::Thinking), Some("thinking_delta")) => {
+                    if let Some(partial) = delta.get("thinking").and_then(Value::as_str) {
+                        if let Some(block) = state.thinking.get_mut(index) {
+                            block.text.push_str(partial);
+                        }
+                        events.push(StreamEvent::ThinkingDelta {
+                            id: block_id(BlockKind::Thinking, index),
+                            text: partial.into(),
+                        });
+                    }
+                }
+                (Some(BlockKind::Thinking), Some("signature_delta")) => {
+                    if let Some(signature) = delta.get("signature").and_then(Value::as_str)
+                        && let Some(block) = state.thinking.get_mut(index)
+                    {
+                        block.signature.push_str(signature);
+                    }
+                }
                 (Some(BlockKind::Tool), Some("input_json_delta")) => {
                     if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                         events.push(StreamEvent::ToolcallDelta {
                             id: block_id(BlockKind::Tool, index),
                             json: partial.into(),
-                        });
-                    }
-                }
-                (Some(BlockKind::Thinking), Some("thinking_delta")) => {
-                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                        events.push(StreamEvent::ThinkingDelta {
-                            id: block_id(BlockKind::Thinking, index),
-                            text: text.into(),
                         });
                     }
                 }
@@ -190,6 +219,9 @@ pub fn decode_event(
                     events.push(StreamEvent::ThinkingEnd {
                         id: block_id(kind, index),
                     });
+                    if let Some(block) = state.thinking.get(index).cloned() {
+                        events.push(StreamEvent::ThinkingBlock { block });
+                    }
                 }
                 Some(kind @ BlockKind::Tool) => {
                     events.push(StreamEvent::ToolcallEnd {
@@ -413,9 +445,20 @@ mod tests {
         );
         assert_eq!(
             ev,
-            vec![StreamEvent::ThinkingEnd {
-                id: BlockId("thinking_0".into())
-            }]
+            vec![
+                StreamEvent::ThinkingEnd {
+                    id: BlockId("thinking_0".into())
+                },
+                // The block itself, with the text it streamed, so the turn can
+                // be replayed to this family.
+                StreamEvent::ThinkingBlock {
+                    block: crate::stream::ThinkingBlock {
+                        text: "let me think".to_owned(),
+                        api: crate::transport::ApiKind::AnthropicMessages,
+                        ..Default::default()
+                    },
+                },
+            ]
         );
     }
 

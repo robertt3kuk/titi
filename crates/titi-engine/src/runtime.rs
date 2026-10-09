@@ -2509,19 +2509,20 @@ async fn run_turn(
                     )
                     .await
                     {
-                        Ok((text, calls)) if calls.is_empty() => {
+                        Ok((text, calls, thinking)) if calls.is_empty() => {
                             if !text.is_empty() {
                                 messages.push(ChatMessage {
                                     role: Role::Assistant,
                                     content: text,
                                     tool_calls: Vec::new(),
+                                    thinking,
                                     ..Default::default()
                                 });
                             }
                             completed = true;
                             break;
                         }
-                        Ok((text, calls)) => {
+                        Ok((text, calls, thinking)) => {
                             if tool_rounds >= config.max_tool_rounds {
                                 meter.settle(&events, turn_id).await;
                                 let _ = events
@@ -2538,6 +2539,7 @@ async fn run_turn(
                                 turn_id,
                                 calls,
                                 text,
+                                thinking,
                                 &tools,
                                 config.approval_mode,
                                 &waiters,
@@ -2780,7 +2782,14 @@ async fn stream_attempt(
     tools: &ToolRegistry,
     // The turn's meter, which adds this request to the session's as well.
     meter: &mut TurnMeter<'_>,
-) -> Result<(SmolStr, Vec<crate::tool_loop::PendingToolCall>), (TransportError, bool)> {
+) -> Result<
+    (
+        SmolStr,
+        Vec<crate::tool_loop::PendingToolCall>,
+        Vec<titi_providers::ThinkingBlock>,
+    ),
+    (TransportError, bool),
+> {
     // Every request the turn makes goes through here, including each transient
     // retry, so this is the one place that can be the last look at the flag
     // before bytes leave. A cancel that lands after `stream` was called hits a
@@ -2788,7 +2797,7 @@ async fn stream_attempt(
     // `RequestCtx::aborted` and drops a silent read on a short tick, so the
     // turn still ends promptly instead of waiting out the socket.
     if aborted.load(Ordering::SeqCst) {
-        return Ok((SmolStr::default(), Vec::new()));
+        return Ok((SmolStr::default(), Vec::new(), Vec::new()));
     }
     let mut request = WireRequest::new(model.clone());
     request.messages = messages.to_vec();
@@ -2808,7 +2817,7 @@ async fn stream_attempt(
 
     while let Some(event) = stream.next().await {
         if aborted.load(Ordering::SeqCst) {
-            return Ok((SmolStr::default(), Vec::new()));
+            return Ok((SmolStr::default(), Vec::new(), Vec::new()));
         }
         visible_output |= event.is_visible_output();
         collector.observe(&event);
@@ -2849,7 +2858,7 @@ async fn stream_attempt(
                         .send(EngineEvent::TurnFinished { turn_id, reason })
                         .await;
                 }
-                return Ok((answer.into(), calls));
+                return Ok((answer.into(), calls, collector.thinking().to_vec()));
             }
             StreamEvent::Error { reason, message } => {
                 let error = if reason == ErrorReason::Connection && !visible_output {

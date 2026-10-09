@@ -31,6 +31,9 @@ pub(crate) struct PendingToolCall {
 #[derive(Default)]
 pub(crate) struct ToolCallCollector {
     open: Vec<(BlockId, PendingToolCall)>,
+    /// The response's thinking blocks, in order. A signed turn has to replay
+    /// them with the call it made; the text is plain so a trace can read it.
+    thinking: Vec<titi_providers::ThinkingBlock>,
 }
 
 impl ToolCallCollector {
@@ -52,6 +55,7 @@ impl ToolCallCollector {
                     pending.arguments.push_str(json);
                 }
             }
+            StreamEvent::ThinkingBlock { block } => self.thinking.push(block.clone()),
             // A call is done when the turn is: `take` hands back every slot,
             // opened and closed alike, in the order they were opened.
             StreamEvent::ToolcallEnd { .. } => {}
@@ -62,6 +66,11 @@ impl ToolCallCollector {
     /// The response's calls, in the order the provider opened them.
     pub fn take(&mut self) -> Vec<PendingToolCall> {
         self.open.drain(..).map(|(_, pending)| pending).collect()
+    }
+
+    /// The response's thinking blocks, in order.
+    pub fn thinking(&self) -> &[titi_providers::ThinkingBlock] {
+        &self.thinking
     }
 }
 
@@ -386,6 +395,9 @@ pub(crate) async fn execute_tools(
     calls: Vec<PendingToolCall>,
     // What the assistant said in the same message as these calls.
     assistant_text: SmolStr,
+    // The thinking blocks that message produced, in order, so the turn can be
+    // replayed to the family that signed them.
+    thinking: Vec<titi_providers::ThinkingBlock>,
     tools: &ToolRegistry,
     approval_mode: ApprovalMode,
     waiters: &ApprovalWaiters,
@@ -419,6 +431,7 @@ pub(crate) async fn execute_tools(
         role: Role::Assistant,
         content: assistant_text,
         tool_calls: assistant_calls,
+        thinking,
         ..Default::default()
     });
 
