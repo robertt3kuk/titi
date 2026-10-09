@@ -136,6 +136,17 @@ pub const EDITOR_VIM_KEY: &str = "editor.vim";
 /// pane — falls back to the fenced-code box, byte for byte what it was.
 pub const TUI_RENDER_MERMAID_KEY: &str = "tui.renderMermaid";
 
+/// Whether a numeric table in an answer is drawn with a bar chart under it.
+///
+/// omp's own key (`tui.autoGraph`, `modes/settings.ts:442`): `smart`,
+/// `always` — its default — or `off`. Unset means **on**, so a table that reads
+/// as one measure is charted and a table that does not is byte for byte what it
+/// was. `smart` is omp's judge model picking the chart kind and columns for a
+/// table with several numeric columns; titi has no judge, so `smart` behaves as
+/// `always` — the built-in guess over a single measure. A value the key does
+/// not know is the default too, as every other cosmetic key treats one.
+pub const TUI_AUTOGRAPH_KEY: &str = "tui.autoGraph";
+
 /// The model a session starts on, when the config names one.
 ///
 /// `modelRoles` is omp's own map (`config/model-roles.ts:56`, where `default`

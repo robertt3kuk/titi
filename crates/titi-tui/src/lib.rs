@@ -3,7 +3,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod caps;
-mod chart;
+/// The bar chart drawn under a numeric GFM table, and the `tui.autoGraph`
+/// setting that turns it off.
+pub mod chart;
 /// Crate version, mirrors the workspace release.
 pub mod component;
 pub mod diff;

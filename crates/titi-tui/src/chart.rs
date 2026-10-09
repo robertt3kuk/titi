@@ -60,6 +60,48 @@ const MAX_UNIT: usize = 8;
 /// Eighths of a cell a bar can be filled to, the whole block last.
 const EIGHTHS: [&str; 8] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
 
+/// Whether a numeric table under an answer is charted, as `tui.autoGraph`
+/// spells it.
+///
+/// omp's key is an enum of `smart`, `always` (its default) and `off`
+/// (`pi-coding-agent/src/modes/settings.ts:442`). `always` and `off` mean what
+/// they say. `smart` is omp's judge model choosing the chart kind and the
+/// columns for a table with several numeric columns; **titi has no judge, so
+/// `smart` is `always` here** — the built-in best guess over a single measure,
+/// which is the whole of what this renderer can draw. That is the one place the
+/// behavior is narrower than the name suggests, and it is a superset of what
+/// `off` leaves alone either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoGraph {
+    /// Leave every table as a table.
+    Off,
+    /// Chart every table that reads as one measure.
+    #[default]
+    Always,
+    /// omp's judge model picks; without one, the same as [`Self::Always`].
+    Smart,
+}
+
+impl AutoGraph {
+    /// The value as the config spells it.
+    ///
+    /// Anything else — a typo, a word from another tool, an empty string — is
+    /// [`Self::Always`], the default, exactly as every other cosmetic key
+    /// treats a value it does not know.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "never" => Self::Off,
+            "smart" => Self::Smart,
+            _ => Self::Always,
+        }
+    }
+
+    /// Whether a table that qualifies gets its bars.
+    pub fn charts(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// One bar: what the row is called, and what it measures.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Bar {
@@ -382,6 +424,26 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|cell| (*cell).to_owned()).collect())
             .collect()
+    }
+
+    #[test]
+    fn the_setting_reads_its_three_values_and_defaults_the_rest() {
+        assert_eq!(AutoGraph::parse("off"), AutoGraph::Off);
+        assert_eq!(AutoGraph::parse(" Off "), AutoGraph::Off);
+        assert_eq!(AutoGraph::parse("always"), AutoGraph::Always);
+        // omp's judge model has no counterpart here, so `smart` is the
+        // built-in guess — the same thing `always` asks for.
+        assert_eq!(AutoGraph::parse("smart"), AutoGraph::Smart);
+        assert_eq!(
+            AutoGraph::parse("smart").charts(),
+            AutoGraph::Always.charts()
+        );
+        assert_eq!(AutoGraph::parse("OFF"), AutoGraph::Off);
+        assert_eq!(AutoGraph::parse(""), AutoGraph::Always);
+        assert_eq!(AutoGraph::parse("sometimes"), AutoGraph::Always);
+        assert_eq!(AutoGraph::parse("yes"), AutoGraph::Always);
+        assert!(AutoGraph::Always.charts() && AutoGraph::Smart.charts());
+        assert!(!AutoGraph::Off.charts());
     }
 
     /// A qualifying table: `Name | Time`.

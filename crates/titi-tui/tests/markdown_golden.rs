@@ -9,6 +9,7 @@
 
 use serde_json::json;
 use std::collections::HashMap;
+use titi_tui::chart::AutoGraph;
 use titi_tui::markdown::render_markdown;
 use titi_tui::theme::{ColorMode, SymbolPreset, Theme};
 use titi_tui::width::visible_width;
@@ -47,7 +48,7 @@ fn golden_theme() -> Theme {
 
 /// Render and re-emit the raw markdown with all styling.
 fn golden_render(md: &str) -> String {
-    render_markdown(md, &golden_theme(), 40, false).join("\n")
+    render_markdown(md, &golden_theme(), 40, false, AutoGraph::Always).join("\n")
 }
 
 /// The same theme with the ASCII symbol preset: what a terminal without block
@@ -68,12 +69,12 @@ fn golden_render_ascii(md: &str) -> String {
         None,
     )
     .expect("golden ascii theme builds");
-    render_markdown(md, &theme, 40, false).join("\n")
+    render_markdown(md, &theme, 40, false, AutoGraph::Always).join("\n")
 }
 
 /// Render at a chosen pane width (the goldens otherwise use 40 columns).
 fn golden_render_w(md: &str, w: u16) -> Vec<String> {
-    render_markdown(md, &golden_theme(), w, false)
+    render_markdown(md, &golden_theme(), w, false, AutoGraph::Always)
 }
 
 #[test]
@@ -649,6 +650,43 @@ fn golden_chart_under_a_numeric_table() {
         &got[..plain.len()],
         folded.as_slice(),
         "the table itself must be untouched"
+    );
+}
+
+/// `off` is the table exactly as it was: no bars, and no other difference.
+#[test]
+fn golden_auto_graph_off_leaves_the_table_alone() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n";
+    let theme = golden_theme();
+    let off = render_markdown(md, &theme, 40, false, AutoGraph::Off);
+    assert!(
+        !off.iter().any(|line| line.contains('\u{2588}')),
+        "no bars with the chart off: {off:#?}"
+    );
+    // The same rows the uncharted table has always had.
+    let words = "| Name | Time |\n|---|---|\n| build | 120 e5 |\n| test | 45 e5 |\n| lint | 8 e5 |\n| fmt | 2 e5 |\n";
+    let plain = render_markdown(words, &theme, 40, false, AutoGraph::Always);
+    let folded: Vec<String> = off
+        .iter()
+        .map(|line| {
+            line.replace("120 ms", "120 e5")
+                .replace("45 ms", "45 e5")
+                .replace("8 ms", "8 e5")
+                .replace("2 ms", "2 e5")
+        })
+        .collect();
+    assert_eq!(folded, plain, "off is the plain table");
+}
+
+/// `smart` is `always` here: the judge model that would pick the columns has no
+/// counterpart, so the built-in guess is what runs.
+#[test]
+fn golden_auto_graph_smart_is_always() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n";
+    let theme = golden_theme();
+    assert_eq!(
+        render_markdown(md, &theme, 40, false, AutoGraph::Smart),
+        render_markdown(md, &theme, 40, false, AutoGraph::Always),
     );
 }
 

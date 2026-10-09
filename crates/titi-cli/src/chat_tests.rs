@@ -4999,7 +4999,16 @@ fn the_geometry_is_one_rule() {
     let theme = test_theme();
     let long = "word ".repeat(30);
     let wrapped = |kind: LineKind, text: String, indent: usize| {
-        let rows = row_texts(&message_rows(&TranscriptLine { kind, text }, 60, &theme, false).0);
+        let rows = row_texts(
+            &message_rows(
+                &TranscriptLine { kind, text },
+                60,
+                &theme,
+                false,
+                titi_tui::chart::AutoGraph::Off,
+            )
+            .0,
+        );
         assert!(rows.len() >= 2, "{kind:?} did not wrap: {rows:?}");
         for (at, row) in rows.iter().enumerate() {
             assert_eq!(
@@ -5047,6 +5056,7 @@ fn the_geometry_is_one_rule() {
             60,
             &theme,
             false,
+            titi_tui::chart::AutoGraph::Off,
         )
         .0,
     ] {
@@ -5072,6 +5082,7 @@ fn the_geometry_is_one_rule() {
             60,
             &theme,
             false,
+            titi_tui::chart::AutoGraph::Off,
         )
         .0,
     );
@@ -8346,7 +8357,8 @@ fn a_multi_line_note_is_one_row_per_line() {
         kind: LineKind::Note,
         text: "alpha\nbeta\n\ngamma".to_owned(),
     };
-    let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
+    let rows =
+        row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert!(rows[0].contains("alpha"), "{rows:?}");
     assert!(rows[1].contains("beta"), "{rows:?}");
@@ -8366,7 +8378,8 @@ fn a_long_note_wraps_within_the_width() {
         kind: LineKind::Note,
         text: words.clone(),
     };
-    let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
+    let rows =
+        row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
     assert!(rows.len() >= 8, "{rows:?}");
     for row in &rows {
         assert!(
@@ -8394,7 +8407,8 @@ fn errors_and_tool_chips_split_too() {
             kind,
             text: "first\nsecond".to_owned(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
+        let rows =
+            row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
         assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
         assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
     }
@@ -8437,7 +8451,14 @@ fn span_with<'a>(rows: &'a [Line<'static>], needle: &str) -> &'a Span<'static> {
 }
 
 fn reply_rows_of(text: &str, width: usize) -> Vec<Line<'static>> {
-    message_rows(&assistant_line(text), width, &test_theme(), false).0
+    message_rows(
+        &assistant_line(text),
+        width,
+        &test_theme(),
+        false,
+        titi_tui::chart::AutoGraph::Off,
+    )
+    .0
 }
 
 /// A heading is rendered as the theme's heading, and its `#` run is syntax:
@@ -8698,7 +8719,7 @@ fn an_edit_result_is_drawn_as_its_file_and_its_diff() {
         "the diff line carries the detail, and only the detail"
     );
 
-    let rows = message_rows(&line, 80, &theme, false).0;
+    let rows = message_rows(&line, 80, &theme, false, titi_tui::chart::AutoGraph::Off).0;
     let texts = row_texts(&rows);
     assert!(texts[0].contains("notes/kept.txt"), "{texts:?}");
     assert_eq!(texts[0], "   ✓ notes/kept.txt", "{texts:?}");
@@ -8800,7 +8821,14 @@ fn only_a_result_with_a_detail_becomes_a_diff_line() {
         // The chip the screen draws when there is no detail keeps saying
         // what it always said.
         if !expected {
-            let rows = message_rows(line, 80, &test_theme(), false).0;
+            let rows = message_rows(
+                line,
+                80,
+                &test_theme(),
+                false,
+                titi_tui::chart::AutoGraph::Off,
+            )
+            .0;
             assert!(
                 row_texts(&rows)[0].starts_with("   ✓ "),
                 "{tool}: {:?}",
@@ -8823,6 +8851,7 @@ fn a_result_without_a_diff_is_the_chip_it_always_was() {
         80,
         &theme,
         false,
+        titi_tui::chart::AutoGraph::Off,
     )
     .0;
     assert_eq!(
@@ -8846,7 +8875,7 @@ fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
         kind: LineKind::Diff,
         text: "not a diff at all\nsecond line".to_owned(),
     };
-    let rows = message_rows(&line, 80, &theme, false).0;
+    let rows = message_rows(&line, 80, &theme, false, titi_tui::chart::AutoGraph::Off).0;
     assert_eq!(
         row_texts(&rows)[..2],
         ["   ✓ not a diff at all", "     second line"],
@@ -8863,7 +8892,14 @@ fn a_diff_block_stays_inside_the_pane() {
         text: edit_result().to_owned(),
     };
     for width in [60usize, 80, 120] {
-        let rows = message_rows(&line, width, &test_theme(), false).0;
+        let rows = message_rows(
+            &line,
+            width,
+            &test_theme(),
+            false,
+            titi_tui::chart::AutoGraph::Off,
+        )
+        .0;
         let texts = row_texts(&rows);
         assert!(texts.len() > 4, "{width}: {texts:?}");
         for (at, row) in texts.iter().enumerate() {
@@ -8888,7 +8924,16 @@ fn a_very_long_diff_is_capped_and_says_so() {
         kind: LineKind::Diff,
         text,
     };
-    let rows = row_texts(&message_rows(&line, 80, &test_theme(), false).0);
+    let rows = row_texts(
+        &message_rows(
+            &line,
+            80,
+            &test_theme(),
+            false,
+            titi_tui::chart::AutoGraph::Off,
+        )
+        .0,
+    );
     // The chip row, `DIFF_MAX_ROWS` renderer rows, then the note.
     assert_eq!(rows.len(), DIFF_MAX_ROWS + 2, "{:?}", rows.len());
     let last = rows.last().expect("a note");
@@ -8911,7 +8956,7 @@ fn a_long_login_url_is_one_slice_per_row() {
         kind: LineKind::Note,
         text: format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
     };
-    let (rows, links) = message_rows(&line, 78, &theme, false);
+    let (rows, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
     let texts = row_texts(&rows);
     assert!(
         links.len() >= 4,
@@ -8951,7 +8996,7 @@ fn a_short_login_url_is_one_row() {
         kind: LineKind::Note,
         text: format!("login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"),
     };
-    let (rows, links) = message_rows(&line, 78, &theme, false);
+    let (rows, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
     assert_eq!(links.len(), 1, "{:?}", row_texts(&rows));
     assert_eq!(row_texts(&rows)[links[0].row], url);
     assert_eq!(links[0].url, url);
@@ -8985,7 +9030,7 @@ fn other_lines_get_no_link_rows() {
             kind,
             text: text.to_owned(),
         };
-        let (_, links) = message_rows(&line, 78, &theme, false);
+        let (_, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
         assert!(links.is_empty(), "{kind:?} {text:?} grew a link: {links:?}");
     }
 }
@@ -12760,4 +12805,46 @@ fn the_age_label_is_a_shape_not_a_clock() {
     assert_eq!(age_label(now, 1_000_000 - 604_800), "1w ago");
     // A file stamped ahead of this machine's clock is not a negative age.
     assert_eq!(age_label(now, 1_000_001), "just now");
+}
+
+/// A numeric table in an answer reaches the screen with its bars, and
+/// `tui.autoGraph` is what decides: off, the same table is the grid it always
+/// was. The end-to-end twin of the mermaid fence's test — the table goes
+/// through the renderer, the chart, the transcript and the frame.
+#[test]
+fn a_numeric_table_is_charted_and_the_setting_turns_it_off() {
+    let table = "The steps:\n\n| Step | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |";
+    let frame = |autograph: titi_tui::chart::AutoGraph| {
+        let mut chat = chat_with_theme(test_theme());
+        chat.autograph = autograph;
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: table.into(),
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        frame_rows(&mut chat, 80, 30)
+            .iter()
+            .map(|row| row.trim_end().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let drawn = frame(titi_tui::chart::AutoGraph::Always);
+    let body = drawn.join("\n");
+    assert!(body.contains('█'), "the bars are on screen: {body}");
+    assert!(
+        !body.contains("| Step |"),
+        "the table's source is not: {body}"
+    );
+
+    let plain = frame(titi_tui::chart::AutoGraph::Off);
+    let off = plain.join("\n");
+    assert!(!off.contains('█'), "off draws no bars: {off}");
+    assert!(off.contains("Step"), "off is still the table: {off}");
 }

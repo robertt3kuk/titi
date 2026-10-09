@@ -586,7 +586,7 @@ pub(crate) fn transcript(
                 Vec::new(),
             )
         } else {
-            message_rows(line, inner, theme, chat.mermaid)
+            message_rows(line, inner, theme, chat.mermaid, chat.autograph)
         };
         for text in texts {
             rows.push(TranscriptRow::Text(text));
@@ -917,6 +917,7 @@ pub(crate) fn message_rows(
     width: usize,
     theme: &Theme,
     mermaid: bool,
+    autograph: titi_tui::chart::AutoGraph,
 ) -> (Vec<Line<'static>>, Vec<LinkRow>) {
     if line.kind == LineKind::Note
         && let Some((head, url, instructions)) = login_link(&line.text)
@@ -936,7 +937,7 @@ pub(crate) fn message_rows(
             width,
             theme,
         ),
-        LineKind::Assistant => reply_rows(&line.text, width, theme, mermaid),
+        LineKind::Assistant => reply_rows(&line.text, width, theme, mermaid, autograph),
         LineKind::Tool => chip(tool_chip(&line.text), theme, width),
         LineKind::Diff => diff_rows(&line.text, theme, width),
         LineKind::Error => chip(
@@ -1146,7 +1147,13 @@ pub(crate) fn speech(
 /// its marker arrives, which is the renderer's own reading of partial markdown.
 /// [`Chat::assistant_rows`] is what keeps that affordable while the answer is
 /// still arriving.
-fn reply_rows(text: &str, width: usize, theme: &Theme, mermaid: bool) -> Vec<Line<'static>> {
+fn reply_rows(
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    mermaid: bool,
+    autograph: titi_tui::chart::AutoGraph,
+) -> Vec<Line<'static>> {
     if !has_markdown(text) {
         return speech(
             "titi",
@@ -1158,7 +1165,7 @@ fn reply_rows(text: &str, width: usize, theme: &Theme, mermaid: bool) -> Vec<Lin
             theme,
         );
     }
-    let bodies = markdown_bodies(text, speech_width(width), theme, mermaid);
+    let bodies = markdown_bodies(text, speech_width(width), theme, mermaid, autograph);
     message_block(
         "titi",
         ThemeColor::Accent,
@@ -1181,9 +1188,10 @@ fn markdown_bodies(
     width: usize,
     theme: &Theme,
     mermaid: bool,
+    autograph: titi_tui::chart::AutoGraph,
 ) -> Vec<Vec<Span<'static>>> {
     // `width` descends from a `u16` pane, so the cast only undoes the widening.
-    titi_tui::markdown::render_markdown(text, theme, width as u16, mermaid)
+    titi_tui::markdown::render_markdown(text, theme, width as u16, mermaid, autograph)
         .into_iter()
         .map(|row| sgr_row(&row))
         .collect()
@@ -1525,7 +1533,7 @@ impl Chat {
         {
             return cached.rows.clone();
         }
-        let rows = reply_rows(text, width, theme, self.mermaid);
+        let rows = reply_rows(text, width, theme, self.mermaid, self.autograph);
         if remember {
             self.reply_render = Some(ReplyRender {
                 source: text.to_owned(),
@@ -1595,6 +1603,7 @@ impl Chat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use titi_tui::chart::AutoGraph;
     use titi_tui::width::visible_width;
 
     /// The dark slot the live screen lands on, built the way the screen builds
@@ -1608,7 +1617,7 @@ mod tests {
     }
 
     fn rows(text: &str, width: usize) -> Vec<String> {
-        reply_rows(text, width, &theme(), false)
+        reply_rows(text, width, &theme(), false, AutoGraph::Always)
             .into_iter()
             .map(|line| {
                 line.spans

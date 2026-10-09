@@ -23,6 +23,8 @@
 //! - Horizontal rules (`---`) — styled with `ThemeColor::MdHr`
 //! - Links (`[text](url)`) — text with `MdLink`, url with `MdLinkUrl`
 //! - GFM tables — a header row, a delimiter row (`|---|:--:|--:|`) and body
+//!   rows, redrawn as a `boxSharp` grid, and a chart under a table that reads
+//!   as one measure unless `tui.autoGraph` turns it off (`crate::chart`)
 //!   rows drawn as a `boxSharp` grid in `ThemeColor::MdCodeBlockBorder`, with
 //!   one space of padding per side, column widths from the widest cell's
 //!   display width, and per-column alignment; a ragged or malformed block
@@ -175,7 +177,13 @@ impl SectionVisibility {
 ///
 /// `text` — raw markdown; `theme` — the active theme (provides token colours
 /// and bold/italic helpers); `width` — column width to wrap paragraphs to.
-pub fn render_markdown(text: &str, theme: &Theme, width: u16, mermaid: bool) -> Vec<String> {
+pub fn render_markdown(
+    text: &str,
+    theme: &Theme,
+    width: u16,
+    mermaid: bool,
+    autograph: crate::chart::AutoGraph,
+) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -289,7 +297,9 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16, mermaid: bool) -> 
                 // A numeric table carries a chart of its one measure, when the
                 // table reads as one (see `chart`): directly under it, so the
                 // bars are read against the rows they came from.
-                if let Some(chart) = crate::chart::plan(&table.header, &table.rows) {
+                if autograph.charts()
+                    && let Some(chart) = crate::chart::plan(&table.header, &table.rows)
+                {
                     lines.append(&mut crate::chart::render(&chart, theme, w));
                 }
             } else {
@@ -1448,14 +1458,14 @@ Done in `AGENTS.md`.";
 
     #[test]
     fn empty_text() {
-        let lines = render_markdown("", &test_theme(), 80, false);
+        let lines = render_markdown("", &test_theme(), 80, false, crate::chart::AutoGraph::Off);
         assert!(lines.is_empty());
     }
 
     #[test]
     fn heading_has_no_hash_prefix() {
         let theme = colored_theme();
-        let lines = render_markdown("# Hello", &theme, 80, false);
+        let lines = render_markdown("# Hello", &theme, 80, false, crate::chart::AutoGraph::Off);
         assert_eq!(
             lines,
             vec!["\x1b[1;4;38;2;255;204;0mHello\x1b[39m\x1b[24m\x1b[22m".to_string()]
@@ -1465,9 +1475,9 @@ Done in `AGENTS.md`.";
     #[test]
     fn heading_levels_are_distinguishable() {
         let theme = colored_theme();
-        let l1 = render_markdown("# A", &theme, 80, false);
-        let l2 = render_markdown("## A", &theme, 80, false);
-        let l3 = render_markdown("### A", &theme, 80, false);
+        let l1 = render_markdown("# A", &theme, 80, false, crate::chart::AutoGraph::Off);
+        let l2 = render_markdown("## A", &theme, 80, false, crate::chart::AutoGraph::Off);
+        let l3 = render_markdown("### A", &theme, 80, false, crate::chart::AutoGraph::Off);
         assert_eq!(plain(&l1), vec!["A"]);
         assert_eq!(plain(&l2), vec!["A"]);
         assert_eq!(plain(&l3), vec!["A"]);
@@ -1480,15 +1490,33 @@ Done in `AGENTS.md`.";
     fn heading_opens_a_block_with_a_blank_row() {
         let theme = test_theme();
         assert_eq!(
-            plain(&render_markdown("text\n## Head", &theme, 80, false)),
+            plain(&render_markdown(
+                "text\n## Head",
+                &theme,
+                80,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["text", "", "Head"]
         );
         assert_eq!(
-            plain(&render_markdown("# Head\n\ntext", &theme, 80, false)),
+            plain(&render_markdown(
+                "# Head\n\ntext",
+                &theme,
+                80,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["Head", "", "text"]
         );
         assert_eq!(
-            plain(&render_markdown("# A\n## B", &theme, 80, false)),
+            plain(&render_markdown(
+                "# A\n## B",
+                &theme,
+                80,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["A", "", "B"]
         );
     }
@@ -1496,7 +1524,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn bold_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("this is **bold** text", &theme, 80, false);
+        let lines = render_markdown(
+            "this is **bold** text",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("\x1b[1m"),
@@ -1509,7 +1543,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn italic_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("this is *italic* text", &theme, 80, false);
+        let lines = render_markdown(
+            "this is *italic* text",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].contains("\x1b[3m"),
@@ -1520,7 +1560,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn inline_code_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("use `ffmpeg` to convert", &theme, 80, false);
+        let lines = render_markdown(
+            "use `ffmpeg` to convert",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         // mdCode token not in test theme (empty map), so returns to default.
         // The word `ffmpeg` should be present.
         assert!(
@@ -1537,6 +1583,7 @@ Done in `AGENTS.md`.";
             &theme,
             80,
             false,
+            crate::chart::AutoGraph::Off,
         );
         assert_eq!(
             lines,
@@ -1551,7 +1598,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn underscore_italic_skips_identifiers() {
         let theme = test_theme();
-        let lines = render_markdown("say _hello_ to snake_case_idents", &theme, 80, false);
+        let lines = render_markdown(
+            "say _hello_ to snake_case_idents",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(plain(&lines), vec!["say hello to snake_case_idents"]);
         assert!(lines[0].contains("\x1b[3mhello\x1b[23m"), "{:?}", lines[0]);
     }
@@ -1559,7 +1612,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn link_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("click [here](https://example.com)", &theme, 80, false);
+        let lines = render_markdown(
+            "click [here](https://example.com)",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert!(
             lines[0].contains("here"),
             "link text should appear: {lines:?}"
@@ -1573,7 +1632,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn unordered_list_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("- item one\n- item two", &theme, 80, false);
+        let lines = render_markdown(
+            "- item one\n- item two",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("item one"), "first item: {lines:?}");
         assert!(lines[1].contains("item two"), "second item: {lines:?}");
@@ -1582,7 +1647,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn ordered_list_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("1. first\n2. second", &theme, 80, false);
+        let lines = render_markdown(
+            "1. first\n2. second",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("first"), "first item: {lines:?}");
         assert!(lines[1].contains("second"), "second item: {lines:?}");
@@ -1596,6 +1667,7 @@ Done in `AGENTS.md`.";
             &theme,
             80,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(
             rows,
@@ -1611,11 +1683,18 @@ Done in `AGENTS.md`.";
             &theme,
             16,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         // The wrap keeps the space it broke on; the hang indent follows the
         // marker width, so `gamma` starts under `alpha`.
         assert_eq!(rows, vec!["10. alpha beta ", "    gamma delta"]);
-        for row in render_markdown("10. alpha beta gamma delta", &theme, 16, false) {
+        for row in render_markdown(
+            "10. alpha beta gamma delta",
+            &theme,
+            16,
+            false,
+            crate::chart::AutoGraph::Off,
+        ) {
             assert!(visible_width(&row) <= 16, "{row:?}");
         }
     }
@@ -1623,7 +1702,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn blockquote_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("> quoted text", &theme, 80, false);
+        let lines = render_markdown(
+            "> quoted text",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert!(lines[0].contains("quoted text"), "blockquote: {lines:?}");
         // The border character should be present.
         assert!(lines[0].contains("▎"), "blockquote border: {lines:?}");
@@ -1632,7 +1717,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn blockquote_uses_a_gutter_not_a_literal_gt() {
         let theme = colored_theme();
-        let lines = render_markdown("> one **two**", &theme, 80, false);
+        let lines = render_markdown(
+            "> one **two**",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(
             lines,
             vec![
@@ -1647,7 +1738,13 @@ Done in `AGENTS.md`.";
     fn code_block_draws_a_frame_with_the_language_once() {
         let theme = colored_theme();
         for w in [60usize, 80usize] {
-            let lines = render_markdown("```rust\nfn main() {}\n```", &theme, w as u16, false);
+            let lines = render_markdown(
+                "```rust\nfn main() {}\n```",
+                &theme,
+                w as u16,
+                false,
+                crate::chart::AutoGraph::Off,
+            );
             let expected = vec![
                 format!("\x1b[38;2;68;68;68m╭─ rust {}╮\x1b[39m", "─".repeat(w - 9)),
                 format!(
@@ -1671,7 +1768,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn code_block_without_language_has_a_plain_top_rule() {
         let theme = colored_theme();
-        let lines = render_markdown("```\nlet x = 1;\n```", &theme, 60, false);
+        let lines = render_markdown(
+            "```\nlet x = 1;\n```",
+            &theme,
+            60,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(
             plain(&lines),
             vec![
@@ -1689,7 +1792,13 @@ Done in `AGENTS.md`.";
     fn overlong_code_line_wraps_inside_the_frame() {
         let theme = colored_theme();
         let long = "a".repeat(70);
-        let lines = render_markdown(&format!("```\n{long}\n```"), &theme, 60, false);
+        let lines = render_markdown(
+            &format!("```\n{long}\n```"),
+            &theme,
+            60,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(lines.len(), 4, "top, two body rows, bottom: {lines:?}");
         for row in &lines {
             assert_eq!(visible_width(row), 60, "{row:?}");
@@ -1704,7 +1813,7 @@ Done in `AGENTS.md`.";
     #[test]
     fn horizontal_rule_rendered() {
         let theme = test_theme();
-        let lines = render_markdown("---", &theme, 80, false);
+        let lines = render_markdown("---", &theme, 80, false, crate::chart::AutoGraph::Off);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains('─'), "hr: {lines:?}");
     }
@@ -1713,7 +1822,7 @@ Done in `AGENTS.md`.";
     fn paragraph_wrapping() {
         let theme = test_theme();
         let long = "This is a very long paragraph that should wrap at the given width limit.";
-        let lines = render_markdown(long, &theme, 20, false);
+        let lines = render_markdown(long, &theme, 20, false, crate::chart::AutoGraph::Off);
         // At width 20, should produce at least 2 lines.
         assert!(lines.len() >= 2, "should wrap: {lines:?}");
     }
@@ -1721,7 +1830,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn multiple_heading_levels() {
         let theme = test_theme();
-        let lines = render_markdown("## Subheading\n### Subsub", &theme, 80, false);
+        let lines = render_markdown(
+            "## Subheading\n### Subsub",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(plain(&lines), vec!["Subheading", "", "Subsub"]);
         assert!(lines.iter().all(|l| !l.contains('#')), "{lines:?}");
     }
@@ -1729,7 +1844,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn bold_and_italic_together() {
         let theme = test_theme();
-        let lines = render_markdown("**bold** and *italic*", &theme, 80, false);
+        let lines = render_markdown(
+            "**bold** and *italic*",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert!(lines[0].contains("\x1b[1m"), "bold marker");
         assert!(lines[0].contains("\x1b[3m"), "italic marker");
     }
@@ -1737,7 +1858,7 @@ Done in `AGENTS.md`.";
     #[test]
     fn mixed_document_renders_every_construct() {
         let theme = colored_theme();
-        let lines = render_markdown(MIXED, &theme, 60, false);
+        let lines = render_markdown(MIXED, &theme, 60, false, crate::chart::AutoGraph::Off);
         assert_eq!(
             plain(&lines),
             vec![
@@ -1811,6 +1932,7 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         );
         assert!(lines.len() >= 2, "should wrap: {lines:?}");
         for row in &lines {
@@ -1834,7 +1956,7 @@ Done in `AGENTS.md`.";
     fn no_row_exceeds_the_pane_width() {
         let theme = colored_theme();
         for w in [20u16, 40, 60, 80, 120] {
-            for row in render_markdown(MIXED, &theme, w, false) {
+            for row in render_markdown(MIXED, &theme, w, false, crate::chart::AutoGraph::Off) {
                 assert!(
                     visible_width(&row) <= w as usize,
                     "w={w} width={} row={row:?}",
@@ -1857,6 +1979,7 @@ Done in `AGENTS.md`.";
             &theme,
             80,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         // col0 = 1, col1 = max(4, 3) = 4 → chrome 7 + 5 = 12 columns.
         assert_eq!(
@@ -1869,7 +1992,13 @@ Done in `AGENTS.md`.";
                 "└───┴──────┘",
             ]
         );
-        for row in render_markdown("| a | 日本 |\n|---|---|\n| b | 🎉c |", &theme, 80, false) {
+        for row in render_markdown(
+            "| a | 日本 |\n|---|---|\n| b | 🎉c |",
+            &theme,
+            80,
+            false,
+            crate::chart::AutoGraph::Off,
+        ) {
             assert_eq!(visible_width(&row), 12, "{row:?}");
         }
     }
@@ -1884,7 +2013,7 @@ Done in `AGENTS.md`.";
                   | supercalifragilisticexpialidocious | 🎉🎉🎉 | ok |\n\
                   | b | c | a much longer note than the header |";
         for w in 12u16..=80 {
-            let lines = render_markdown(md, &theme, w, false);
+            let lines = render_markdown(md, &theme, w, false, crate::chart::AutoGraph::Off);
             for row in &lines {
                 assert!(
                     visible_width(row) <= w as usize,
@@ -1903,7 +2032,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn escaped_pipe_is_literal_text() {
         let theme = colored_theme();
-        let lines = render_markdown("| a \\| b | c |\n|---|---|\n| 1 | 2 |", &theme, 40, false);
+        let lines = render_markdown(
+            "| a \\| b | c |\n|---|---|\n| 1 | 2 |",
+            &theme,
+            40,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         let rows = plain(&lines);
         assert_eq!(
             rows,
@@ -1927,6 +2062,7 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(rows[3], "│ a │ b │ c │");
         // Wider cells make the padding visible.
@@ -1935,6 +2071,7 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(rows[3], "│ aa   │   bb   │    cc │");
     }
@@ -1949,6 +2086,7 @@ Done in `AGENTS.md`.";
             &theme,
             20,
             false,
+            crate::chart::AutoGraph::Off,
         );
         let rows = plain(&lines);
         assert_eq!(rows.len(), 5, "{rows:?}");
@@ -1966,7 +2104,13 @@ Done in `AGENTS.md`.";
     fn malformed_tables_stay_literal() {
         let theme = colored_theme();
         assert_eq!(
-            plain(&render_markdown("| a | b |\n|---|", &theme, 40, false)),
+            plain(&render_markdown(
+                "| a | b |\n|---|",
+                &theme,
+                40,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["| a | b |", "|---|"]
         );
         assert_eq!(
@@ -1975,6 +2119,7 @@ Done in `AGENTS.md`.";
                 &theme,
                 40,
                 false,
+                crate::chart::AutoGraph::Off,
             )),
             vec![
                 "┌───┬───┐",
@@ -1986,7 +2131,13 @@ Done in `AGENTS.md`.";
         );
         // A row with no pipe at all is never a table row.
         assert_eq!(
-            plain(&render_markdown("a\n|---|", &theme, 40, false)),
+            plain(&render_markdown(
+                "a\n|---|",
+                &theme,
+                40,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["a", "|---|"]
         );
     }
@@ -2001,12 +2152,19 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(rows[0], "Summary:");
         assert_eq!(rows[1], "");
         assert!(rows[2].starts_with('┌'), "{rows:?}");
         // First row of the answer: no leading blank.
-        let rows = plain(&render_markdown("| a |\n|---|\n| 1 |", &theme, 40, false));
+        let rows = plain(&render_markdown(
+            "| a |\n|---|\n| 1 |",
+            &theme,
+            40,
+            false,
+            crate::chart::AutoGraph::Off,
+        ));
         assert!(rows[0].starts_with('┌'), "{rows:?}");
     }
 
@@ -2015,7 +2173,13 @@ Done in `AGENTS.md`.";
     fn header_only_table_is_a_closed_frame() {
         let theme = colored_theme();
         assert_eq!(
-            plain(&render_markdown("| a | b |\n|---|---|", &theme, 40, false)),
+            plain(&render_markdown(
+                "| a | b |\n|---|---|",
+                &theme,
+                40,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["┌───┬───┐", "│ a │ b │", "├───┼───┤", "└───┴───┘"]
         );
     }
@@ -2025,7 +2189,13 @@ Done in `AGENTS.md`.";
     #[test]
     fn empty_cells_and_theme_tokens() {
         let theme = colored_theme();
-        let lines = render_markdown("| a |  |\n|---|---|\n|  | 2 |", &theme, 40, false);
+        let lines = render_markdown(
+            "| a |  |\n|---|---|\n|  | 2 |",
+            &theme,
+            40,
+            false,
+            crate::chart::AutoGraph::Off,
+        );
         assert_eq!(
             plain(&lines),
             vec![
@@ -2050,6 +2220,7 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         );
         let body = &lines[3];
         assert!(body.contains("\x1b[1mb\x1b[22m"), "{body:?}");
@@ -2077,7 +2248,13 @@ Done in `AGENTS.md`.";
         for i in 0..MAX_TABLE_ROWS + 3 {
             md.push_str(&format!("| {i} |\n"));
         }
-        let rows = plain(&render_markdown(&md, &theme, 40, false));
+        let rows = plain(&render_markdown(
+            &md,
+            &theme,
+            40,
+            false,
+            crate::chart::AutoGraph::Off,
+        ));
         assert_eq!(
             rows.iter().filter(|r| r.starts_with("│ ")).count(),
             1 + MAX_TABLE_ROWS,
@@ -2100,6 +2277,7 @@ Done in `AGENTS.md`.";
             &theme,
             200,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(rows, vec![header, delim], "a row that wide is prose");
     }
@@ -2115,6 +2293,7 @@ Done in `AGENTS.md`.";
             &theme,
             16,
             false,
+            crate::chart::AutoGraph::Off,
         );
         assert_eq!(
             plain(&lines),
@@ -2201,12 +2380,19 @@ Done in `AGENTS.md`.";
                 "## Growth $O(n\\log n)$",
                 &theme,
                 40,
-                false
+                false,
+                crate::chart::AutoGraph::Off,
             )),
             vec!["Growth O(n log n)"]
         );
         assert_eq!(
-            plain(&render_markdown("- step $x^2$", &theme, 40, false)),
+            plain(&render_markdown(
+                "- step $x^2$",
+                &theme,
+                40,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec!["• step x²"]
         );
         assert_eq!(
@@ -2214,7 +2400,8 @@ Done in `AGENTS.md`.";
                 "> limit $\\to \\infty$",
                 &theme,
                 40,
-                false
+                false,
+                crate::chart::AutoGraph::Off,
             )),
             vec!["▎ limit → ∞"]
         );
@@ -2230,6 +2417,7 @@ Done in `AGENTS.md`.";
             &theme,
             40,
             false,
+            crate::chart::AutoGraph::Off,
         ));
         assert_eq!(
             rows,
@@ -2255,7 +2443,13 @@ Done in `AGENTS.md`.";
             "An open $x with no closer.",
         ] {
             assert_eq!(
-                plain(&render_markdown(line, &theme, 60, false)),
+                plain(&render_markdown(
+                    line,
+                    &theme,
+                    60,
+                    false,
+                    crate::chart::AutoGraph::Off
+                )),
                 vec![line],
                 "left literal: {line:?}"
             );
@@ -2273,6 +2467,7 @@ Done in `AGENTS.md`.";
                 &theme,
                 40,
                 false,
+                crate::chart::AutoGraph::Off,
             )),
             vec!["The bound is n² exactly."]
         );
@@ -2288,7 +2483,8 @@ Done in `AGENTS.md`.";
                 "$$\nx^2\nand more text",
                 &theme,
                 40,
-                false
+                false,
+                crate::chart::AutoGraph::Off,
             )),
             vec!["$$", "x^2", "and more text"]
         );
@@ -2300,7 +2496,13 @@ Done in `AGENTS.md`.";
     fn display_block_is_centred_and_fits() {
         let theme = colored_theme();
         let md = "Before.\n$$\\sum_{i=1}^{n} i$$";
-        let rows = plain(&render_markdown(md, &theme, 30, false));
+        let rows = plain(&render_markdown(
+            md,
+            &theme,
+            30,
+            false,
+            crate::chart::AutoGraph::Off,
+        ));
         // Block width 5 in a 30-column pane: centred with 12 columns of margin,
         // the limits stacked over and under the symbol, blank rows on both sides.
         assert_eq!(
@@ -2315,7 +2517,7 @@ Done in `AGENTS.md`.";
             ]
         );
         for width in [80u16, 40, 20, 8, 4, 1] {
-            for row in render_markdown(md, &theme, width, false) {
+            for row in render_markdown(md, &theme, width, false, crate::chart::AutoGraph::Off) {
                 assert!(
                     visible_width(&row) <= usize::from(width),
                     "width {width}: {row:?}"
@@ -2334,12 +2536,19 @@ Done in `AGENTS.md`.";
                 "rate $\\frac{1}{1-x}$ now",
                 &theme,
                 40,
-                false
+                false,
+                crate::chart::AutoGraph::Off,
             )),
             vec!["rate 1/(1-x) now"]
         );
         assert_eq!(
-            plain(&render_markdown("$$\\frac{1}{1-x}$$", &theme, 40, false)),
+            plain(&render_markdown(
+                "$$\\frac{1}{1-x}$$",
+                &theme,
+                40,
+                false,
+                crate::chart::AutoGraph::Off
+            )),
             vec![
                 "                   1",
                 "                  ───",

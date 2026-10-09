@@ -687,6 +687,12 @@ pub struct Chat {
     /// (`tui.renderMermaid`). Unset is on, so a fence that parses is a
     /// drawing and one that does not is the code box it always was.
     pub(crate) mermaid: bool,
+    /// Whether a numeric table in an answer is drawn with a chart under it
+    /// (`tui.autoGraph`, `off | always | smart`). Unset is `always`, omp's own
+    /// default, so a table that reads as one measure is charted and one that
+    /// does not is what it always was; `smart` is `always` here because the
+    /// judge model that would pick between columns has no counterpart.
+    pub(crate) autograph: titi_tui::chart::AutoGraph,
     /// Characters of the running answer that are on screen. It only means
     /// anything while `smooth` is on and a turn is streaming.
     pub(crate) revealed: usize,
@@ -910,6 +916,7 @@ impl Chat {
             tight: false,
             smooth: false,
             mermaid: true,
+            autograph: titi_tui::chart::AutoGraph::Always,
             revealed: 0,
             reveal_at: None,
             pinned: PinnedStrip::default(),
@@ -4169,6 +4176,15 @@ pub fn run(
     chat.mermaid = settings.as_ref().is_none_or(|settings| {
         !titi_config::settings::switch_off(settings, titi_config::settings::TUI_RENDER_MERMAID_KEY)
     });
+    // The value as written: `off`, `always` (the default) or `smart`, which
+    // has no judge model here and so behaves as `always`. Anything else — a
+    // typo, a switch written as `true`, an empty string — is the default, as
+    // every other cosmetic key treats a value it does not know.
+    chat.autograph = settings
+        .as_ref()
+        .and_then(|settings| settings.get(titi_config::settings::TUI_AUTOGRAPH_KEY))
+        .and_then(|value| value.as_str().map(titi_tui::chart::AutoGraph::parse))
+        .unwrap_or(titi_tui::chart::AutoGraph::Always);
     chat.smooth = settings.as_ref().is_some_and(|settings| {
         titi_config::settings::switch_on(
             settings,
