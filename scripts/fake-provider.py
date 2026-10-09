@@ -20,6 +20,10 @@ the real binary and the real HTTP stack:
                   live agent at a time
   "pin batch"     one `agent` call carrying `tasks: [...]`: the children run at
                   once, so the strip shows two live agents together
+  "pin exec"      a batch of two `agent` calls *and* a `bash` call in one
+                  response: the strip is live while the parent turn asks for an
+                  approval, which is the crossing a pane has to survive
+  "mermaid answer"  a `flowchart TD` fence, closed, so the transcript can draw it
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
@@ -158,6 +162,27 @@ def script(last: dict) -> list[tuple[dict, float]]:
                 {"name": "beta", "task": "slow beta", "kind": "subagent"},
                 index=1,
             )
+        ]
+    if "pin exec" in content:
+        return [(chunk({"content": "Batch and a shell. "}), 0)] + [
+            (c, 0)
+            for c in call(
+                "call_pin_exec",
+                "agent",
+                {
+                    "tasks": [
+                        {"task": "slow alpha", "name": "alpha"},
+                        {"task": "slow beta", "name": "beta"},
+                    ]
+                },
+            )
+        ] + [
+            (c, 0)
+            for c in call("call_exec", "bash", {"command": "echo qa-approval"})
+        ]
+    if "mermaid answer" in content:
+        return [
+            (chunk({"content": "Here it is.\n\n```mermaid\nflowchart TD\n  A[Start] --> B{Go?}\n  B -->|yes| C[Done]\n  B -->|no| A\n```\n"}), 0)
         ]
     if "pin batch" in content:
         return [(chunk({"content": "Spawning a batch. "}), 0)] + [
