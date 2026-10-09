@@ -15,8 +15,11 @@ the real binary and the real HTTP stack:
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
-  "pin agents"    two `agent` calls in one round (the pinned strip's subject:
-                  several live at once), each with a small task
+  "pin agents"    two `agent` calls in one round, each with a small task: the
+                  tool loop runs them one after another, so the strip shows one
+                  live agent at a time
+  "pin batch"     one `agent` call carrying `tasks: [...]`: the children run at
+                  once, so the strip shows two live agents together
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
@@ -140,7 +143,7 @@ def script(last: dict) -> list[tuple[dict, float]]:
             for c in call(
                 "call_agent_1",
                 "agent",
-                {"name": "alpha", "task": "say alpha", "kind": "subagent"},
+                {"name": "alpha", "task": "slow alpha", "kind": "subagent"},
                 index=0,
                 # The finish_reason belongs to the message, not to one call:
                 # sending it after the first call ends the round there, and the
@@ -152,8 +155,22 @@ def script(last: dict) -> list[tuple[dict, float]]:
             for c in call(
                 "call_agent_2",
                 "agent",
-                {"name": "beta", "task": "say beta", "kind": "subagent"},
+                {"name": "beta", "task": "slow beta", "kind": "subagent"},
                 index=1,
+            )
+        ]
+    if "pin batch" in content:
+        return [(chunk({"content": "Spawning a batch. "}), 0)] + [
+            (c, 0)
+            for c in call(
+                "call_batch",
+                "agent",
+                {
+                    "tasks": [
+                        {"task": "slow alpha", "name": "alpha"},
+                        {"task": "slow beta", "name": "beta"},
+                    ]
+                },
             )
         ]
     if "big output" in content:
