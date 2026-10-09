@@ -175,10 +175,15 @@ def script(last: dict) -> list[tuple[dict, float]]:
                         {"task": "slow beta", "name": "beta"},
                     ]
                 },
+                # Same reason as the batch above: a finish_reason on the first
+                # call ends the round there and the `bash` call never arrives.
+                finish=False,
             )
         ] + [
             (c, 0)
-            for c in call("call_exec", "bash", {"command": "echo qa-approval"})
+            for c in call(
+                "call_exec", "bash", {"command": "echo qa-approval"}, index=1
+            )
         ]
     if "mermaid answer" in content:
         return [
