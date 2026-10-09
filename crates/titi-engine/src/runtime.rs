@@ -2488,11 +2488,16 @@ async fn run_turn(
                     .await;
                 let mut last_error = None;
                 let mut completed = false;
+                // One fold per turn for a request the provider rejected as too
+                // long: the window does not change, so a second rejection is
+                // the answer.
+                let mut folded_for_length = false;
                 for attempt in 0..=config.max_transient_retries {
                     // A stall already waited out its own timeout; a rate limit or
                     // an outage is asked again only after a pause.
-                    if matches!(last_error, Some(TransportError::Retryable { .. }))
-                        && !back_off(retry_delay(config.retry_backoff, attempt), &aborted).await
+                    if let Some(wait) =
+                        retry_wait(last_error.as_ref(), config.retry_backoff, attempt)
+                        && !back_off(wait, &aborted).await
                     {
                         return None;
                     }
@@ -2570,9 +2575,35 @@ async fn run_turn(
                             if aborted.load(Ordering::SeqCst) {
                                 return None;
                             }
+                            // The request was longer than the model's window.
+                            // Fold once and ask again: a provider's own words
+                            // say what it refused, and the fold is the one
+                            // thing that can change the request's length.
+                            if !folded_for_length
+                                && error.is_context_too_long()
+                                && !visible_output
+                            {
+                                folded_for_length = true;
+                                let forced = titi_core::compaction::CompactionPolicy {
+                                    threshold_percent: 0.0,
+                                    ..config.compaction.clone()
+                                };
+                                let _ = crate::compaction::compact(
+                                    &mut messages,
+                                    &forced,
+                                    config.context_window.max(1),
+                                );
+                                last_error = None;
+                                continue;
+                            }
                             if visible_output || !error.is_retryable() {
                                 meter.settle(&events, turn_id).await;
-                                emit_transport_failure(&events, turn_id, error).await;
+                                emit_transport_failure(
+                                    &events,
+                                    turn_id,
+                                    error.naming_the_window(config.context_window),
+                                )
+                                .await;
                                 return None;
                             }
                             last_error = Some(error);
@@ -2625,6 +2656,23 @@ pub const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 
 /// The pause before attempt `attempt` (1 is the first retry): `base`, then
 /// doubled each time, capped.
+/// How long to wait before the next attempt.
+///
+/// What the provider asked for in a `retry-after`-family header wins; with
+/// nothing asked for, the caller's own doubling schedule applies. `None` means
+/// this error is not one to pause for at all (a stall already waited out its
+/// own timeout).
+fn retry_wait(
+    last_error: Option<&TransportError>,
+    base: std::time::Duration,
+    attempt: u32,
+) -> Option<std::time::Duration> {
+    let TransportError::Retryable { retry_after, .. } = last_error? else {
+        return None;
+    };
+    Some(retry_after.unwrap_or_else(|| retry_delay(base, attempt)))
+}
+
 fn retry_delay(base: std::time::Duration, attempt: u32) -> std::time::Duration {
     let doublings = attempt.saturating_sub(1).min(16);
     base.saturating_mul(1 << doublings).min(MAX_RETRY_BACKOFF)
@@ -2865,11 +2913,15 @@ async fn stream_attempt(
                     TransportError::Retryable {
                         status: None,
                         message,
+                        retry_after: None,
                     }
                 } else {
+                    // A stream error carries no status and no window: the
+                    // provider said what it said, in words.
                     TransportError::Fatal {
                         status: None,
                         message,
+                        context_too_long: false,
                     }
                 };
                 return Err((error, visible_output));
@@ -2882,6 +2934,7 @@ async fn stream_attempt(
         TransportError::Retryable {
             status: None,
             message: "stream ended without terminal event".into(),
+            retry_after: None,
         },
         visible_output,
     ))

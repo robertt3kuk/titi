@@ -953,6 +953,7 @@ mod tests {
             Err(TransportError::Fatal {
                 status: None,
                 message: "not wired".into(),
+                context_too_long: false,
             })
         }
     }
@@ -1290,6 +1291,7 @@ mod tests {
         let fetch = titi_providers::MockFetch::new(vec![Err(TransportError::Retryable {
             status: None,
             message: "request failed: connection refused".into(),
+            retry_after: None,
         })]);
         let provider = gateway("lmstudio", "http://127.0.0.1:1234/v1", None);
 
@@ -1489,6 +1491,7 @@ mod tests {
         let unreachable = titi_providers::MockFetch::new(vec![Err(TransportError::Retryable {
             status: None,
             message: "connection refused".into(),
+            retry_after: None,
         })]);
         registry.refresh_models(&provider, None, &unreachable).await;
         assert!(
