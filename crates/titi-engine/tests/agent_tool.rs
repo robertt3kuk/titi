@@ -287,6 +287,59 @@ async fn a_cancelled_turn_stops_the_child_it_spawned() {
     assert!(stopped, "the child was stopped with the turn: {events:?}");
 }
 
+/// A stopped child says so once. The status word is the whole message: the
+/// summary a stop carries is empty, and a renderer that printed both read as
+/// `alpha — was stopped stopped`.
+#[tokio::test]
+async fn a_stopped_batch_child_says_so_once() {
+    let transport = Arc::new(MockTransport::new(vec![MockBody::Events(tool_call(
+        "agent",
+        r#"{"tasks":[{"task":"left","name":"alpha"},{"task":"right","name":"beta"}]}"#,
+    ))]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(HangingRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+
+    let mut started = 0;
+    while started < 2 {
+        if let EngineEvent::AgentStarted { .. } = engine.recv().await.expect("an event") {
+            started += 1;
+        }
+    }
+    engine.send(EngineCommand::Cancel).await.unwrap();
+
+    // The tool answers each child the group did not finish; the ones it
+    // stopped answer through their own status.
+    let mut output = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = engine.recv().await {
+            if let EngineEvent::ToolFinished { output: text, .. } = &event {
+                output = text.to_string();
+                break;
+            }
+        }
+    })
+    .await;
+    // The surface renders the answer as one line, so newlines collapse: this
+    // is the text the user read as `alpha — was stopped stopped`.
+    let rendered: String = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !rendered.contains("stopped stopped"),
+        "the status is said once: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("was stopped"),
+        "and it is said: {rendered:?}"
+    );
+}
+
 /// Depth is bounded by the tool list: the subagent's own registry has no
 /// `agent` tool, so a subagent cannot spawn a subagent at any depth.
 #[tokio::test]

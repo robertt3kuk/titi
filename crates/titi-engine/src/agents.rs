@@ -212,7 +212,9 @@ impl AgentSupervisor {
         // flag, so this is the only outcome that waiter gets.
         let _ = record.outcome_tx.send(Some(AgentOutcome {
             status: AgentStatus::Aborted,
-            summary: "stopped".into(),
+            // Empty: the status is what there is to say, and a caller that
+            // prints both would say "was stopped" twice.
+            summary: SmolStr::default(),
             success: false,
         }));
         drop(records);

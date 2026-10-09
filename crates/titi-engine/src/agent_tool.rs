@@ -255,13 +255,18 @@ impl AgentTool {
 
         match outcome {
             Some(outcome) => ToolResult {
-                output: format!(
-                    "agent {} {}: {}",
-                    item.name,
-                    word(Some(&outcome)),
-                    capped(&outcome.summary, MAX_ANSWER_CHARS)
-                )
-                .into(),
+                output: match outcome.summary.is_empty() {
+                    // A child that was stopped has nothing to add to its
+                    // status; a colon and an empty answer would say it twice.
+                    true => format!("agent {} {}", item.name, word(Some(&outcome))).into(),
+                    false => format!(
+                        "agent {} {}: {}",
+                        item.name,
+                        word(Some(&outcome)),
+                        capped(&outcome.summary, MAX_ANSWER_CHARS)
+                    )
+                    .into(),
+                },
                 is_error: !outcome.success,
                 detail: None,
             },
@@ -455,8 +460,12 @@ fn sections(items: &[Item], outcomes: &[Option<AgentOutcome>]) -> SmolStr {
             .as_ref()
             .map(|outcome| outcome.summary.as_str())
             .unwrap_or_default();
-        out.push_str(&capped(answer, share));
-        out.push('\n');
+        // A stopped child has no answer to print: the header already said so,
+        // and repeating it reads as "was stopped stopped".
+        if !answer.is_empty() {
+            out.push_str(&capped(answer, share));
+            out.push('\n');
+        }
     }
     out.trim_end().into()
 }
