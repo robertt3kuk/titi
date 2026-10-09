@@ -299,6 +299,7 @@ fn store_oauth_row(
 fn token_response() -> MockFetchResponse {
     MockFetchResponse {
         status: 200,
+        headers: Vec::new(),
         chunks: vec![
             r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#
                 .to_owned(),
@@ -373,6 +374,7 @@ async fn a_rejected_refresh_token_removes_the_row() {
 
     let fetch = MockFetch::new(vec![Ok(MockFetchResponse {
         status: 400,
+        headers: Vec::new(),
         chunks: vec![r#"{"error":"invalid_grant","error_description":"expired"}"#.to_owned()],
     })]);
     let outcomes = source.refresh_due(&fetch).await;
@@ -551,6 +553,7 @@ async fn a_flagged_provider_is_listed_with_its_stored_credential() {
 
     let fetch = MockFetch::new(vec![Ok(MockFetchResponse {
         status: 200,
+        headers: Vec::new(),
         chunks: vec![r#"{"data":[{"id":"gpt-6-sol"},{"id":"gpt-5.5"}]}"#.to_owned()],
     })]);
     registry.discover_providers(&fetch).await;
@@ -642,6 +645,7 @@ async fn a_keyless_provider_is_still_listed_without_a_credential() {
 
     let fetch = MockFetch::new(vec![Ok(MockFetchResponse {
         status: 200,
+        headers: Vec::new(),
         chunks: vec![r#"{"data":[{"id":"qwen3:8b"}]}"#.to_owned()],
     })]);
     registry.discover_providers(&fetch).await;
