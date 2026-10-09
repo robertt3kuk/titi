@@ -74,11 +74,16 @@ def chunk(delta: dict, finish: str | None = None) -> dict:
     }
 
 
-def call(call_id: str, name: str, args: dict) -> list[dict]:
-    """One tool call, its arguments in a single fragment."""
+def call(call_id: str, name: str, args: dict, index: int = 0) -> list[dict]:
+    """One tool call, its arguments in a single fragment.
+
+    `index` numbers the call within the message: a provider that sends two
+    calls with the same index has them merged into one by any reader that
+    keys on it, which is what a two-call case must not do.
+    """
     return [
         chunk({"tool_calls": [{
-            "index": 0, "id": call_id, "type": "function",
+            "index": index, "id": call_id, "type": "function",
             "function": {"name": name, "arguments": json.dumps(args)},
         }]}),
         chunk({}, "tool_calls"),
@@ -136,6 +141,7 @@ def script(last: dict) -> list[tuple[dict, float]]:
                 "call_agent_1",
                 "agent",
                 {"name": "alpha", "task": "say alpha", "kind": "subagent"},
+                index=0,
             )
         ] + [
             (c, 0)
@@ -143,6 +149,7 @@ def script(last: dict) -> list[tuple[dict, float]]:
                 "call_agent_2",
                 "agent",
                 {"name": "beta", "task": "say beta", "kind": "subagent"},
+                index=1,
             )
         ]
     if "big output" in content:
