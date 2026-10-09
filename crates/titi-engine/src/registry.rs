@@ -102,7 +102,8 @@ impl ModelPrice {
             output: as_micro_dollars(output).map_err(|problem| format!("`output`: {problem}"))?,
             cached_input: match cached_input {
                 Some(text) => Some(
-                    as_micro_dollars(text).map_err(|problem| format!("`cachedInput`: {problem}"))?,
+                    as_micro_dollars(text)
+                        .map_err(|problem| format!("`cachedInput`: {problem}"))?,
                 ),
                 None => None,
             },
@@ -118,9 +119,8 @@ impl ModelPrice {
 /// wrote down.
 fn as_micro_dollars(text: &str) -> Result<u64, String> {
     let text = text.trim();
-    let unreadable = || {
-        format!("{text:?} is not a figure — dollars per million tokens, digits only")
-    };
+    let unreadable =
+        || format!("{text:?} is not a figure — dollars per million tokens, digits only");
     let (whole, fraction) = match text.split_once('.') {
         Some((whole, fraction)) => (whole, fraction),
         None => (text, ""),
@@ -139,12 +139,16 @@ fn as_micro_dollars(text: &str) -> Result<u64, String> {
     let units: u64 = if whole.is_empty() {
         0
     } else {
-        whole.parse().map_err(|_| format!("{text:?} is too large a figure"))?
+        whole
+            .parse()
+            .map_err(|_| format!("{text:?} is too large a figure"))?
     };
     let part: u64 = if fraction.is_empty() {
         0
     } else {
-        fraction.parse().map_err(|_| format!("{text:?} is too large a figure"))?
+        fraction
+            .parse()
+            .map_err(|_| format!("{text:?} is too large a figure"))?
     };
     units
         .checked_mul(1_000_000)
@@ -1311,6 +1315,7 @@ mod tests {
                 titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
                     status,
                     chunks: vec![r#"{"error":{"message":"invalid api key"}}"#.to_owned()],
+                    headers: Vec::new(),
                 })]);
             let provider = gateway("openai", "https://api.openai.com/v1", None);
 
@@ -1333,6 +1338,7 @@ mod tests {
         let fetch = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
             status: 404,
             chunks: vec!["not found".to_owned()],
+            headers: Vec::new(),
         })]);
         let provider = gateway("ollama", "http://127.0.0.1:11434/v1", None);
 
@@ -1452,6 +1458,7 @@ mod tests {
         let refused = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
             status: 401,
             chunks: vec![r#"{"error":"invalid api key"}"#.to_owned()],
+            headers: Vec::new(),
         })]);
         registry.refresh_models(&refusing, None, &refused).await;
 
@@ -1502,6 +1509,7 @@ mod tests {
         let refused = titi_providers::MockFetch::new(vec![Ok(titi_providers::MockFetchResponse {
             status: 403,
             chunks: vec!["forbidden".to_owned()],
+            headers: Vec::new(),
         })]);
         registry.refresh_models(&provider, None, &refused).await;
         assert_eq!(registry.discovery_errors().len(), 1);
@@ -1629,17 +1637,15 @@ mod user_price_tests {
     /// A model with no price is unpriced, exactly as before this key existed.
     #[test]
     fn a_model_without_a_price_is_left_unpriced() {
-        let (parsed, problems) = ProviderRegistryConfig::from_user_settings(
-            &serde_json::json!({
-                "providers": [{
-                    "id": "fake",
-                    "api": "openai-completions",
-                    "base_url": "http://127.0.0.1:18999/v1",
-                    "credential_required": false,
-                }],
-                "models": [{"id": "fake/scripted", "provider": "fake", "wire_model": "fake"}],
-            }),
-        );
+        let (parsed, problems) = ProviderRegistryConfig::from_user_settings(&serde_json::json!({
+            "providers": [{
+                "id": "fake",
+                "api": "openai-completions",
+                "base_url": "http://127.0.0.1:18999/v1",
+                "credential_required": false,
+            }],
+            "models": [{"id": "fake/scripted", "provider": "fake", "wire_model": "fake"}],
+        }));
         assert_eq!(problems, Vec::<String>::new());
         assert_eq!(price_of(&parsed), None);
     }
@@ -1650,10 +1656,7 @@ mod user_price_tests {
     #[test]
     fn a_price_that_cannot_be_read_is_refused_by_key() {
         for (price, expected) in [
-            (
-                serde_json::json!({"input": -2, "output": 15}),
-                "`input`",
-            ),
+            (serde_json::json!({"input": -2, "output": 15}), "`input`"),
             (
                 serde_json::json!({"input": "free", "output": 15}),
                 "`input`",
@@ -1669,7 +1672,10 @@ mod user_price_tests {
             (serde_json::json!({"input": 3}), "`output`"),
             (serde_json::json!({"output": 15}), "`input`"),
             (serde_json::json!(3), "expected a mapping"),
-            (serde_json::json!({"input": [3], "output": 15}), "not a number"),
+            (
+                serde_json::json!({"input": [3], "output": 15}),
+                "not a number",
+            ),
         ] {
             let (parsed, problems) = config(price.clone());
             let named = problems.join(" ");
