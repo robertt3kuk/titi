@@ -11788,7 +11788,7 @@ fn smooth_streaming_reveals_a_prefix_and_settles_at_a_tool_call() {
 
     // A tool call closes the line, so a reveal still in flight settles: the
     // line is whole from the frame the tool call lands in.
-    let mut chat = chat();
+    let chat = chat();
     pacing.smooth = true;
     type_text(&mut pacing, "hello");
     pacing.on_key(Key::Enter, Instant::now());
