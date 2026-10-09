@@ -182,7 +182,9 @@ pub enum StreamEvent {
     /// One thinking block finished streaming, with everything the provider
     /// needs echoed back. Emitted at the block's end, so the payload is
     /// complete.
-    ThinkingBlock { block: ThinkingBlock },
+    ThinkingBlock {
+        block: ThinkingBlock,
+    },
 }
 
 impl StreamEvent {

@@ -158,7 +158,11 @@ fn parse_http_date(text: &str) -> Option<u64> {
         return None;
     }
     // Days from civil (Howard Hinnant's algorithm), then the time of day.
-    let (y, m) = if month <= 2 { (year - 1, month + 12) } else { (year, month) };
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
     let era = y / 400;
     let yoe = y - era * 400;
     let doy = (153 * (m - 3) + 2) / 5 + day - 1;
@@ -513,7 +517,8 @@ fn gemini_contents_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
                     if !call.thought_signature.is_empty() {
                         // The signature belongs to the part, beside the call
                         // it signs.
-                        part["thoughtSignature"] = Value::String(call.thought_signature.to_string());
+                        part["thoughtSignature"] =
+                            Value::String(call.thought_signature.to_string());
                     }
                     parts.push(part);
                 }
@@ -1706,7 +1711,9 @@ mod tests {
         }];
 
         let anthropic = body_of(ApiKind::AnthropicMessages, &req);
-        let blocks = anthropic["messages"][0]["content"].as_array().expect("blocks");
+        let blocks = anthropic["messages"][0]["content"]
+            .as_array()
+            .expect("blocks");
         let types: Vec<&str> = blocks
             .iter()
             .filter_map(|block| block["type"].as_str())
@@ -1720,7 +1727,9 @@ mod tests {
         let responses = body_of(ApiKind::OpenAiResponses, &req);
         let input = responses["input"].as_array().expect("input");
         assert!(
-            input.iter().any(|item| item["encrypted_content"] == "responses-enc"),
+            input
+                .iter()
+                .any(|item| item["encrypted_content"] == "responses-enc"),
             "{responses}"
         );
         assert!(
@@ -1770,8 +1779,14 @@ mod tests {
             ApiKind::AnthropicMessages,
             ApiKind::GeminiGenerateContent,
         ] {
-            assert!(!context_length_rejection(api, "rejected (HTTP 401): invalid api key"));
-            assert!(!context_length_rejection(api, "rejected (HTTP 400): malformed tool call"));
+            assert!(!context_length_rejection(
+                api,
+                "rejected (HTTP 401): invalid api key"
+            ));
+            assert!(!context_length_rejection(
+                api,
+                "rejected (HTTP 400): malformed tool call"
+            ));
         }
     }
 
@@ -1808,11 +1823,9 @@ mod tests {
     /// the provider's own number in the message.
     #[tokio::test]
     async fn a_wait_past_the_cap_fails_the_attempt_by_name() {
-        let fetch = Arc::new(MockFetch::new(vec![Ok(
-            MockFetchResponse::sse(Vec::new())
-                .with_status(429)
-                .with_header("retry-after", "600"),
-        )]));
+        let fetch = Arc::new(MockFetch::new(vec![Ok(MockFetchResponse::sse(Vec::new())
+            .with_status(429)
+            .with_header("retry-after", "600"))]));
         let transport = FamilyTransport::new(
             ApiKind::OpenAiCompletions,
             "http://x/v1",
@@ -1831,10 +1844,7 @@ mod tests {
             error.to_string().contains("600"),
             "and names the wait: {error}"
         );
-        assert!(
-            error.to_string().contains("cap"),
-            "and the cap: {error}"
-        );
+        assert!(error.to_string().contains("cap"), "and the cap: {error}");
     }
 
     /// The two OpenAI families declare a tool differently: Completions nests

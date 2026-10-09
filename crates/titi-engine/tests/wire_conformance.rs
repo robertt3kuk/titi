@@ -427,7 +427,11 @@ async fn responses_keeps_every_call_and_its_arguments() {
         items
             .iter()
             .position(|item| item["type"] == "reasoning")
-            .zip(items.iter().position(|item| item["type"] == "function_call"))
+            .zip(
+                items
+                    .iter()
+                    .position(|item| item["type"] == "function_call")
+            )
             .is_some_and(|(reasoning, call)| reasoning < call),
         "before the call it reasoned about: {items:?}"
     );
