@@ -15,19 +15,25 @@ fn write(root: &Path, rel: &str, body: &str) {
     fs::write(path, body).unwrap();
 }
 
-/// Move a file's mtime an hour back, so a walk sees it as settled.
-///
-/// A file written within `RACY_MTIME` of the walk is read whatever its
-/// metadata says - two writes inside one timestamp tick look identical. A
-/// test about the *unchanged* case has to age its files past that window
-/// before the metadata gate is the thing under test.
-fn settle(root: &Path, rel: &str) {
+/// Put a file's mtime where the test wants it.
+fn set_mtime(root: &Path, rel: &str, at: SystemTime) {
     fs::File::options()
         .write(true)
         .open(root.join(rel))
         .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .set_modified(at)
         .unwrap();
+}
+
+/// Move a file's mtime an hour back, so a walk sees it as settled.
+///
+/// A file written within `RACY_MTIME` of the walk is read whatever its
+/// metadata says - two writes inside one timestamp tick look identical - and a
+/// record *taken* while its mtime was that fresh is distrusted for good. A
+/// test about the *unchanged* case has to age its files past that window
+/// before the metadata gate is the thing under test.
+fn settle(root: &Path, rel: &str) {
+    set_mtime(root, rel, SystemTime::now() - Duration::from_secs(3600));
 }
 
 #[test]
@@ -723,6 +729,48 @@ fn a_write_inside_one_mtime_tick_is_still_caught() {
     let stats = genome.refresh(root).unwrap();
     assert_eq!(stats.parsed, 1, "the bytes moved inside one tick");
     assert!(genome.files["src/a.rs"].exports.contains(&"ab".to_owned()));
+}
+
+/// A record taken while its mtime was still racy can never be trusted by
+/// metadata again, however settled the file looks later.
+///
+/// The sequence metadata alone loses: write at T, walk at T+0.5 - the file is
+/// racy, so it is read and the record holds mtime T - a second write of the
+/// same length at T+0.9 inside the same tick, which leaves the mtime at T, and
+/// a walk at T+3. The file has aged out of the racy window by then, so a rule
+/// that consults only the file's clock trusts it, size and mtime match, and
+/// the second write is never read by anything again. The record knows it was
+/// taken inside the window, so it is re-read and the hash settles it.
+#[test]
+fn a_record_taken_while_its_mtime_was_racy_is_never_trusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/a.rs", "pub fn aa() {}\n");
+    // An mtime that is racy at the moment it is read.
+    set_mtime(root, "src/a.rs", SystemTime::now() - Duration::from_secs(1));
+    let mut genome = Genome::index(root).unwrap();
+    let recorded = genome.files["src/a.rs"].clone();
+    assert!(
+        recorded.mtime + titi_genome::RACY_MTIME > recorded.read_at,
+        "the fixture's record was taken while its mtime was racy"
+    );
+
+    // A second write inside the same tick: the same length, and the mtime put
+    // back to the record's.
+    write(root, "src/a.rs", "pub fn ab() {}\n");
+    set_mtime(root, "src/a.rs", recorded.mtime);
+
+    // The file ages out of the window; the record does not.
+    std::thread::sleep(titi_genome::RACY_MTIME + Duration::from_millis(500));
+    let stats = genome.refresh(root).unwrap();
+    assert_eq!(stats.parsed, 1, "the record was racy, so the file is read");
+    assert!(genome.files["src/a.rs"].exports.contains(&"ab".to_owned()));
+
+    let fresh = genome.files["src/a.rs"].clone();
+    assert!(
+        fresh.mtime + titi_genome::RACY_MTIME <= fresh.read_at,
+        "and the record it wrote is settled, so this costs one read, not every walk"
+    );
 }
 
 /// A targeted update confirms content by hash exactly as a walk does: a

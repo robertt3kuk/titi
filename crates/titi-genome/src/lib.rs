@@ -152,6 +152,16 @@ pub struct FileRecord {
     pub raw_refs: Vec<String>,
     pub size: u64,
     pub mtime: SystemTime,
+    /// The moment this record's bytes were read.
+    ///
+    /// Together with `mtime` it answers a question the file cannot answer for
+    /// itself later: whether the record was taken while its `mtime` was still
+    /// inside [`RACY_MTIME`] of the read. A record that was can never be
+    /// trusted by metadata again - see `Genome::absorb` - because a second
+    /// write inside that same timestamp tick leaves `size` and `mtime` exactly
+    /// as this record has them, and by the time the file looks settled the
+    /// write that landed in between is no longer visible to any clock.
+    pub read_at: SystemTime,
     /// FNV-1a of the bytes this record was parsed from.
     ///
     /// `size` and `mtime` are the cheap pre-filter; this is the confirmation
@@ -169,15 +179,19 @@ pub struct FileRecord {
 /// is not a use of the file that uniquely exports `join`.
 pub const MAX_DEFINERS: usize = 1;
 
-/// How fresh a file's `mtime` may be before the walk stops trusting it.
+/// How fresh an `mtime` may be, against the clock of a read, before the walk
+/// stops trusting metadata about it.
 ///
-/// A file modified within this window of the moment it is listed is re-read
-/// even when `size` and `mtime` match its record: two writes inside one
-/// filesystem timestamp tick are indistinguishable by metadata alone, and the
-/// content hash that would tell them apart is only computed for a file that
-/// was read. Two seconds is the margin git's index uses for the same reason.
-/// It bounds the extra reads to what was just written; a settled tree pays
-/// nothing.
+/// Two writes inside one filesystem timestamp tick leave `size` and `mtime`
+/// exactly as they were, and the content hash that would tell them apart is
+/// only computed for a file that was read. So a file modified within this
+/// window of the moment it is listed is read whatever its metadata says - and
+/// a *record* taken while its own `mtime` was within this window of its read
+/// ([`FileRecord::read_at`]) is never trusted by metadata again, however
+/// settled the file looks later: the file ages out of the window, the write
+/// that landed inside it does not become visible again. Two seconds is the
+/// margin git's index uses for the same reason. A settled tree pays nothing;
+/// a just-written file pays at most one extra read after it settles.
 pub const RACY_MTIME: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One symbol the workspace defines, and who leans on it.
@@ -550,10 +564,25 @@ impl Genome {
                 if !settled {
                     return true;
                 }
-                !self
-                    .files
-                    .get(&file.path)
-                    .is_some_and(|record| record.size == file.size && record.mtime == file.mtime)
+                let Some(record) = self.files.get(&file.path) else {
+                    return true;
+                };
+                if record.size != file.size || record.mtime != file.mtime {
+                    return true;
+                }
+                // The metadata matches, and that is still not enough. The file
+                // above is settled *now*; the record may have been taken while
+                // it was not. Sequence that metadata alone loses: write at T,
+                // walk at T+0.5 (racy, so it is read; the record holds mtime
+                // T), a second same-length write at T+0.9 inside the same tick
+                // (mtime still T), walk at T+3 - the file has aged out, size
+                // and mtime match, and the second write is never read by
+                // anything again. So the record answers for its own clock: one
+                // taken inside the window is re-read on every walk until it is
+                // replaced by one taken outside it, and the hash then decides
+                // whether anything moved. That is at most one extra read for a
+                // file that was just written, and none for a settled tree.
+                record.mtime + RACY_MTIME > record.read_at
             })
             .collect();
         let stale = prioritize(stale, urgent);
@@ -994,6 +1023,10 @@ fn parse_one(
         if overlay.get(&file.path).is_none() && old.size == file.size && old.hash == hash {
             let mut record = old.clone();
             record.mtime = file.mtime;
+            // The bytes were read just now and agreed with the record, so the
+            // clock that matters for the next walk is this one, not the one
+            // the previous record was taken under.
+            record.read_at = SystemTime::now();
             return (record, false);
         }
     }
@@ -1017,6 +1050,7 @@ fn parse_one(
             raw_refs: result.refs,
             size: file.size,
             mtime: file.mtime,
+            read_at: SystemTime::now(),
             hash,
         },
         true,
