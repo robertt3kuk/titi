@@ -127,6 +127,19 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// Which entries `/tree` opens showing.
+///
+/// `default` (the whole tree, which is what it has always shown), `no-tools`
+/// (everything but the tool traffic) or `user-only` (only what the user said).
+/// Unset means `default`, and anything else — a typo, a number — leaves the
+/// tree as it was rather than refusing to start.
+///
+/// omp's `treeFilterMode` is the same key with two more modes
+/// (`modes/settings.ts:908`): its `all` would be this `default`, because titi's
+/// tree hides nothing to begin with, and its `labeled-only` has nothing to
+/// filter by, because a titi entry carries no label.
+pub const TREE_FILTER_MODE_KEY: &str = "treeFilterMode";
+
 /// Whether a finished turn's footer names its wall time.
 ///
 /// Unset means on. The footer is the dim row under the answer; this is the

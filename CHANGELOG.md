@@ -6,6 +6,7 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `/tree` shows what you ask it to: `alt+f` cycles the panel through every entry, everything but the tool traffic, and only what you said, and `treeFilterMode` (`default` / `no-tools` / `user-only`, unset = `default`) names the one it opens in. Hiding the tool rows does not break the tree: an entry whose parent the filter hides hangs from the nearest entry it keeps, so the answer that followed a tool call stays where it belongs instead of landing at the root. The title names the filter and counts what is left, and the cursor follows the entry it was on. omp's two other modes are not ported and the GAP says why.
 - `--continue` / `-c` reopens the newest session in the agent directory instead of starting blank; with nothing to resume, it starts fresh and says so. `session.autoResume`, set in a config layer, does the same at every launch and is off unless set.
 - A bare `exit`, `quit`, `q` (or `/exit`, `/quit`) in the composer leaves the chat instead of being sent to the model — straight away before the first turn, and on a second Enter once the session has one.
 - A second `Escape` on an empty composer opens the rewind cut, the same as `/rewind`.

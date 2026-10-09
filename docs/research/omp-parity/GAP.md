@@ -85,23 +85,23 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: small. `crates/titi-tui/src/status.rs` (a rolling delta estimate) + one field through the existing snapshot in `crates/titi-cli/src/chat.rs`.
 - beauty: `42 tok/s` next to the thinking level on the working row, last reading kept between turns.
 
-## 12. Auto-resume the last session
+## 12. Auto-resume the last session — **ported** (`--continue`/`-c` + `session.autoResume`)
 - omp: `autoResume` (`modes/settings.ts:30`, off by default) — resumes the most recent session in the cwd.
-- titi: absent — `grep -rli "autoResume\|auto_resume" crates/` → none; `main.rs` flags (`:85-196`) have no `--continue`, and the screen starts a new session every launch.
+- titi: `--continue`/`-c` reopens the newest session in the agent directory and `session.autoResume` (`crates/titi-config/src/settings.rs`, unset = off) does the same at every launch; with nothing to resume it starts fresh and says so. omp's is cwd-scoped where titi's is agent-dir-wide — the workspace is not in `SessionMeta` yet, which is a separate gap.
 - value: every user who closes the terminal and comes back — today the past turns are only reachable via `/sessions` or `Ctrl+X`.
 - cost: small. `crates/titi-cli/src/main.rs` (one flag + one config read) + a call into `titi-core::session::store` (already lists sessions); the restart path in `crates/titi-cli/src/chat.rs` already replays a session.
 - beauty: the lockup's fact block shows yesterday's session instead of a fresh one; no new chrome.
 
-## 13. Bare exit / bare slash commands
+## 13. Bare exit / bare slash commands — **ported** (bare `exit`/`quit`/`q`, and a second Enter once the session has turns)
 - omp: `input.bareExitOnEmptySession` (`modes/settings.ts:882`) and `input.bareSlashCommands` (`:895`, Enter twice to confirm once messages exist).
-- titi: absent — `grep -rn '"exit"\|"quit"' crates/titi-cli/src/chat.rs` → none; a bare `exit` is submitted to the model.
+- titi: a bare `exit`/`quit`/`q` (or `/exit`, `/quit`) in the composer leaves the chat — straight away before the first turn, and on a second Enter once the session has turns (`Chat::exit_word`, the same two-press window Ctrl+C uses). `input.bareSlashCommands` (a bare `/` meaning a command) is not ported.
 - value: every user in their first minute — typing `exit` (or `q`) to leave is muscle memory.
 - cost: tiny (single file). `crates/titi-cli/src/chat.rs` submit path only.
 - beauty: `exit` quits (or shows `press Enter again to quit` mid-session) instead of costing an API call.
 
-## 14. Double-Escape action
+## 14. Double-Escape action — **ported** (a second Esc on an empty composer opens the rewind; `doubleEscapeAction`'s `tree` and `none` are not offered)
 - omp: `doubleEscapeAction` (`modes/settings.ts:867`, rewind / tree / none); handled in `pi-coding-agent/src/modes/controllers/input-controller.ts:582-586`, legacy mapping at `config/settings.ts:2579`.
-- titi: partly — Esc-Esc already backs out of pickers (`crates/titi-cli/src/chat.rs:7898-7920`), but with an empty composer it does nothing; `/rewind` and `/fork` are typed commands.
+- titi: a second Esc on an empty composer opens the rewind cut (`Chat::escape`, the same 2 s window Ctrl+C uses), which is exactly what `/rewind` does; Esc on an open list or picker still closes that first. `doubleEscapeAction` is not a setting: `tree` and `none` are not offered, and the chord is always the rewind.
 - value: every user who wants to undo the last turn — one chord instead of typing `/rewind`.
 - cost: small. `crates/titi-cli/src/chat.rs` only (reuse the existing 2-press timer).
 - beauty: an empty composer + Esc Esc opens the rewind picker that `/rewind` already shows.
@@ -134,9 +134,9 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: small–medium. `crates/titi-tools/src/fs.rs` (numbering) + `crates/titi-tui/src/markdown.rs` (reuse the new table/render path for `.md`).
 - beauty: read blocks show `  12 │` gutters; a `.md` read renders as the same styled transcript markdown.
 
-## 19. Transcript display preferences
+## 19. Transcript display preferences — **partly ported** (`/details` hides a section; the `Compacted` divider is the fold)
 - omp: `display.smoothStreaming` (`modes/settings.ts:622`), `display.collapseCompacted` (`:693`), `display.hideToolActivity` (`:634`).
-- titi: partly — `/details` visibility per section exists (`crates/titi-tui/src/transcript.rs:94`), so "hide tool activity" is covered, but there is no smooth reveal (`grep -rli smooth crates/` → none) and no post-compaction collapse divider (`grep -rn "collapse\|fold\|divider" crates/titi-tui/src/transcript.rs` → none; `/compact` folds history in place, `crates/titi-cli/src/chat.rs:3025`).
+- titi: `/details` sets the visibility of each transcript section (`Chat::details`, `titi_tui::markdown::SectionMode`), which covers "hide tool activity"; the post-compaction collapse is the `LineKind::Fold` divider the engine's `Compacted` event pushes (`▸ folded 14 turns · 22k tokens`, expanded by `/details folded expanded`), which is `display.collapseCompacted`'s job. Missing: `display.smoothStreaming` — the reveal is per delta today, not paced (`grep -rli smooth crates/` → none), and it is the one item here that would make every streaming frame time-dependent.
 - value: every user after the first compaction — a folded divider keeps the live transcript short.
 - cost: small. `crates/titi-tui/src/transcript.rs` (a summary divider with an expander) + the compaction event in `crates/titi-cli/src/chat.rs`.
 - beauty: one line — `▸ folded 14 turns · 22k tokens` — expandable with the existing `/details` machinery.
@@ -163,13 +163,12 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: medium. `crates/titi-soul/src/builder.rs` (invite it) + `crates/titi-tui/src/transcript.rs` (badge row) + engine parse of the marker.
 - beauty: `👍` on the right edge of your prompt bubble; no layout shift, one theme colour.
 
-## 23. Session tree with filters + branch summaries — **partly ported** (`/tree`: the tree view and the branch switch)
-- omp: `treeFilterMode` (`modes/settings.ts:908`), `branchSummary.enabled` (`session/context-settings.ts:528`), `doubleEscapeAction: "tree"` (`:867`); commands `/branch`, `/tree`, `/move`.
-- titi: partly — `/tree` draws one session's stored entries as the tree they are (`SessionStore::open` for every branch, `walk` for the path to the leaf) in the panel above the composer: indented by depth, the path to the leaf marked `•`, the leaf named `✓ current`, the title counting the entries off the path. Enter moves the leaf to the row under the cursor and replays that path to the engine (`crates/titi-cli/src/session_fs.rs:branch_at` → `EngineCommand::RestoreHistory`), so the entry left behind stays in the store: a branch, not a rewind. `/fork` and `/sessions` are as they were. Still missing: the filter modes (`treeFilterMode`), a generated one-line summary per branch (`branchSummary.enabled`), `/branch` and `/move`, and `doubleEscapeAction: "tree"` — titi's Esc-Esc is the rewind (entry 14).
+## 23. Session tree with filters + branch summaries — **partly ported** (`/tree` view + branch switch; the filter: `feat(cli): filter what the tree shows`)
+- omp: `treeFilterMode` (`modes/settings.ts:908`, `default`/`no-tools`/`user-only`/`labeled-only`/`all`, default `default`) as the mode the panel opens in, plus alt+key shortcuts and filter tabs inside it (`pi-tui/src/overlays/tree-selector.ts:15,573`); `branchSummary.enabled` (`session/context-settings.ts:528`); `doubleEscapeAction: "tree"` (`:867`); commands `/branch`, `/tree`, `/move`.
+- titi: `/tree` draws one session's stored entries as the tree they are (`SessionStore::open` for every branch, `walk` for the path to the leaf) in the panel above the composer: indented by depth, the path to the leaf marked `•`, the leaf named `✓ current`, the title counting the entries off the path. Enter moves the leaf to the row under the cursor and replays that path to the engine (`crates/titi-cli/src/session_fs.rs:branch_at` → `EngineCommand::RestoreHistory`), so the entry left behind stays in the store: a branch, not a rewind. The filter is in too: `treeFilterMode` names the mode the panel opens in and `alt+f` cycles it, and a hidden entry's children are re-parented onto the nearest entry the filter keeps (`TreeFilter`/`lay_out`, `crates/titi-cli/src/pickers.rs`), so hiding the tool traffic leaves one tree rather than a row of orphans at depth 0.
+- not ported, and why: omp's `all` would be titi's `default` (titi's tree hides nothing to begin with, where omp's hides bookkeeping entries) and `labeled-only` has nothing to filter by (a titi entry carries no label); a generated one-line summary per branch (`branchSummary.enabled`) needs a model call, which is the engine's half and not this wave's; `/move` (moving a branch to another parent) has no store operation; `doubleEscapeAction: "tree"` is moot, because the chord is already the rewind (`feat(cli): rewind on a double Escape`).
 - value: users exploring multiple approaches in one repo.
-- cost: medium–large. `crates/titi-core/src/session/` (parent links) + `crates/titi-tui/src/panels.rs` (tree overlay) + `crates/titi-cli/src/chat.rs`.
-- beauty: an indented tree with filter chips (`all / tools / files`), each branch showing a one-line summary it generated.
-
+- cost: paid for the view, the branch switch and the filter; the summary is the one piece left.
 ## 24. Mermaid fenced blocks as ASCII diagrams
 - omp: `tui.renderMermaid` (`modes/settings.ts:417`); `pi-tui/src/chat/fence-figure.ts:38-68` and `components/markdown.ts:3141`, cache in `pi-tui/src/theme/mermaid-cache.ts:1`.
 - titi: absent — `grep -rli mermaid crates/` → none; titi's markdown draws every fence as a box (`crates/titi-tui/src/markdown.rs:281`).

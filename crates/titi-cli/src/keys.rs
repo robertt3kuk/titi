@@ -321,6 +321,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
         what: "pick a model",
     },
     Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "alt+f",
+        what: "cycle what `/tree` shows: everything, no tool traffic, only yours",
+    },
+    Hotkey {
         group: HotkeyGroup::Transcript,
         keys: "↑ · ↓",
         what: "scroll the transcript a row, with text in the draft",
@@ -548,6 +553,10 @@ impl Chat {
                 self.open_model_picker();
                 Applied::none()
             }
+            // alt+f is the tree's own: with no tree open it does nothing
+            // rather than opening one, so the key cannot surprise a composer.
+            Key::AltF if self.tree_picker.is_some() => self.tree_picker_key(key, now),
+            Key::AltF => Applied::none(),
             Key::CtrlD if self.input.is_empty() => Applied::effect(ChatEffect::Quit),
             Key::Up if self.picking() => {
                 self.move_picker(-1);
@@ -1153,6 +1162,7 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         // leaves both chords with nothing to reach.
         KeyCode::Char('x') if control => Some(Key::CtrlX),
         KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltF),
         KeyCode::Char('r') if control => Some(Key::CtrlR),
         KeyCode::Char('w') if control => Some(Key::DeleteWord),
         // The two ends of the keyboard's own word delete: the macOS chord and

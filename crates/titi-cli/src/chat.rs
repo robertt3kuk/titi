@@ -155,6 +155,18 @@ fn footer_switches(
     }
 }
 
+/// Which entries `/tree` opens showing (`treeFilterMode`).
+///
+/// Unset, unknown, or anything that is not one of the filter's names is the
+/// whole tree: a typo in a cosmetic key leaves the panel as it was rather than
+/// refusing to start, the way every other cosmetic key here reads.
+fn tree_filter(settings: Option<&titi_config::settings::Settings>) -> TreeFilter {
+    setting_string(settings, titi_config::settings::TREE_FILTER_MODE_KEY)
+        .as_deref()
+        .and_then(TreeFilter::from_id)
+        .unwrap_or_default()
+}
+
 /// One notification the run state owes the terminal, from an event the screen
 /// saw once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +232,8 @@ pub enum Key {
     CtrlX,
     /// `app.model.select`: alt+m.
     AltM,
+    /// The `/tree` filter: alt+f, while the tree is open.
+    AltF,
     /// `app.history.search`: ctrl+r.
     CtrlR,
     /// Delete the word before the caret: alt+backspace or ctrl+w.
@@ -539,6 +553,10 @@ pub struct Chat {
     /// `/tree`: the session's own entries as a tree, the leaf marked; `None` =
     /// closed.
     pub(crate) tree_picker: Option<TreePicker>,
+    /// Which entries `/tree` opens showing (`treeFilterMode`), and what alt+f
+    /// cycles from there. Read from the settings at startup; unset is the whole
+    /// tree, which is what `/tree` has always shown.
+    pub(crate) tree_filter: TreeFilter,
     /// The large-paste menu: a paste long enough for `paste.menuThreshold`,
     /// held while the panel offers the ways to attach it; `None` = closed.
     pub(crate) paste_menu: Option<PasteMenu>,
@@ -736,6 +754,7 @@ impl Chat {
             login_picker: None,
             session_picker: None,
             tree_picker: None,
+            tree_filter: TreeFilter::default(),
             workspace: crate::session_fs::current_workspace(),
             paste_menu: None,
             paste_menu_after: PASTE_MENU_AFTER,
@@ -3882,6 +3901,7 @@ pub fn run(
         .as_ref()
         .and_then(|settings| settings.paste_menu_threshold())
         .unwrap_or(PASTE_MENU_AFTER);
+    chat.tree_filter = tree_filter(settings.as_ref());
     // The vim keys, off unless `editor.vim` asks for them: a switch that
     // changes what typing does is not turned on by a config that says nothing.
     chat.vim = settings
@@ -11017,6 +11037,7 @@ mod tests {
             Key::CtrlX => "ctrl+x",
             Key::CtrlR => "ctrl+r",
             Key::AltM => "alt+m",
+            Key::AltF => "alt+f",
             // Neither half-page key can be pressed any more: the crate's table
             // gives ctrl+u to the caret's own delete and ctrl+d to quit, and
             // `map_key` reaches the half-page arms after both.
@@ -16070,6 +16091,194 @@ mod tests {
         chat.on_key(Key::Esc, Instant::now());
         assert!(chat.tree_picker.is_none());
         assert_eq!(store.open(&id).expect("entries").len(), 4);
+    }
+
+    /// A session with the shape a working turn leaves: your prompt, the
+    /// answer, the tool call, and the answer that followed it.
+    fn tool_session() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp");
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        let id = store
+            .create(titi_core::session::SessionMeta::default())
+            .expect("session");
+        store
+            .append(&id, Role::User, "read the config")
+            .expect("you");
+        store
+            .append(&id, Role::Assistant, "reading it")
+            .expect("titi");
+        store.append(&id, Role::Tool, "fn main() {}").expect("tool");
+        store
+            .append(&id, Role::Assistant, "the config reads fine")
+            .expect("after");
+        (dir, id)
+    }
+
+    /// The tree rows of an open picker, as the panel draws them.
+    fn tree_rows(chat: &Chat) -> Vec<String> {
+        chat.tree_picker
+            .as_ref()
+            .expect("the tree is open")
+            .rows
+            .iter()
+            .map(|row| row.text.clone())
+            .collect()
+    }
+
+    /// `alt+f` narrows the tree, and the tree stays one tree: an entry whose
+    /// parent the filter hides hangs from the nearest entry the filter keeps
+    /// instead of breaking off the trunk and landing at depth 0.
+    #[test]
+    fn the_tree_filter_hides_the_tool_traffic_and_keeps_the_tree_whole() {
+        let (dir, id) = tool_session();
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(
+            tree_rows(&chat),
+            [
+                "• you   read the config",
+                "  • titi  reading it",
+                "    • tool  fn main() {}",
+                "      • titi  the config reads fine  ✓ current",
+            ]
+        );
+
+        // alt+f: everything but the tool traffic. The answer that followed the
+        // tool call keeps its place under the message above it.
+        chat.on_key(Key::AltF, Instant::now());
+        assert_eq!(
+            tree_rows(&chat),
+            [
+                "• you   read the config",
+                "  • titi  reading it",
+                "    • titi  the config reads fine  ✓ current",
+            ],
+            "the tool row is gone and the tree is still one tree"
+        );
+        let picker = chat.tree_picker.as_ref().expect("the tree is open");
+        assert_eq!(picker.filter, TreeFilter::NoTools);
+        assert_eq!(picker.selected, 2, "the cursor followed the leaf");
+        assert_eq!(picker.off_path, 0, "everything left is on the path");
+
+        // Once more: only what you said, and the cursor is on the entry it was
+        // on when that entry survives.
+        chat.on_key(Key::AltF, Instant::now());
+        assert_eq!(tree_rows(&chat), ["• you   read the config"]);
+        let picker = chat.tree_picker.as_ref().expect("the tree is open");
+        assert_eq!(picker.filter, TreeFilter::UserOnly);
+        assert_eq!(picker.selected, 0, "the only row there is");
+        assert_eq!(picker.off_path, 0);
+
+        // And round again: the whole tree, with the cursor on the entry it
+        // was on — your prompt, which every filter shows.
+        chat.on_key(Key::AltF, Instant::now());
+        assert_eq!(tree_rows(&chat).len(), 4);
+        let picker = chat.tree_picker.as_ref().expect("the tree is open");
+        assert_eq!(picker.filter, TreeFilter::Default);
+        assert_eq!(picker.selected, 0, "the entry the cursor was on");
+    }
+
+    /// The filter is a view, not a move: Enter after a filter still branches
+    /// on the row the cursor is on, and Esc leaves the store alone.
+    #[test]
+    fn a_filtered_tree_still_branches_where_the_cursor_is() {
+        let (dir, id) = tool_session();
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        chat.on_key(Key::AltF, Instant::now());
+        assert_eq!(
+            chat.tree_picker.as_ref().expect("open").filter,
+            TreeFilter::NoTools
+        );
+
+        // Up twice: from the leaf (the last row) to your own prompt.
+        chat.on_key(Key::Up, Instant::now());
+        chat.on_key(Key::Up, Instant::now());
+        let picker = chat.tree_picker.as_ref().expect("the tree is open");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.selected_id(), Some(picker.rows[0].entry_id.as_str()));
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.tree_picker.is_none());
+        let store = titi_core::session::SessionStore::new(dir.path()).expect("store");
+        assert_eq!(store.open(&id).expect("entries").len(), 4, "nothing moved");
+    }
+
+    /// The setting names the filter the panel opens in, and an unknown name is
+    /// the whole tree rather than a refusal to start.
+    #[test]
+    fn the_tree_filter_mode_setting_names_the_opening_filter() {
+        let dir = tempfile::tempdir().expect("temp");
+        let project = tempfile::tempdir().expect("temp");
+        let settings = |text: &str| {
+            std::fs::write(dir.path().join("config.yml"), text).expect("write");
+            titi_config::settings::Settings::load(dir.path(), project.path(), &[]).expect("load")
+        };
+        assert_eq!(tree_filter(None), TreeFilter::Default);
+        assert_eq!(
+            tree_filter(Some(&settings("treeFilterMode: no-tools\n"))),
+            TreeFilter::NoTools
+        );
+        assert_eq!(
+            tree_filter(Some(&settings("treeFilterMode: user-only\n"))),
+            TreeFilter::UserOnly
+        );
+        assert_eq!(
+            tree_filter(Some(&settings("treeFilterMode: default\n"))),
+            TreeFilter::Default
+        );
+        assert_eq!(
+            tree_filter(Some(&settings("treeFilterMode: everything\n"))),
+            TreeFilter::Default,
+            "a typo leaves the tree as it was"
+        );
+        assert_eq!(
+            tree_filter(Some(&settings("treeFilterMode: 7\n"))),
+            TreeFilter::Default
+        );
+
+        // And the panel opens in it, and says so in the title.
+        let (dir, id) = tool_session();
+        let mut chat = Chat::new("openai/gpt-4.1", &id, test_theme());
+        chat.agent_dir = dir.path().to_path_buf();
+        chat.tree_filter = TreeFilter::NoTools;
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        assert_eq!(tree_rows(&chat).len(), 3, "the tool row is not drawn");
+        let view = panel_view_for(&chat, 30, 100).expect("a panel");
+        let title = view.title.clone().unwrap_or_default();
+        assert!(
+            title.contains("tree · 3 entries · no-tools · 0 off this path"),
+            "{title:?}"
+        );
+
+        // The default view does not name a filter it is not.
+        chat.tree_filter = TreeFilter::Default;
+        chat.tree_picker = None;
+        type_text(&mut chat, "/tree");
+        chat.on_key(Key::Enter, Instant::now());
+        let view = panel_view_for(&chat, 30, 100).expect("a panel");
+        let title = view.title.clone().unwrap_or_default();
+        assert!(
+            title.contains("tree · 4 entries · 0 off this path"),
+            "{title:?}"
+        );
+    }
+
+    /// alt+f with no tree open does nothing: the key belongs to the panel, and
+    /// must not surprise the composer.
+    #[test]
+    fn the_tree_filter_key_is_the_panels_own() {
+        let mut chat = chat();
+        type_text(&mut chat, "draft");
+        assert!(chat.on_key(Key::AltF, Instant::now()).effect.is_none());
+        assert_eq!(chat.input, "draft", "the composer is untouched");
+        assert!(chat.tree_picker.is_none(), "and no tree opened");
     }
 
     /// Enter on a row moves the leaf there: the path through it is what the

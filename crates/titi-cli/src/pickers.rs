@@ -799,6 +799,65 @@ pub(crate) struct TreeRow {
     pub(crate) text: String,
 }
 
+/// Which entries a tree shows.
+///
+/// omp's `treeFilterMode` is the same idea (`pi-tui/src/overlays/tree-selector.ts:15`),
+/// with two of its five modes left out on purpose: `all` would be this
+/// `default` (titi's tree hides nothing to begin with, where omp's hides
+/// bookkeeping entries), and `labeled-only` has nothing to filter by, because
+/// a titi entry carries no label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TreeFilter {
+    /// Every entry, which is what `/tree` has always shown.
+    #[default]
+    Default,
+    /// Everything but the tool traffic: a working session is mostly tool calls,
+    /// and the tool rows are what buries the two messages around them.
+    NoTools,
+    /// Only what the user said.
+    UserOnly,
+}
+
+impl TreeFilter {
+    /// The name the setting writes and the panel's title shows.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            TreeFilter::Default => "default",
+            TreeFilter::NoTools => "no-tools",
+            TreeFilter::UserOnly => "user-only",
+        }
+    }
+
+    /// The filter a setting name asks for. `None` for anything else, so a typo
+    /// in a cosmetic key leaves the panel as it was.
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "default" => Some(TreeFilter::Default),
+            "no-tools" => Some(TreeFilter::NoTools),
+            "user-only" => Some(TreeFilter::UserOnly),
+            _ => None,
+        }
+    }
+
+    /// The next filter, for the key that cycles them.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            TreeFilter::Default => TreeFilter::NoTools,
+            TreeFilter::NoTools => TreeFilter::UserOnly,
+            TreeFilter::UserOnly => TreeFilter::Default,
+        }
+    }
+
+    /// Whether the tree shows this entry.
+    fn shows(self, entry: &titi_core::session::Entry) -> bool {
+        match self {
+            TreeFilter::Default => true,
+            TreeFilter::NoTools => entry.role != titi_core::session::Role::Tool,
+            TreeFilter::UserOnly => entry.role == titi_core::session::Role::User,
+        }
+    }
+}
+
 /// The `/tree` picker: one session's stored entries as the tree they are.
 ///
 /// The store is append-only, so every branch ever taken is still in it — this
@@ -813,12 +872,26 @@ pub(crate) struct TreePicker {
     /// Entries the path to the leaf does not hold, for the title: what a move
     /// away from where the screen is would put behind it.
     pub(crate) off_path: usize,
+    /// Every entry of the session, kept so the filter key can lay the tree out
+    /// again without reading the store a second time.
+    entries: Vec<titi_core::session::Entry>,
+    /// The path to the leaf, as ids: what keeps the marks right when the
+    /// filter changes.
+    path: Vec<String>,
+    /// The leaf: the entry the store says the session is on.
+    leaf: Option<String>,
+    /// Which entries the tree is showing.
+    pub(crate) filter: TreeFilter,
 }
 
 impl TreePicker {
     /// Reads one session's entries and lays them out as a tree, the leaf's own
     /// path marked and the cursor on the leaf.
-    pub(crate) fn open(agent_dir: &std::path::Path, session_id: &str) -> Result<Self, String> {
+    pub(crate) fn open(
+        agent_dir: &std::path::Path,
+        session_id: &str,
+        filter: TreeFilter,
+    ) -> Result<Self, String> {
         let store = titi_core::session::SessionStore::new(agent_dir).map_err(|e| e.to_string())?;
         let entries = store.open(session_id).map_err(|e| e.to_string())?;
         if entries.is_empty() {
@@ -826,69 +899,51 @@ impl TreePicker {
         }
         let path = store.walk(session_id, None).map_err(|e| e.to_string())?;
         let leaf = path.last().map(|entry| entry.id.clone());
-        let on_path: std::collections::HashSet<&str> =
-            path.iter().map(|entry| entry.id.as_str()).collect();
-
-        // parent → its children, in the order they were appended; an entry
-        // whose parent is not in the log is a root (a torn write, or a branch
-        // whose head was pruned).
-        let mut children: std::collections::HashMap<&str, Vec<usize>> =
-            std::collections::HashMap::new();
-        let index: std::collections::HashMap<&str, usize> = entries
-            .iter()
-            .enumerate()
-            .map(|(at, entry)| (entry.id.as_str(), at))
-            .collect();
-        let mut roots: Vec<usize> = Vec::new();
-        for (at, entry) in entries.iter().enumerate() {
-            match entry.parent_id.as_deref().and_then(|id| index.get(id)) {
-                Some(parent) => children
-                    .entry(entries[*parent].id.as_str())
-                    .or_default()
-                    .push(at),
-                None => roots.push(at),
-            }
-        }
-
-        let mut rows = Vec::new();
-        let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|at| (*at, 0)).collect();
-        while let Some((at, depth)) = stack.pop() {
-            let entry = &entries[at];
-            let mark = if on_path.contains(entry.id.as_str()) {
-                "• "
-            } else {
-                "  "
-            };
-            let current = if leaf.as_deref() == Some(entry.id.as_str()) {
-                "  ✓ current"
-            } else {
-                ""
-            };
-            rows.push(TreeRow {
-                entry_id: entry.id.clone(),
-                text: format!(
-                    "{indent}{mark}{role}  {label}{current}",
-                    indent = "  ".repeat(depth),
-                    role = tree_role(entry.role),
-                    label = one_line(entry.content.trim(), 60),
-                ),
-            });
-            if let Some(kids) = children.get(entry.id.as_str()) {
-                for kid in kids.iter().rev() {
-                    stack.push((*kid, depth + 1));
-                }
-            }
-        }
+        let rows = lay_out(&entries, &path, filter);
+        // The cursor opens on the leaf when the filter shows it, and on the
+        // last row when it does not (the leaf of a session whose last entry is
+        // a tool call is hidden by `no-tools`).
         let selected = rows
             .iter()
             .position(|row| leaf.as_deref() == Some(row.entry_id.as_str()))
             .unwrap_or(rows.len() - 1);
-        let off_path = entries.len().saturating_sub(on_path.len());
         Ok(Self {
             rows,
             selected,
-            off_path,
+            off_path: off_path(&entries, &path, filter),
+            entries,
+            path: path.iter().map(|entry| entry.id.clone()).collect(),
+            leaf,
+            filter,
         })
+    }
+
+    /// Shows the entries another filter keeps, keeping the cursor on the entry
+    /// it was on when that entry survives — and on the leaf's nearest visible
+    /// ancestor when it does not, so the cursor never lands on nothing.
+    pub(crate) fn set_filter(&mut self, filter: TreeFilter) {
+        if filter == self.filter {
+            return;
+        }
+        let on = self.selected_id().map(str::to_owned);
+        let path: Vec<titi_core::session::Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| self.path.contains(&entry.id))
+            .cloned()
+            .collect();
+        self.rows = lay_out(&self.entries, &path, filter);
+        self.off_path = off_path(&self.entries, &path, filter);
+        self.filter = filter;
+        let wanted = on
+            .as_deref()
+            .and_then(|id| self.rows.iter().position(|row| row.entry_id == id))
+            .or_else(|| {
+                self.leaf
+                    .as_deref()
+                    .and_then(|id| self.rows.iter().position(|row| row.entry_id == id))
+            });
+        self.selected = wanted.unwrap_or_else(|| self.rows.len().saturating_sub(1));
     }
 
     /// The entry the cursor is on.
@@ -897,6 +952,114 @@ impl TreePicker {
             .get(self.selected)
             .map(|row| row.entry_id.as_str())
     }
+}
+
+/// Lays the entries out as a tree under `filter`.
+///
+/// An entry the filter hides is stepped over: its children hang from the
+/// nearest entry the filter keeps, at the depth that entry gives them. That is
+/// what keeps the tree one tree — hiding the tool traffic of a session would
+/// otherwise break every assistant message that answered a tool call off the
+/// trunk and into a row of its own at depth 0.
+///
+fn lay_out(
+    entries: &[titi_core::session::Entry],
+    path: &[titi_core::session::Entry],
+    filter: TreeFilter,
+) -> Vec<TreeRow> {
+    let on_path: std::collections::HashSet<&str> =
+        path.iter().map(|entry| entry.id.as_str()).collect();
+    let leaf = path.last().map(|entry| entry.id.as_str());
+    let index: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| (entry.id.as_str(), at))
+        .collect();
+    let visible: Vec<bool> = entries.iter().map(|entry| filter.shows(entry)).collect();
+
+    // Each visible entry's parent: the nearest visible entry above it, walking
+    // up through whatever the filter hides.
+    let mut parent_of: Vec<Option<usize>> = vec![None; entries.len()];
+    for (at, entry) in entries.iter().enumerate() {
+        let mut above = entry
+            .parent_id
+            .as_deref()
+            .and_then(|id| index.get(id))
+            .copied();
+        while let Some(parent) = above {
+            if visible[parent] {
+                parent_of[at] = Some(parent);
+                break;
+            }
+            above = entries[parent]
+                .parent_id
+                .as_deref()
+                .and_then(|id| index.get(id))
+                .copied();
+        }
+    }
+
+    // parent → its children, in the order they were appended; an entry whose
+    // parent is not in the log (a torn write, or a branch whose head was
+    // pruned) is a root.
+    let mut children: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (at, parent) in parent_of.iter().enumerate() {
+        if !visible[at] {
+            continue;
+        }
+        match parent {
+            Some(parent) => children.entry(*parent).or_default().push(at),
+            None => roots.push(at),
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|at| (*at, 0)).collect();
+    while let Some((at, depth)) = stack.pop() {
+        let entry = &entries[at];
+        let mark = if on_path.contains(entry.id.as_str()) {
+            "• "
+        } else {
+            "  "
+        };
+        let current = if leaf == Some(entry.id.as_str()) {
+            "  ✓ current"
+        } else {
+            ""
+        };
+        rows.push(TreeRow {
+            entry_id: entry.id.clone(),
+            text: format!(
+                "{indent}{mark}{role}  {label}{current}",
+                indent = "  ".repeat(depth),
+                role = tree_role(entry.role),
+                label = one_line(entry.content.trim(), 60),
+            ),
+        });
+        if let Some(kids) = children.get(&at) {
+            for kid in kids.iter().rev() {
+                stack.push((*kid, depth + 1));
+            }
+        }
+    }
+    rows
+}
+
+/// How many entries the filter hides from the path to the leaf: what the title
+/// counts as "off this path", read through the filter that is on.
+fn off_path(
+    entries: &[titi_core::session::Entry],
+    path: &[titi_core::session::Entry],
+    filter: TreeFilter,
+) -> usize {
+    let on_path: std::collections::HashSet<&str> =
+        path.iter().map(|entry| entry.id.as_str()).collect();
+    entries
+        .iter()
+        .filter(|entry| filter.shows(entry) && !on_path.contains(entry.id.as_str()))
+        .count()
 }
 
 /// How a tree row names the writer of an entry, in the transcript's own words.
@@ -922,8 +1085,13 @@ fn tree_panel(chat: &Chat, total: u16) -> PanelView {
             accent: false,
         })
         .collect();
+    let filter = if picker.filter == TreeFilter::Default {
+        String::new()
+    } else {
+        format!(" · {}", picker.filter.id())
+    };
     let title = format!(
-        "tree · {} entries · {} off this path",
+        "tree · {} entries{filter} · {} off this path",
         picker.rows.len(),
         picker.off_path
     );
@@ -2039,7 +2207,7 @@ impl Chat {
     /// A session with nothing in it says so rather than opening an empty panel,
     /// the way the prompt history does.
     pub(crate) fn open_tree(&mut self) -> Applied {
-        match TreePicker::open(&self.agent_dir, &self.session_id) {
+        match TreePicker::open(&self.agent_dir, &self.session_id, self.tree_filter) {
             Ok(picker) => {
                 self.tree_picker = Some(picker);
                 Applied::none()
@@ -2107,6 +2275,15 @@ impl Chat {
     /// and is handled as composer input.
     pub(crate) fn tree_picker_key(&mut self, key: Key, now: Instant) -> Applied {
         match key {
+            // alt+f cycles what the tree shows: every entry, everything but the
+            // tool traffic, only what you said. The cursor follows the entry it
+            // was on, so a filter is a view change and not a move.
+            Key::AltF => {
+                if let Some(picker) = self.tree_picker.as_mut() {
+                    picker.set_filter(picker.filter.next());
+                }
+                Applied::none()
+            }
             Key::Up => {
                 self.move_tree_picker(-1);
                 Applied::none()
