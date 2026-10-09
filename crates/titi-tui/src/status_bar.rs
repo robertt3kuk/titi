@@ -348,6 +348,12 @@ pub struct StatusLineStyle {
     /// needs-you) are untouched, because those say something the accent does
     /// not.
     pub session_accent: bool,
+    /// Whether the row drops its leading cell (`tui.tight`).
+    ///
+    /// The brand is the row's first segment and carries a space before it, so
+    /// that one cell is the row's own left padding; the right edge has none to
+    /// drop, because the line is padded out to the pane by the gap itself.
+    pub tight: bool,
     /// Whether the status line paints the theme's own background
     /// (`statusLine.transparent`).
     ///
@@ -368,6 +374,7 @@ impl StatusLineStyle {
         separator: Option<&str>,
         session_accent: bool,
         transparent: bool,
+        tight: bool,
     ) -> Self {
         Self {
             preset: preset
@@ -379,6 +386,7 @@ impl StatusLineStyle {
             separator: separator.and_then(Separator::parse),
             session_accent,
             transparent,
+            tight,
         }
     }
 }
@@ -578,6 +586,13 @@ pub fn render_status_line(
 
     let left_s = join(&left, &sep);
     let right_s = join(&right, &sep);
+    // `tui.tight`: the row's own left padding is the space the brand segment
+    // opens with, so it is dropped here rather than in the segment builder —
+    // one place, whatever drew the first cell.
+    let left_s = match (style.tight, left_s.strip_prefix(' ')) {
+        (true, Some(stripped)) => stripped.to_owned(),
+        _ => left_s,
+    };
     let gap = cells
         .saturating_sub(visible_width(&left_s) + visible_width(&right_s))
         .max(min_gap);
@@ -1538,16 +1553,16 @@ mod tests {
     #[test]
     fn an_unknown_name_falls_back_rather_than_failing() {
         let style =
-            StatusLineStyle::resolve(Some("nope"), Some("nope"), Some("nope"), false, false);
+            StatusLineStyle::resolve(Some("nope"), Some("nope"), Some("nope"), false, false, false);
         assert_eq!(style, StatusLineStyle::default());
         assert_eq!(style.preset, StatusLinePreset::Default);
         assert_eq!(style.context_line, ContextLine::Off);
         assert_eq!(
-            StatusLineStyle::resolve(None, None, None, false, false),
+            StatusLineStyle::resolve(None, None, None, false, false, false),
             StatusLineStyle::default()
         );
         assert_eq!(
-            StatusLineStyle::resolve(Some("minimal"), Some("embedded"), None, false, false)
+            StatusLineStyle::resolve(Some("minimal"), Some("embedded"), None, false, false, false)
                 .context_line,
             ContextLine::Embedded
         );

@@ -106,11 +106,11 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: small. `crates/titi-cli/src/chat.rs` only (reuse the existing 2-press timer).
 - beauty: an empty composer + Esc Esc opens the rewind picker that `/rewind` already shows.
 
-## 15. Tight layout — **open**
+## 15. Tight layout — **ported** (`tui.tight`)
 - omp: `tui.tight` (`modes/settings.ts:560`) — drops the 1-cell left/right padding.
-- titi: absent — `grep -rni "tight" crates/titi-cli/src crates/titi-tui/src` → one test's local variable name, nothing else. The padding is `Padding::horizontal(1)` in `crates/titi-cli/src/composer.rs` plus the transcript's own margins (`BODY_MARGIN`, `crates/titi-cli/src/transcript.rs`), which is where a `tui.tight` key would land.
+- titi: in — `tui.tight` (unset = off) drops one cell from the surfaces that carry a padding: the composer box (`Padding::horizontal`, `crates/titi-cli/src/composer.rs`), the status row's leading cell (`render_status_line`, `crates/titi-tui/src/status_bar.rs`) and the panel boxes (`panel_box`/`panel_row`, `crates/titi-cli/src/pickers.rs`). Icons, list indents and the message gutters are not padding and stay, and the transcript's right margin (`BODY_MARGIN`, threaded through four renderers that do not all have the screen) is left for a later pass — named here rather than silently skipped.
 - value: narrow terminals (≤80 cols) — 2 more usable columns for every row.
-- cost: small — the padding is `Padding::horizontal(1)` in `crates/titi-cli/src/composer.rs` and the transcript's `BODY_MARGIN` in `crates/titi-cli/src/transcript.rs`, plus one new config key.
+- cost: paid for the three surfaces above; the transcript's right margin is the one piece left, and it is small.
 - beauty: settings-level only; transcripts and the box composer sit flush to the edge.
 
 ## 16. Working-row shimmer — **open**

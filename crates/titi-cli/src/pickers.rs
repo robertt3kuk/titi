@@ -1736,7 +1736,12 @@ fn model_offer_label(offer: &ModelOffer, current: &str, room: usize) -> String {
 /// a capped one — the crate's scrollbar beside the body when the list does not
 /// fit. The selected row also carries the theme's `SelectedBg`, so the
 /// highlight survives a terminal where the marker alone is easy to miss.
-pub(crate) fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragraph<'static> {
+pub(crate) fn panel_box(
+    view: &PanelView,
+    width: u16,
+    tight: bool,
+    theme: &Theme,
+) -> Paragraph<'static> {
     let width = width as usize;
     let body =
         view.window.count + usize::from(view.window.above > 0) + usize::from(view.window.below > 0);
@@ -1758,7 +1763,13 @@ pub(crate) fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragrap
         .skip(view.window.start)
         .take(view.window.count)
     {
-        bodies.push(panel_row(line, view.selected == Some(at), inner, theme));
+        bodies.push(panel_row(
+            line,
+            view.selected == Some(at),
+            inner,
+            tight,
+            theme,
+        ));
     }
     if view.window.below > 0 {
         bodies.push(hidden_spans(view.window.below, "below", inner, theme));
@@ -1789,7 +1800,13 @@ pub(crate) fn panel_box(view: &PanelView, width: u16, theme: &Theme) -> Paragrap
 /// the fill out to the right border. A heading names a section rather than being
 /// a choice, so its own `▾` stands where a choice has its cursor and it is never
 /// selected; both put their label in the same column.
-fn panel_row(line: &PanelLine, selected: bool, inner: usize, theme: &Theme) -> Vec<Span<'static>> {
+fn panel_row(
+    line: &PanelLine,
+    selected: bool,
+    inner: usize,
+    tight: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let (text, style) = match line {
         PanelLine::Heading(text) => (
             text.clone(),
@@ -1817,9 +1834,17 @@ fn panel_row(line: &PanelLine, selected: bool, inner: usize, theme: &Theme) -> V
     let shown = titi_tui::width::truncate_to_width(&text, content.saturating_sub(2));
     let pad = content.saturating_sub(titi_tui::width::visible_width(&shown));
     vec![
-        Span::styled("│ ", fg(theme, ThemeColor::Border)),
+        // `tui.tight` drops the box's one cell of padding on each side; the
+        // row's own two-cell list indent is not padding and stays.
+        Span::styled(
+            if tight { "│" } else { "│ " },
+            fg(theme, ThemeColor::Border),
+        ),
         Span::styled(format!("{shown}{}", " ".repeat(pad)), band),
-        Span::styled(" │", fg(theme, ThemeColor::Border)),
+        Span::styled(
+            if tight { "│" } else { " │" },
+            fg(theme, ThemeColor::Border),
+        ),
     ]
 }
 

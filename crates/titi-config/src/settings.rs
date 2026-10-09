@@ -127,6 +127,18 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// Whether the screen drops one cell of horizontal padding from its surfaces.
+///
+/// Unset means **off**, so an unset key leaves every frame exactly as it was.
+/// omp's `tui.tight` (`modes/settings.ts:560`) removes "the 1-character
+/// horizontal padding from the left and right of the terminal output" by
+/// subtracting one from every component's `paddingX` (`utils.ts:764`,
+/// `getPaddingX`), which is what this does to titi's own four: the composer
+/// box, the status row's leading cell, the transcript's right margin, and the
+/// panel boxes. Icons, list indents and the message gutters are not padding and
+/// stay.
+pub const TUI_TIGHT_KEY: &str = "tui.tight";
+
 /// The glyph between the status line's segments.
 ///
 /// `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none` or `ascii`

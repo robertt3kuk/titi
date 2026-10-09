@@ -64,9 +64,14 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
         .border_type(BorderType::Rounded)
         .border_style(fg(theme, border))
         .title_bottom(title.centered())
-        .padding(Padding::horizontal(1))
+        // `tui.tight` drops the box's one cell of horizontal padding, so the
+        // draft starts one column further left and the row keeps one more
+        // character.
+        .padding(Padding::horizontal(if chat.tight { 0 } else { 1 }))
         .style(surface(theme));
-    let inner = (width as usize).saturating_sub(6).max(4);
+    let inner = (width as usize)
+        .saturating_sub(if chat.tight { 4 } else { 6 })
+        .max(4);
     let line = if let Some(pending) = &chat.approval {
         const KEYS: &str = "   y allow    n refuse";
         let room = inner.saturating_sub(titi_tui::width::visible_width(KEYS));

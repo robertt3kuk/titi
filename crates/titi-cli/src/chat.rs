@@ -557,6 +557,10 @@ pub struct Chat {
     /// cycles from there. Read from the settings at startup; unset is the whole
     /// tree, which is what `/tree` has always shown.
     pub(crate) tree_filter: TreeFilter,
+    /// Whether the screen drops one cell of horizontal padding from its boxes
+    /// and its status row (`tui.tight`). Unset is off, so an unset key leaves
+    /// every frame exactly as it was.
+    pub(crate) tight: bool,
     /// The large-paste menu: a paste long enough for `paste.menuThreshold`,
     /// held while the panel offers the ways to attach it; `None` = closed.
     pub(crate) paste_menu: Option<PasteMenu>,
@@ -755,6 +759,7 @@ impl Chat {
             session_picker: None,
             tree_picker: None,
             tree_filter: TreeFilter::default(),
+            tight: false,
             workspace: crate::session_fs::current_workspace(),
             paste_menu: None,
             paste_menu_after: PASTE_MENU_AFTER,
@@ -3902,6 +3907,9 @@ pub fn run(
         .and_then(|settings| settings.paste_menu_threshold())
         .unwrap_or(PASTE_MENU_AFTER);
     chat.tree_filter = tree_filter(settings.as_ref());
+    chat.tight = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_on(settings, titi_config::settings::TUI_TIGHT_KEY)
+    });
     // The vim keys, off unless `editor.vim` asks for them: a switch that
     // changes what typing does is not turned on by a config that says nothing.
     chat.vim = settings
@@ -3947,6 +3955,7 @@ pub fn run(
         separator.as_deref(),
         session_accent,
         transparent,
+        chat.tight,
     );
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
@@ -4667,7 +4676,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     paint_photos(frame, cols[2], &photos, &theme);
     paint_links(frame, cols[2], &links);
     if let Some(view) = &panel {
-        frame.render_widget(panel_box(view, cols[3].width, &theme), cols[3]);
+        frame.render_widget(panel_box(view, cols[3].width, chat.tight, &theme), cols[3]);
     }
     if let Some(status) = status {
         frame.render_widget(status, cols[4]);
@@ -9835,7 +9844,7 @@ mod tests {
             .get(titi_config::settings::STATUS_LINE_PRESET_KEY)
             .and_then(|value| value.as_str().map(str::to_owned));
         assert_eq!(
-            StatusLineStyle::resolve(stored.as_deref(), None, None, false, false).preset,
+            StatusLineStyle::resolve(stored.as_deref(), None, None, false, false, false).preset,
             StatusLinePreset::Minimal
         );
     }
@@ -16305,6 +16314,116 @@ mod tests {
         );
     }
 
+    /// `tui.tight` drops one cell of horizontal padding from the composer box
+    /// and from the status row's left edge, and unset is every frame byte for
+    /// byte what it was.
+    #[test]
+    fn tight_packs_the_composer_and_the_status_row() {
+        let mut chat = chat();
+        type_text(&mut chat, "one two");
+        let before = frame_rows(&mut chat, 60, 20);
+        assert!(before[0].starts_with(" titi"), "{:?}", before[0]);
+        assert!(
+            before.iter().any(|row| row.starts_with("│ › one two")),
+            "{before:#?}"
+        );
+
+        // Tight: the status row loses its leading cell and the draft starts one
+        // column further left. Everything else is the same row.
+        let mut packed_chat = chat_with_theme(test_theme());
+        type_text(&mut packed_chat, "one two");
+        packed_chat.tight = true;
+        packed_chat.status_line.tight = true;
+        let packed = frame_rows(&mut packed_chat, 60, 20);
+        assert!(packed[0].starts_with("titi"), "{:?}", packed[0]);
+        assert!(
+            packed.iter().any(|row| row.starts_with("│› one two")),
+            "{packed:#?}"
+        );
+        assert_eq!(before.len(), packed.len(), "the same screen, packed left");
+
+        // The right group is where it was: the cell that went came off the
+        // left, and the gap between the groups took it.
+        assert_eq!(
+            before[0].find('⬢'),
+            packed[0].find('⬢'),
+            "the status row's right group sits at the same column"
+        );
+
+        // And the composer's prompt sits one column further left: that cell is
+        // the box padding the key drops.
+        let prompt = |rows: &[String]| {
+            rows.iter()
+                .find_map(|row| row.find('›'))
+                .expect("the composer's prompt")
+        };
+        assert_eq!(
+            prompt(&packed) + 1,
+            prompt(&before),
+            "one cell of box padding"
+        );
+    }
+
+    /// The panel boxes lose their padding too, on both sides, and keep the
+    /// list's own indent.
+    #[test]
+    fn tight_packs_a_panel_box() {
+        let mut chat = chat();
+        type_text(&mut chat, "/he");
+        let box_row = |rows: &[String]| {
+            rows.iter()
+                .find(|row| row.contains("help"))
+                .expect("a row")
+                .to_owned()
+        };
+        let before = box_row(&frame_rows(&mut chat, 60, 20));
+        assert!(
+            before.starts_with("│ ▶ ") || before.starts_with("│  ▶ "),
+            "{before:?}"
+        );
+        assert!(before.trim_end().ends_with('│'), "{before:?}");
+
+        let mut packed_chat = chat_with_theme(test_theme());
+        type_text(&mut packed_chat, "/he");
+        packed_chat.tight = true;
+        let packed = box_row(&frame_rows(&mut packed_chat, 60, 20));
+        // The box is full width either way, so what moves is the row inside
+        // it: one cell left, and one more cell of room for the text.
+        let cursor = |row: &str| row.find('▶').expect("the cursor");
+        assert_eq!(cursor(&packed) + 1, cursor(&before), "one cell of padding");
+        assert!(packed.contains("/help"), "the same row, packed: {packed:?}");
+    }
+
+    /// The key itself: unset is off, `true`/`on` are on, and anything else
+    /// leaves the screen as it was.
+    #[test]
+    fn the_tight_key_is_a_switch() {
+        use titi_config::settings::{Settings, switch_on};
+
+        let dir = tempfile::tempdir().expect("temp");
+        let project = tempfile::tempdir().expect("temp");
+        let read = |text: &str| {
+            std::fs::write(dir.path().join("config.yml"), text).expect("write");
+            Settings::load(dir.path(), project.path(), &[]).expect("load")
+        };
+        assert!(!switch_on(
+            &read("theme:\n  dark: titanium\n"),
+            titi_config::settings::TUI_TIGHT_KEY
+        ));
+        for text in ["tui:\n  tight: true\n", "tui:\n  tight: on\n"] {
+            assert!(
+                switch_on(&read(text), titi_config::settings::TUI_TIGHT_KEY),
+                "{text}"
+            );
+        }
+        for text in ["tui:\n  tight: false\n", "tui:\n  tight: 7\n"] {
+            assert!(
+                !switch_on(&read(text), titi_config::settings::TUI_TIGHT_KEY),
+                "{text}"
+            );
+        }
+    }
+
     /// The three status-line keys, read from a real config file: the separator
     /// by name, the accent and the transparent background as switches.
     #[test]
@@ -16334,6 +16453,7 @@ mod tests {
                         titi_config::settings::STATUS_LINE_TRANSPARENT_KEY,
                     )
                 }),
+                false,
             )
         };
 
