@@ -2853,6 +2853,12 @@ impl Chat {
                 self.phase = WorkPhase::Waiting;
                 self.approval = None;
                 self.pending_ask = None;
+                // The live agents belonged to the session being left: their
+                // rows are that session's, and so is any focus on one of them.
+                // The engine's own supervisor stops them; the screen forgets
+                // them here so a switch cannot show a dead session's strip.
+                self.agents.clear();
+                self.agent_focus = None;
                 self.push(LineKind::Note, format!("session {id}"));
                 Applied::send(EngineCommand::RestoreHistory { messages }, None)
             }

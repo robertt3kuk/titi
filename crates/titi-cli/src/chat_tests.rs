@@ -5802,6 +5802,7 @@ fn plan_mode_enters_on_the_engines_word_and_done_leaves() {
     /// The masthead row, where the badge lives. The transcript below it
     /// also says "mode: plan", and that line is not the badge; the test
     /// backend is 80 columns wide, so the first row is the first 80
+
     /// characters of the frame.
     fn badge(chat: &mut Chat) -> String {
         frame_text(chat).chars().take(80).collect()
@@ -11307,6 +11308,30 @@ fn the_pinned_settings_and_the_state_glyphs() {
             Duration::from_millis(200)
         ),
         "and it moves"
+    );
+}
+
+/// A session switch forgets the session it left — its live agents and any
+/// focus on one of them included. The strip is that session's state, and a
+/// switch that kept it would show a dead session's agents under the new
+/// one's masthead.
+#[test]
+fn a_session_switch_forgets_the_live_agents_it_left() {
+    let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+    let other = seed_session(dir.path(), "other", "another question");
+
+    chat.on_event(agent_started("alpha"));
+    chat.on_event(agent_started("beta"));
+    chat.agent_focus = Some("alpha".to_owned());
+    assert_eq!(chat.agents.len(), 2);
+
+    chat.switch_to_session(other);
+    assert!(chat.agents.is_empty(), "the old session's agents are gone");
+    assert!(chat.agent_focus.is_none(), "and so is its focus");
+    let frame = frame_rows(&mut chat, 80, 24);
+    assert!(
+        !frame.iter().any(|row| row.contains("alpha")),
+        "the strip does not carry them over: {frame:#?}"
     );
 }
 
