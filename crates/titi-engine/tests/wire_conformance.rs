@@ -289,9 +289,10 @@ fn completions_sink() -> Vec<&'static str> {
     vec![
         r#"data: {"choices":[{"delta":{"reasoning_content":"thinking hard"},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"delta":{"content":"before "},"finish_reason":null}]}"#,
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},{"index":1,"id":"call_b","type":"function","function":{"name":"grep","arguments":"{\"pattern\":\"b\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},{"index":1,"id":"call_b","type":"function","function":{"name":"grep","arguments":""}}]},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"call_c","type":"function","function":{"name":"glob","arguments":"{}"}}]},"finish_reason":null}]}"#,
-        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"pattern\":\"b2\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"pattern\":\"b"}}]},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2\"}"}}]},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"delta":{"content":" after"},"finish_reason":null}]}"#,
         r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":40}}}"#,
         "data: [DONE]",
@@ -540,6 +541,8 @@ async fn a_mid_stream_error_fails_the_turn_in_every_family() {
         (
             ApiKind::AnthropicMessages,
             vec![
+                r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
                 r#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half"}}"#,
                 r#"event: error
@@ -571,38 +574,5 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}
             "{api:?} streamed what arrived before the error: {events:?}"
         );
         assert!(!bodies(&fetch).is_empty(), "{api:?} made its request");
-    }
-}
-
-#[tokio::test]
-async fn dump_bodies() {
-    for (api, sink, done) in [
-        (
-            ApiKind::OpenAiCompletions,
-            completions_sink(),
-            completions_done(),
-        ),
-        (
-            ApiKind::OpenAiResponses,
-            responses_sink(),
-            completions_done(),
-        ),
-        (
-            ApiKind::AnthropicMessages,
-            anthropic_sink(),
-            completions_done(),
-        ),
-        (
-            ApiKind::GeminiGenerateContent,
-            gemini_sink(),
-            completions_done(),
-        ),
-    ] {
-        let (_events, fetch) = turn(api, vec![sink, done], &["read", "grep", "glob"]).await;
-        let bodies = bodies(&fetch);
-        println!("=== {api:?} requests: {}", bodies.len());
-        if let Some(second) = bodies.get(1) {
-            println!("{}", serde_json::to_string_pretty(second).unwrap());
-        }
     }
 }
