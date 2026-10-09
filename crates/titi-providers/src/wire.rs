@@ -43,13 +43,59 @@ impl Role {
     }
 }
 
+/// The completions family's messages, tool calls included.
+///
+/// An assistant message that called tools must carry them: a `tool` message
+/// with no preceding `tool_calls` is a result answering a call the provider
+/// was never shown, which a strict OpenAI-compatible endpoint rejects outright
+/// and a lenient one answers as if the model had called nothing. The same
+/// pairing the Responses path does applies here: a tool result carries no call
+/// id of its own, but `execute_tools` appends one result per call in the order
+/// it recorded them, so each result takes the oldest still-unmatched call id
+/// of the assistant message in front of it.
 fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
     let mut out = Vec::with_capacity(req.messages.len() + 1);
     if let Some(sys) = &req.system {
         out.push(serde_json::json!({"role": "system", "content": sys.as_str()}));
     }
+    let mut pending: VecDeque<SmolStr> = VecDeque::new();
     for m in &req.messages {
-        out.push(serde_json::json!({"role": m.role.openai_role(), "content": m.content.as_str()}));
+        match m.role {
+            Role::Assistant if !m.tool_calls.is_empty() => {
+                pending.clear();
+                pending.extend(m.tool_calls.iter().map(|call| call.call_id.clone()));
+                out.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": m.content.as_str(),
+                    "tool_calls": m
+                        .tool_calls
+                        .iter()
+                        .map(|call| serde_json::json!({
+                            "id": call.call_id.as_str(),
+                            "type": "function",
+                            // `ChatMessage` carries the call's name and id but
+                            // not its arguments, which is the trade the
+                            // Responses path already makes; the API accepts an
+                            // empty string there.
+                            "function": {"name": call.name.as_str(), "arguments": ""},
+                        }))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+            Role::Tool => {
+                let id = pending.pop_front().unwrap_or_default();
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id.as_str(),
+                    "content": m.content.as_str(),
+                }));
+            }
+            _ => {
+                out.push(
+                    serde_json::json!({"role": m.role.openai_role(), "content": m.content.as_str()}),
+                );
+            }
+        }
     }
     out
 }
@@ -1212,6 +1258,65 @@ mod tests {
             tool_calls: Vec::new(),
         });
         r
+    }
+
+    /// The second request of a tool round must replay the assistant's calls,
+    /// and pair each result with one: a provider that sees results answering
+    /// calls it was never shown rejects the request.
+    #[test]
+    fn completions_replays_the_assistants_tool_calls() {
+        let mut req = WireRequest::new("m");
+        req.messages = vec![
+            ChatMessage {
+                role: Role::User,
+                content: "go".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "before".into(),
+                tool_calls: vec![
+                    crate::stream::ToolCallRef {
+                        call_id: "call_a".into(),
+                        name: "read".into(),
+                    },
+                    crate::stream::ToolCallRef {
+                        call_id: "call_b".into(),
+                        name: "grep".into(),
+                    },
+                ],
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: "a.rs".into(),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: "b".into(),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let body = body_of(ApiKind::OpenAiCompletions, &req);
+        let messages = body["messages"].as_array().expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("the assistant message");
+        let calls = assistant["tool_calls"]
+            .as_array()
+            .expect("the assistant's calls are on the wire");
+        assert_eq!(calls.len(), 2, "{assistant}");
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "read");
+        assert_eq!(calls[1]["id"], "call_b");
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().expect("a tool_call_id"))
+            .collect();
+        assert_eq!(ids, vec!["call_a", "call_b"], "each result takes its call");
     }
 
     fn body_of(api: ApiKind, r: &WireRequest) -> Value {
