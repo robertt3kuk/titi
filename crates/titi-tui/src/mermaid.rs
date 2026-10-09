@@ -37,6 +37,15 @@
 //!   label carries a double-width glyph is laid out wrong, so `draw` returns
 //!   `None` for it and the code-box fallback keeps the fence readable.
 //!
+//! # Size
+//!
+//! A fence is model-written text, so the work it can ask for is bounded before
+//! any of it happens: at most [`MAX_NODES`] nodes, [`MAX_EDGES`] edges,
+//! [`MAX_LAYERS`] layers and [`MAX_ROWS`] drawn rows. A diagram past any of
+//! them is one nobody could read in a pane, and it falls back to the code box
+//! like every other thing this module declines. The bounds are what keep a
+//! hostile or merely enormous fence from turning into a crash or a wall.
+//!
 //! # Cycles
 //!
 //! A depth-first pass finds the back edges; they are dropped from the layering
@@ -78,13 +87,31 @@ pub(crate) fn draw(source: &str, width: usize, theme: &Theme) -> Option<Vec<Stri
     if graph.nodes.is_empty() {
         return None;
     }
+    if graph.nodes.len() > MAX_NODES || graph.edges.len() > MAX_EDGES {
+        return None;
+    }
     let plan = layout(&graph, width)?;
+    if plan.layers.len() > MAX_LAYERS {
+        return None;
+    }
     let rows = paint(&plan, width, theme)?;
+    if rows.len() > MAX_ROWS {
+        return None;
+    }
     if rows.iter().any(|row| visible_width(row) > width) {
         return None;
     }
     Some(rows)
 }
+
+/// The most a fence may ask this module to draw. Past any of these the diagram
+/// could not be read in a pane anyway, and the code box is the honest answer —
+/// see the module's `# Size`. The numbers are generous for a transcript: a
+/// flowchart a person writes is a handful of nodes.
+const MAX_NODES: usize = 200;
+const MAX_EDGES: usize = 400;
+const MAX_LAYERS: usize = 200;
+const MAX_ROWS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -242,7 +269,9 @@ fn scan_id(s: &str, p: &mut usize) -> String {
     let start = *p;
     while *p < s.len() {
         let rest = &s[*p..];
-        let c = rest.chars().next().expect("non-empty");
+        // `*p < s.len()` and every advance is a whole character, so there is
+        // one; the `else` is the guard spelled where a reader can see it.
+        let Some(c) = rest.chars().next() else { break };
         let edge_dash = c == '-' && (rest.starts_with("--") || rest.starts_with("-."));
         if c.is_ascii_alphanumeric() || c == '_' || c == '.' || (c == '-' && !edge_dash) {
             *p += c.len_utf8();
@@ -314,7 +343,7 @@ fn edge(s: &str, p: usize) -> Option<(EdgeKind, Option<String>, usize)> {
         let at = tail.find("-->")?;
         (EdgeKind::Arrow, Some(tail[..at].to_owned()), p + 2 + at + 3)
     } else {
-        return None;
+        None?
     };
     skip_ws(s, &mut q);
     if let Some(tail) = s[q..].strip_prefix('|') {
@@ -389,7 +418,9 @@ fn back_edges(n: usize, hops: &[Hop]) -> BTreeSet<(usize, usize)> {
         stack.push((seed, 0));
         while let Some(&(u, i)) = stack.last() {
             if i < adj[u].len() {
-                stack.last_mut().expect("stack non-empty").1 += 1;
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
                 let v = adj[u][i];
                 match colour[v] {
                     0 => {
@@ -468,6 +499,9 @@ fn order(layers: &mut [Vec<usize>], hops: &[Hop], layer: &[usize], n: usize) {
         preds[h.to].push(h.from);
         succs[h.from].push(h.to);
     }
+    // The loop writes the layer it indexes, so it cannot walk the slice as
+    // items; the index is the point.
+    #[allow(clippy::needless_range_loop)]
     for li in 1..layers.len() {
         let mut keyed: Vec<(f64, usize)> = layers[li]
             .iter()
@@ -673,9 +707,10 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
                             count += 1;
                         }
                     }
-                    if count > 0 {
-                        x = (sum / count).saturating_sub(w / 2);
-                    }
+                    x = sum
+                        .checked_div(count)
+                        .map(|mean| mean.saturating_sub(w / 2))
+                        .unwrap_or(x);
                 }
                 if let Some(at) = cursor {
                     x = x.max(at);
@@ -721,9 +756,10 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
                         count += 1;
                     }
                 }
-                if count > 0 {
-                    top = (sum / count).saturating_sub((slot - 1) / 2);
-                }
+                top = sum
+                    .checked_div(count)
+                    .map(|mean| mean.saturating_sub((slot - 1) / 2))
+                    .unwrap_or(top);
             }
             top = top.max(y);
             pos[node] = top;
@@ -1201,14 +1237,132 @@ fn write_label(canvas: &mut Canvas, x: usize, y: usize, label: &str, room: usize
     if !canvas.ink(x - 1, y, ' ') {
         return None;
     }
-    let mut at = x;
-    for c in label.chars().take(room) {
-        if !canvas.ink(at, y, c) {
+    for (offset, c) in label.chars().take(room).enumerate() {
+        if !canvas.ink(x + offset, y, c) {
             break;
         }
-        at += 1;
     }
     Some(())
+}
+
+#[cfg(test)]
+mod hostile {
+    use super::*;
+
+    /// A fence is model-written text, so this drives `draw` with the shapes
+    /// that make a hand-written parser fall over: an empty label, an unmatched
+    /// `|`, a bare `-->`, a five-hundred-node chain, an id reused with two
+    /// shapes, unicode in an id, CRLF, tabs, an extremely long label, and
+    /// widths one, two and three. Every case either draws inside its width or
+    /// declines — and none of them panics, which is the point of the test.
+    #[test]
+    fn hostile_fences_draw_or_decline_but_never_panic() {
+        let mut cases: Vec<String> = vec![
+            // The shapes the parser can be surprised by.
+            "flowchart TD\nA[] --> B\n".to_owned(),
+            "flowchart TD\nA[|] --> B\n".to_owned(),
+            "flowchart TD\nA --> |unclosed B\n".to_owned(),
+            "flowchart TD\nA -->|yes B\n".to_owned(),
+            "flowchart TD\n-->\n".to_owned(),
+            "flowchart TD\nA -->\n".to_owned(),
+            "flowchart TD\nA[one] --> B[two]\nA{three} --> B(four)\n".to_owned(),
+            "flowchart TD\n\u{4f60}\u{597d}[\u{4e16}\u{754c}] --> \u{1f389}\n".to_owned(),
+            "flowchart TD\r\nA[crlf] --> B\r\n".to_owned(),
+            "flowchart TD\n\tA[tab] -->\tB\n".to_owned(),
+            "flowchart TD\nA --> B\n".to_owned(),
+            "flowchart TD\nA[x] --> A[y]\n".to_owned(),
+            "flowchart TD\nA --> B\nB --> A\nA --> B\n".to_owned(),
+            "flowchart LR\nA --> B --> C --> D\n".to_owned(),
+            "flowchart TD\n".to_owned(),
+            "flowchart TD\nsubgraph s\nA --> B\nend\n".to_owned(),
+            "flowchart TD\nsubgraph s\nsubgraph t\nA --> B\nend\nend\n".to_owned(),
+            "flowchart TD\n%% comment\nA --> B\n".to_owned(),
+            "graph TB\nA --> B\n".to_owned(),
+            "sequenceDiagram\nA->>B: hi\n".to_owned(),
+            "\u{0}\u{1}\u{2}".to_owned(),
+        ];
+        // An extremely long label, and the chain the cap exists for.
+        cases.push(format!("flowchart TD\nA[{}] --> B\n", "x".repeat(4000)));
+        let mut chain = String::from("flowchart TD\nA0");
+        for n in 1..500 {
+            chain.push_str(&format!(" --> A{n}"));
+        }
+        chain.push('\n');
+        cases.push(chain);
+
+        for source in &cases {
+            for width in [1usize, 2, 3, 8, 40, 200] {
+                let drawn = draw(source, width, &theme());
+                if let Some(rows) = drawn {
+                    assert!(!rows.is_empty(), "an empty drawing: {source:?}");
+                    for row in &rows {
+                        assert!(
+                            visible_width(row) <= width,
+                            "row wider than {width} for {source:?}: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The size cap, named: past [`MAX_NODES`] nodes or [`MAX_ROWS`] rows the
+    /// fence falls back to code rather than drawing a wall.
+    #[test]
+    fn a_fence_past_the_cap_declines() {
+        let chain = |nodes: usize| {
+            let mut source = String::from("flowchart TD\nA0");
+            for n in 1..nodes {
+                source.push_str(&format!(" --> A{n}"));
+            }
+            source.push('\n');
+            source
+        };
+        // Inside the cap: a drawing (at a width that can hold a small chain).
+        // A chain of MAX_NODES is a layer per node, which is past the row cap
+        // even before the node cap; either way it declines rather than drawing
+        // a wall.
+        assert!(
+            draw(&chain(MAX_NODES), 40, &theme()).is_none(),
+            "a chain of {MAX_NODES} nodes declines"
+        );
+        // Past the node cap: nothing.
+        assert!(
+            draw(&chain(MAX_NODES + 1), 200, &theme()).is_none(),
+            "past {MAX_NODES} nodes"
+        );
+        // A wide fan-out is a drawing while it fits, and declines when it does
+        // not; either way it never panics.
+        let fan = |n: usize| {
+            let mut source = String::from("flowchart TD\nR --> A0");
+            for i in 1..n {
+                source.push_str(&format!("\nR --> A{i}"));
+            }
+            source.push('\n');
+            source
+        };
+        assert!(draw(&fan(3), 40, &theme()).is_some(), "a small fan draws");
+        assert!(
+            draw(&fan(MAX_NODES + 1), 400, &theme()).is_none(),
+            "a huge fan declines"
+        );
+    }
+
+    /// The module's own theme, so a hostile fence is drawn on the palette the
+    /// real tests use rather than a second one.
+    fn theme() -> Theme {
+        Theme::new(
+            "test".to_owned(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            crate::theme::ColorMode::Truecolor,
+            crate::theme::SymbolPreset::Unicode,
+            std::collections::HashMap::new(),
+            None,
+            None,
+        )
+        .expect("theme builds")
+    }
 }
 
 #[cfg(test)]
