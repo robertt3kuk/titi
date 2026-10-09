@@ -75,7 +75,7 @@ titi --mode plan
 | `/model` | Switches to the next model in the list. `/model <id>` picks one by id or by its short name |
 | `/switch` | Fuzzy search over the same list: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` resolves a model role from the settings |
 | `/usage` | Tokens for this turn and for the session, prompt and completion apart — as the provider counted them, estimated only when it reports none, with the part served from the prompt cache named |
-| `/budget` | Caps what the session may spend: `/budget 200k`, `/budget 1.5m`, `/budget off`. The cap is in tokens; a cap in money is refused, because nothing here knows a price |
+| `/budget` | Caps what the session may spend: `/budget 200k`, `/budget 1.5m`, `/budget $2`, `/budget off`. Tokens or money (exact micro-dollars, charged at each round's model price by the engine's own ledger; a model with no price says so rather than pretending) |
 | `/settings` | Every resolved setting with the layer it came from |
 | `/theme` | Chooses a palette; bare `/theme` opens the picker and remembers the choice |
 | `/keys` · `/whoami` | Which providers have a key: env, stored, or none. The key itself is never shown |
@@ -102,6 +102,16 @@ titi --mode plan
 | `/git` | Shows git status or diff, read-only |
 | `/genome` | Manages the prompt map: `/genome on`, `/genome off`, `/genome limit <n>` |
 | `/diagnose` | Prints a diagnostics block to paste into a bug report |
+| `←` `→` / `alt+←` `alt+→` / `home` `end` | Move the caret: a character, a word, the ends of the draft. `ctrl+a` / `ctrl+e` are the ends too |
+| `delete` / `ctrl+u` | Delete what is after the caret, and everything before it |
+| `alt+backspace` / `ctrl+w` | Delete the word before the caret |
+| `alt+f` | Cycles what `/tree` shows: every entry, everything but the tool traffic, only yours |
+| `alt+a` | Walks the view through the live agents and back to the turn |
+| `/hotkeys` | Every key the screen answers, grouped, from the same table the screen reads |
+| `/tree` | The session's stored entries as a tree, every branch, the path to the leaf marked. Enter branches there; `alt+f` filters |
+| `/sessions [query]` | Bare, the list Ctrl+X shows. With a query, search over past sessions: each row is the line that matched, dated by that line |
+| `/changelog [full\|last n]` | What changed in the build you are running, from the notes embedded in it |
+| `/budget $2` | A cap in money as well as in tokens |
 | `/statusline` | Chooses the status line preset (default, minimal, compact, full, ascii). Bare `/statusline` states the preset in force and lists them all |
 | `/mouse` | Mouse reporting: off, wheel, buttons, all (drag selects, release copies) |
 | `/hub` | Shows or hides the roster of the local hub |
@@ -112,6 +122,12 @@ titi --mode plan
 | `/help` | Lists these commands |
 | Up / Down | Move through the command list. It opens only when `/` is the start of the line |
 | Tab | Fills the highlighted command. Enter on a prefix runs it. Esc clears the slash |
+
+A `paste.menuThreshold` (default 100, `0` turns it off) long paste is offered a way to reach the model instead of pasting a wall of text: attach it as a fenced block, as a file under `.titi/pastes/`, or leave the `[Paste #N · …]` marker every shorter paste gets. Dropping `statusLine.separator` (`powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`) changes the glyph between the status line's segments; `statusLine.sessionAccent` (unset = off) puts the theme's accent on the idle editor border and on the rest of the context gauge; `statusLine.transparent` (unset = off) leaves that row's background to the terminal. `display.turnFooter.time`, `.tokens` and `.cacheMiss` (each unset = on) mute one part of the dim row under a finished answer.
+
+Other keys this build reads, each unset = off unless said otherwise: `editor.vim` turns the composer into vim's two modes (Esc leaves Insert for Normal, which has `h l w b e 0 ^ $` with counts, `x X s`, the `d`/`c` operators with a motion, `dd`, `D`, `cc`, `C`, `S`, and `i a I A` back; enter sends in either mode, and `i`/`esc` are the whole of it if you never leave Insert). `display.pinnedAgents` (`off|collapsed|full`, unset = `collapsed`) pins the live agents above the composer — one row each, with `display.subagentLivePreview` (unset = off) adding what each is doing — and `alt+a` walks their panes. `display.smoothStreaming` reveals a streamed answer at a readable rate instead of in the provider's bursts, and `tui.tight` drops one cell of horizontal padding from the composer, the status row and the panels. `treeFilterMode` (`default|no-tools|user-only`) names the filter `/tree` opens in, and `startup.changelog` (unset = on) says one line when the build changed since your last run, pointing at `/changelog`. `session.autoResume` (unset = off) reopens the newest session in the agent directory at every launch.
+
+A dotted key may be written flat: `editor.vim: true` at the top level is the same setting as `editor:\n  vim: true`, which is what `/settings` prints, so a line copied out of it works. Where a file writes both, the nested one wins. `ask` is the tool the model uses to put a question to you: options, several if it says so, or your own words — answered in the panel above the composer. `agent` spawns a subagent (up to four in one call) whose lifecycle the pinned strip shows.
 
 The picker also offers the skills it found in `<agent_dir>/skills/`, `.agents/skills/`, and `.titi/skills/`. A `/name` that is not a command and is a skill expands that `SKILL.md` into the prompt, after the same screening the metadata gets. A skill's scripts are never executed.
 
@@ -291,7 +307,7 @@ titi --mode plan
 | `/model` | Следующая модель в списке. `/model <id>` выбирает по id или по короткому имени |
 | `/switch` | Нечёткий поиск по тому же списку: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` разворачивает роль модели из настроек |
 | `/usage` | Токены за ход и за сессию, prompt и completion отдельно — как их посчитал провайдер; оценка, только если он не сообщает; часть из кэша промпта названа отдельно |
-| `/budget` | Ограничивает трату сессии: `/budget 200k`, `/budget 1.5m`, `/budget off`. Лимит в токенах; лимит в деньгах отклоняется — прайса здесь никто не знает |
+| `/budget` | Ограничивает трату сессии: `/budget 200k`, `/budget 1.5m`, `/budget $2`, `/budget off`. Токены или деньги (точные микро-доллары, по цене модели каждого раунда из леджера самого движка; модель без цены говорит об этом, а не делает вид) |
 | `/settings` | Все разрешённые настройки и слой, из которого пришла каждая |
 | `/theme` | Выбирает палитру; голый `/theme` открывает выбор и запоминает его |
 | `/keys` · `/whoami` | У кого есть ключ: env, сохранён или нет. Сам ключ не показывается |
@@ -313,6 +329,16 @@ titi --mode plan
 | `/loop` | Повторяет промпт в фоне: `/loop 5m <промпт>`, интервалы `90s`, `5m`, `2h`. Таймер живёт в движке, поэтому закрытый экран его не убивает |
 | `/jobs` | Список фоновых циклов. `/jobs cancel <id>` останавливает один |
 | `/advisor` | Второе мнение по этому разговору, без инструментов; `/advisor <вопрос>` — про конкретное. Это не ход: сказанное им не исполняется |
+| `←` `→` / `alt+←` `alt+→` / `home` `end` | Двигают каретку: на символ, на слово, к краям черновика. `ctrl+a` / `ctrl+e` — тоже края |
+| `delete` / `ctrl+u` | Удаляют то, что после каретки, и всё, что до неё |
+| `alt+backspace` / `ctrl+w` | Удаляют слово перед кареткой |
+| `alt+f` | Перебирает, что показывает `/tree`: всё, всё кроме вызовов инструментов, только ваше |
+| `alt+a` | Ведёт вид по живым агентам и обратно к ходу |
+| `/hotkeys` | Все клавиши, которые отвечает экран, по группам — из той же таблицы, что читает сам экран |
+| `/tree` | Записи сессии как дерево, все ветки, путь к листу помечен. Enter ветвится там; `alt+f` фильтрует |
+| `/sessions [запрос]` | Без аргумента — список, который даёт Ctrl+X. С запросом — поиск по прошлым сессиям: строка — это совпавшая реплика, и время у неё её собственное |
+| `/changelog [full\|last n]` | Что изменилось в сборке, которую вы запустили, — по заметкам, вшитым в неё |
+| `/budget $2` | Денежное ограничение, а не только в токенах |
 | `/hub` | Показывает или прячет ростер локального хаба |
 | `/join` | Подключает к локальному хабу, `/join <имя>` — под своим именем; по умолчанию это id сессии |
 | `/leave` | Выходит из хаба и снимает этого участника с ростера |
@@ -330,6 +356,12 @@ titi --mode plan
 Тот же список предлагает найденные скиллы — из `<agent_dir>/skills/`, `.agents/skills/` и `.titi/skills/`. `/name`, который не команда, а скилл, разворачивает его `SKILL.md` в промпт после той же проверки, что проходят метаданные. Скрипты скилла не выполняются никогда.
 
 Экран — чат на ratatui: сверху модель и сессия, плюс значок `plan` или `duck`, когда движок подтвердил этот режим, посередине разговор, снизу одна строка ввода. `--mouse` по-прежнему принимается, чтобы старые команды не падали; этот экран мышь не отслеживает.
+
+Вставка длиной от `paste.menuThreshold` (по умолчанию 100, `0` выключает) получает выбор, как дойти до модели: блоком в ограде, файлом в `.titi/pastes/` или обычным маркером `[Paste #N · …]`. `statusLine.separator` (`powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none`, `ascii`) меняет глиф между сегментами строки состояния; `statusLine.sessionAccent` (не задан = выключено) отдаёт акцент темы бездействующей рамке редактора и остатку контекстной шкалы; `statusLine.transparent` (не задан = выключено) оставляет фон этой строки терминалу. `display.turnFooter.time`, `.tokens` и `.cacheMiss` (каждый не задан = включено) гасят по одной части тусклой строки под законченным ответом.
+
+Остальные ключи этой сборки, не задан = выключено, если не сказано иначе: `editor.vim` включает в композере два режима vim (Esc уводит из Insert в Normal, где есть `h l w b e 0 ^ $` со счётом, `x X s`, операторы `d`/`c` с движением, `dd`, `D`, `cc`, `C`, `S` и возврат по `i a I A`; Enter отправляет в любом режиме). `display.pinnedAgents` (`off|collapsed|full`, не задан = `collapsed`) прикрепляет живых агентов над композером — по строке на каждого, а `display.subagentLivePreview` (не задан = выключено) добавляет, чем он занят; `alt+a` ведёт по их панелям. `display.smoothStreaming` показывает потоковый ответ с читаемой скоростью, а не всплесками провайдера, `tui.tight` убирает по одной ячейке горизонтального отступа у композера, строки состояния и панелей. `treeFilterMode` (`default|no-tools|user-only`) задаёт фильтр, с которым открывается `/tree`, а `startup.changelog` (не задан = включено) говорит одну строку, когда сборка сменилась с прошлого запуска, и указывает на `/changelog`; `session.autoResume` (не задан = выключено) открывает свежайшую сессию агентского каталога при каждом запуске.
+
+Ключ с точкой можно писать плоско: `editor.vim: true` в корне — та же настройка, что вложенная, то есть то, что печатает `/settings`, поэтому скопированная оттуда строка работает. Если в файле есть оба написания, побеждает вложенное. Инструмент `ask` — это вопрос модели к вам: варианты, несколько если она так сказала, или свои слова; отвечают в панели над композером. `agent` запускает субагента (до четырёх за один вызов), и его жизненный цикл виден в прикреплённой строке.
 
 В Kitty и Ghostty локальное фото, названное в разговоре, рисуется на месте: png, jpeg, gif, bmp или ico, в том числе картинка из markdown. Пиксели уходят один раз. В остальных терминалах остаётся путь. `TITI_NO_KITTY_PLACEHOLDERS=1` выключает картинки.
 
