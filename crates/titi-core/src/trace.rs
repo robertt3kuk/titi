@@ -36,6 +36,19 @@ use serde_json::Value;
 /// this module rather than a string two crates agree on by luck.
 pub const THINKING_CHARS_ATTR: &str = "titi.thinking_chars";
 
+/// Attribute key holding how long a round spent before its answer began, in
+/// milliseconds — the thinking-and-tool-call time ahead of the first visible
+/// token. Recorded by the engine; absent when it was not measured.
+pub const THINKING_MS_ATTR: &str = "titi.thinking_ms";
+
+/// Attribute key holding a tool call's arguments, under the OTel GenAI name.
+/// Masked by the caller before it is written.
+pub const TOOL_ARGUMENTS_ATTR: &str = "gen_ai.tool.call.arguments";
+
+/// Attribute key holding a tool call's result, under the OTel GenAI name.
+/// Masked and capped by the caller before it is written.
+pub const TOOL_RESULT_ATTR: &str = "gen_ai.tool.call.result";
+
 /// The most thinking text one span keeps, head and tail together.
 ///
 /// A trace keeps a round's reasoning for every model call, so the text is
@@ -284,6 +297,25 @@ impl Span {
         self.end_ms.saturating_sub(self.start_ms)
     }
 
+    /// The thinking size this span records: the kept text's own length when it
+    /// was recorded, else the count the engine wrote when only the metric was.
+    /// `None` when the span has no thinking at all.
+    pub fn thinking_chars(&self) -> Option<u64> {
+        if let Some(text) = &self.thinking {
+            return Some(text.chars().count() as u64);
+        }
+        self.attributes
+            .get(THINKING_CHARS_ATTR)
+            .and_then(Value::as_u64)
+    }
+
+    /// Milliseconds the round spent before its answer began, when recorded.
+    pub fn thinking_ms(&self) -> Option<u64> {
+        self.attributes
+            .get(THINKING_MS_ATTR)
+            .and_then(Value::as_u64)
+    }
+
     pub fn with_parent(mut self, parent_span_id: impl Into<String>) -> Self {
         self.parent_span_id = Some(parent_span_id.into());
         self
@@ -510,6 +542,33 @@ impl TurnTrace {
             .sum()
     }
 
+    /// The turn's model calls.
+    fn llm_spans(&self) -> impl Iterator<Item = &Span> {
+        self.spans.iter().filter(|s| s.kind == SpanKind::Llm)
+    }
+
+    /// Thinking characters across the turn's model calls.
+    pub fn thinking_chars(&self) -> u64 {
+        self.llm_spans().filter_map(Span::thinking_chars).sum()
+    }
+
+    /// The model calls that recorded any thinking at all.
+    pub fn thinking_calls(&self) -> usize {
+        self.llm_spans()
+            .filter(|s| s.thinking_chars().is_some())
+            .count()
+    }
+
+    /// Output tokens the providers attributed to reasoning.
+    pub fn reasoning_tokens(&self) -> u64 {
+        self.llm_spans().map(|s| s.reasoning_tokens).sum()
+    }
+
+    /// Milliseconds spent before the answer began, when the engine recorded it.
+    pub fn thinking_ms(&self) -> u64 {
+        self.llm_spans().filter_map(Span::thinking_ms).sum()
+    }
+
     /// Sum of the LLM spans' cost, or `None` when none of them was priced.
     pub fn cost_micro_usd(&self) -> Option<u64> {
         let mut total = None;
@@ -550,6 +609,209 @@ pub fn read_session(agent_dir: &Path, session_id: &str) -> Result<Vec<TurnTrace>
         });
     }
     Ok(out)
+}
+
+/// Every session with a trace, sorted by id.
+pub fn sessions(agent_dir: &Path) -> Result<Vec<String>, TraceError> {
+    let root = agent_dir.join("traces");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Ok(Vec::new());
+    };
+    let mut ids: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+/// Which part of a span a search matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchField {
+    Name,
+    Thinking,
+    Arguments,
+    Result,
+    Error,
+}
+
+impl MatchField {
+    /// The word a search result prints for the field.
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchField::Name => "name",
+            MatchField::Thinking => "thinking",
+            MatchField::Arguments => "arguments",
+            MatchField::Result => "result",
+            MatchField::Error => "error",
+        }
+    }
+}
+
+/// One search hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanMatch {
+    pub session_id: String,
+    pub turn: u64,
+    pub span_id: String,
+    pub kind: SpanKind,
+    /// The span names from the root down to the span.
+    pub path: Vec<String>,
+    pub field: MatchField,
+    pub snippet: String,
+}
+
+impl SpanMatch {
+    /// The path as one line: `turn 1 › chat › read`.
+    pub fn path_line(&self) -> String {
+        self.path.join(" › ")
+    }
+}
+
+/// The characters of context a snippet keeps before and after the match.
+const SNIPPET_BEFORE: usize = 32;
+const SNIPPET_AFTER: usize = 64;
+
+/// The field of `span` that contains `needle`, with the line it matched.
+///
+/// The needle is looked for case-insensitively in the span's name, its
+/// recorded thinking, its tool arguments and result, and its error — the
+/// fields a run's text lives in. The first field that matches wins, in that
+/// fixed order, so one span is one hit.
+pub fn span_match(span: &Span, needle: &str) -> Option<(MatchField, String)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let hay = needle.to_lowercase();
+    if let Some(snippet) = snippet_of(&span.name, &hay) {
+        return Some((MatchField::Name, snippet));
+    }
+    if let Some(text) = &span.thinking
+        && let Some(snippet) = snippet_of(text, &hay)
+    {
+        return Some((MatchField::Thinking, snippet));
+    }
+    if let Some(value) = span.attributes.get(TOOL_ARGUMENTS_ATTR)
+        && let Some(snippet) = snippet_of(&value.to_string(), &hay)
+    {
+        return Some((MatchField::Arguments, snippet));
+    }
+    if let Some(value) = span.attributes.get(TOOL_RESULT_ATTR)
+        && let Some(snippet) = snippet_of(&value.to_string(), &hay)
+    {
+        return Some((MatchField::Result, snippet));
+    }
+    if let Some(error) = &span.error
+        && let Some(snippet) = snippet_of(error, &hay)
+    {
+        return Some((MatchField::Error, snippet));
+    }
+    None
+}
+
+/// Searches one session's spans, or every session's when `session` is `None`.
+///
+/// A plain scan of the JSONL files the turns wrote — no index, no FTS: a
+/// trace file is small (tool output and thinking are already capped when they
+/// are recorded), and a session has as many files as it had turns. Hits come
+/// oldest turn first, in the order the spans were written.
+pub fn search(
+    agent_dir: &Path,
+    session: Option<&str>,
+    needle: &str,
+) -> Result<Vec<SpanMatch>, TraceError> {
+    if needle.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let sessions = match session {
+        Some(id) => vec![id.to_owned()],
+        None => sessions(agent_dir)?,
+    };
+    let mut out = Vec::new();
+    for session_id in sessions {
+        for turn in turns(agent_dir, &session_id)? {
+            let spans = read_turn(agent_dir, &session_id, turn)?;
+            let paths = span_paths(&spans);
+            for span in &spans {
+                let Some((field, snippet)) = span_match(span, needle) else {
+                    continue;
+                };
+                out.push(SpanMatch {
+                    session_id: session_id.clone(),
+                    turn,
+                    span_id: span.span_id.clone(),
+                    kind: span.kind,
+                    // A hit on the turn's own span has no path left — its name
+                    // is the fallback, so the line is never blank.
+                    path: paths
+                        .get(&span.span_id)
+                        .filter(|path| !path.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| vec![span.name.clone()]),
+                    field,
+                    snippet,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Each span's name path from the root, by span id. A missing or cyclic
+/// parent ends the walk rather than hanging it.
+///
+/// The turn's own span is the frame, not a step in the stack — the line this
+/// feeds already carries `turn N` — so its name is left out.
+fn span_paths(spans: &[Span]) -> HashMap<String, Vec<String>> {
+    let by_id: HashMap<&str, &Span> = spans.iter().map(|s| (s.span_id.as_str(), s)).collect();
+    let mut out = HashMap::with_capacity(spans.len());
+    for span in spans {
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut at = Some(span);
+        while let Some(node) = at {
+            if !seen.insert(node.span_id.as_str()) {
+                break;
+            }
+            if node.kind != SpanKind::Turn {
+                path.push(node.name.clone());
+            }
+            at = node
+                .parent_span_id
+                .as_deref()
+                .and_then(|id| by_id.get(id).copied());
+        }
+        path.reverse();
+        out.insert(span.span_id.clone(), path);
+    }
+    out
+}
+
+/// The line of `text` that contains `hay` (lowercase), windowed around the
+/// match. The snippet keeps the text's own case; only whole characters are
+/// ever taken, so a multi-byte line cannot be cut mid-scalar.
+fn snippet_of(text: &str, hay: &str) -> Option<String> {
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let Some(at) = lower.find(hay) else {
+            continue;
+        };
+        let before = lower[..at].chars().count();
+        let chars: Vec<char> = line.chars().collect();
+        let end = (before + hay.chars().count() + SNIPPET_AFTER).min(chars.len());
+        let start = before.saturating_sub(SNIPPET_BEFORE);
+        let mut snippet = String::new();
+        if start > 0 {
+            snippet.push('…');
+        }
+        snippet.extend(chars[start..end].iter());
+        if end < chars.len() {
+            snippet.push('…');
+        }
+        return Some(snippet);
+    }
+    None
 }
 
 /// One node of a span tree.
@@ -976,6 +1238,169 @@ mod tests {
         assert!(capped.contains("characters left out"));
         assert!(!capped.contains('\u{FFFD}'));
         assert!(capped.starts_with("思考") && capped.ends_with("思考"));
+    }
+
+    #[test]
+    fn thinking_totals_are_metric_first_and_text_when_kept() {
+        let attr_only = Span::new("s1", "a", SpanKind::Llm, "chat", 0)
+            .with_end_ms(10)
+            .with_tokens(0, 100, 0, 22)
+            .with_attr(THINKING_CHARS_ATTR, json!(40))
+            .with_attr(THINKING_MS_ATTR, json!(1_200));
+        let kept = Span::new("s1", "b", SpanKind::Llm, "chat", 11)
+            .with_end_ms(20)
+            .with_tokens(0, 100, 0, 8)
+            .with_thinking("12345678");
+        let tool = Span::new("s1", "t", SpanKind::Tool, "read", 21).with_end_ms(30);
+        let trace = TurnTrace {
+            turn: 1,
+            spans: vec![attr_only, kept, tool],
+        };
+        assert_eq!(
+            trace.thinking_chars(),
+            48,
+            "40 from the count, 8 from the text"
+        );
+        assert_eq!(trace.thinking_calls(), 2);
+        assert_eq!(trace.reasoning_tokens(), 30);
+        assert_eq!(trace.thinking_ms(), 1_200);
+
+        // A text the engine kept is its own size, whatever a count says.
+        let both = Span::new("s1", "c", SpanKind::Llm, "chat", 0)
+            .with_end_ms(1)
+            .with_attr(THINKING_CHARS_ATTR, json!(999))
+            .with_thinking("1234");
+        assert_eq!(both.thinking_chars(), Some(4));
+        assert_eq!(both.thinking_ms(), None);
+    }
+
+    /// A session whose spans carry text in thinking, in tool arguments, in a
+    /// tool result and in an error — all under a turn span.
+    fn search_fixture(dir: &Path) {
+        let mut w = TraceWriter::open(dir, "s1", 1).unwrap_or_else(|e| panic!("{e}"));
+        let turn = Span::new("s1", "t", SpanKind::Turn, "turn 1", 0).with_end_ms(100);
+        let llm = Span::new("s1", "l", SpanKind::Llm, "chat gpt-4o", 0)
+            .with_parent("t")
+            .with_end_ms(100)
+            .with_thinking("let me look at the parser\nsecond line about PARSE")
+            .with_attr(TOOL_ARGUMENTS_ATTR, json!({"path": "src/parse.rs"}));
+        let tool = Span::new("s1", "r", SpanKind::Tool, "read", 10)
+            .with_parent("l")
+            .with_end_ms(20)
+            .with_attr(TOOL_RESULT_ATTR, json!("fn main() {}"));
+        let bad = Span::new("s1", "e", SpanKind::Llm, "chat gpt-4o", 30)
+            .with_parent("l")
+            .with_end_ms(40)
+            .with_error("timed out waiting for the parse");
+        for s in [turn, llm, tool, bad] {
+            w.append(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        w.flush().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn search_finds_the_field_and_the_line_it_matched() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        search_fixture(dir.path());
+
+        // Thinking: the matching line, under the span's path.
+        let hits =
+            search(dir.path(), Some("s1"), "look at the parser").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].field, MatchField::Thinking);
+        assert_eq!(hits[0].snippet, "let me look at the parser");
+        assert_eq!(hits[0].path_line(), "chat gpt-4o");
+        assert_eq!(hits[0].kind, SpanKind::Llm);
+
+        // Case-insensitive, and a tool's arguments are searchable.
+        let hits = search(dir.path(), Some("s1"), "src/PARSE.rs").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].field, MatchField::Arguments);
+        assert!(
+            hits[0].snippet.contains("src/parse.rs"),
+            "{}",
+            hits[0].snippet
+        );
+
+        // A result, and the path names the call above it.
+        let hits = search(dir.path(), Some("s1"), "fn main").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits[0].field, MatchField::Result);
+        assert_eq!(hits[0].path_line(), "chat gpt-4o › read");
+
+        // An error.
+        let hits = search(dir.path(), Some("s1"), "waiting for").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits[0].field, MatchField::Error);
+
+        // The turn's own span is the frame, not a path step: a hit on it falls
+        // back to its own name so the line is never blank.
+        let hits = search(dir.path(), Some("s1"), "turn 1").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].field, MatchField::Name);
+        assert_eq!(hits[0].kind, SpanKind::Turn);
+        assert_eq!(hits[0].path_line(), "turn 1");
+
+        // Nothing at all, and an empty needle finds nothing rather than all.
+        assert!(
+            search(dir.path(), Some("s1"), "no such text")
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty()
+        );
+        assert!(
+            search(dir.path(), Some("s1"), "  ")
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_without_a_session_reads_every_one() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        search_fixture(dir.path());
+        let mut w = TraceWriter::open(dir.path(), "s2", 3).unwrap_or_else(|e| panic!("{e}"));
+        w.append(
+            &Span::new("s2", "t", SpanKind::Tool, "grep", 0)
+                .with_end_ms(5)
+                .with_attr(TOOL_RESULT_ATTR, json!("src/parse.rs:12: the parser")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        w.flush().unwrap_or_else(|e| panic!("{e}"));
+        drop(w);
+
+        assert_eq!(sessions(dir.path()).unwrap_or_default(), vec!["s1", "s2"]);
+        let hits = search(dir.path(), None, "the parser").unwrap_or_else(|e| panic!("{e}"));
+        let seen: Vec<(&str, u64)> = hits
+            .iter()
+            .map(|hit| (hit.session_id.as_str(), hit.turn))
+            .collect();
+        assert_eq!(seen, vec![("s1", 1), ("s2", 3)]);
+    }
+
+    #[test]
+    fn a_snippet_windows_one_long_line_and_keeps_its_case() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let long = format!("{}NEEDLE{}", "a".repeat(200), "b".repeat(200));
+        let mut w = TraceWriter::open(dir.path(), "s1", 1).unwrap_or_else(|e| panic!("{e}"));
+        w.append(
+            &Span::new("s1", "t", SpanKind::Tool, "bash", 0)
+                .with_end_ms(1)
+                .with_attr(TOOL_RESULT_ATTR, json!(long)),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        w.flush().unwrap_or_else(|e| panic!("{e}"));
+        drop(w);
+
+        let hits = search(dir.path(), Some("s1"), "needle").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(
+            snippet.starts_with('…') && snippet.ends_with('…'),
+            "{snippet}"
+        );
+        assert!(
+            snippet.contains("NEEDLE"),
+            "the text keeps its case: {snippet}"
+        );
+        assert!(snippet.chars().count() < 140, "{snippet}");
     }
 
     #[test]

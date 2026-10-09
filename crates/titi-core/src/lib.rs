@@ -14,7 +14,9 @@ pub mod trajectory;
 pub use hub::{HubBroker, HubClient, HubError, HubEvent, HubRequest, SOCKET_NAME, join_or_host};
 pub use session::{SessionMeta, SessionStore};
 pub use share::{ShareError, ShareKey, SharePackage, open_package, seal_export, share_session};
-pub use trace::{Span, SpanKind, SpanStatus, TraceNode, TraceWriter, TurnTrace};
+pub use trace::{
+    MatchField, Span, SpanKind, SpanMatch, SpanStatus, TraceNode, TraceWriter, TurnTrace,
+};
 pub use trajectory::{EventKind, TrajectoryRecorder};
 
 /// Crate version, mirrors the workspace release.
