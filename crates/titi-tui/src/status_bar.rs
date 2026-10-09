@@ -1552,8 +1552,14 @@ mod tests {
 
     #[test]
     fn an_unknown_name_falls_back_rather_than_failing() {
-        let style =
-            StatusLineStyle::resolve(Some("nope"), Some("nope"), Some("nope"), false, false, false);
+        let style = StatusLineStyle::resolve(
+            Some("nope"),
+            Some("nope"),
+            Some("nope"),
+            false,
+            false,
+            false,
+        );
         assert_eq!(style, StatusLineStyle::default());
         assert_eq!(style.preset, StatusLinePreset::Default);
         assert_eq!(style.context_line, ContextLine::Off);

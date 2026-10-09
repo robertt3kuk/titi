@@ -50,6 +50,10 @@ fn a_declared_model_leads_the_catalog() {
     assert!(
         config.models.len() > 1,
         "the builtins stay in the catalog behind it: {:?}",
-        config.models.iter().map(|m| m.id.to_string()).collect::<Vec<_>>()
+        config
+            .models
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect::<Vec<_>>()
     );
 }
