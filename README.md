@@ -29,6 +29,9 @@ titi --list-keys
 
 Without a key the turn fails in the open: the provider requires a credential. Settings stack from lowest to highest: built-in defaults, `~/.titi/agent`, `<project>/.titi/config.yml`, then environment variables. The project file cannot declare `providers` or `models`, and cannot loosen `privacy.allow` or `privacy.maskIps`: a provider entry names where your key is sent, so only your own layers decide it.
 
+A model you declare can say what it costs, in the same dollars per million tokens every provider publishes: `price: { input: 3, output: 15, cachedInput: 0.3 }`. That is the rate `/budget $` and the `· $x` footer meter; a model with no `price` is unpriced — which is not free — and a money cap over it is refused by name rather than guessed. A rate nobody can read is refused the same way, naming the key (`input`, `output`, `cachedInput`), and the model loads unpriced rather than at zero.
+
+
 Built in:
 
 | Provider | Models | Key |
@@ -264,6 +267,9 @@ titi --list-keys
 ```
 
 Без ключа ход падает открыто: провайдер требует credential. Настройки складываются снизу вверх: встроенные значения, `~/.titi/agent`, `<проект>/.titi/config.yml`, затем переменные окружения. Проектный файл не может объявить `providers` или `models` и не может ослабить `privacy.allow` или `privacy.maskIps`: запись провайдера называет, куда уйдёт ваш ключ, поэтому решают только ваши собственные слои.
+
+Объявленная вами модель может назвать свою цену — в тех же долларах за миллион токенов, что публикует провайдер: `price: { input: 3, output: 15, cachedInput: 0.3 }`. Именно эту ставку считают `/budget $` и строка `· $x`; модель без `price` — не «бесплатная», а без цены, и денежный лимит по ней отклоняется с названием модели, а не угадывается. Нечитаемая ставка отклоняется так же, с названием ключа (`input`, `output`, `cachedInput`), и модель загружается без цены, а не с нулевой.
+
 
 Встроены:
 

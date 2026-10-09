@@ -535,23 +535,45 @@ pub fn registry_config_for(
     agent_dir: &std::path::Path,
     cwd: &std::path::Path,
 ) -> ProviderRegistryConfig {
+    registry_config_for_with_problems(agent_dir, cwd).0
+}
+
+/// The same registry, with what the user's own block got wrong.
+///
+/// One problem per price that could not be read, each naming the key — a
+/// negative rate, a word where a figure belongs, a seventh decimal place — and
+/// empty for a config that is entirely readable. The model itself is still
+/// there, unpriced: a price nobody can read is not a price of zero, and the
+/// engine says so rather than charging the turn as free.
+pub fn registry_config_for_with_problems(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+) -> (ProviderRegistryConfig, Vec<String>) {
     let defaults = default_registry_config();
     let Ok(settings) = titi_config::settings::Settings::load(agent_dir, cwd, &[]) else {
-        return defaults;
+        return (defaults, Vec::new());
     };
     let user = serde_json::json!({
         "providers": settings.get_user("providers"),
         "models": settings.get_user("models"),
     });
-    match ProviderRegistryConfig::from_settings_value(&user) {
-        Some(parsed) => merge_registry_config(defaults, parsed),
-        None => defaults,
+    match ProviderRegistryConfig::from_user_settings(&user) {
+        (Some(parsed), problems) => (merge_registry_config(defaults, parsed), problems),
+        (None, problems) => (defaults, problems),
     }
 }
 
 pub fn load_registry_config() -> ProviderRegistryConfig {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    registry_config_for(&titi_config::agent_dir(), &cwd)
+    let (config, problems) = registry_config_for_with_problems(&titi_config::agent_dir(), &cwd);
+    for problem in &problems {
+        // Said once, where the session starts: the screen owns the terminal
+        // from here, so a price nobody could read has to be said now or not
+        // at all. The model is unpriced, and `/budget $` says as much again
+        // when a cap meets it.
+        eprintln!("titi: config: {problem}");
+    }
+    config
 }
 
 /// Starts the engine, returning it with the model catalog and the session id
