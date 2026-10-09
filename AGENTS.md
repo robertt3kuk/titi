@@ -43,6 +43,7 @@ compile locally:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets     # informational, not denied
+cargo audit                                # informational; RustSec ids, needs cargo-audit
 cargo test --workspace --locked
 gh run list --repo robertt3kuk/titi --branch master --limit 5
 ```

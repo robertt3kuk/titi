@@ -7,10 +7,13 @@ description: How verification works in titi — tests, fmt, and clippy run on Gi
 
 Verification for titi happens on GitHub Actions, never on a contributor's
 machine — nothing is meant to compile locally. The workflow is
-`.github/workflows/ci.yml` with three jobs on every push and on PRs into
+`.github/workflows/ci.yml` with five jobs on every push and on PRs into
 master: `fmt` (`cargo fmt --all --check`), `clippy` (`cargo clippy
---workspace --all-targets`, not denied), and `test` (`cargo test
---workspace --locked`).
+--workspace --all-targets`, not denied), `audit` (`cargo audit` against
+`Cargo.lock` — informational, `continue-on-error`, so an advisory appears in
+the job's log as a crate and version with its `RUSTSEC-…` id and the version
+that fixes it, and never reddens the run), `test` (`cargo test --workspace
+--locked`) and `tui-smoke` (the real binary on a pty, `scripts/tui-smoke.py`).
 
 ## Read the results with gh
 

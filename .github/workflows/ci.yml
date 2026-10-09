@@ -33,6 +33,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets
 
+  audit:
+    runs-on: ubuntu-latest
+    # Informational, the way clippy is: an advisory is reported on every push
+    # and never fails the build. `cargo audit` exits non-zero as soon as it
+    # finds one, so the job is allowed to fail — that is the only knob it has,
+    # and it is the job-level equivalent of clippy running without
+    # `-D warnings`. The tool goes in with the cargo cache this workflow
+    # already uses (`Swatinem/rust-cache` caches `~/.cargo/bin`), which is why
+    # there is no new third-party action here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      # Reads Cargo.lock: a RustSec advisory for any crate the lockfile
+      # resolves, printed with its id and the version that fixes it.
+      - run: cargo audit
+
   test:
     runs-on: ubuntu-latest
     steps:
