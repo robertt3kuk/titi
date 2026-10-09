@@ -10,6 +10,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::claims::{ClaimError, Claims};
 use crate::protocol::{EngineEvent, TurnId};
+use crate::spans::{self, OpenSpan, SpanSink};
+use titi_core::trace::{SpanKind, TOOL_ARGUMENTS_ATTR, TOOL_RESULT_ATTR};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingToolCall {
@@ -341,13 +343,30 @@ async fn invoke_group(
     }
 }
 
+/// The first line of a failed call's answer, capped: what a trace says went
+/// wrong without repeating the whole output.
+fn error_line(output: &str) -> String {
+    output
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect()
+}
+
 /// Masks a call's answer, records it, and hands it to the model — in order.
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     turn_id: TurnId,
     prepared: Prepared,
     executed: Executed,
     messages: &mut Vec<ChatMessage>,
     trajectory: &TrajectorySink,
+    spans: &SpanSink,
+    // The model call whose response asked for this call: the tool's span
+    // hangs from it, so a trace shows which round wanted what.
+    parent_span: Option<&str>,
     events: &mpsc::Sender<EngineEvent>,
     mask_ips: bool,
 ) {
@@ -364,13 +383,39 @@ async fn finish(
             .map(|detail| mask(detail, mask_ips).into()),
         ..executed
     };
+    let elapsed = prepared.started.elapsed();
     if let Some(recorder) = trajectory.lock().await.as_mut() {
         let _ = recorder.record(titi_core::trajectory::EventKind::ToolResult {
             id: result.call_id.to_string(),
-            duration_ms: prepared.started.elapsed().as_millis() as u64,
+            duration_ms: elapsed.as_millis() as u64,
             ok: !result.is_error,
         });
     }
+    // The call as the trace sees it: what it was asked with (masked), what it
+    // answered (masked and capped), how long it took — the wait for an
+    // approval included, since that is time the turn spent on it.
+    let mut span = OpenSpan::open_at(
+        spans,
+        parent_span.map(str::to_owned),
+        SpanKind::Tool,
+        prepared.call.name.as_str(),
+        spans::now_ms().saturating_sub(elapsed.as_millis() as u64),
+    )
+    .attr("gen_ai.operation.name", serde_json::json!("execute_tool"))
+    .attr(
+        "gen_ai.tool.name",
+        serde_json::json!(prepared.call.name.as_str()),
+    )
+    .attr(
+        "gen_ai.tool.call.id",
+        serde_json::json!(result.call_id.as_str()),
+    )
+    .attr(TOOL_ARGUMENTS_ATTR, mask_args(&prepared.args, mask_ips))
+    .attr(TOOL_RESULT_ATTR, serde_json::json!(result.output.as_str()));
+    if result.is_error {
+        span = span.failed(error_line(&result.output));
+    }
+    span.finish(spans::now_ms());
     let _ = events
         .send(EngineEvent::ToolFinished {
             turn_id,
@@ -404,6 +449,7 @@ pub(crate) async fn execute_tools(
     events: &mpsc::Sender<EngineEvent>,
     aborted: &AtomicBool,
     trajectory: &TrajectorySink,
+    spans: &SpanSink,
     touched: &TouchedSink,
     // The session's live index, when it has one: a mutating tool call folds
     // the path it wrote into it before returning. `None` for a caller with no
@@ -412,6 +458,7 @@ pub(crate) async fn execute_tools(
     claims: &Claims,
     agent_id: &SmolStr,
     mask_ips: bool,
+    parent_span: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut assistant_calls = Vec::new();
@@ -473,6 +520,8 @@ pub(crate) async fn execute_tools(
                     executed,
                     &mut messages,
                     trajectory,
+                    spans,
+                    parent_span,
                     events,
                     mask_ips,
                 )
@@ -535,6 +584,8 @@ pub(crate) async fn execute_tools(
             result,
             &mut messages,
             trajectory,
+            spans,
+            parent_span,
             events,
             mask_ips,
         )
@@ -801,6 +852,9 @@ mod tests {
         let (events, _inbox) = mpsc::channel(8);
         let touched: TouchedSink = TouchedSink::default();
         let trajectory: TrajectorySink = TrajectorySink::default();
+        // A test with no surface: the span sink is empty, so the tool loop
+        // records exactly what it always did.
+        let spans: SpanSink = SpanSink::default();
         let aborted = AtomicBool::new(false);
         let claims = Claims::new();
         let call = PendingToolCall {
@@ -829,11 +883,13 @@ mod tests {
             &events,
             &aborted,
             &trajectory,
+            &spans,
             &touched,
             Some(&live),
             &claims,
             &SmolStr::new_inline("Main"),
             false,
+            None,
         )
         .await;
         assert_eq!(messages.len(), 2, "the call message and its result");

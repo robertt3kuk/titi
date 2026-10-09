@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::StreamExt;
 use smol_str::SmolStr;
+use titi_core::trace::{SpanKind, SpanStatus, THINKING_CHARS_ATTR, THINKING_MS_ATTR};
 use titi_genome::GenomeHandle;
 use titi_genome::live::Request as IndexRequest;
 use titi_providers::{
@@ -21,9 +22,10 @@ use crate::claims::Claims;
 use crate::findings::Findings;
 use crate::protocol::{ContextPart, EngineCommand, EngineEvent, TurnId};
 use crate::registry::{ModelPrice, RefreshOutcome, RegistryError, ResolvedModel};
+use crate::spans::{self, OpenSpan, SpanSink};
 use crate::steering::Steering;
 use crate::tool_loop::{
-    ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools,
+    ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools, mask,
 };
 
 /// Identity the main turn claims files under.
@@ -608,6 +610,11 @@ pub struct EngineConfig {
     /// Mask IPv4 addresses in tool output (`privacy.maskIps`). Keys are
     /// masked regardless.
     pub mask_ips: bool,
+    /// Whether a round's reasoning text is written into its trace span
+    /// (`trace.thinking`). Off unless asked for: the text is the most
+    /// sensitive thing a trace could hold. The size and the time a round spent
+    /// thinking are recorded either way.
+    pub trace_thinking: bool,
     /// Checks run against the coder's patch before a reviewer is called
     /// (`goal.gates`). Each entry is a program and its arguments; an empty
     /// list sends every patch straight to the reviewer.
@@ -660,6 +667,7 @@ impl EngineConfig {
             embedding_model: None,
             sensitive: titi_tools::SensitivePolicy::default(),
             mask_ips: true,
+            trace_thinking: false,
             goal_gates: Vec::new(),
             session_id: None,
             judgment_provider: None,
@@ -961,6 +969,10 @@ pub struct EngineRuntime {
     /// [`SessionAsk`].
     ask_waiters: AskWaiters,
     trajectory: TrajectorySink,
+    /// Where a turn's spans are written (`titi_core::trace`). The surface
+    /// builds it bound to the session; a sink with nothing inside means the
+    /// session is not traced and every span call is a no-op.
+    spans: SpanSink,
     /// The session's live index and the background worker behind it, when a
     /// root is configured. Written by the tool loop as it runs — synchronously,
     /// so a turn's own prompt is current by construction — and fed a resync per
@@ -1020,6 +1032,7 @@ impl EngineRuntime {
             None,
             ToolRegistry::new(),
             TrajectorySink::default(),
+            SpanSink::default(),
         )
     }
 
@@ -1034,6 +1047,7 @@ impl EngineRuntime {
             Some(runner),
             ToolRegistry::new(),
             TrajectorySink::default(),
+            SpanSink::default(),
         )
     }
 
@@ -1042,7 +1056,14 @@ impl EngineRuntime {
         resolver: Arc<dyn TransportResolver>,
         tools: ToolRegistry,
     ) -> Engine {
-        Self::start_inner(config, resolver, None, tools, TrajectorySink::default())
+        Self::start_inner(
+            config,
+            resolver,
+            None,
+            tools,
+            TrajectorySink::default(),
+            SpanSink::default(),
+        )
     }
 
     pub fn start_with_agents_and_tools(
@@ -1057,6 +1078,7 @@ impl EngineRuntime {
             Some(runner),
             tools,
             TrajectorySink::default(),
+            SpanSink::default(),
         )
     }
 
@@ -1066,8 +1088,9 @@ impl EngineRuntime {
         runner: Option<Arc<dyn crate::agents::AgentRunner>>,
         tools: ToolRegistry,
         trajectory: TrajectorySink,
+        spans: SpanSink,
     ) -> Engine {
-        Self::start_inner(config, resolver, runner, tools, trajectory)
+        Self::start_inner(config, resolver, runner, tools, trajectory, spans)
     }
 
     fn start_inner(
@@ -1076,6 +1099,7 @@ impl EngineRuntime {
         runner: Option<Arc<dyn crate::agents::AgentRunner>>,
         mut tools: ToolRegistry,
         trajectory: TrajectorySink,
+        spans: SpanSink,
     ) -> Engine {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (event_tx, event_rx) = mpsc::channel(config.event_capacity);
@@ -1166,7 +1190,8 @@ impl EngineRuntime {
                 .with_approval_mode(approval)
                 .with_max_rounds(config.agent_rounds)
                 .with_mask_ips(config.mask_ips)
-                .with_genome(genome.clone()),
+                .with_genome(genome.clone())
+                .with_spans(Arc::clone(&spans), config.trace_thinking),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
         // The surface builds the session's tools before the engine starts —
@@ -1206,6 +1231,7 @@ impl EngineRuntime {
             approval_waiters: ApprovalWaiters::default(),
             ask_waiters,
             trajectory,
+            spans,
             genome,
             touched,
             claims: claims.clone(),
@@ -1993,6 +2019,7 @@ impl EngineRuntime {
         let tools = self.mode_tools();
         let waiters = Arc::clone(&self.approval_waiters);
         let trajectory = Arc::clone(&self.trajectory);
+        let spans = Arc::clone(&self.spans);
         let touched = Arc::clone(&self.touched);
         let genome = self.genome.clone();
         let claims = self.claims.clone();
@@ -2020,6 +2047,7 @@ impl EngineRuntime {
                 tools,
                 waiters,
                 trajectory,
+                spans,
                 touched,
                 genome,
                 claims,
@@ -2306,6 +2334,7 @@ async fn run_turn(
     tools: ToolRegistry,
     waiters: ApprovalWaiters,
     trajectory: TrajectorySink,
+    spans: SpanSink,
     touched: TouchedSink,
     genome: Option<GenomeHandle>,
     claims: Claims,
@@ -2317,6 +2346,18 @@ async fn run_turn(
     money: MoneyLedger,
     money_bounded: bool,
 ) -> Option<Vec<ChatMessage>> {
+    // The turn's own span opens here and closes at the tail — the one place
+    // every path below reaches, because the early returns all belong to the
+    // block underneath. It frames the turn: a fallback and a fold hang from
+    // it, and each round's model call is its child.
+    // The number the session gives this turn — its own ordinal, which is what
+    // the file is named after and what `titi trace --turn N` counts.
+    let turn_number = spans::begin_turn(&spans, turn_id.0).unwrap_or(turn_id.0);
+    let mut turn_span = OpenSpan::open(&spans, None, SpanKind::Turn, format!("turn {turn_number}"));
+    let turn_span_id = turn_span.id().map(str::to_owned);
+    // Why the turn ended, when it ended badly: the tail writes it on the span.
+    let mut turn_error: Option<String> = None;
+
     // In front of the resolve below, and outside the synchronous ladder: a
     // subscription token that expires between turns would otherwise fail the
     // turn it was resolved for. The outcomes are the resolver's business —
@@ -2374,20 +2415,31 @@ async fn run_turn(
                 let _ = events
                     .send(EngineEvent::ModelSwitched {
                         turn_id: Some(turn_id),
-                        from: previous,
+                        from: previous.clone(),
                         to: model.clone(),
                     })
                     .await;
+                // The ladder moved on. The failed model's own span, already
+                // written, carries why; this one says that it happened at all.
+                OpenSpan::open(
+                    &spans,
+                    turn_span_id.clone(),
+                    SpanKind::Event,
+                    format!("fallback {previous} -> {model}"),
+                )
+                .finish(spans::now_ms());
             }
             let resolved = match resolver.resolve(&model) {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     meter.settle(&events, turn_id).await;
+                    let message = error.to_string();
+                    turn_error = Some(message.clone());
                     let _ = events
                         .send(EngineEvent::Failed {
                             turn_id: Some(turn_id),
                             reason: ErrorReason::Rejected,
-                            message: error.to_string().into(),
+                            message: message.into(),
                         })
                         .await;
                     return None;
@@ -2478,6 +2530,10 @@ async fn run_turn(
                             strategy: folded.strategy.clone(),
                         })
                         .await;
+                    OpenSpan::open(&spans, turn_span_id.clone(), SpanKind::Event, "fold")
+                        .attr("titi.folded", serde_json::json!(folded.folded as u64))
+                        .attr("titi.strategy", serde_json::json!(folded.strategy.as_str()))
+                        .finish(spans::now_ms());
                 }
                 let _ = events
                     .send(EngineEvent::ContextUsage {
@@ -2486,6 +2542,25 @@ async fn run_turn(
                         window: config.context_window,
                     })
                     .await;
+                // The round's model call: one span over every attempt it
+                // took, which is the OTel rule — a retry does not get a span
+                // of its own, its time belongs to the call it repeated — and
+                // each retry is an event inside it.
+                let mut round_span = OpenSpan::open(
+                    &spans,
+                    turn_span_id.clone(),
+                    SpanKind::Llm,
+                    format!("chat {wire_model}"),
+                )
+                .attr("gen_ai.operation.name", serde_json::json!("chat"))
+                .attr(
+                    "gen_ai.request.model",
+                    serde_json::json!(wire_model.as_str()),
+                );
+                let round_span_id = round_span.id().map(str::to_owned);
+                // What this round reported and reasoned, for its span.
+                let mut round_report: Option<RoundReport> = None;
+                let mut attempts = 0u32;
                 let mut last_error = None;
                 let mut completed = false;
                 // One fold per turn for a request the provider rejected as too
@@ -2493,13 +2568,28 @@ async fn run_turn(
                 // the answer.
                 let mut folded_for_length = false;
                 for attempt in 0..=config.max_transient_retries {
+                    attempts = attempt + 1;
                     // A stall already waited out its own timeout; a rate limit or
                     // an outage is asked again only after a pause.
                     if let Some(wait) =
                         retry_wait(last_error.as_ref(), config.retry_backoff, attempt)
-                        && !back_off(wait, &aborted).await
                     {
-                        return None;
+                        // A retry is an event inside the round it belongs to:
+                        // how long the pause was, and what asked for it.
+                        let mut retry = OpenSpan::open(
+                            &spans,
+                            round_span_id.clone(),
+                            SpanKind::Event,
+                            format!("retry {attempt}"),
+                        )
+                        .attr("titi.wait_ms", serde_json::json!(wait.as_millis() as u64));
+                        if let Some(error) = &last_error {
+                            retry = retry.attr("error.type", serde_json::json!(error_type(error)));
+                        }
+                        retry.finish(spans::now_ms());
+                        if !back_off(wait, &aborted).await {
+                            return None;
+                        }
                     }
                     match stream_attempt(
                         turn_id,
@@ -2514,7 +2604,8 @@ async fn run_turn(
                     )
                     .await
                     {
-                        Ok((text, calls, thinking)) if calls.is_empty() => {
+                        Ok((text, calls, thinking, report)) if calls.is_empty() => {
+                            round_report = Some(report);
                             if !text.is_empty() {
                                 messages.push(ChatMessage {
                                     role: Role::Assistant,
@@ -2527,9 +2618,11 @@ async fn run_turn(
                             completed = true;
                             break;
                         }
-                        Ok((text, calls, thinking)) => {
+                        Ok((text, calls, thinking, report)) => {
+                            round_report = Some(report);
                             if tool_rounds >= config.max_tool_rounds {
                                 meter.settle(&events, turn_id).await;
+                                turn_error = Some("tool round cap reached".to_owned());
                                 let _ = events
                                     .send(EngineEvent::Failed {
                                         turn_id: Some(turn_id),
@@ -2551,6 +2644,7 @@ async fn run_turn(
                                 &events,
                                 &aborted,
                                 &trajectory,
+                                &spans,
                                 &touched,
                                 // No genome root means no index to feed: a
                                 // write has nowhere to go. The handle's
@@ -2565,6 +2659,7 @@ async fn run_turn(
                                 &claims,
                                 &MAIN_AGENT,
                                 config.mask_ips,
+                                round_span_id.as_deref(),
                             )
                             .await;
                             messages.extend(extra);
@@ -2579,9 +2674,7 @@ async fn run_turn(
                             // Fold once and ask again: a provider's own words
                             // say what it refused, and the fold is the one
                             // thing that can change the request's length.
-                            if !folded_for_length
-                                && error.is_context_too_long()
-                                && !visible_output
+                            if !folded_for_length && error.is_context_too_long() && !visible_output
                             {
                                 folded_for_length = true;
                                 let forced = titi_core::compaction::CompactionPolicy {
@@ -2593,23 +2686,71 @@ async fn run_turn(
                                     &forced,
                                     config.context_window.max(1),
                                 );
+                                OpenSpan::open(
+                                    &spans,
+                                    turn_span_id.clone(),
+                                    SpanKind::Event,
+                                    "fold",
+                                )
+                                .attr("titi.reason", serde_json::json!("context_too_long"))
+                                .finish(spans::now_ms());
                                 last_error = None;
                                 continue;
                             }
                             if visible_output || !error.is_retryable() {
                                 meter.settle(&events, turn_id).await;
-                                emit_transport_failure(
-                                    &events,
-                                    turn_id,
-                                    error.naming_the_window(config.context_window),
-                                )
-                                .await;
+                                let message = error.naming_the_window(config.context_window);
+                                turn_error = Some(message.to_string());
+                                emit_transport_failure(&events, turn_id, message).await;
                                 return None;
                             }
                             last_error = Some(error);
                         }
                     }
                 }
+                // The round closes here, on every path out of the retry loop:
+                // the pauses it absorbed are inside its span, and the words of
+                // the failure that ended it go on the span rather than being
+                // lost with the loop.
+                if let Some(report) = &round_report {
+                    round_span = round_span
+                        .tokens(
+                            report.prompt,
+                            report.completion,
+                            report.cached,
+                            report.reasoning,
+                        )
+                        .cost(report.cost_micro_usd)
+                        .attr(
+                            "gen_ai.response.finish_reasons",
+                            serde_json::json!([report.finish.clone()]),
+                        );
+                    if let Some(ms) = report.thinking_ms {
+                        round_span = round_span.attr(THINKING_MS_ATTR, serde_json::json!(ms));
+                    }
+                }
+                round_span = round_span.attr("titi.attempts", serde_json::json!(attempts));
+                // A round that paused and then succeeded is a success: the
+                // failure that asked for the retry belongs to the attempts
+                // inside the span, not to the span's own outcome.
+                if !completed && let Some(error) = &last_error {
+                    round_span = round_span.failed(error.to_string());
+                }
+                // How much the round thought, always; the text itself only when
+                // the session asked for it, masked like everything else that
+                // leaves for a file.
+                let thought = round_report
+                    .as_ref()
+                    .map_or("", |report| report.thinking.as_str());
+                let thought_chars = thought.chars().count() as u64;
+                if thought_chars > 0 {
+                    round_span =
+                        round_span.attr(THINKING_CHARS_ATTR, serde_json::json!(thought_chars));
+                    if config.trace_thinking {
+                        round_span = round_span.thinking(Some(mask(thought, config.mask_ips)));
+                    }
+                }
+                round_span.finish(spans::now_ms());
                 if completed {
                     if let Some(recorder) = trajectory.lock().await.as_mut() {
                         let _ = recorder.record(titi_core::trajectory::EventKind::TurnEnd);
@@ -2631,16 +2772,16 @@ async fn run_turn(
         }
 
         meter.settle(&events, turn_id).await;
+        let message: SmolStr = match last_failure {
+            Some(last) => format!("all configured models are unavailable; last, {last}").into(),
+            None => "all configured models are unavailable".into(),
+        };
+        turn_error = Some(message.to_string());
         let _ = events
             .send(EngineEvent::Failed {
                 turn_id: Some(turn_id),
                 reason: ErrorReason::Connection,
-                message: match last_failure {
-                    Some(last) => {
-                        format!("all configured models are unavailable; last, {last}").into()
-                    }
-                    None => "all configured models are unavailable".into(),
-                },
+                message,
             })
             .await;
         None
@@ -2648,11 +2789,45 @@ async fn run_turn(
     .await;
     // A cancelled turn ends here without a word of its own.
     meter.settle(&events, turn_id).await;
+    // The turn's span closes at this one point, whatever the block above did:
+    // a cancelled turn is a cancelled span, a turn that ran out of models is an
+    // errored one, and the words of the failure go on it.
+    let status = if aborted.load(Ordering::SeqCst) {
+        SpanStatus::Cancelled
+    } else if history.is_some() {
+        SpanStatus::Ok
+    } else {
+        SpanStatus::Error
+    };
+    if let Some(error) = turn_error {
+        turn_span = turn_span.failed(error);
+    }
+    turn_span.status(status).finish(spans::now_ms());
     history
 }
 
 /// Longest pause before one transient retry.
 pub const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The round's stop reason in the OTel GenAI vocabulary, which is what goes
+/// on a span's `gen_ai.response.finish_reasons`.
+fn finish_reason(reason: titi_providers::StopReason) -> &'static str {
+    match reason {
+        titi_providers::StopReason::Stop => "stop",
+        titi_providers::StopReason::Length => "length",
+        titi_providers::StopReason::ToolUse => "tool_calls",
+    }
+}
+
+/// A transport failure's class, for a span's `error.type`: low-cardinality,
+/// the way the conventions ask, rather than the sentence it came in.
+fn error_type(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::Fatal { .. } => "fatal",
+        TransportError::Retryable { .. } => "retryable",
+        TransportError::Stalled { .. } => "stalled",
+    }
+}
 
 /// The pause before attempt `attempt` (1 is the first retry): `base`, then
 /// doubled each time, capped.
@@ -2708,6 +2883,38 @@ async fn back_off(delay: std::time::Duration, aborted: &AtomicBool) -> bool {
 struct MoneyLedger {
     spent_micro_usd: Arc<AtomicU64>,
     unpriced_said: Arc<AtomicBool>,
+}
+
+/// What one round's model call reported.
+///
+/// The meter accumulates the turn; this is the round's own share of it, which
+/// is what the round's span carries: the provider's counts, the price the
+/// round ran at, the reason it stopped, and how long it thought before its
+/// answer began.
+#[derive(Default)]
+struct RoundReport {
+    prompt: u64,
+    completion: u64,
+    cached: u64,
+    /// Reasoning output tokens. Zero until a provider reports them apart from
+    /// the completion count, which none does yet: the span says what it was
+    /// told and nothing it was not.
+    reasoning: u64,
+    cost_micro_usd: Option<u64>,
+    /// The stop reason in the OTel GenAI vocabulary (`stop`, `length`,
+    /// `tool_calls`).
+    finish: String,
+    /// Time from the first reasoning delta to the first answer delta, when the
+    /// round produced both.
+    thinking_ms: Option<u64>,
+    /// The reasoning the round streamed, as it arrived.
+    ///
+    /// Measured from the deltas rather than from the collector's blocks: a
+    /// block is what has to be echoed back to the family that signed it, and
+    /// only some families send one — a delta is what every reasoning model
+    /// sends, so this is the only place a round's thinking can be counted for
+    /// all of them.
+    thinking: String,
 }
 
 /// What one turn has spent, round by round. A tool round re-sends the whole
@@ -2778,7 +2985,9 @@ impl<'a> TurnMeter<'a> {
         }
     }
 
-    fn charge(&mut self, prompt: u64, completion: u64, cached: u64) {
+    /// Adds one round to the turn's totals and answers what that round cost,
+    /// or `None` when the model it ran on has no price.
+    fn charge(&mut self, prompt: u64, completion: u64, cached: u64) -> Option<u64> {
         self.prompt = self.prompt.saturating_add(prompt);
         self.cached = self.cached.saturating_add(cached);
         self.completion = self.completion.saturating_add(completion);
@@ -2799,8 +3008,12 @@ impl<'a> TurnMeter<'a> {
                 self.money
                     .spent_micro_usd
                     .fetch_add(micro, Ordering::SeqCst);
+                Some(micro)
             }
-            None => self.unpriced = true,
+            None => {
+                self.unpriced = true;
+                None
+            }
         }
     }
 }
@@ -2835,6 +3048,7 @@ async fn stream_attempt(
         SmolStr,
         Vec<crate::tool_loop::PendingToolCall>,
         Vec<titi_providers::ThinkingBlock>,
+        RoundReport,
     ),
     (TransportError, bool),
 > {
@@ -2845,7 +3059,12 @@ async fn stream_attempt(
     // `RequestCtx::aborted` and drops a silent read on a short tick, so the
     // turn still ends promptly instead of waiting out the socket.
     if aborted.load(Ordering::SeqCst) {
-        return Ok((SmolStr::default(), Vec::new(), Vec::new()));
+        return Ok((
+            SmolStr::default(),
+            Vec::new(),
+            Vec::new(),
+            RoundReport::default(),
+        ));
     }
     let mut request = WireRequest::new(model.clone());
     request.messages = messages.to_vec();
@@ -2862,21 +3081,35 @@ async fn stream_attempt(
     let mut collector = ToolCallCollector::default();
     let mut answer = String::new();
     let mut reported: Option<TokenUsage> = None;
+    // When the round's thinking began and when its answer did: the difference
+    // is what the round spent before it started writing, which is the one
+    // timing a trace can report about thinking at all.
+    let mut thought_at: Option<std::time::Instant> = None;
+    let mut answered_at: Option<std::time::Instant> = None;
+    let mut thinking_text = String::new();
 
     while let Some(event) = stream.next().await {
         if aborted.load(Ordering::SeqCst) {
-            return Ok((SmolStr::default(), Vec::new(), Vec::new()));
+            return Ok((
+                SmolStr::default(),
+                Vec::new(),
+                Vec::new(),
+                RoundReport::default(),
+            ));
         }
         visible_output |= event.is_visible_output();
         collector.observe(&event);
         match event {
             StreamEvent::TextDelta { text, .. } => {
                 answer.push_str(&text);
+                answered_at.get_or_insert_with(std::time::Instant::now);
                 let _ = events
                     .send(EngineEvent::StreamDelta { turn_id, text })
                     .await;
             }
             StreamEvent::ThinkingDelta { text, .. } => {
+                thought_at.get_or_insert_with(std::time::Instant::now);
+                thinking_text.push_str(&text);
                 let _ = events
                     .send(EngineEvent::ThinkingDelta { turn_id, text })
                     .await;
@@ -2888,25 +3121,41 @@ async fn stream_attempt(
                 // meter is bumped here rather than once per turn. The
                 // provider's own count wins; a provider that reports none
                 // (or a malformed one) is charged the project's estimate.
-                match reported {
-                    Some(usage) => meter.charge(
+                let (prompt, completion, cached) = match reported {
+                    Some(usage) => (
                         usage.prompt_tokens,
                         usage.completion_tokens,
                         usage.cached_tokens,
                     ),
-                    None => meter.charge(
+                    None => (
                         crate::compaction::estimate_request(messages),
                         titi_core::compaction::estimate_tokens(&answer),
                         0,
                     ),
-                }
+                };
+                let cost_micro_usd = meter.charge(prompt, completion, cached);
+                let report = RoundReport {
+                    prompt,
+                    completion,
+                    cached,
+                    cost_micro_usd,
+                    finish: finish_reason(reason).to_owned(),
+                    thinking: thinking_text,
+                    thinking_ms: match (thought_at, answered_at) {
+                        (Some(thought), Some(answered)) => {
+                            Some(answered.saturating_duration_since(thought).as_millis() as u64)
+                        }
+                        _ => None,
+                    },
+                    ..Default::default()
+                };
                 if calls.is_empty() {
                     let _ = events.send(meter.usage(turn_id)).await;
                     let _ = events
                         .send(EngineEvent::TurnFinished { turn_id, reason })
                         .await;
                 }
-                return Ok((answer.into(), calls, collector.thinking().to_vec()));
+                return Ok((answer.into(), calls, collector.thinking().to_vec(), report));
             }
             StreamEvent::Error { reason, message } => {
                 let error = if reason == ErrorReason::Connection && !visible_output {

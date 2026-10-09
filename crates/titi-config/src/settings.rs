@@ -236,6 +236,15 @@ pub const STATUS_LINE_TRANSPARENT_KEY: &str = "statusLine.transparent";
 /// filter by, because a titi entry carries no label.
 pub const TREE_FILTER_MODE_KEY: &str = "treeFilterMode";
 
+/// Whether a round's reasoning text is written into its trace span.
+///
+/// Off unless asked for (`trace.thinking: true`): a span's thinking text is
+/// the most sensitive thing a trace file could hold — a model echoes what it
+/// read — so it is opt-in, like the OTel conventions' own content capture.
+/// The *size* of a round's thinking and how long it took are recorded either
+/// way, so `/trace` and `titi trace` show the metrics with the setting off.
+pub const TRACE_THINKING_KEY: &str = "trace.thinking";
+
 /// Whether a finished turn's footer names its wall time.
 ///
 /// Unset means on. The footer is the dim row under the answer; this is the

@@ -933,6 +933,13 @@ pub fn start_engine_with(
         .unwrap_or_else(|| (SensitivePolicy::default(), true));
     engine_config.sensitive = sensitive.clone();
     engine_config.mask_ips = mask_ips;
+    // A round's reasoning text is the most sensitive thing a trace holds, so it
+    // is opt-in (`trace.thinking: true`); the size and the time are recorded
+    // either way. Read through the same helper the editor switch uses: unset is
+    // off, and a typo leaves it off rather than quietly turning it on.
+    engine_config.trace_thinking = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_on(settings, titi_config::settings::TRACE_THINKING_KEY)
+    });
     if let Some(settings) = &settings {
         engine_config.genome_limit = genome_limit_from(settings);
         // The setting names how long a `bash` call may hold the turn before
@@ -1013,9 +1020,20 @@ pub fn start_engine_with(
     engine_config.session_id = Some(session_id.clone());
     let recorder = titi_core::trajectory::TrajectoryRecorder::open(&agent_dir, &session_id).ok();
     let trajectory: TrajectorySink = std::sync::Arc::new(tokio::sync::Mutex::new(recorder));
+    // The session's traces: the same shape as the trajectory above, but one
+    // file per turn of spans. The recorder is bound to the session here — it is
+    // the only place that knows both the agent directory and the id — and the
+    // engine opens each turn's file as the turn starts.
+    let spans = titi_engine::SpanSink::default();
+    *spans
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(titi_engine::SpanRecorder::new(
+        agent_dir.clone(),
+        session_id.clone(),
+    ));
     let catalog = ModelCatalog::new(models, Arc::clone(&registry));
     Ok((
-        EngineRuntime::start_with_session(engine_config, registry, None, tools, trajectory),
+        EngineRuntime::start_with_session(engine_config, registry, None, tools, trajectory, spans),
         catalog,
         session_id,
         pin_note,

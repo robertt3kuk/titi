@@ -20,6 +20,7 @@ pub mod registry;
 pub mod review;
 pub mod runtime;
 pub mod skills;
+pub mod spans;
 pub mod steering;
 pub mod tool_agent;
 pub mod tool_loop;
@@ -55,6 +56,7 @@ pub use registry::{
 };
 pub use review::{AgentReviewer, REVIEWER_BRIEF, Review, ReviewRequest, Reviewer, Verdict};
 pub use runtime::{Engine, EngineConfig, EngineError, EngineRuntime, TransportResolver};
+pub use spans::{SpanRecorder, SpanSink};
 pub use steering::{STEERING_CAPACITY, Steering};
 pub use tool_agent::{DEFAULT_AGENT_ROUNDS, ToolAgentRunner};
 pub use tool_loop::{

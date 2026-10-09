@@ -29,9 +29,11 @@ use crate::agents::{AgentContext, AgentRequest, AgentRunner};
 use crate::claims::Claims;
 use crate::protocol::TurnId;
 use crate::runtime::TransportResolver;
+use crate::spans::{self, OpenSpan, SpanSink};
 use crate::tool_loop::{
-    ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools,
+    ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools, mask,
 };
+use titi_core::trace::SpanKind;
 
 /// Rounds a subagent may spend calling tools before it is stopped.
 pub const DEFAULT_AGENT_ROUNDS: u32 = 6;
@@ -50,6 +52,13 @@ pub struct ToolAgentRunner {
     approval_mode: ApprovalMode,
     max_rounds: u32,
     mask_ips: bool,
+    /// Where this subagent's spans are written, shared with the turn that
+    /// spawned it: a subagent's calls are part of its parent's trace, and its
+    /// tool calls are recorded through the same sink its own model calls use.
+    spans: SpanSink,
+    /// Whether this subagent's reasoning text is recorded (`trace.thinking`),
+    /// as the session asked for it.
+    trace_thinking: bool,
 }
 
 impl ToolAgentRunner {
@@ -73,7 +82,18 @@ impl ToolAgentRunner {
             approval_mode: ApprovalMode::Write,
             max_rounds: DEFAULT_AGENT_ROUNDS,
             mask_ips: true,
+            spans: SpanSink::default(),
+            trace_thinking: false,
         }
+    }
+
+    /// The session's span sink, and whether a round's reasoning text is
+    /// recorded. A runner built without one produces no spans at all, which is
+    /// the honest state for a caller that has no trace of its own.
+    pub fn with_spans(mut self, spans: SpanSink, trace_thinking: bool) -> Self {
+        self.spans = spans;
+        self.trace_thinking = trace_thinking;
+        self
     }
 
     /// The session's index, so this runner's writes are folded in as they
@@ -116,7 +136,47 @@ impl ToolAgentRunner {
 
 #[async_trait]
 impl AgentRunner for ToolAgentRunner {
+    /// The subagent's run, wrapped in the span that frames it: everything this
+    /// agent does — its model calls, its tool calls — hangs from it in the
+    /// turn's trace, so a subagent is a branch of the turn that spawned it
+    /// rather than a set of unrelated rows.
     async fn run(&self, request: AgentRequest, context: AgentContext) -> Result<SmolStr, SmolStr> {
+        let mut agent_span = OpenSpan::open(
+            &self.spans,
+            spans::turn_span(&self.spans),
+            SpanKind::Agent,
+            request.name.to_string(),
+        )
+        .attr("gen_ai.operation.name", serde_json::json!("invoke_agent"))
+        .attr("gen_ai.agent.id", serde_json::json!(request.id.as_str()))
+        .attr(
+            "gen_ai.agent.name",
+            serde_json::json!(request.name.as_str()),
+        )
+        .attr(
+            "gen_ai.agent.kind",
+            serde_json::json!(format!("{:?}", request.kind).to_lowercase()),
+        );
+        let agent_span_id = agent_span.id().map(str::to_owned);
+        let outcome = self.run_agent(&request, &context, agent_span_id).await;
+        agent_span = match &outcome {
+            Ok(_) => agent_span.status(titi_core::trace::SpanStatus::Ok),
+            Err(reason) => agent_span.failed(reason.to_string()),
+        };
+        agent_span.finish(spans::now_ms());
+        outcome
+    }
+}
+
+impl ToolAgentRunner {
+    /// The body of [`run`](AgentRunner::run), with the frame's span id in
+    /// hand: it is what this agent's model calls and tool calls hang from.
+    async fn run_agent(
+        &self,
+        request: &AgentRequest,
+        context: &AgentContext,
+        agent_span_id: Option<String>,
+    ) -> Result<SmolStr, SmolStr> {
         let resolved = self
             .resolver
             .resolve(&self.model)
@@ -150,10 +210,30 @@ impl AgentRunner for ToolAgentRunner {
                 return Err("aborted".into());
             }
 
+            // This round's model call, under the agent's own span: a subagent
+            // is a branch of the turn that spawned it, not a row beside it.
+            let mut llm_span = OpenSpan::open(
+                &self.spans,
+                agent_span_id.clone(),
+                SpanKind::Llm,
+                format!("chat {}", resolved.wire_model),
+            )
+            .attr("gen_ai.operation.name", serde_json::json!("chat"))
+            .attr(
+                "gen_ai.request.model",
+                serde_json::json!(resolved.wire_model.as_str()),
+            );
+            let llm_span_id = llm_span.id().map(str::to_owned);
+            let mut reported: Option<titi_providers::TokenUsage> = None;
+            // The reasoning this round streams, counted from the deltas: the
+            // collector's blocks are what has to be replayed, and not every
+            // family sends one.
+            let mut thinking_text = String::new();
+
             let mut wire = WireRequest::new(resolved.wire_model.clone());
             wire.messages = messages.clone();
             wire.tools = self.tools.specs();
-            let mut stream = resolved
+            let mut stream = match resolved
                 .transport
                 .stream(
                     wire,
@@ -163,13 +243,21 @@ impl AgentRunner for ToolAgentRunner {
                     },
                 )
                 .await
-                .map_err(|error| SmolStr::from(error.to_string()))?;
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let reason = SmolStr::from(error.to_string());
+                    llm_span.mark_failed(reason.to_string());
+                    return Err(reason);
+                }
+            };
 
             let mut collector = ToolCallCollector::default();
             let mut text = String::new();
             while let Some(event) = stream.next().await {
                 if context.is_aborted() {
                     aborted.store(true, Ordering::SeqCst);
+                    llm_span.set_status(titi_core::trace::SpanStatus::Cancelled);
                     return Err("aborted".into());
                 }
                 collector.observe(&event);
@@ -178,7 +266,14 @@ impl AgentRunner for ToolAgentRunner {
                         text.push_str(&delta);
                         context.progress(delta).await;
                     }
-                    StreamEvent::Error { message, .. } => return Err(message),
+                    StreamEvent::Usage(usage) => reported = Some(usage),
+                    StreamEvent::ThinkingDelta { text: thought, .. } => {
+                        thinking_text.push_str(&thought);
+                    }
+                    StreamEvent::Error { message, .. } => {
+                        llm_span.mark_failed(message.to_string());
+                        return Err(message);
+                    }
                     StreamEvent::Done { .. } => break,
                     _ => {}
                 }
@@ -188,6 +283,36 @@ impl AgentRunner for ToolAgentRunner {
                 summary.push_str(&text);
             }
             let calls = collector.take();
+            // What this round cost and reasoned, then its span closes: the
+            // tools it asked for run after the call that asked for them, and
+            // hang from this span by id.
+            let (prompt, completion, cached) = match reported {
+                Some(usage) => (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cached_tokens,
+                ),
+                None => (0, 0, 0),
+            };
+            llm_span = llm_span.tokens(prompt, completion, cached, 0).attr(
+                "gen_ai.response.finish_reasons",
+                serde_json::json!([if calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                }]),
+            );
+            let thought_chars = thinking_text.chars().count() as u64;
+            if thought_chars > 0 {
+                llm_span = llm_span.attr(
+                    titi_core::trace::THINKING_CHARS_ATTR,
+                    serde_json::json!(thought_chars),
+                );
+                if self.trace_thinking {
+                    llm_span = llm_span.thinking(Some(mask(&thinking_text, self.mask_ips)));
+                }
+            }
+            llm_span.finish(spans::now_ms());
             if calls.is_empty() {
                 break;
             }
@@ -218,6 +343,7 @@ impl AgentRunner for ToolAgentRunner {
                 &sink,
                 &aborted,
                 &trajectory,
+                &self.spans,
                 &self.touched,
                 // The same publish point the main turn's tool loop gets: a
                 // subagent's write is folded in as the call returns, so the
@@ -228,6 +354,7 @@ impl AgentRunner for ToolAgentRunner {
                 &self.claims,
                 &request.id,
                 self.mask_ips,
+                llm_span_id.as_deref(),
             )
             .await;
             messages.extend(results);

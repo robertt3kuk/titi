@@ -678,6 +678,9 @@ async fn session_trajectory_records_user_tools_and_turn_end() {
         None,
         echo_registry(),
         trajectory,
+        // These tests do not trace: an empty sink writes no spans, and the
+        // turn behaves exactly as it did before tracing existed.
+        titi_engine::SpanSink::default(),
     );
     engine
         .send(EngineCommand::SubmitPrompt { text: "hi".into() })
@@ -737,6 +740,9 @@ async fn tool_output_is_masked_before_the_trajectory_records_it() {
         None,
         echo_registry(),
         trajectory,
+        // These tests do not trace: an empty sink writes no spans, and the
+        // turn behaves exactly as it did before tracing existed.
+        titi_engine::SpanSink::default(),
     );
     engine
         .send(EngineCommand::SubmitPrompt { text: "hi".into() })
@@ -794,6 +800,9 @@ async fn tool_arguments_are_masked_before_the_trajectory_records_them() {
         None,
         echo_registry(),
         trajectory,
+        // These tests do not trace: an empty sink writes no spans, and the
+        // turn behaves exactly as it did before tracing existed.
+        titi_engine::SpanSink::default(),
     );
     engine
         .send(EngineCommand::SubmitPrompt { text: "hi".into() })
