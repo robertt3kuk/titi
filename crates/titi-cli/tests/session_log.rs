@@ -121,6 +121,7 @@ fn a_restored_tool_round_is_the_one_the_live_session_had() {
     let call = titi_providers::ToolCallRef {
         call_id: "call-1".into(),
         name: "read".into(),
+        ..Default::default()
     };
     // What the live turn sent: prompt, the call, its output, then the answer.
     let live = vec![
@@ -167,6 +168,7 @@ fn a_truncated_restore_never_splits_a_tool_round() {
             vec![titi_providers::ToolCallRef {
                 call_id: format!("call-{index}").into(),
                 name: "read".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -179,6 +181,7 @@ fn a_truncated_restore_never_splits_a_tool_round() {
         vec![titi_providers::ToolCallRef {
             call_id: "call-cut-short".into(),
             name: "bash".into(),
+            ..Default::default()
         }],
     )
     .unwrap();
@@ -225,6 +228,7 @@ fn a_broken_round_in_the_middle_does_not_erase_what_came_after() {
         vec![titi_providers::ToolCallRef {
             call_id: "call-abandoned".into(),
             name: "bash".into(),
+            ..Default::default()
         }],
     )
     .unwrap();
@@ -269,5 +273,8 @@ fn message(
         role,
         content: text.into(),
         tool_calls: tool_calls.to_vec(),
+        // The struct grew fields (`tool_call_id` and the call's `arguments`);
+        // the literals here set what they are about and take the rest.
+        ..Default::default()
     }
 }
