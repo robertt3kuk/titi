@@ -1,14 +1,15 @@
 # Agent tracing — Laminar-shaped spans for a titi session
 
-Status: **research + plan, with Phase A part 1 implemented.** It ends with a
-phased plan (A/B/C), the exact files each phase touches, and the decisions the
-owner had to make — those were answered, and §6/§7 below are now the shapes the
-code uses: `crates/titi-core/src/trace.rs` (span model, writer, reader, tree,
-retention, thinking cap) and `crates/titi-cli/src/trace_cmd.rs` (`titi trace
-[session] [--turn N]`), committed 2026-10-09. The engine half of Phase A (the
-`SpanSink` in §7 A2–A5) is still to come. Owner ask, 2026-10-09: *"We should be
-able to stack-trace the agents as Laminar does — at least minimally — and
-analyze the thinking part too if needed."*
+Status: **Phase A is implemented** (core `feb9e3c`/`1f6d718`, CLI and panel
+`9501184`, engine `a6e4955`); Phase B step 1 (thinking metrics and search) is in
+as well, and Phase C is not started. §6/§7 below are the shapes the code uses:
+`crates/titi-core/src/trace.rs` (span model, writer, reader, tree, retention,
+thinking cap), `crates/titi-cli/src/trace_cmd.rs` (`titi trace [session]
+[--turn N]`, `--search`, `--all`), the `/trace` panel in `pickers.rs`, and
+`crates/titi-engine/src/spans.rs` (the sink the engine writes through). §10
+records the answers the owner gave to the questions this plan raised. Owner ask,
+2026-10-09: *"We should be able to stack-trace the agents as Laminar does — at
+least minimally — and analyze the thinking part too if needed."*
 
 Method: primary sources read over the network on 2026-10-09 (the OTel GenAI
 semantic conventions repo and `lmnr-ai/lmnr`), plus the titi tree at `27c06e5`.
@@ -469,10 +470,10 @@ and `/trace` render it.
 | # | Change | Files | Notes |
 | --- | --- | --- | --- |
 | A1 | `Span`/`SpanKind`/`SpanStatus` types + `TraceWriter` + reader + tree + retention (done, `feb9e3c`/`1f6d718`) | **new** `crates/titi-core/src/trace.rs`; `crates/titi-core/src/lib.rs` (add `pub mod trace;` + re-exports, mirroring `:16`) | reuses the trajectory's torn-tail/0600/flush patterns rather than extracting them (the third repetition would be the trigger) |
-| A2 | A `SpanSink` (like `TrajectorySink`) threaded through the engine; open the recorder beside the trajectory | `crates/titi-engine/src/runtime.rs` (`EngineConfig`/`start_inner`, `:963-1059`), `crates/titi-engine/src/lib.rs`; `crates/titi-cli/src/engine.rs:992` | same `Arc<Mutex<Option<…>>>` shape as the trajectory |
-| A3 | LLM span: start/end, wire model, per-round usage, finish reason, attempt count, thinking buffer | `crates/titi-engine/src/runtime.rs:2491, 2709-2722, 2772-2865` | thinking text masked via `titi_memory::redact` and capped at `THINKING_CAP_CHARS` |
-| A4 | Tool span: reuse `Prepared.started` + args + masked result | `crates/titi-engine/src/tool_loop.rs:202-211, 355-375` | nesting parent = the current LLM span's id |
-| A5 | Agent + Turn spans; real parent id; reattach the subagent tool sink | `crates/titi-engine/src/agents.rs:172-182, 286-368`; `crates/titi-engine/src/tool_agent.rs:141-142, 210-211` | detached goal/council/orchestrator runs stay outside Phase A (no span graph) |
+| A2 | A `SpanSink` threaded through the engine; the recorder opened beside the trajectory (done, `a6e4955`) | **new** `crates/titi-engine/src/spans.rs`; `crates/titi-engine/src/runtime.rs`, `lib.rs`; `crates/titi-cli/src/engine.rs:1036` | same shape as the trajectory, but a std `Mutex` — never held across an await, so a turn's future stays `Send` |
+| A3 | LLM span: start/end, wire model, per-round usage, finish reason, attempt count, thinking (done, `a6e4955`) | `crates/titi-engine/src/runtime.rs` (`stream_attempt`'s `RoundReport`) | the thinking is measured from the *deltas*, not the collector's blocks — only some families send a block, so a delta is the only thing every reasoning model gives |
+| A4 | Tool span: `Prepared.started` + masked args + masked, capped result (done, `a6e4955`) | `crates/titi-engine/src/tool_loop.rs` (`finish`) | the parent is passed in — the round's span id — rather than read from a shared stack, because a read group runs concurrently |
+| A5 | Turn + Agent spans; the subagent's tool sink reattached (done, `a6e4955`) | `crates/titi-engine/src/runtime.rs`, `crates/titi-engine/src/tool_agent.rs` | the agent hangs from the turn's frame (not from the tool call that spawned it — that needs a per-call context the tool trait does not carry); detached goal/council/orchestrator runs still have no span graph |
 | A6 | `titi trace [session]` CLI tree (dur/tokens/cost/error, thinking folded) | **new** `crates/titi-cli/src/trace_cmd.rs`; `crates/titi-cli/src/main.rs` (short-circuit at `:81`, mirroring `genome_cmd`); resolve id via `session_fs.rs:62, 119` | bare = newest session |
 | A7 | `/trace` panel: reuse the `/tree` machinery | `crates/titi-cli/src/chat.rs:2245` (match arm), `crates/titi-cli/src/pickers.rs` (`COMMANDS` ~`:129`, `panel_view_for` `:1107`, a `trace_panel` beside `tree_panel` `:1080`, `lay_out` `:969`) | re-render on open; no live push |
 
@@ -527,22 +528,23 @@ export must not block a turn (fire-and-forget, bounded queue).
 
 ---
 
-## 10. Owner decisions
+## 10. Owner decisions (answered 2026-10-09)
 
-1. **Thinking full text**: persist by default (masked + capped, honest to the
-   ask) or opt-in (OTel's own default)? The viewer folds it either way, but the
-   file's contents change.
-2. **Retention**: cap trace files by size/age (and fix the existing trajectory
-   leak where deleting a session leaves its trajectory behind,
-   `session_fs.rs:155-158`), or leave unbounded like the trajectory?
-3. **Trace granularity**: one trace per **turn** (recommended — matches Laminar's
-   "one agent run"), or one per session?
-4. **`/trace` liveness**: read the trace file on open (no protocol change, Phase
-   A) or add a live `EngineEvent::Span` (protocol + round-trip test, more work)?
-5. **Phase C at all**: do you want OTLP/Laminar export, and may a crate be added
-   (`opentelemetry-proto`), or should it stay a hand-rolled JSON POST?
-6. **Phase B scope**: local metrics/view/search only, or also the model-run
-   `--analyze` (spends tokens per trace)?
+1. **Thinking full text**: **opt-in** — `trace.thinking` (unset = off), read
+   through `switch_on`; the metrics (chars, ms, reasoning tokens) are recorded
+   either way, and the text, when on, is masked and capped.
+2. **Retention**: **bounded** — the newest 500 files and nothing older than 30
+   days, pruned at session start; deleting a session deletes its traces, and its
+   trajectory now goes with it too (`ee4d2c2`).
+3. **Trace granularity**: **one trace per turn**, grouped by session — the file
+   is named for the session's own turn ordinal (not the engine's per-process
+   turn counter, which a resumed session would restart at 1).
+4. **`/trace` liveness**: **read the file on open** — no protocol change; the
+   panel re-renders from the file each time it opens.
+5. **Phase C**: **not now** — no exporter, local traces only. The attributes are
+   already the OTel GenAI names, so an exporter stays a mapping.
+6. **Phase B scope**: **local metrics, view and search first** (step 1, done);
+   the model-run `--analyze` is later and opt-in.
 
 ## 11. Sources
 
