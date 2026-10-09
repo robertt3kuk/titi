@@ -286,6 +286,12 @@ pub fn render_markdown(text: &str, theme: &Theme, width: u16, mermaid: bool) -> 
                     lines.push(String::new());
                 }
                 lines.append(&mut render_table(&table, theme, w));
+                // A numeric table carries a chart of its one measure, when the
+                // table reads as one (see `chart`): directly under it, so the
+                // bars are read against the rows they came from.
+                if let Some(chart) = crate::chart::plan(&table.header, &table.rows) {
+                    lines.append(&mut crate::chart::render(&chart, theme, w));
+                }
             } else {
                 lines.append(&mut literal_rows(raw, theme, w));
             }
@@ -753,6 +759,17 @@ fn parse_table(source: &[&str]) -> Option<(TableBlock, usize)> {
 /// `│ `…` │` border, which is `3n + 1` columns of chrome.
 fn table_fits(cols: usize, w: usize) -> bool {
     cols > 0 && w >= 4 * cols + 1
+}
+
+/// Whether `text` holds a GFM table the renderer would draw.
+///
+/// The question a caller has to answer before choosing between this renderer
+/// and plain text — "is this answer markdown at all?" — asked with the same
+/// reader the renderer itself uses ([`parse_table`]), so the two can never
+/// disagree about what a table is.
+pub fn has_table(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.windows(2).any(|pair| parse_table(pair).is_some())
 }
 
 /// Render source lines as ordinary paragraph text — the fallback for a block

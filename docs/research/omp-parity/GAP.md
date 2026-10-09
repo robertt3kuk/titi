@@ -177,9 +177,9 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 - cost: large. `crates/titi-tui/src/markdown.rs` + a new box-drawing graph layout module (its own tests).
 - beauty: the fence is replaced by an ASCII flowchart in `MdCodeBlock` colours, redrawn only when the block closes.
 
-## 25. Auto-graph under numeric tables — **open**
+## 25. Auto-graph under numeric tables — **partly ported** (`feat(tui): chart a numeric table below it`)
 - omp: `tui.autoGraph` (`modes/settings.ts:442`, smart/always/off); `pi-tui/src/charts/chart-plan.ts`, `chart-svg.ts`, `table-data.ts`.
-- titi: absent — `grep -rln "chart\|Chart" crates/titi-tui/src/` → two emoji names (`bar_chart`, `chart_with_upwards_trend`), nothing else. Its dependency (#2, GFM tables) is ported, so what is missing is the plot renderer itself.
+- titi: the first slice is in — `crates/titi-tui/src/chart.rs` draws **horizontal bars under a GFM table that reads as one measure**: labels from the first column (never an index), bars scaled so the largest fills the field (eighth blocks, `#` in the ASCII preset), each value as written at its own bar's end. It qualifies only for 4–12 body rows, a first column of labels, one column whose every cell is one quantity in one unit (`%`, a currency, a unit word, `k`/`M`/`B`), no negatives, and only when the bars say more than the numbers (✱ omp's own `worthCharting`: nine values, or a three-fold spread). A cell that carries a second number — a range, a date, a transition, a parenthesized share — skips the table, as does a pane too narrow for a bar field; such a table renders byte-for-byte as before. Not yet: omp's other eight kinds, its dimension/unit normalization, `a → b` pairs, the total-row rule, and the SVG path (omp draws on a graphics-capable terminal; this is text). The key `tui.autoGraph` is not read — the behavior is its default `always`, and the call site is in the chat renderer, so the flag is a later one-line change.
 - value: users who ask for data ("compare these numbers") — a chart makes the answer readable at a glance.
 - cost: large (depends on #2 for the table, needs a plot renderer + a graphics path).
 - beauty: a sparkline/bar block in theme colours directly under the table; `off` leaves the table alone.
@@ -200,7 +200,7 @@ Welcome lockup · todo tool · read ranges · real globs · regex grep · bash b
 The three this section recommended — transcript markdown tables (#2), the turn footer (#1) and the terminal title (#3) — are all **ported**; the caveat about `chat.rs` being the serialized file is what the split answered. Read the statuses above instead; the honest queue from them is:
 1. **Pinned live agents + subagent preview (#17)** — the highest value on the board and **blocked** on one engine piece (a model-facing spawn tool; the surface half is then one wave). The engine worker has it.
 2. **A surface item that is genuinely open and small**: `tui.tight` (#15), the working-row shimmer (#16), or the status line's `separator`/`sessionAccent` (#10). All three are cosmetic and independent of `chat.rs`'s orchestration; none needs a model call.
-3. **The next large one**: mermaid fences (#24) or the auto-graph (#25), both surface-only and both wanting the picture budget the product review left unmeasured.
+3. **The next large one**: the rest of the auto-graph (#25) — its other kinds, unit normalization and the judge model for several series — surface-only, and wanting the picture budget the product review left unmeasured.
 
 ## Not verified / not portable
 - Left unranked on purpose (checked, too large or outside the gates): `xd://` tool devices (`tools.xdev`, `tools.xdevDocs`, `tools.xdevInlineDevices` — a whole device-URL tool layer titi has no counterpart to), `snapcompact.*` (a compaction-shaping package; titi's `titi-engine/src/compaction.rs` already decides the same policy by hand), `worktree.*` / `/worktree`, `loop.*` (titi has `/loop`), `hindsight`/`mnemopi` memory backends (titi has `titi-memory`), `share.*` (titi has `titi-core/src/share.rs`), and everything gated by M6/M9 (`skills.*`, `hooks`, `mcp.*`, `extensions`, `plugins`).

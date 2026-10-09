@@ -50,6 +50,27 @@ fn golden_render(md: &str) -> String {
     render_markdown(md, &golden_theme(), 40, false).join("\n")
 }
 
+/// The same theme with the ASCII symbol preset: what a terminal without block
+/// glyphs gets, and the preset's separator is `#`.
+fn golden_render_ascii(md: &str) -> String {
+    let mut fg = HashMap::new();
+    for (k, v) in MD_TOKENS {
+        fg.insert((*k).to_string(), json!(v));
+    }
+    let theme = Theme::new(
+        "golden-ascii".into(),
+        fg,
+        HashMap::new(),
+        ColorMode::Truecolor,
+        SymbolPreset::Ascii,
+        HashMap::new(),
+        None,
+        None,
+    )
+    .expect("golden ascii theme builds");
+    render_markdown(md, &theme, 40, false).join("\n")
+}
+
 /// Render at a chosen pane width (the goldens otherwise use 40 columns).
 fn golden_render_w(md: &str, w: u16) -> Vec<String> {
     render_markdown(md, &golden_theme(), w, false)
@@ -567,4 +588,124 @@ fn golden_math_inline_never_exceeds_the_pane() {
             "row fits a 20-column pane: {row:?}"
         );
     }
+}
+
+/// A numeric table carries a bar chart of its one measure, drawn directly
+/// under it: labels left, bars scaled so the largest fills the field, and the
+/// value as written at each bar's own end.
+///
+/// The table above the bars is **byte-identical** to the same table rendered
+/// where no column qualifies (`120 e5` is the same width as `120 ms` and is not
+/// one quantity), which is what proves the chart only ever appends.
+#[test]
+fn golden_chart_under_a_numeric_table() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n";
+    let quiet = "| Name | Time |\n|---|---|\n| build | 120 e5 |\n| test | 45 e5 |\n| lint | 8 e5 |\n| fmt | 2 e5 |\n";
+    let got = golden_render_w(md, 40);
+    let plain = golden_render_w(quiet, 40);
+    let bars = &got[got.len() - 4..];
+    let dim = "\x1b[38;2;68;68;68m";
+    let ink = "\x1b[38;2;201;209;217m";
+    let off = "\x1b[39m";
+    // The field is 26 cells at this width: 120 ms fills it, and the rest are
+    // scaled and rounded to the nearest eighth of a cell.
+    let expected = vec![
+        format!(
+            "  {dim}build{off} {ink}{}{off} {off}120 ms{off}",
+            "\u{2588}".repeat(26)
+        ),
+        format!(
+            "  {dim}test{off}  {ink}{}{off} {off}45 ms{off}",
+            format!("{}\u{258a}{}", "\u{2588}".repeat(9), " ".repeat(16))
+        ),
+        format!(
+            "  {dim}lint{off}  {ink}{}{off} {off}8 ms{off}",
+            format!("\u{2588}\u{258a}{}", " ".repeat(24))
+        ),
+        format!(
+            "  {dim}fmt{off}   {ink}{}{off} {off}2 ms{off}",
+            format!("\u{258d}{}", " ".repeat(25))
+        ),
+    ];
+    assert_eq!(bars, expected.as_slice(), "\n--- got ---\n{bars:#?}");
+    assert_eq!(
+        got.len(),
+        plain.len() + 4,
+        "the chart adds exactly one row per bar"
+    );
+    // The table part is the same layout, cell for cell: the only difference is
+    // the text of the measure column itself (`120 e5` where the charted table
+    // says `120 ms`), so folding that back makes the two byte-identical.
+    let folded: Vec<String> = plain
+        .iter()
+        .map(|line| {
+            line.replace("120 e5", "120 ms")
+                .replace("45 e5", "45 ms")
+                .replace("8 e5", "8 ms")
+                .replace("2 e5", "2 ms")
+        })
+        .collect();
+    assert_eq!(
+        &got[..plain.len()],
+        folded.as_slice(),
+        "the table itself must be untouched"
+    );
+}
+
+/// A table that does not qualify gets no chart at all — three rows is a list.
+#[test]
+fn golden_no_chart_below_a_short_table() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n";
+    let got = golden_render_w(md, 40);
+    assert!(
+        !got.iter().any(|line| line.contains('\u{2588}')),
+        "no bars under three rows: {got:#?}"
+    );
+}
+
+/// A pane too narrow for a bar field draws the table alone, never a chart whose
+/// bars all look alike.
+#[test]
+fn golden_no_chart_in_a_narrow_pane() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n";
+    for width in [16u16, 20, 23] {
+        let got = golden_render_w(md, width);
+        assert!(
+            !got.iter().any(|line| line.contains('\u{2588}')),
+            "no chart at width {width}: {got:#?}"
+        );
+    }
+}
+
+/// The ASCII preset draws the same chart in `#`, with no eighth blocks.
+#[test]
+fn golden_chart_in_ascii() {
+    let md = "| Name | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n";
+    let got = golden_render_ascii(md);
+    let dim = "\x1b[38;2;68;68;68m";
+    let ink = "\x1b[38;2;201;209;217m";
+    let off = "\x1b[39m";
+    // The same bars in `#`: a cell is filled or it is not, so the eighth of a
+    // cell that rounds up in Unicode is a whole one here.
+    let expected = [
+        format!(
+            "  {dim}build{off} {ink}{}{off} {off}120 ms{off}",
+            "#".repeat(26)
+        ),
+        format!(
+            "  {dim}test{off}  {ink}{}{off} {off}45 ms{off}",
+            format!("{}{}", "#".repeat(10), " ".repeat(16))
+        ),
+        format!(
+            "  {dim}lint{off}  {ink}{}{off} {off}8 ms{off}",
+            format!("{}{}", "#".repeat(2), " ".repeat(24))
+        ),
+        format!(
+            "  {dim}fmt{off}   {ink}{}{off} {off}2 ms{off}",
+            format!("{}{}", "#".repeat(1), " ".repeat(25))
+        ),
+    ];
+    let bars = &got.split('\n').collect::<Vec<_>>();
+    let bars = &bars[bars.len() - 4..];
+    assert_eq!(bars, expected.as_slice(), "\n--- got ---\n{bars:#?}");
 }

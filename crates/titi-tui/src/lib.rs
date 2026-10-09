@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod caps;
+mod chart;
 /// Crate version, mirrors the workspace release.
 pub mod component;
 pub mod diff;

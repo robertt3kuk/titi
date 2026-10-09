@@ -132,6 +132,9 @@ Other keys this build reads, each unset = off unless said otherwise: `editor.vim
 
 A mermaid `flowchart`/`graph` fence is drawn as a diagram (top-down and left-right, labels, chains, `subgraph`’s nodes without its box; an unsupported fence keeps its source) unless `tui.renderMermaid` is off — unset is on, omp’s default.
 
+A GFM table whose numbers read as one measure gets a bar chart under it: labels left, bars scaled so the largest fills the field, each value as written at its own bar's end. Only for 4–12 rows, a first column of labels rather than an index, one column whose every cell is one quantity in one unit (`12`, `1,400 tok/s`, `45%`, `$250`, `2.5k`), no negatives, and only when the bars say more than the numbers already do (nine values, or a three-fold spread). Anything else — a range, a date, a cell with a second number, a pane too narrow for a bar field — leaves the table exactly as it was. omp draws this (`tui.autoGraph`, default `always`) as SVG on a graphics terminal; titi draws it in text.
+
+
 The model a session starts on can be named: `modelRoles:` / `  default: openai/gpt-4.1` — unset is the first available model, which is what it always was, and a pinned id that is not available starts there anyway and says so once, by name.
 
 A dotted key may be written flat: `editor.vim: true` at the top level is the same setting as `editor:\n  vim: true`, which is what `/settings` prints, so a line copied out of it works. Where a file writes both, the nested one wins. `ask` is the tool the model uses to put a question to you: options, several if it says so, or your own words — answered in the panel above the composer. `agent` spawns a subagent (up to four in one call) whose lifecycle the pinned strip shows.
@@ -224,7 +227,7 @@ The engine, streaming, model switching and a fallback chain across providers, to
 
 ### What is not
 
-A desktop window on GPUI (M9). MCP, hooks, and a skills runtime that runs anything: a skill is found and its text is expanded, never executed (M6). A price table — everything here is counted in tokens, and `/budget $10` is refused instead of converted at a made-up rate.
+A desktop window on GPUI (M9). MCP, hooks, and a skills runtime that runs anything: a skill is found and its text is expanded, never executed (M6). A shipped price table: no built-in model carries a price, so a money cap over one is refused by name rather than converted at a rate nobody wrote down. A model you declare may carry its own `price` (see above), and then the cap is enforced against it.
 
 ### Safe to publish
 
@@ -373,6 +376,9 @@ titi --mode plan
 
 Фенс mermaid `flowchart`/`graph` рисуется диаграммой (сверху вниз и слева направо, подписи, цепочки, узлы `subgraph` без его рамки; неподдержанный фенс остаётся исходником), если `tui.renderMermaid` не выключен — не задан значит включено, как в omp.
 
+Таблица GFM, числа которой читаются как одна мера, получает под собой столбиковую диаграмму: подписи слева, столбики в масштабе самого длинного, значение — у конца своего столбика. Только для 4–12 строк, первого столбца подписей (не индекса), одного столбца, где каждая ячейка — одна величина в одной единице (`12`, `1,400 tok/s`, `45%`, `$250`, `2.5k`), без отрицательных значений — и только если столбики говорят больше, чем сами числа (девять значений или трёхкратный разброс). Всё прочее — диапазон, дата, ячейка со вторым числом, слишком узкая панель — оставляет таблицу ровно как была. omp рисует это (`tui.autoGraph`, по умолчанию `always`) как SVG на графическом терминале; titi рисует текстом.
+
+
 Модель, с которой начинается сессия, можно назвать: `modelRoles:` / `  default: openai/gpt-4.1` — не задано значит первая доступная модель, как и было, а закреплённый id, который недоступен, начинает там же и говорит об этом один раз, по имени.
 
 Ключ с точкой можно писать плоско: `editor.vim: true` в корне — та же настройка, что вложенная, то есть то, что печатает `/settings`, поэтому скопированная оттуда строка работает. Если в файле есть оба написания, побеждает вложенное. Инструмент `ask` — это вопрос модели к вам: варианты, несколько если она так сказала, или свои слова; отвечают в панели над композером. `agent` запускает субагента (до четырёх за один вызов), и его жизненный цикл виден в прикреплённой строке.
@@ -459,7 +465,7 @@ cargo run -p titi-genome --example map -- . 40
 
 ### Чего ещё нет
 
-Настольного окна на GPUI (M9). MCP, хуков и рантайма скиллов, который что-то запускает: скилл находится, его текст разворачивается, но не исполняется (M6). Прайс-таблицы — здесь всё считается в токенах, и `/budget $10` отклоняется, а не пересчитывается по выдуманной ставке.
+Настольного окна на GPUI (M9). MCP, хуков и рантайма скиллов, который что-то запускает: скилл находится, его текст разворачивается, но не исполняется (M6). Прайс-таблицы в поставке: ни одна встроенная модель не несёт цены, поэтому денежный лимит по ней отклоняется с названием модели, а не пересчитывается по ставке, которую никто не писал. Объявленная вами модель может нести свою `price` (см. выше), и тогда лимит по ней соблюдается.
 
 ### Можно публиковать
 
