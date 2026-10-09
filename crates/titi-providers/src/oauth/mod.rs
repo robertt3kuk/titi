@@ -689,6 +689,7 @@ fn map_transport_error(error: TransportError) -> OAuthError {
         TransportError::Fatal {
             status: Some(status),
             message,
+            ..
         } if matches!(status, 400 | 401 | 403) => OAuthError::TokenRejected {
             status,
             message: format!("HTTP {status}: {message}"),
@@ -756,6 +757,7 @@ mod tests {
 
     fn ok(body: Value) -> Result<MockFetchResponse, TransportError> {
         Ok(MockFetchResponse {
+            headers: Vec::new(),
             status: 200,
             chunks: vec![body.to_string()],
         })
@@ -763,6 +765,7 @@ mod tests {
 
     fn status(code: u16, body: Value) -> Result<MockFetchResponse, TransportError> {
         Ok(MockFetchResponse {
+            headers: Vec::new(),
             status: code,
             chunks: vec![body.to_string()],
         })
@@ -1116,6 +1119,7 @@ mod tests {
         assert!(error.to_string().contains("invalid_grant"), "{error}");
 
         let offline = MockFetch::new(vec![Err(TransportError::Retryable {
+            retry_after: None,
             status: None,
             message: "offline".into(),
         })]);

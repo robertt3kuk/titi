@@ -67,6 +67,7 @@ impl ReqwestFetch {
             .map_err(|e| TransportError::Fatal {
                 status: None,
                 message: format!("client build failed: {e}").into(),
+                context_too_long: false,
             })?;
         Ok(Self { client })
     }
@@ -82,6 +83,7 @@ impl HttpFetch for ReqwestFetch {
                 TransportError::Fatal {
                     status: None,
                     message: format!("bad method: {e}").into(),
+                    context_too_long: false,
                 }
             })?;
             let mut builder = self.client.request(method, req.url.as_str());
@@ -97,6 +99,7 @@ impl HttpFetch for ReqwestFetch {
                 .map_err(|e| TransportError::Retryable {
                     status: None,
                     message: format!("request failed: {e}").into(),
+                    retry_after: None,
                 })?;
             let status = resp.status().as_u16();
             let headers = resp

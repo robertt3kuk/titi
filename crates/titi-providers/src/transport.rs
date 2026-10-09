@@ -146,11 +146,19 @@ pub enum TransportError {
     Retryable {
         status: Option<u16>,
         message: SmolStr,
+        /// How long the provider asked to be left alone, when it said so in a
+        /// `retry-after`-family header. `None` means it said nothing and the
+        /// caller's own schedule applies.
+        retry_after: Option<Duration>,
     },
     /// Definitive rejection: do not retry, do not fall back.
     Fatal {
         status: Option<u16>,
         message: SmolStr,
+        /// True when the rejection is the request being longer than the
+        /// model's window. The message carries the provider's own words; this
+        /// is what a caller can act on — fold the history and try once more.
+        context_too_long: bool,
     },
     /// Watchdog: no first event or too long between events. `model` and
     /// `waited` are what the person needs to see: which endpoint was silent
@@ -176,6 +184,39 @@ impl TransportError {
             TransportError::Retryable { .. } | TransportError::Stalled { .. }
         )
     }
+
+    /// Whether this rejection is the request being longer than the model's
+    /// window — the one rejection a caller can do something about.
+    pub fn is_context_too_long(&self) -> bool {
+        matches!(
+            self,
+            TransportError::Fatal {
+                context_too_long: true,
+                ..
+            }
+        )
+    }
+
+    /// The same error, with the model's window named when the request was too
+    /// long for it. A person reading the failure needs the number the fold is
+    /// trying to fit into.
+    pub fn naming_the_window(self, window: u64) -> Self {
+        match self {
+            TransportError::Fatal {
+                status,
+                message,
+                context_too_long: true,
+            } => TransportError::Fatal {
+                status,
+                message: format!(
+                    "{message} (this model's window is {window} tokens; the history was folded and the request was still too long)"
+                )
+                .into(),
+                context_too_long: true,
+            },
+            other => other,
+        }
+    }
 }
 
 impl std::fmt::Display for TransportError {
@@ -184,18 +225,22 @@ impl std::fmt::Display for TransportError {
             TransportError::Retryable {
                 status: Some(status),
                 message,
+                ..
             } => write!(f, "temporarily unavailable (HTTP {status}): {message}"),
             TransportError::Retryable {
                 status: None,
                 message,
+                ..
             } => write!(f, "temporarily unavailable: {message}"),
             TransportError::Fatal {
                 status: Some(status),
                 message,
+                ..
             } => write!(f, "rejected (HTTP {status}): {message}"),
             TransportError::Fatal {
                 status: None,
                 message,
+                ..
             } => write!(f, "rejected: {message}"),
             TransportError::Stalled {
                 phase: StallPhase::FirstEvent,
@@ -285,6 +330,7 @@ mod tests {
     fn retryability_classes() {
         assert!(
             TransportError::Retryable {
+                retry_after: None,
                 status: Some(429),
                 message: "rl".into()
             }
@@ -300,6 +346,7 @@ mod tests {
         );
         assert!(
             !TransportError::Fatal {
+                context_too_long: false,
                 status: Some(401),
                 message: "no".into()
             }
@@ -327,6 +374,7 @@ mod tests {
         let cases = [
             (
                 TransportError::Fatal {
+                    context_too_long: false,
                     status: Some(401),
                     message: "invalid api key".into(),
                 },
@@ -334,6 +382,7 @@ mod tests {
             ),
             (
                 TransportError::Fatal {
+                    context_too_long: false,
                     status: None,
                     message: "bad frame".into(),
                 },
@@ -341,6 +390,7 @@ mod tests {
             ),
             (
                 TransportError::Retryable {
+                    retry_after: None,
                     status: Some(429),
                     message: "slow down".into(),
                 },
@@ -348,6 +398,7 @@ mod tests {
             ),
             (
                 TransportError::Retryable {
+                    retry_after: None,
                     status: None,
                     message: "connection refused".into(),
                 },

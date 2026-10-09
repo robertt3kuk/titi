@@ -359,6 +359,7 @@ mod tests {
 
     fn rate_limited() -> TransportError {
         TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "rate limited".into(),
         }
@@ -464,14 +465,17 @@ mod tests {
     fn only_rate_limits_rotate_accounts() {
         let not_rate_limits = [
             TransportError::Retryable {
+                retry_after: None,
                 status: Some(500),
                 message: "server".into(),
             },
             TransportError::Retryable {
+                retry_after: None,
                 status: None,
                 message: "unknown".into(),
             },
             TransportError::Fatal {
+                context_too_long: false,
                 status: Some(401),
                 message: "unauthorized".into(),
             },
@@ -493,6 +497,7 @@ mod tests {
         let mut rot = AccountRotation::new(accounts(&["work", "personal"]));
         assert!(
             rot.next_on_rate_limit(&TransportError::Fatal {
+                context_too_long: false,
                 status: Some(429),
                 message: "quota".into(),
             })

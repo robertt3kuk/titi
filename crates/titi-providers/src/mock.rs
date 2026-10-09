@@ -16,6 +16,9 @@ pub struct MockFetchResponse {
     pub status: u16,
     /// SSE/text chunks streamed in order.
     pub chunks: Vec<String>,
+    /// Headers the response carries. A `retry-after` on a 429 is the reason
+    /// this exists.
+    pub headers: Vec<(smol_str::SmolStr, smol_str::SmolStr)>,
 }
 
 impl MockFetchResponse {
@@ -23,11 +26,21 @@ impl MockFetchResponse {
         Self {
             status: 200,
             chunks,
+            headers: Vec::new(),
         }
     }
 
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
+        self
+    }
+
+    pub fn with_header(
+        mut self,
+        name: impl Into<smol_str::SmolStr>,
+        value: impl Into<smol_str::SmolStr>,
+    ) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 }
@@ -84,14 +97,18 @@ impl HttpFetch for MockFetch {
                 return Err(TransportError::Fatal {
                     status: None,
                     message: "mock exhausted: no scripted responses".into(),
+                    context_too_long: false,
                 });
             };
             let resp = resp?;
             let status = resp.status;
             let chunks = resp.chunks.into_iter().map(|c| Ok(c.into_bytes()));
+            let mut headers: Vec<(smol_str::SmolStr, smol_str::SmolStr)> =
+                vec![("content-type".into(), "text/event-stream".into())];
+            headers.extend(resp.headers);
             Ok(HttpResponse {
                 status,
-                headers: vec![("content-type".into(), "text/event-stream".into())],
+                headers,
                 body: Box::pin(futures::stream::iter(chunks)),
             })
         })
@@ -169,6 +186,7 @@ impl Transport for MockTransport {
             None => Err(TransportError::Fatal {
                 status: None,
                 message: "mock exhausted".into(),
+                context_too_long: false,
             }),
             Some(MockBody::Err(e)) => Err(e),
             Some(MockBody::Events(events)) => Ok(Box::pin(futures::stream::iter(events))),

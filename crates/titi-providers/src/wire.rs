@@ -43,6 +43,155 @@ impl Role {
     }
 }
 
+/// The longest a provider may ask this client to wait.
+///
+/// Past it the attempt fails with the provider's own number in the message: a
+/// `retry-after: 600` is not a pause a turn can sit through, and holding one
+/// would look like a hang.
+pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait a `retry-after`-family header asks for, in the order the families
+/// document them.
+///
+/// `retry-after-ms` (Anthropic and OpenAI both send it beside the seconds
+/// form), then `retry-after` — seconds, or an HTTP-date, which is what a
+/// gateway in front of a provider tends to send — then OpenAI's
+/// `x-ratelimit-reset-requests` / `-tokens`, whose values are durations like
+/// `1s`, `20ms` or `6m0s`. Nothing parseable means nothing asked for.
+fn retry_after_of(headers: &[(SmolStr, SmolStr)]) -> Option<std::time::Duration> {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    if let Some(ms) = header("retry-after-ms").and_then(|value| value.trim().parse::<u64>().ok()) {
+        return Some(std::time::Duration::from_millis(ms));
+    }
+    if let Some(value) = header("retry-after") {
+        let value = value.trim();
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(std::time::Duration::from_secs(seconds));
+        }
+        if let Some(at) = parse_http_date(value) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0);
+            return Some(std::time::Duration::from_secs(at.saturating_sub(now)));
+        }
+    }
+    for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+        if let Some(wait) = header(name).and_then(parse_duration_text) {
+            return Some(wait);
+        }
+    }
+    None
+}
+
+/// `1s`, `20ms`, `6m0s` — the shape OpenAI's reset headers use.
+fn parse_duration_text(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let mut total = std::time::Duration::ZERO;
+    let mut number = String::new();
+    let mut saw_unit = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            number.push(c);
+            continue;
+        }
+        let value: f64 = number.parse().ok()?;
+        number.clear();
+        saw_unit = true;
+        total += match c {
+            'h' => std::time::Duration::from_secs_f64(value * 3600.0),
+            // `ms` is milliseconds; a bare `m` is minutes. The families send
+            // both.
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                std::time::Duration::from_millis(value as u64)
+            }
+            'm' => std::time::Duration::from_secs_f64(value * 60.0),
+            's' => std::time::Duration::from_secs_f64(value),
+            'u' | 'µ' => std::time::Duration::from_micros(value as u64),
+            'n' => std::time::Duration::from_nanos(value as u64),
+            _ => return None,
+        };
+    }
+    // A bare number of milliseconds is what the header sends when it has no
+    // unit at all.
+    if !number.is_empty() {
+        let value: f64 = number.parse().ok()?;
+        total += std::time::Duration::from_millis(value as u64);
+    }
+    (saw_unit || total > std::time::Duration::ZERO).then_some(total)
+}
+
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as seconds since the
+/// epoch. The one date shape `retry-after` documents; anything else is `None`.
+fn parse_http_date(text: &str) -> Option<u64> {
+    let rest = text.split_once(", ").map(|(_, rest)| rest).unwrap_or(text);
+    let mut parts = rest.split_whitespace();
+    let day: u64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.split(':');
+    let hour: u64 = clock.next()?.parse().ok()?;
+    let minute: u64 = clock.next()?.parse().ok()?;
+    let second: u64 = clock.next()?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 || day == 0 || day > 31 {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm), then the time of day.
+    let (y, m) = if month <= 2 { (year - 1, month + 12) } else { (year, month) };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Whether a rejection is the request being longer than the model's window.
+///
+/// Each family says it its own way, and all three say it in words: OpenAI's
+/// code is `context_length_exceeded`, Anthropic's message reads "prompt is too
+/// long", Gemini answers `INVALID_ARGUMENT` about tokens. The message carries
+/// the provider's own words; this is what a caller can act on.
+fn context_length_rejection(api: ApiKind, message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    match api {
+        ApiKind::OpenAiCompletions | ApiKind::OpenAiResponses => {
+            lower.contains("context_length_exceeded")
+                || lower.contains("maximum context length")
+                || lower.contains("too many tokens")
+        }
+        ApiKind::AnthropicMessages => {
+            lower.contains("prompt is too long") || lower.contains("context length")
+        }
+        ApiKind::GeminiGenerateContent => {
+            lower.contains("invalid_argument") && lower.contains("token")
+                || lower.contains("input token count")
+                || lower.contains("exceeds the maximum")
+        }
+    }
+}
+
 /// The completions family's messages, tool calls included.
 ///
 /// An assistant message that called tools must carry them: a `tool` message
@@ -1246,17 +1395,38 @@ impl Transport for FamilyTransport {
         let http_req = build_http_request(self.api, &self.base_url, &req, ctx.credential.as_ref());
         let resp = self.fetch.fetch(http_req).await?;
         if resp.status >= 400 {
+            // The headers are read before the body is consumed: a provider
+            // that says how long to wait says it there.
+            let asked = retry_after_of(&resp.headers);
             let message =
                 upstream_error_message(resp.status, resp.body, ctx.credential.as_ref()).await;
+            let context_too_long = context_length_rejection(self.api, &message);
             return Err(if resp.status == 429 || resp.status >= 500 {
-                TransportError::Retryable {
-                    status: Some(resp.status),
-                    message,
+                match asked {
+                    // A wait past the cap is not a pause, it is a refusal: the
+                    // turn fails with the provider's own number in the message
+                    // rather than holding a person's session for minutes.
+                    Some(wait) if wait > MAX_RETRY_AFTER => TransportError::Fatal {
+                        status: Some(resp.status),
+                        message: format!(
+                            "{message} (the provider asked to wait {}s, past the {}-second cap)",
+                            wait.as_secs(),
+                            MAX_RETRY_AFTER.as_secs()
+                        )
+                        .into(),
+                        context_too_long,
+                    },
+                    wait => TransportError::Retryable {
+                        status: Some(resp.status),
+                        message,
+                        retry_after: wait,
+                    },
                 }
             } else {
                 TransportError::Fatal {
                     status: Some(resp.status),
                     message,
+                    context_too_long,
                 }
             });
         }
@@ -1274,6 +1444,7 @@ impl Transport for FamilyTransport {
                 return Err(TransportError::Fatal {
                     status: None,
                     message: "cancelled before the stream opened".into(),
+                    context_too_long: false,
                 });
             }
             ReadStep::Idle => {
@@ -1561,6 +1732,68 @@ mod tests {
     fn body_of(api: ApiKind, r: &WireRequest) -> Value {
         let hr = build_http_request(api, "http://x/v1", r, None);
         serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json")
+    }
+
+    /// A 429 that says how long to wait carries that number, in every shape
+    /// the families send it.
+    #[test]
+    fn a_rate_limit_carries_the_wait_it_asked_for() {
+        let header = |name: &str, value: &str| vec![(name.into(), value.into())];
+        assert_eq!(
+            retry_after_of(&header("retry-after-ms", "1500")),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert_eq!(
+            retry_after_of(&header("retry-after", "2")),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_after_of(&header("x-ratelimit-reset-requests", "6m0s")),
+            Some(std::time::Duration::from_secs(360))
+        );
+        assert_eq!(
+            retry_after_of(&header("x-ratelimit-reset-tokens", "20ms")),
+            Some(std::time::Duration::from_millis(20))
+        );
+        // An HTTP-date, the shape a gateway in front of a provider sends.
+        let at = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").expect("the documented shape");
+        assert_eq!(at, 784111777);
+        // Nothing parseable is nothing asked for.
+        assert_eq!(retry_after_of(&header("retry-after", "soon")), None);
+        assert_eq!(retry_after_of(&[]), None);
+    }
+
+    /// A wait past the cap is a refusal, not a pause: the attempt fails with
+    /// the provider's own number in the message.
+    #[tokio::test]
+    async fn a_wait_past_the_cap_fails_the_attempt_by_name() {
+        let fetch = Arc::new(MockFetch::new(vec![Ok(
+            MockFetchResponse::sse(Vec::new())
+                .with_status(429)
+                .with_header("retry-after", "600"),
+        )]));
+        let transport = FamilyTransport::new(
+            ApiKind::OpenAiCompletions,
+            "http://x/v1",
+            Arc::clone(&fetch) as Arc<dyn HttpFetch>,
+        );
+        let error = transport
+            .stream(WireRequest::new("m"), RequestCtx::default())
+            .await
+            .err()
+            .expect("a 429 is an error");
+        assert!(
+            matches!(&error, TransportError::Fatal { .. }),
+            "past the cap is fatal: {error}"
+        );
+        assert!(
+            error.to_string().contains("600"),
+            "and names the wait: {error}"
+        );
+        assert!(
+            error.to_string().contains("cap"),
+            "and the cap: {error}"
+        );
     }
 
     /// The two OpenAI families declare a tool differently: Completions nests
