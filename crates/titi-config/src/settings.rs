@@ -127,6 +127,22 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// How the pinned list of live agents above the composer behaves.
+///
+/// `off` hides it, `collapsed` (the default, omp's too —
+/// `modes/settings.ts:591`) shows up to three live agents with `… N more`, and
+/// `full` lists every one. Unset means `collapsed`, because the strip is the
+/// feature: a screen with no live agent draws nothing either way, so an idle
+/// frame is untouched.
+pub const DISPLAY_PINNED_AGENTS_KEY: &str = "display.pinnedAgents";
+
+/// Whether a pinned agent's row carries what it is doing.
+///
+/// Unset means **off**, omp's default too (`modes/settings.ts:610`): the row is
+/// a name and a state, and the preview — the engine's `tools: read, grep`
+/// activity, or the tail of the agent's own answer — is the noisy half.
+pub const DISPLAY_SUBAGENT_PREVIEW_KEY: &str = "display.subagentLivePreview";
+
 /// Whether the screen drops one cell of horizontal padding from its surfaces.
 ///
 /// Unset means **off**, so an unset key leaves every frame exactly as it was.

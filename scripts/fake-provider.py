@@ -15,6 +15,8 @@ the real binary and the real HTTP stack:
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
+  "pin agents"    two `agent` calls in one round (the pinned strip's subject:
+                  several live at once), each with a small task
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
@@ -126,6 +128,22 @@ def script(last: dict) -> list[tuple[dict, float]]:
     if "run bash" in content:
         return [(chunk({"content": "Running it. "}), 0)] + [
             (c, 0) for c in call("call_bash", "bash", {"command": "echo titi-smoke"})
+        ]
+    if "pin agents" in content:
+        return [(chunk({"content": "Spawning two. "}), 0)] + [
+            (c, 0)
+            for c in call(
+                "call_agent_1",
+                "agent",
+                {"name": "alpha", "task": "say alpha", "kind": "subagent"},
+            )
+        ] + [
+            (c, 0)
+            for c in call(
+                "call_agent_2",
+                "agent",
+                {"name": "beta", "task": "say beta", "kind": "subagent"},
+            )
         ]
     if "big output" in content:
         return [(c, 0) for c in call("call_big", "bash", {"command": "seq 1 20000"})]

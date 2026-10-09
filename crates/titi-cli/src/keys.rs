@@ -326,6 +326,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
         what: "cycle what `/tree` shows: everything, no tool traffic, only yours",
     },
     Hotkey {
+        group: HotkeyGroup::Lists,
+        keys: "alt+a",
+        what: "move the view through the live agents and back to the turn",
+    },
+    Hotkey {
         group: HotkeyGroup::Transcript,
         keys: "↑ · ↓",
         what: "scroll the transcript a row, with text in the draft",
@@ -413,8 +418,21 @@ impl Chat {
     // that scrolled would move the text out from under the selection.
 
     /// Mouse press: anchor a drag-select at a screen cell.
-    pub fn mouse_press(&mut self, x: u16, y: u16) {
+    /// Mouse press. On a pinned agent's row it is a click on the jump list and
+    /// nothing else — no selection starts there, because the strip is chrome,
+    /// not transcript — which is why this returns what the screen should do.
+    pub fn mouse_press(&mut self, x: u16, y: u16) -> Option<Applied> {
+        if let Some(agent_id) = self.agent_at_row(y) {
+            let agent_id = agent_id.to_owned();
+            self.agent_focus = Some(agent_id.clone());
+            return Some(Applied::effect(ChatEffect::Send(
+                EngineCommand::FocusAgent {
+                    agent_id: agent_id.into(),
+                },
+            )));
+        }
         self.selection = Some(Selection::anchor(x, y));
+        None
     }
 
     /// Mouse drag: move the selection's far corner.
@@ -557,6 +575,20 @@ impl Chat {
             // rather than opening one, so the key cannot surprise a composer.
             Key::AltF if self.tree_picker.is_some() => self.tree_picker_key(key, now),
             Key::AltF => Applied::none(),
+            // alt+a walks the pinned agents and back to the main turn. Landing
+            // on an agent asks the engine for its pane; the walk back to the
+            // main turn is the screen's own, because the engine's `FocusAgent`
+            // names an agent and has no form for "none".
+            Key::AltA => {
+                self.disarm();
+                self.cycle_agent_focus();
+                match self.agent_focus.clone() {
+                    Some(id) => Applied::effect(ChatEffect::Send(EngineCommand::FocusAgent {
+                        agent_id: id.into(),
+                    })),
+                    None => Applied::none(),
+                }
+            }
             Key::CtrlD if self.input.is_empty() => Applied::effect(ChatEffect::Quit),
             Key::Up if self.picking() => {
                 self.move_picker(-1);
@@ -693,6 +725,12 @@ impl Chat {
             // on an empty composer the second press is the rewind chord.
             Key::Esc if self.picking() => {
                 self.picker_hidden = true;
+                self.disarm();
+                Applied::none()
+            }
+            // An agent's pane is Esc's next stop: back to the main turn.
+            Key::Esc if self.agent_focus.is_some() => {
+                self.agent_focus = None;
                 self.disarm();
                 Applied::none()
             }
@@ -1104,6 +1142,53 @@ impl Chat {
         self.arm_quit(now, EXIT_HINT)
     }
 
+    /// An agent that reached the end of its life leaves the strip — and takes
+    /// the view with it when its pane had it, so the screen never shows a pane
+    /// that is gone.
+    pub(crate) fn forget_agent(&mut self, agent_id: &str) {
+        self.agents.retain(|agent| agent.id != agent_id);
+        if self.agent_focus.as_deref() == Some(agent_id) {
+            self.agent_focus = None;
+        }
+    }
+
+    /// The agent whose pane has the view, if one does and it is still live.
+    pub(crate) fn focused_agent(&self) -> Option<&PinnedAgent> {
+        let id = self.agent_focus.as_deref()?;
+        self.agents.iter().find(|agent| agent.id == id)
+    }
+
+    /// The agent a screen row belongs to, for a click on the strip: `row` is a
+    /// screen row and the strip knows where it starts.
+    pub(crate) fn agent_at_row(&self, row: u16) -> Option<&str> {
+        let offset = row.checked_sub(self.pinned_top)?;
+        if offset >= self.pinned_rows {
+            return None;
+        }
+        self.agents
+            .get(offset as usize)
+            .map(|agent| agent.id.as_str())
+    }
+
+    /// The next focus in the jump list: the main turn, then each live agent in
+    /// start order, back round to the main turn.
+    pub(crate) fn cycle_agent_focus(&mut self) {
+        if self.agents.is_empty() {
+            self.agent_focus = None;
+            return;
+        }
+        self.agent_focus = match self.agent_focus.as_deref() {
+            None => Some(self.agents[0].id.clone()),
+            Some(current) => {
+                let at = self.agents.iter().position(|agent| agent.id == current);
+                match at {
+                    Some(at) if at + 1 < self.agents.len() => Some(self.agents[at + 1].id.clone()),
+                    _ => None,
+                }
+            }
+        };
+    }
+
     /// Whether the screen holds something a leave would give up: a finished
     /// turn's lines, or one still in flight.
     fn has_conversation(&self) -> bool {
@@ -1163,6 +1248,7 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Char('x') if control => Some(Key::CtrlX),
         KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
         KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltF),
+        KeyCode::Char('a') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltA),
         KeyCode::Char('r') if control => Some(Key::CtrlR),
         KeyCode::Char('w') if control => Some(Key::DeleteWord),
         // The two ends of the keyboard's own word delete: the macOS chord and

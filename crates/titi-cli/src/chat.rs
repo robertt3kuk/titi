@@ -167,6 +167,116 @@ fn tree_filter(settings: Option<&titi_config::settings::Settings>) -> TreeFilter
         .unwrap_or_default()
 }
 
+/// How the pinned strip of live agents behaves (`display.pinnedAgents`).
+///
+/// A strip with nothing live draws no rows in any mode, so the default only
+/// decides what happens once an agent starts — omp's default is `collapsed`
+/// too, and an idle frame is the frame it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PinnedAgents {
+    /// No strip at all.
+    Off,
+    /// Up to [`PINNED_ROWS`] rows, then `… N more`.
+    #[default]
+    Collapsed,
+    /// Every live agent the pane has room for.
+    Full,
+}
+
+/// Rows the collapsed strip shows before it counts the rest.
+const PINNED_ROWS: usize = 3;
+
+impl PinnedAgents {
+    /// The name the setting writes (omp's spellings).
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            PinnedAgents::Off => "off",
+            PinnedAgents::Collapsed => "collapsed",
+            PinnedAgents::Full => "full",
+        }
+    }
+
+    /// The mode a setting name asks for; `None` for anything else, so a typo in
+    /// a cosmetic key leaves the strip as it was.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(PinnedAgents::Off),
+            "collapsed" => Some(PinnedAgents::Collapsed),
+            "full" => Some(PinnedAgents::Full),
+            _ => None,
+        }
+    }
+
+    /// Whether the preview is drawn on the rows. The switch is separate
+    /// (`display.subagentLivePreview`), so this only reports the mode.
+    fn shows_rows(self) -> bool {
+        self != PinnedAgents::Off
+    }
+}
+
+/// The pinned mode and the preview switch, read together: the strip is the
+/// engine's five agent events made visible, and the two keys are what decide
+/// how much of it a screen draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PinnedStrip {
+    pub(crate) mode: PinnedAgents,
+    /// `display.subagentLivePreview`, unset = off.
+    pub(crate) preview: bool,
+}
+
+/// One live agent's pinned row: what the strip draws and what its pane needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PinnedAgent {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: titi_engine::AgentKind,
+    pub(crate) status: titi_engine::AgentStatus,
+    /// The last `AgentActivity` — what it is doing (`tools: read, grep`).
+    pub(crate) activity: String,
+    /// The agent's own text, as `AgentProgress` streamed it. This is the pane's
+    /// body and never a line of the parent's transcript.
+    pub(crate) answer: String,
+    /// When it started, for the spinner.
+    pub(crate) since: Instant,
+}
+
+impl PinnedAgent {
+    /// The one line the preview shows: what it is doing when the engine said,
+    /// and the tail of what it has said when it has not.
+    pub(crate) fn preview(&self) -> Option<String> {
+        let text = if self.activity.is_empty() {
+            self.answer.trim_end()
+        } else {
+            self.activity.as_str()
+        };
+        if text.is_empty() {
+            return None;
+        }
+        Some(one_line(text, PREVIEW_CHARS))
+    }
+}
+
+/// Characters a pinned row's preview keeps, before the strip cuts it to the
+/// pane anyway.
+const PREVIEW_CHARS: usize = 60;
+
+/// The pinned mode the settings ask for: `display.pinnedAgents` (unset =
+/// collapsed), and `display.subagentLivePreview` (unset = off).
+fn pinned_agents(settings: Option<&titi_config::settings::Settings>) -> PinnedStrip {
+    PinnedStrip {
+        mode: setting_string(settings, titi_config::settings::DISPLAY_PINNED_AGENTS_KEY)
+            .as_deref()
+            .and_then(PinnedAgents::parse)
+            .unwrap_or_default(),
+        preview: settings.is_some_and(|settings| {
+            titi_config::settings::switch_on(
+                settings,
+                titi_config::settings::DISPLAY_SUBAGENT_PREVIEW_KEY,
+            )
+        }),
+    }
+}
+
 /// One notification the run state owes the terminal, from an event the screen
 /// saw once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +344,8 @@ pub enum Key {
     AltM,
     /// The `/tree` filter: alt+f, while the tree is open.
     AltF,
+    /// The pinned agents: alt+a moves the view through them and back.
+    AltA,
     /// `app.history.search`: ctrl+r.
     CtrlR,
     /// Delete the word before the caret: alt+backspace or ctrl+w.
@@ -561,6 +673,22 @@ pub struct Chat {
     /// and its status row (`tui.tight`). Unset is off, so an unset key leaves
     /// every frame exactly as it was.
     pub(crate) tight: bool,
+    /// How the pinned strip above the composer behaves
+    /// (`display.pinnedAgents`), and whether its rows preview what the agent is
+    /// doing (`display.subagentLivePreview`).
+    pub(crate) pinned: PinnedStrip,
+    /// The live agents, in the order they started, fed by the engine's five
+    /// agent events. Several can be live at once (one `agent` call may spawn up
+    /// to four, and a wave up to thirty-two), so this is a list and not a slot.
+    pub(crate) agents: Vec<PinnedAgent>,
+    /// The agent whose pane has the view (`AgentFocused`); `None` is the
+    /// main turn.
+    pub(crate) agent_focus: Option<String>,
+    /// The screen row the strip starts on, so a click can name the agent it
+    /// landed on ([`Chat::agent_at_row`]).
+    pub(crate) pinned_top: u16,
+    /// How many rows the strip drew, for the same reason.
+    pub(crate) pinned_rows: u16,
     /// The large-paste menu: a paste long enough for `paste.menuThreshold`,
     /// held while the panel offers the ways to attach it; `None` = closed.
     pub(crate) paste_menu: Option<PasteMenu>,
@@ -760,6 +888,11 @@ impl Chat {
             tree_picker: None,
             tree_filter: TreeFilter::default(),
             tight: false,
+            pinned: PinnedStrip::default(),
+            agents: Vec::new(),
+            agent_focus: None,
+            pinned_top: 0,
+            pinned_rows: 0,
             workspace: crate::session_fs::current_workspace(),
             paste_menu: None,
             paste_menu_after: PASTE_MENU_AFTER,
@@ -1709,8 +1842,68 @@ impl Chat {
                 self.session_label = title.to_string();
                 Applied::none()
             }
-            EngineEvent::AgentStarted { name, .. } => {
+            // The five agent events, in one place: the strip is their only
+            // surface, so the screen's job is to keep the rows current and let
+            // the pane read them. `AgentProgress` is the agent's own text and
+            // never touches the parent's transcript; `AgentActivity` is the one
+            // status line that replaces in place.
+            EngineEvent::AgentStarted {
+                agent_id,
+                name,
+                kind,
+                ..
+            } => {
+                // The note line stays: it is what builds the transcript's
+                // `subagents` section (the same `LineKind::Agent` a finished
+                // agent writes), and the strip does not replace that — it says
+                // who is alive *now*, which is the one thing a line that
+                // scrolls cannot. The two are complementary, not duplicates.
                 self.push(LineKind::Agent, format!("tool agent {name}: started"));
+                self.agents.retain(|agent| agent.id != agent_id);
+                self.agents.push(PinnedAgent {
+                    id: agent_id.to_string(),
+                    name: name.to_string(),
+                    kind,
+                    status: titi_engine::AgentStatus::Running,
+                    activity: String::new(),
+                    answer: String::new(),
+                    since: Instant::now(),
+                });
+                Applied::none()
+            }
+            EngineEvent::AgentProgress { agent_id, text } => {
+                if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                    agent.answer.push_str(&text);
+                }
+                Applied::none()
+            }
+            EngineEvent::AgentActivity { agent_id, text } => {
+                if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                    agent.activity = text.to_string();
+                }
+                Applied::none()
+            }
+            EngineEvent::AgentStatusChanged { agent_id, status } => {
+                let terminal = !matches!(
+                    status,
+                    titi_engine::AgentStatus::Running
+                        | titi_engine::AgentStatus::Idle
+                        | titi_engine::AgentStatus::Parked
+                );
+                if terminal {
+                    self.forget_agent(&agent_id);
+                } else if let Some(agent) =
+                    self.agents.iter_mut().find(|agent| agent.id == agent_id)
+                {
+                    agent.status = status;
+                }
+                Applied::none()
+            }
+            EngineEvent::AgentFocused { agent_id } => {
+                // The engine is the one that knows whether an agent exists; the
+                // screen only shows what it is told, and a focus on nothing is
+                // the main turn.
+                self.agent_focus = agent_id.as_ref().map(|id| id.to_string());
                 Applied::none()
             }
             EngineEvent::AgentFinished {
@@ -1719,6 +1912,10 @@ impl Chat {
                 success,
                 ..
             } => {
+                self.forget_agent(&agent_id);
+                // The outcome stays a note: it is the one thing about a
+                // finished agent the strip cannot show, because the row goes
+                // when the agent does.
                 if success {
                     self.push(
                         LineKind::Agent,
@@ -3910,6 +4107,7 @@ pub fn run(
     chat.tight = settings.as_ref().is_some_and(|settings| {
         titi_config::settings::switch_on(settings, titi_config::settings::TUI_TIGHT_KEY)
     });
+    chat.pinned = pinned_agents(settings.as_ref());
     // The vim keys, off unless `editor.vim` asks for them: a switch that
     // changes what typing does is not turned on by a config that says nothing.
     chat.vim = settings
@@ -4646,11 +4844,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     let picker_h = panel.as_ref().map(PanelView::height).unwrap_or(0);
     let roster_h = roster_height(chat, area.height);
     let status = work_row(chat, area.width, &theme);
+    let pinned_h = pinned_height(chat, area.height);
     let cols = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(roster_h),
         Constraint::Min(1),
         Constraint::Length(picker_h),
+        // Zero while no agent is live, so an idle screen keeps every row it had
+        // before the strip existed.
+        Constraint::Length(pinned_h),
         // Zero while nothing is running, so an idle screen keeps every row it
         // had before this row existed.
         Constraint::Length(u16::from(status.is_some())),
@@ -4678,10 +4880,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if let Some(view) = &panel {
         frame.render_widget(panel_box(view, cols[3].width, chat.tight, &theme), cols[3]);
     }
-    if let Some(status) = status {
-        frame.render_widget(status, cols[4]);
+    // The strip draws here and remembers its own rows, so a click on one can
+    // name the agent it landed on.
+    chat.pinned_top = cols[4].y;
+    chat.pinned_rows = pinned_h;
+    if pinned_h > 0 {
+        frame.render_widget(pinned(chat, &theme), cols[4]);
     }
-    frame.render_widget(composer(chat, cols[5].width, &theme), cols[5]);
+    if let Some(status) = status {
+        frame.render_widget(status, cols[5]);
+    }
+    frame.render_widget(composer(chat, cols[6].width, &theme), cols[6]);
 }
 
 /// Rows the roster panel takes: one per peer plus its heading, capped so a
@@ -4693,6 +4902,103 @@ fn roster_height(chat: &Chat, total: u16) -> u16 {
     let rows = chat.hub.peers().len().max(1) + 1;
     let cap = (total / 3).max(2);
     (rows as u16).min(cap)
+}
+
+/// How many rows the strip draws: one per visible agent, plus the `… N more`
+/// line when the mode collapsed the rest away.
+fn pinned_rows_for(chat: &Chat) -> (usize, usize) {
+    if !chat.pinned.mode.shows_rows() || chat.agents.is_empty() {
+        return (0, 0);
+    }
+    let shown = match chat.pinned.mode {
+        PinnedAgents::Off => 0,
+        PinnedAgents::Collapsed => chat.agents.len().min(PINNED_ROWS),
+        PinnedAgents::Full => chat.agents.len(),
+    };
+    (shown, chat.agents.len() - shown)
+}
+
+/// Rows the pinned strip takes: its agents, its `… N more` line when there is
+/// one, and nothing at all when no agent is live — which is what keeps an idle
+/// frame exactly the frame it was.
+fn pinned_height(chat: &Chat, total: u16) -> u16 {
+    let (shown, hidden) = pinned_rows_for(chat);
+    if shown == 0 {
+        return 0;
+    }
+    let rows = shown + usize::from(hidden > 0);
+    // A crowded strip cannot take the conversation's room: the same third the
+    // hub roster is capped to.
+    (rows as u16).min((total / 3).max(2))
+}
+
+/// The glyph a row leads with: the spinner for a running agent, and a mark for
+/// the states that are not moving.
+///
+/// A running agent's glyph moves with the same clock the working row's does, so
+/// a strip of live agents reads as alive rather than as a frozen list.
+pub(crate) fn agent_glyph(status: titi_engine::AgentStatus, elapsed: Duration) -> &'static str {
+    match status {
+        titi_engine::AgentStatus::Running => spinner_frame(elapsed),
+        titi_engine::AgentStatus::Idle => "·",
+        titi_engine::AgentStatus::Parked => "‖",
+        titi_engine::AgentStatus::Aborted | titi_engine::AgentStatus::Failed => "✗",
+        titi_engine::AgentStatus::Completed => "✓",
+    }
+}
+
+/// The row colour of a state: the accent while it runs, dim when it waits, the
+/// two outcome tokens when it ended.
+fn agent_color(status: titi_engine::AgentStatus) -> ThemeColor {
+    match status {
+        titi_engine::AgentStatus::Running => ThemeColor::Accent,
+        titi_engine::AgentStatus::Failed | titi_engine::AgentStatus::Aborted => ThemeColor::Warning,
+        titi_engine::AgentStatus::Completed => ThemeColor::Success,
+        titi_engine::AgentStatus::Idle | titi_engine::AgentStatus::Parked => ThemeColor::Dim,
+    }
+}
+
+/// The live agents, pinned above the composer: a jump list that says who is
+/// running without opening anything.
+///
+/// The cursor wall is the same one the hub roster uses, and the strip never
+/// takes more than a third of the screen: a wave of thirty-two agents shows its
+/// head and counts the rest rather than pushing the conversation off.
+fn pinned(chat: &Chat, theme: &Theme) -> Paragraph<'static> {
+    let (shown, hidden) = pinned_rows_for(chat);
+    let mut lines = Vec::new();
+    for agent in chat.agents.iter().take(shown) {
+        let elapsed = Instant::now().saturating_duration_since(agent.since);
+        let focused = chat.agent_focus.as_deref() == Some(agent.id.as_str());
+        let mut row = vec![Span::styled(
+            format!("{} ", if focused { "▸" } else { " " }),
+            fg(theme, ThemeColor::Accent),
+        )];
+        row.push(Span::styled(
+            format!("{} ", agent_glyph(agent.status, elapsed)),
+            fg(theme, agent_color(agent.status)),
+        ));
+        row.push(Span::styled(
+            agent.name.clone(),
+            fg(theme, ThemeColor::Text),
+        ));
+        if chat.pinned.preview
+            && let Some(preview) = agent.preview()
+        {
+            row.push(Span::styled(
+                format!(" · {preview}"),
+                fg(theme, ThemeColor::Dim),
+            ));
+        }
+        lines.push(Line::from(row));
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {hidden} more"),
+            fg(theme, ThemeColor::Dim),
+        )));
+    }
+    Paragraph::new(lines).style(page(theme))
 }
 
 /// Who is on the hub right now, this session marked as itself.
@@ -5191,7 +5497,11 @@ fn pump(
             Event::Paste(text) => chat.paste(&text),
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    chat.mouse_press(mouse.column, mouse.row)
+                    if let Some(applied) = chat.mouse_press(mouse.column, mouse.row)
+                        && dispatch(engine, chat, session_log, cast, applied)
+                    {
+                        return Ok(true);
+                    }
                 }
                 // A drag moves the selection's corner and nothing else: the
                 // transcript must not scroll out from under the highlight.
@@ -11082,6 +11392,7 @@ mod tests {
             Key::CtrlR => "ctrl+r",
             Key::AltM => "alt+m",
             Key::AltF => "alt+f",
+            Key::AltA => "alt+a",
             // Neither half-page key can be pressed any more: the crate's table
             // gives ctrl+u to the caret's own delete and ctrl+d to quit, and
             // `map_key` reaches the half-page arms after both.
@@ -16311,6 +16622,320 @@ mod tests {
         assert!(
             title.contains("tree · 4 entries · 0 off this path"),
             "{title:?}"
+        );
+    }
+
+    /// One live agent, started by the engine.
+    fn agent_started(name: &str) -> EngineEvent {
+        EngineEvent::AgentStarted {
+            agent_id: name.to_owned().into(),
+            name: name.into(),
+            parent_id: Some("Main".into()),
+            kind: titi_engine::AgentKind::Subagent,
+        }
+    }
+
+    fn agent_finished(name: &str, success: bool) -> EngineEvent {
+        EngineEvent::AgentFinished {
+            agent_id: name.to_owned().into(),
+            summary: format!("{name} did the thing").into(),
+            success,
+        }
+    }
+
+    /// The strip lists the live agents — several at once, finishing out of
+    /// order — and an agent that ends leaves it. `off` draws nothing, `full`
+    /// draws all of them, and `collapsed` counts the overflow.
+    #[test]
+    fn the_strip_lists_live_agents_and_they_leave_in_any_order() {
+        let strip = |frame: &[String]| {
+            frame
+                .iter()
+                .filter(|row| {
+                    ["alpha", "beta", "gamma", "delta"]
+                        .iter()
+                        .any(|n| row.contains(n))
+                })
+                .count()
+        };
+        let mut chat = chat();
+        chat.on_event(agent_started("alpha"));
+        chat.on_event(agent_started("beta"));
+        chat.on_event(agent_started("gamma"));
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert_eq!(strip(&frame), 3, "{frame:#?}");
+        assert!(
+            frame.iter().any(|row| row.contains("alpha")),
+            "a row per live agent: {frame:#?}"
+        );
+
+        // The fourth is one too many for `collapsed`: it is counted, not drawn.
+        chat.on_event(agent_started("delta"));
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert_eq!(strip(&frame), 3);
+        assert!(
+            frame.iter().any(|row| row.contains("… 1 more")),
+            "{frame:#?}"
+        );
+
+        // Out of order: the middle agent finishes on its own.
+        chat.on_event(EngineEvent::AgentStatusChanged {
+            agent_id: "beta".into(),
+            status: titi_engine::AgentStatus::Completed,
+        });
+        assert_eq!(chat.agents.len(), 3);
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(!frame.iter().any(|row| row.contains("beta")), "{frame:#?}");
+        assert!(frame.iter().any(|row| row.contains("gamma")), "{frame:#?}");
+
+        // `full` lists every one the pane has room for.
+        chat.pinned.mode = PinnedAgents::Full;
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert_eq!(strip(&frame), 3, "alpha, gamma and delta: {frame:#?}");
+        assert!(!frame.iter().any(|row| row.contains("more")), "{frame:#?}");
+
+        // A focused agent's row carries the marker.
+        chat.agent_focus = Some("gamma".to_owned());
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains('▸') && row.contains("gamma")),
+            "the focused row is marked: {frame:#?}"
+        );
+        chat.agent_focus = None;
+
+        // `off` draws no strip at all, and the turn's own rows are untouched.
+        chat.pinned.mode = PinnedAgents::Off;
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert_eq!(strip(&frame), 0, "{frame:#?}");
+        chat.pinned.mode = PinnedAgents::Collapsed;
+
+        // A finished agent leaves the strip and stays a note: the outcome is
+        // the one thing about it the strip cannot show.
+        chat.on_event(agent_finished("alpha", true));
+        assert_eq!(chat.agents.len(), 2);
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("tool done")),
+            "the outcome is still a line in the transcript: {:#?}",
+            chat.lines
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `AgentProgress` is the agent's own text: the preview may show its tail,
+    /// but it never becomes a line of the parent's transcript.
+    #[test]
+    fn an_agents_words_go_to_its_row_and_never_to_the_transcript() {
+        let mut chat = chat();
+        chat.on_event(agent_started("alpha"));
+        chat.on_event(EngineEvent::AgentProgress {
+            agent_id: "alpha".into(),
+            text: "looking at the parser now".into(),
+        });
+        assert_eq!(chat.agents[0].answer, "looking at the parser now");
+        assert!(
+            !chat
+                .lines
+                .iter()
+                .any(|line| line.text.contains("parser now")),
+            "the parent's transcript is untouched"
+        );
+        let frame = frame_rows(&mut chat, 80, 24);
+        // The preview is off by default, so the row is a name and a state.
+        assert!(
+            !frame.iter().any(|row| row.contains("parser now")),
+            "{frame:#?}"
+        );
+
+        chat.pinned.preview = true;
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("looking at the parser now")),
+            "the preview shows what it said when the engine sent no activity: {frame:#?}"
+        );
+
+        // The engine's own activity line wins over the answer's tail.
+        chat.on_event(EngineEvent::AgentActivity {
+            agent_id: "alpha".into(),
+            text: "tools: read, grep".into(),
+        });
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame.iter().any(|row| row.contains("tools: read, grep")),
+            "{frame:#?}"
+        );
+        assert!(
+            !frame.iter().any(|row| row.contains("parser now")),
+            "{frame:#?}"
+        );
+    }
+
+    /// `alt+a` walks the jump list — an agent's pane, the next one, and back to
+    /// the turn — and Esc returns from a pane.
+    #[test]
+    fn alt_a_walks_the_agents_and_esc_comes_back() {
+        let mut chat = chat();
+        chat.on_event(agent_started("alpha"));
+        chat.on_event(agent_started("beta"));
+        chat.on_event(EngineEvent::AgentProgress {
+            agent_id: "beta".into(),
+            text: "the second agent's answer".into(),
+        });
+
+        // No live agent: the key is the main turn either way.
+        let mut empty = chat_with_theme(test_theme());
+        assert!(empty.on_key(Key::AltA, Instant::now()).effect.is_none());
+        assert!(empty.agent_focus.is_none());
+
+        let focus_of = |applied: &Applied| match &applied.effect {
+            Some(ChatEffect::Send(EngineCommand::FocusAgent { agent_id })) => {
+                Some(agent_id.to_string())
+            }
+            _ => None,
+        };
+
+        let applied = chat.on_key(Key::AltA, Instant::now());
+        assert_eq!(focus_of(&applied).as_deref(), Some("alpha"));
+        assert_eq!(chat.agents.len(), 2);
+        assert!(chat.focused_agent().is_some());
+        // The marker itself is drawn in
+        // `the_strip_lists_live_agents_and_they_leave_in_any_order`, where the
+        // strip's own frame is the subject.
+
+        let applied = chat.on_key(Key::AltA, Instant::now());
+        assert_eq!(focus_of(&applied).as_deref(), Some("beta"));
+        assert_eq!(chat.agent_focus.as_deref(), Some("beta"));
+
+        // Round to the main turn: the screen's own move, and no command.
+        let applied = chat.on_key(Key::AltA, Instant::now());
+        assert!(applied.effect.is_none(), "the engine has no form for it");
+        assert!(chat.agent_focus.is_none());
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            !frame.iter().any(|row| row.contains("agent beta ·")),
+            "{frame:#?}"
+        );
+
+        // A pane is Esc's next stop after an open list.
+        chat.on_key(Key::AltA, Instant::now());
+        assert_eq!(chat.agent_focus.as_deref(), Some("alpha"));
+        chat.on_key(Key::Esc, Instant::now());
+        assert!(chat.agent_focus.is_none(), "Esc comes back to the turn");
+
+        // An agent that ends while its pane has the view takes the view with
+        // it, so the screen never shows a pane that is gone.
+        chat.on_key(Key::AltA, Instant::now());
+        chat.on_event(agent_finished("alpha", false));
+        assert!(chat.agent_focus.is_none());
+        assert!(
+            chat.lines
+                .iter()
+                .any(|line| line.text.contains("tool error")),
+            "the outcome is a transcript line (the section folds it): {:#?}",
+            chat.lines
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A click on a pinned row focuses that agent, and a click anywhere else is
+    /// still a selection.
+    #[test]
+    fn a_click_on_a_pinned_row_focuses_that_agent() {
+        let mut chat = chat();
+        chat.on_event(agent_started("alpha"));
+        chat.on_event(agent_started("beta"));
+        let _ = frame_rows(&mut chat, 80, 24);
+        let first = chat.pinned_top;
+        assert!(chat.pinned_rows >= 2, "the strip drew its rows");
+
+        let applied = chat.mouse_press(2, first).expect("a jump, not a selection");
+        match applied.effect {
+            Some(ChatEffect::Send(EngineCommand::FocusAgent { agent_id })) => {
+                assert_eq!(agent_id.as_str(), "alpha");
+            }
+            other => panic!("expected FocusAgent, got {other:?}"),
+        }
+        assert_eq!(chat.agent_focus.as_deref(), Some("alpha"));
+        assert!(
+            chat.selection.is_none(),
+            "the strip is chrome, not transcript"
+        );
+
+        // Below the strip the press is a selection as it always was.
+        assert!(chat.mouse_press(2, chat.transcript_top + 1).is_none());
+        assert!(chat.selection.is_some());
+    }
+
+    /// The two settings, from a real config file, and the glyph per state.
+    #[test]
+    fn the_pinned_settings_and_the_state_glyphs() {
+        let dir = tempfile::tempdir().expect("temp");
+        let project = tempfile::tempdir().expect("temp");
+        let read = |text: &str| {
+            std::fs::write(dir.path().join("config.yml"), text).expect("write");
+            titi_config::settings::Settings::load(dir.path(), project.path(), &[]).expect("load")
+        };
+        assert_eq!(
+            pinned_agents(None),
+            PinnedStrip::default(),
+            "unset = collapsed"
+        );
+        assert_eq!(
+            pinned_agents(Some(&read("display:\n  pinnedAgents: off\n"))).mode,
+            PinnedAgents::Off
+        );
+        assert_eq!(
+            pinned_agents(Some(&read("display:\n  pinnedAgents: full\n"))).mode,
+            PinnedAgents::Full
+        );
+        assert_eq!(
+            pinned_agents(Some(&read("display:\n  pinnedAgents: hoops\n"))).mode,
+            PinnedAgents::Collapsed,
+            "a typo leaves the strip as it was"
+        );
+        assert!(!pinned_agents(Some(&read("theme:\n  dark: titanium\n"))).preview);
+        assert!(
+            pinned_agents(Some(&read("display:\n  subagentLivePreview: true\n"))).preview,
+            "the preview is its own switch"
+        );
+
+        // The names round-trip, and a running agent's glyph moves with the
+        // clock the working row already uses.
+        for mode in [
+            PinnedAgents::Off,
+            PinnedAgents::Collapsed,
+            PinnedAgents::Full,
+        ] {
+            assert_eq!(PinnedAgents::parse(mode.id()), Some(mode));
+        }
+        assert_eq!(
+            agent_glyph(titi_engine::AgentStatus::Parked, Duration::ZERO),
+            "‖"
+        );
+        assert_eq!(
+            agent_glyph(titi_engine::AgentStatus::Failed, Duration::ZERO),
+            "✗"
+        );
+        assert_eq!(
+            agent_glyph(titi_engine::AgentStatus::Running, Duration::from_millis(0)),
+            spinner_frame(Duration::ZERO)
+        );
+        assert_ne!(
+            agent_glyph(titi_engine::AgentStatus::Running, Duration::ZERO),
+            agent_glyph(
+                titi_engine::AgentStatus::Running,
+                Duration::from_millis(200)
+            ),
+            "and it moves"
         );
     }
 
