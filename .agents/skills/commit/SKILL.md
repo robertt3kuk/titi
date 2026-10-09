@@ -36,6 +36,11 @@ Serialize:
   ```
   The lock directory belongs to whoever created it; a stale one must be
   reported (to the holder or the user), never deleted.
+- `scripts/commit.sh <message-file> <path>...` is this whole step in one
+  command: it takes the lock, stages the paths given, prints what is cached,
+  refuses (and releases) if the cached set holds anything outside them, commits
+  with a pathspec, checks the paths are clean, and releases the lock on every
+  exit path. Prefer it to hand-typing the chain.
 - Stage by explicit path. Never `git add -A`, `git add .`, or `git commit
   -am` — that is how sibling work gets swept in.
 - Before committing: `git diff --cached --name-only` and `git status --short`
