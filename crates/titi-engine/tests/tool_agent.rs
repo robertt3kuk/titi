@@ -125,10 +125,18 @@ async fn a_subagent_reads_a_file_through_its_own_tool_loop() {
 
     assert_eq!(summary, "read it");
     assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, EngineEvent::AgentProgress { text, .. } if text.contains("tools: read"))),
-        "the subagent reports the tool it ran: {events:?}"
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::AgentActivity { text, .. } if text == "tools: read"
+        )),
+        "what the subagent is doing is an activity, not a line of its answer: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::AgentProgress { text, .. } if text == "read it"
+        )),
+        "and what it says is progress: {events:?}"
     );
     // Two provider requests: the tool round and the answer.
     assert_eq!(transport.call_count(), 2);

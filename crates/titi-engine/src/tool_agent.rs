@@ -198,8 +198,12 @@ impl AgentRunner for ToolAgentRunner {
             rounds += 1;
 
             let names: Vec<String> = calls.iter().map(|call| call.name.to_string()).collect();
+            // Activity, not progress: this is the engine saying what the agent
+            // is doing, not the model saying something. A surface that renders
+            // them the same way is the surface's choice; the wire keeps them
+            // apart so it can choose.
             context
-                .progress(format!("tools: {}", names.join(", ")))
+                .activity(format!("tools: {}", names.join(", ")))
                 .await;
 
             let results = execute_tools(

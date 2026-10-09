@@ -242,7 +242,23 @@ pub enum EngineEvent {
         parent_id: Option<SmolStr>,
         kind: AgentKind,
     },
+    /// The text the agent's model is writing, streamed as it arrives.
+    ///
+    /// This is the answer being written. What the agent is *doing* - which
+    /// tools it just called, which file it is reading - is
+    /// [`Self::AgentActivity`], because a surface that wants to say "what is
+    /// this agent up to" cannot get that out of the model's prose.
     AgentProgress {
+        agent_id: SmolStr,
+        text: SmolStr,
+    },
+    /// What the agent is doing rather than saying: `tools: read, grep`.
+    ///
+    /// The engine's own line, never the model's words, so a surface can show
+    /// it as activity without parsing or trusting the stream. Split out of
+    /// `AgentProgress`, which used to carry both and left a reader unable to
+    /// tell a sentence from a status.
+    AgentActivity {
         agent_id: SmolStr,
         text: SmolStr,
     },

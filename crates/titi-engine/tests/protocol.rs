@@ -287,6 +287,13 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"AgentProgress":{"agent_id":"a1","text":"reading"}}"#,
     );
     event(
+        EngineEvent::AgentActivity {
+            agent_id: "a1".into(),
+            text: "tools: read, grep".into(),
+        },
+        r#"{"AgentActivity":{"agent_id":"a1","text":"tools: read, grep"}}"#,
+    );
+    event(
         EngineEvent::AgentStatusChanged {
             agent_id: "a1".into(),
             status: AgentStatus::Parked,

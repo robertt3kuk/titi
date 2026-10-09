@@ -65,6 +65,21 @@ impl AgentContext {
             .await;
     }
 
+    /// What this agent is *doing* rather than saying: `tools: read, grep`.
+    ///
+    /// The engine's line, not the model's, and a different event from
+    /// [`Self::progress`] for exactly that reason — a surface showing "what is
+    /// this agent up to" cannot tell a status from a sentence otherwise.
+    pub async fn activity(&self, text: impl Into<SmolStr>) {
+        let _ = self
+            .events
+            .send(EngineEvent::AgentActivity {
+                agent_id: self.agent_id.clone(),
+                text: text.into(),
+            })
+            .await;
+    }
+
     /// Records something worth handing back to the parent.
     pub fn finding(&self, text: impl Into<SmolStr>) -> u64 {
         self.findings.push(self.agent_id.clone(), None, text)
