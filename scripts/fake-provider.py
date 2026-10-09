@@ -24,6 +24,8 @@ the real binary and the real HTTP stack:
                   response: the strip is live while the parent turn asks for an
                   approval, which is the crossing a pane has to survive
   "mermaid answer"  a `flowchart TD` fence, closed, so the transcript can draw it
+  "chart table"   a GFM table whose one numeric column has a wide spread, which
+                  the transcript charts under the table
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
@@ -184,6 +186,10 @@ def script(last: dict) -> list[tuple[dict, float]]:
             for c in call(
                 "call_exec", "bash", {"command": "echo qa-approval"}, index=1
             )
+        ]
+    if "chart table" in content:
+        return [
+            (chunk({"content": "The steps, slowest first.\n\n| Step | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |\n\nBuild is the one to look at.\n"}), 0)
         ]
     if "mermaid answer" in content:
         return [
