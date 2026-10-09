@@ -1734,6 +1734,47 @@ mod tests {
         serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json")
     }
 
+    /// Each family says "too long" its own way, and all three are recognised:
+    /// the reaction to this rejection is a fold and one more attempt, so a
+    /// miss here means a turn that fails where it could have continued.
+    #[test]
+    fn a_context_length_rejection_is_recognised_in_every_family() {
+        let cases = [
+            (
+                ApiKind::OpenAiCompletions,
+                "rejected (HTTP 400): This model's maximum context length is 128000 tokens. (code: context_length_exceeded)",
+            ),
+            (
+                ApiKind::OpenAiResponses,
+                "rejected (HTTP 400): Error code: context_length_exceeded",
+            ),
+            (
+                ApiKind::AnthropicMessages,
+                "rejected (HTTP 400): prompt is too long: 210000 tokens > 200000 maximum",
+            ),
+            (
+                ApiKind::GeminiGenerateContent,
+                "rejected (HTTP 400): INVALID_ARGUMENT: input token count exceeds the maximum number of tokens allowed",
+            ),
+        ];
+        for (api, message) in cases {
+            assert!(
+                context_length_rejection(api, message),
+                "{api:?} should be recognised: {message}"
+            );
+        }
+        // And nothing else is.
+        for api in [
+            ApiKind::OpenAiCompletions,
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+            ApiKind::GeminiGenerateContent,
+        ] {
+            assert!(!context_length_rejection(api, "rejected (HTTP 401): invalid api key"));
+            assert!(!context_length_rejection(api, "rejected (HTTP 400): malformed tool call"));
+        }
+    }
+
     /// A 429 that says how long to wait carries that number, in every shape
     /// the families send it.
     #[test]
