@@ -21,9 +21,9 @@ const USAGE_EXIT: i32 = 2;
 /// The exit for "there is nothing to print": no session, or no such turn.
 const MISSING_EXIT: i32 = 1;
 
-/// The most thinking lines the tree prints under one span before it says how
+/// The most thinking lines a view prints under one span before it says how
 /// many are left — a trace is for reading, not for dumping a transcript.
-const THINKING_LINES: usize = 20;
+pub(crate) const THINKING_LINES: usize = 20;
 
 /// Recognises `titi trace …` and prints it, exiting with a code. `None` when
 /// the first argument is not `trace`, so the caller falls through to its own
@@ -218,7 +218,7 @@ fn render_thinking(span: &titi_core::trace::Span, prefix: &str, out: &mut String
 
 /// The thinking size: the recorded text's length, or the count the engine wrote
 /// when the text itself was left out.
-fn thinking_chars(span: &titi_core::trace::Span) -> Option<u64> {
+pub(crate) fn thinking_chars(span: &titi_core::trace::Span) -> Option<u64> {
     if let Some(text) = &span.thinking {
         return Some(text.chars().count() as u64);
     }
@@ -228,8 +228,17 @@ fn thinking_chars(span: &titi_core::trace::Span) -> Option<u64> {
 }
 
 fn span_line(span: &titi_core::trace::Span) -> String {
-    let mut line = format!("{} {}", span.kind.label(), span.name);
-    line.push_str(&format!(" · {}", human_ms(span.duration_ms())));
+    format!("{} {}", span.kind.label(), span_summary(span))
+}
+
+/// A span's own facts without the kind's name: `name · 190ms · in 1.2k out 180
+/// · $0.0021`.
+///
+/// Shared with the `/trace` panel, which prefixes a kind glyph where this
+/// prints a kind word — so the two views cannot print a duration, a token
+/// count or a cost two different ways.
+pub(crate) fn span_summary(span: &titi_core::trace::Span) -> String {
+    let mut line = format!("{} · {}", span.name, human_ms(span.duration_ms()));
     if span.kind == SpanKind::Llm {
         let mut usage = format!("in {}", human_tokens(span.input_tokens));
         if span.cached_tokens > 0 {

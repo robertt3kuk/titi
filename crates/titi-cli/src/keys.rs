@@ -323,7 +323,7 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     Hotkey {
         group: HotkeyGroup::Lists,
         keys: "alt+f",
-        what: "cycle what `/tree` shows: everything, no tool traffic, only yours",
+        what: "cycle what `/tree` shows — everything, no tool traffic, only yours · or an older turn in `/trace`",
     },
     Hotkey {
         group: HotkeyGroup::Lists,
@@ -539,6 +539,9 @@ impl Chat {
         }
         if self.tree_picker.is_some() {
             return self.tree_picker_key(key, now);
+        }
+        if self.trace_picker.is_some() {
+            return self.trace_picker_key(key, now);
         }
         if self.login_picker.is_some() {
             return self.login_picker_key(key, now);

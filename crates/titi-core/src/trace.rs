@@ -157,6 +157,21 @@ impl SpanKind {
             SpanKind::Event => "event",
         }
     }
+
+    /// The one-cell mark a dense view prefixes a row with, where there is no
+    /// room for [`label`](Self::label).
+    ///
+    /// The same family the screen already uses (`▸`, `▾`, `•`); the tool mark
+    /// is `⚙`, the one the status row gives a running tool.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            SpanKind::Turn => "◆",
+            SpanKind::Llm => "✦",
+            SpanKind::Tool => "⚙",
+            SpanKind::Agent => "◈",
+            SpanKind::Event => "•",
+        }
+    }
 }
 
 /// How a span ended.

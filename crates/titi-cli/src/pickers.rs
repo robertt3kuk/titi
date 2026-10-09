@@ -127,6 +127,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "navigate the session tree, switching branches",
     },
     Command {
+        name: "trace",
+        about: "a turn's spans as a tree: durations, tokens, cost (usage: /trace [turn])",
+    },
+    Command {
         name: "recap",
         about: "what this session did",
     },
@@ -958,6 +962,326 @@ impl TreePicker {
     }
 }
 
+/// One row of the `/trace` panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TraceRow {
+    /// The row as the panel draws it: indented by depth, the kind's glyph,
+    /// the span's own summary.
+    pub(crate) text: String,
+    /// The span this row acts on — the span's own row, or its folded thinking
+    /// row. `None` on a line of thinking *text*, which the cursor steps over.
+    pub(crate) span_id: Option<String>,
+    /// Whether Enter on this row folds or unfolds its thinking block.
+    pub(crate) toggles: bool,
+}
+
+/// The `/trace` picker: one turn's spans as the tree they are.
+///
+/// One turn at a time, the newest unless `/trace N` names another, because a
+/// trace is a turn's stack — laying several turns out together would make a
+/// forest where the parent links cross files. `alt+f` walks to an older turn.
+///
+/// The rows are built once, when `/trace` runs, from the trace file the turn
+/// wrote; a fold or a turn change lays them out again from the tree in hand
+/// rather than reading a second time.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TracePicker {
+    pub(crate) rows: Vec<TraceRow>,
+    /// The row the cursor is on, an index into [`TracePicker::rows`].
+    pub(crate) selected: usize,
+    /// The turn on screen.
+    pub(crate) turn: u64,
+    /// Every turn of the session that has a trace, newest first: what `alt+f`
+    /// walks.
+    turns: Vec<u64>,
+    agent_dir: std::path::PathBuf,
+    session_id: String,
+    /// The span ids whose thinking text is unfolded.
+    unfolded: std::collections::HashSet<String>,
+    /// The turn's tree, kept so a fold or a turn change does not read again.
+    tree: Vec<titi_core::trace::TraceNode>,
+    /// How many spans the turn holds (the rows that stand for one).
+    spans: usize,
+}
+
+impl TracePicker {
+    /// Reads one turn's spans and lays them out as a tree. `turn` names the
+    /// turn to open; `None` is the newest one.
+    pub(crate) fn open(
+        agent_dir: &std::path::Path,
+        session_id: &str,
+        turn: Option<u64>,
+    ) -> Result<Self, String> {
+        let mut turns =
+            titi_core::trace::turns(agent_dir, session_id).map_err(|e| e.to_string())?;
+        if turns.is_empty() {
+            return Err("this session has no traces yet".to_owned());
+        }
+        turns.reverse();
+        let turn = match turn {
+            Some(n) if turns.contains(&n) => n,
+            Some(n) => return Err(format!("no turn {n} in this session's traces")),
+            None => turns[0],
+        };
+        let tree = read_tree(agent_dir, session_id, turn)?;
+        let mut picker = Self {
+            rows: Vec::new(),
+            selected: 0,
+            turn,
+            turns,
+            agent_dir: agent_dir.to_path_buf(),
+            session_id: session_id.to_owned(),
+            unfolded: std::collections::HashSet::new(),
+            tree,
+            spans: 0,
+        };
+        picker.lay_out(None);
+        Ok(picker)
+    }
+
+    /// The title the panel insets in its top rule: which turn of how many,
+    /// how big, and the keys that do something a reader cannot guess.
+    pub(crate) fn title(&self) -> String {
+        let mut title = format!(
+            "trace · turn {} of {} · {} spans",
+            self.turn,
+            self.turns.len(),
+            self.spans
+        );
+        if self.rows.iter().any(|row| row.toggles) {
+            title.push_str(" · enter folds thinking");
+        }
+        if self.turns.len() > 1 {
+            title.push_str(" · alt+f older turn");
+        }
+        title
+    }
+
+    /// Lays the rows out from the tree in hand, then puts the cursor back on
+    /// `keep` when that span still has a row — a fold changes the rows under
+    /// the cursor without moving it off the span it was on.
+    fn lay_out(&mut self, keep: Option<&str>) {
+        let mut rows = Vec::new();
+        let mut spans = 0;
+        push_trace_rows(&self.tree, 0, &self.unfolded, &mut rows, &mut spans);
+        self.rows = rows;
+        self.spans = spans;
+        self.selected = keep
+            .and_then(|id| {
+                self.rows
+                    .iter()
+                    .position(|row| row.span_id.as_deref() == Some(id))
+            })
+            .unwrap_or(0);
+    }
+}
+
+impl Chat {
+    /// `/trace [turn]`: the current session's spans as the tree they are, the
+    /// newest turn unless a number names another. A session with nothing
+    /// recorded says so rather than opening an empty panel, the way `/tree`
+    /// does.
+    pub(crate) fn open_trace(&mut self, args: &str) -> Applied {
+        let turn = match args.trim() {
+            "" => None,
+            raw => match raw.parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    self.push(
+                        LineKind::Error,
+                        format!("trace: turn must be a number, got `{raw}`"),
+                    );
+                    return Applied::none();
+                }
+            },
+        };
+        match TracePicker::open(&self.agent_dir, &self.session_id, turn) {
+            Ok(picker) => {
+                self.trace_picker = Some(picker);
+                Applied::none()
+            }
+            Err(reason) => {
+                self.push(LineKind::Note, format!("trace: {reason}"));
+                Applied::none()
+            }
+        }
+    }
+
+    /// Typing while the trace is up: arrows move, Enter folds or unfolds the
+    /// thinking under the cursor, alt+f walks to the next older turn, Esc
+    /// closes; anything else closes the panel and is handled as composer
+    /// input.
+    pub(crate) fn trace_picker_key(&mut self, key: Key, now: Instant) -> Applied {
+        match key {
+            Key::AltF => self.older_trace_turn(),
+            Key::Up => {
+                self.move_trace_picker(-1);
+                Applied::none()
+            }
+            Key::Down => {
+                self.move_trace_picker(1);
+                Applied::none()
+            }
+            Key::Enter => self.toggle_trace_thinking(),
+            Key::Esc => {
+                self.trace_picker = None;
+                Applied::none()
+            }
+            other => {
+                self.trace_picker = None;
+                self.on_key(other, now)
+            }
+        }
+    }
+
+    /// Moves the cursor to the next selectable row, skipping the lines of a
+    /// thinking text — they are the fold's content, not a row to act on.
+    fn move_trace_picker(&mut self, delta: isize) {
+        let Some(picker) = self.trace_picker.as_mut() else {
+            return;
+        };
+        let len = picker.rows.len();
+        if len == 0 {
+            return;
+        }
+        let mut at = picker.selected;
+        for _ in 0..len {
+            at = (at as isize + delta).rem_euclid(len as isize) as usize;
+            if picker.rows[at].span_id.is_some() {
+                picker.selected = at;
+                return;
+            }
+        }
+    }
+
+    /// Enter on a row: fold or unfold the thinking of the span it stands for.
+    /// A row with nothing to unfold — a tool, or a model call whose thinking
+    /// was not recorded — does nothing, so Enter cannot invent a block.
+    pub(crate) fn toggle_trace_thinking(&mut self) -> Applied {
+        let Some(picker) = self.trace_picker.as_mut() else {
+            return Applied::none();
+        };
+        let target = match picker.rows.get(picker.selected) {
+            Some(row) if row.toggles => row.span_id.clone(),
+            _ => None,
+        };
+        let Some(id) = target else {
+            return Applied::none();
+        };
+        if !picker.unfolded.remove(&id) {
+            picker.unfolded.insert(id.clone());
+        }
+        picker.lay_out(Some(&id));
+        Applied::none()
+    }
+
+    /// `alt+f`: the next older turn, wrapping back to the newest. A session
+    /// with one turn stays where it is.
+    pub(crate) fn older_trace_turn(&mut self) -> Applied {
+        let next = {
+            let Some(picker) = self.trace_picker.as_ref() else {
+                return Applied::none();
+            };
+            let at = picker
+                .turns
+                .iter()
+                .position(|turn| *turn == picker.turn)
+                .unwrap_or(0);
+            let turn = picker.turns[(at + 1) % picker.turns.len()];
+            (picker.agent_dir.clone(), picker.session_id.clone(), turn)
+        };
+        let (dir, session, turn) = next;
+        match read_tree(&dir, &session, turn) {
+            Ok(tree) => {
+                if let Some(picker) = self.trace_picker.as_mut() {
+                    picker.turn = turn;
+                    picker.tree = tree;
+                    // Span ids are unique within a turn's file, not across
+                    // turns: an unfolded id from the last turn could name a
+                    // span here. Only the newest turn survives a change.
+                    picker.unfolded.clear();
+                    picker.lay_out(None);
+                }
+                Applied::none()
+            }
+            Err(reason) => {
+                self.push(LineKind::Error, format!("trace: {reason}"));
+                Applied::none()
+            }
+        }
+    }
+}
+
+/// One turn's spans, as a forest.
+fn read_tree(
+    agent_dir: &std::path::Path,
+    session_id: &str,
+    turn: u64,
+) -> Result<Vec<titi_core::trace::TraceNode>, String> {
+    let spans =
+        titi_core::trace::read_turn(agent_dir, session_id, turn).map_err(|e| e.to_string())?;
+    Ok(titi_core::trace::build_tree(spans))
+}
+
+/// Depth-first rows for one turn's tree: a span's own row, its folded thinking
+/// row when it has one, and the thinking text when unfolded.
+fn push_trace_rows(
+    nodes: &[titi_core::trace::TraceNode],
+    depth: usize,
+    unfolded: &std::collections::HashSet<String>,
+    rows: &mut Vec<TraceRow>,
+    spans: &mut usize,
+) {
+    for node in nodes {
+        *spans += 1;
+        let indent = "  ".repeat(depth);
+        rows.push(TraceRow {
+            text: format!(
+                "{indent}{} {}",
+                node.span.kind.glyph(),
+                crate::trace_cmd::span_summary(&node.span)
+            ),
+            span_id: Some(node.span.span_id.clone()),
+            toggles: node.span.thinking.is_some(),
+        });
+        if let Some(chars) = crate::trace_cmd::thinking_chars(&node.span) {
+            let open = unfolded.contains(&node.span.span_id);
+            let mark = match (node.span.thinking.is_some(), open) {
+                (true, true) => "▾",
+                (true, false) => "▸",
+                // Metrics without the text: a count, not a fold.
+                (false, _) => "·",
+            };
+            let child = "  ".repeat(depth + 1);
+            rows.push(TraceRow {
+                text: format!("{child}{mark} thinking · {chars} chars"),
+                span_id: Some(node.span.span_id.clone()),
+                toggles: node.span.thinking.is_some(),
+            });
+            if open && let Some(text) = &node.span.thinking {
+                let text_indent = "  ".repeat(depth + 2);
+                let mut lines = text.lines();
+                for line in lines.by_ref().take(crate::trace_cmd::THINKING_LINES) {
+                    rows.push(TraceRow {
+                        text: format!("{text_indent}{line}"),
+                        span_id: None,
+                        toggles: false,
+                    });
+                }
+                let rest = lines.count();
+                if rest > 0 {
+                    rows.push(TraceRow {
+                        text: format!("{text_indent}… {rest} more lines"),
+                        span_id: None,
+                        toggles: false,
+                    });
+                }
+            }
+        }
+        push_trace_rows(&node.children, depth + 1, unfolded, rows, spans);
+    }
+}
+
 /// Lays the entries out as a tree under `filter`.
 ///
 /// An entry the filter hides is stepped over: its children hang from the
@@ -1102,6 +1426,28 @@ fn tree_panel(chat: &Chat, total: u16) -> PanelView {
     panel_view(Some(title), lines, Some(picker.selected), panel_body(total))
 }
 
+/// The `/trace` panel: one turn's spans, one row each, thinking folded under
+/// the model call that produced it.
+fn trace_panel(chat: &Chat, total: u16) -> PanelView {
+    let Some(picker) = chat.trace_picker.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let lines: Vec<PanelLine> = picker
+        .rows
+        .iter()
+        .map(|row| PanelLine::Row {
+            text: row.text.clone(),
+            accent: false,
+        })
+        .collect();
+    panel_view(
+        Some(picker.title()),
+        lines,
+        Some(picker.selected),
+        panel_body(total),
+    )
+}
+
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
@@ -1119,6 +1465,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     }
     if chat.tree_picker.is_some() {
         return Some(tree_panel(chat, total));
+    }
+    if chat.trace_picker.is_some() {
+        return Some(trace_panel(chat, total));
     }
     if chat.session_search.is_some() {
         return Some(session_search_panel(chat, total));
@@ -1899,6 +2248,7 @@ impl Chat {
             || self.theme_picker.is_some()
             || self.session_picker.is_some()
             || self.tree_picker.is_some()
+            || self.trace_picker.is_some()
             || self.paste_menu.is_some()
             || self.pending_ask.is_some()
             || self.login_picker.is_some()

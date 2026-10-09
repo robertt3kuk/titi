@@ -672,6 +672,9 @@ pub struct Chat {
     /// cycles from there. Read from the settings at startup; unset is the whole
     /// tree, which is what `/tree` has always shown.
     pub(crate) tree_filter: TreeFilter,
+    /// `/trace`: one turn's spans as a tree, a round's thinking folded under
+    /// the model call that produced it; `None` = closed.
+    pub(crate) trace_picker: Option<TracePicker>,
     /// Whether the screen drops one cell of horizontal padding from its boxes
     /// and its status row (`tui.tight`). Unset is off, so an unset key leaves
     /// every frame exactly as it was.
@@ -903,6 +906,7 @@ impl Chat {
             session_picker: None,
             tree_picker: None,
             tree_filter: TreeFilter::default(),
+            trace_picker: None,
             tight: false,
             smooth: false,
             mermaid: true,
@@ -2257,6 +2261,7 @@ impl Chat {
             "recap" => self.recap(),
             "sessions" => self.sessions(args),
             "tree" => self.open_tree(),
+            "trace" => self.open_trace(args),
             "pause" => self.toggle_pause(),
             "fork" => self.fork(),
             "export" => self.export(args),

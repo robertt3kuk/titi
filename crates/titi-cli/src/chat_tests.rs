@@ -5664,6 +5664,14 @@ fn probe_chats() -> Vec<(&'static str, Chat)> {
     let mut vimming = chat();
     vimming.vim = Some(crate::vim::VimState::default());
 
+    // The trace panel, open on a fixture turn: its arrows and its fold key
+    // are the panel's own, so the guard has to press them here.
+    let mut tracing = chat();
+    seed_trace(&tracing.agent_dir, &tracing.session_id, 1);
+    tracing.trace_picker = Some(
+        TracePicker::open(&tracing.agent_dir, &tracing.session_id, None).expect("trace picker"),
+    );
+
     vec![
         ("bare", chat()),
         ("draft", draft),
@@ -5677,6 +5685,7 @@ fn probe_chats() -> Vec<(&'static str, Chat)> {
         ("session picker", sessions),
         ("paste menu", pasted),
         ("question", asked),
+        ("trace", tracing),
     ]
 }
 
@@ -10966,6 +10975,236 @@ fn the_tree_filter_mode_setting_names_the_opening_filter() {
         title.contains("tree · 4 entries · 0 off this path"),
         "{title:?}"
     );
+}
+
+/// One turn's trace file under `agent_dir`, the shape a working turn leaves:
+/// a turn root, a priced model call with thinking, a tool call under it, and a
+/// second model call that failed.
+fn seed_trace(agent_dir: &Path, session_id: &str, turn: u64) {
+    use titi_core::trace::{Span, SpanKind, TraceWriter};
+    let mut writer = TraceWriter::open(agent_dir, session_id, turn).expect("trace writer");
+    let spans = [
+        Span::new(
+            session_id,
+            "turn",
+            SpanKind::Turn,
+            format!("turn {turn}"),
+            0,
+        )
+        .with_end_ms(500),
+        Span::new(session_id, "llm", SpanKind::Llm, "chat gpt-4o", 10)
+            .with_parent("turn")
+            .with_end_ms(200)
+            .with_tokens(1_200, 180, 1_000, 40)
+            .with_cost_micro_usd(2_100)
+            .with_thinking("first thought\nsecond thought"),
+        Span::new(session_id, "tool", SpanKind::Tool, "read", 210)
+            .with_parent("llm")
+            .with_end_ms(240),
+        Span::new(session_id, "err", SpanKind::Llm, "chat gpt-4o", 250)
+            .with_parent("turn")
+            .with_end_ms(400)
+            .with_tokens(300, 0, 0, 0)
+            .with_error("timeout"),
+    ];
+    for span in spans {
+        writer.append(&span).expect("append");
+    }
+    writer.flush().expect("flush");
+}
+
+/// A chat whose own agent directory holds a trace for each of `turns`.
+fn trace_chat(turns: &[u64]) -> Chat {
+    let chat = chat();
+    for turn in turns {
+        seed_trace(&chat.agent_dir, &chat.session_id, *turn);
+    }
+    chat
+}
+
+/// The trace rows of an open picker, as the panel draws them.
+fn trace_rows(chat: &Chat) -> Vec<String> {
+    chat.trace_picker
+        .as_ref()
+        .expect("the trace is open")
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect()
+}
+
+/// `/trace` opens the newest turn as the tree it is: the kind's glyph, the
+/// span's own duration, a model call's tokens, cache hits, reasoning and cost,
+/// an error in place of an `ok`, and the thinking folded under the call that
+/// produced it.
+#[test]
+fn the_trace_panel_shows_the_turn_tree_with_thinking_folded() {
+    let mut chat = trace_chat(&[1]);
+    type_text(&mut chat, "/trace");
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(
+        trace_rows(&chat),
+        [
+            "◆ turn 1 · 500ms",
+            "  ✦ chat gpt-4o · 190ms · in 1.2k (cached 1.0k) out 180 · 40 reasoning · $0.0021",
+            "    ▸ thinking · 28 chars",
+            "    ⚙ read · 30ms · ok",
+            "  ✦ chat gpt-4o · 150ms · in 300 out 0 · error: timeout",
+        ]
+    );
+
+    let view = panel_view_for(&chat, 30, 100).expect("a panel");
+    let title = view.title.clone().unwrap_or_default();
+    assert!(title.contains("turn 1 of 1 · 4 spans"), "{title:?}");
+    assert!(title.contains("enter folds thinking"), "{title:?}");
+}
+
+/// Enter folds and unfolds the thinking of the row it is on. A row with
+/// nothing to unfold — the turn, a tool — does nothing, and the arrows step
+/// over the folded text rather than landing on a line of it.
+#[test]
+fn enter_folds_and_unfolds_the_thinking_under_the_cursor() {
+    let mut chat = trace_chat(&[1]);
+    type_text(&mut chat, "/trace");
+    chat.on_key(Key::Enter, Instant::now());
+
+    // The cursor opens on the turn root, which has no thinking.
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(trace_rows(&chat).len(), 5, "nothing unfolded");
+
+    // One row down is the model call: Enter unfolds its reasoning.
+    chat.on_key(Key::Down, Instant::now());
+    chat.on_key(Key::Enter, Instant::now());
+    let rows = trace_rows(&chat);
+    assert_eq!(rows.len(), 7);
+    assert!(
+        rows.contains(&"    ▾ thinking · 28 chars".to_owned()),
+        "{rows:?}"
+    );
+    assert!(rows.contains(&"      first thought".to_owned()));
+    assert!(rows.contains(&"      second thought".to_owned()));
+
+    // The thinking row is a stop of its own — Enter folds it from there too —
+    // and one more Down steps over its two text lines to the tool call.
+    chat.on_key(Key::Down, Instant::now());
+    let picker = chat.trace_picker.as_ref().expect("open");
+    assert_eq!(picker.rows[picker.selected].span_id.as_deref(), Some("llm"));
+    assert!(
+        picker.rows[picker.selected].toggles,
+        "the thinking row folds"
+    );
+    chat.on_key(Key::Down, Instant::now());
+    let picker = chat.trace_picker.as_ref().expect("open");
+    assert_eq!(
+        picker.rows[picker.selected].span_id.as_deref(),
+        Some("tool")
+    );
+
+    // Up is back on the thinking row; Enter folds it away, and the cursor
+    // stays on the span, not on the line that just disappeared.
+    chat.on_key(Key::Up, Instant::now());
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(trace_rows(&chat).len(), 5);
+    let picker = chat.trace_picker.as_ref().expect("open");
+    assert_eq!(picker.rows[picker.selected].span_id.as_deref(), Some("llm"));
+}
+
+/// alt+f walks the session's turns newest first, wrapping; the title names
+/// which of how many is on screen.
+#[test]
+fn alt_f_walks_the_session_turns_newest_first() {
+    let mut chat = trace_chat(&[1, 2]);
+    type_text(&mut chat, "/trace");
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(
+        chat.trace_picker.as_ref().expect("open").turn,
+        2,
+        "bare opens the newest turn"
+    );
+    let view = panel_view_for(&chat, 30, 100).expect("a panel");
+    assert!(
+        view.title
+            .clone()
+            .unwrap_or_default()
+            .contains("turn 2 of 2"),
+        "{:?}",
+        view.title
+    );
+
+    chat.on_key(Key::AltF, Instant::now());
+    assert_eq!(chat.trace_picker.as_ref().expect("open").turn, 1);
+    assert!(trace_rows(&chat)[0].starts_with("◆ turn 1"));
+    chat.on_key(Key::AltF, Instant::now());
+    assert_eq!(
+        chat.trace_picker.as_ref().expect("open").turn,
+        2,
+        "and wraps back"
+    );
+}
+
+/// `/trace <turn>` opens that turn, and what cannot be shown is said rather
+/// than shown as an empty panel.
+#[test]
+fn trace_says_what_it_cannot_show_and_closes_on_esc() {
+    let mut screened = trace_chat(&[1]);
+    type_text(&mut screened, "/trace 1");
+    screened.on_key(Key::Enter, Instant::now());
+    assert!(screened.trace_picker.is_some());
+
+    // Esc closes it and leaves the draft clear; nothing was sent.
+    screened.on_key(Key::Esc, Instant::now());
+    assert!(screened.trace_picker.is_none());
+
+    // A turn that has no trace: a note, no panel.
+    type_text(&mut screened, "/trace 9");
+    screened.on_key(Key::Enter, Instant::now());
+    assert!(screened.trace_picker.is_none());
+    assert!(
+        screened
+            .lines
+            .iter()
+            .any(|line| line.text.contains("no turn 9")),
+        "the refusal is on screen"
+    );
+
+    // A word where a number belongs is an error, not a silent newest turn.
+    type_text(&mut screened, "/trace later");
+    screened.on_key(Key::Enter, Instant::now());
+    assert!(screened.trace_picker.is_none());
+    assert!(
+        screened
+            .lines
+            .iter()
+            .any(|line| line.kind == LineKind::Error && line.text.contains("must be a number")),
+        "the bad number is an error"
+    );
+
+    // A session with nothing recorded says so.
+    let mut empty = chat();
+    type_text(&mut empty, "/trace");
+    empty.on_key(Key::Enter, Instant::now());
+    assert!(empty.trace_picker.is_none());
+    assert!(
+        empty
+            .lines
+            .iter()
+            .any(|line| line.text.contains("no traces yet")),
+        "an empty session is not an empty panel"
+    );
+}
+
+/// A key the panel does not own closes it and reaches the composer, the way
+/// every other picker's unmatched key does.
+#[test]
+fn another_key_closes_the_trace_and_types() {
+    let mut chat = trace_chat(&[1]);
+    type_text(&mut chat, "/trace");
+    chat.on_key(Key::Enter, Instant::now());
+    assert!(chat.trace_picker.is_some());
+
+    chat.on_key(Key::Char('x'), Instant::now());
+    assert!(chat.trace_picker.is_none());
+    assert_eq!(chat.input, "x", "the key reached the composer");
 }
 
 /// One live agent, started by the engine.
