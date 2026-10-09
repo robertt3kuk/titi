@@ -135,9 +135,12 @@ impl ToolHandler for AgentTool {
                               you say can rely on its answer. Use it for work that would \
                               flood this context — searching a tree, reading many files, a \
                               self-contained edit — not for something one tool call already \
-                              answers. A batch runs its children at once (at most four in \
-                              flight) and answers with one section per child, so use it when \
-                              the pieces are independent of each other. A subagent cannot \
+                              answers. To run several agents at once, pass them in one \
+                              call as `tasks`: separate `agent` calls in one response run \
+                              one after another, and a batch runs its children together \
+                              (at most four in flight) and answers with one section per \
+                              child, so use it when the pieces are independent of each \
+                              other. A subagent cannot \
                               ask you anything and cannot spawn subagents of its own."
                     .into(),
                 parameters: json!({
