@@ -112,6 +112,13 @@ fn chunk_events(
                     call: ToolCallRef {
                         call_id: SmolStr::from(format!("gemini_{index}")),
                         name: name.into(),
+                        // A thinking model signs the part; the call has to
+                        // carry the signature back with it.
+                        thought_signature: part
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into(),
                         ..Default::default()
                     },
                 });

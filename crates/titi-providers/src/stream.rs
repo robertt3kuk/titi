@@ -40,6 +40,13 @@ pub struct ToolCallRef {
     /// this field existed.
     #[serde(default, skip_serializing_if = "SmolStr::is_empty")]
     pub arguments: SmolStr,
+    /// Gemini's `thoughtSignature` for the part this call came on.
+    ///
+    /// A thinking model requires the signature echoed with the function call
+    /// it belongs to; without it the next request is rejected. Empty for every
+    /// other family, and for a call persisted before this field existed.
+    #[serde(default, skip_serializing_if = "SmolStr::is_empty")]
+    pub thought_signature: SmolStr,
 }
 
 /// Why the model finished the turn.

@@ -16,6 +16,9 @@ pub(crate) struct PendingToolCall {
     pub call_id: SmolStr,
     pub name: SmolStr,
     pub arguments: String,
+    /// Gemini's `thoughtSignature` for the part this call came on, echoed back
+    /// with the call when the turn is replayed.
+    pub thought_signature: SmolStr,
 }
 
 /// Gathers a response's tool calls as the provider streams them.
@@ -40,6 +43,7 @@ impl ToolCallCollector {
                         call_id: call.call_id.clone(),
                         name: call.name.clone(),
                         arguments: String::new(),
+                        thought_signature: call.thought_signature.clone(),
                     },
                 ));
             }
@@ -407,6 +411,7 @@ pub(crate) async fn execute_tools(
             // replayed history has to show the model what it actually asked
             // for, not an empty string.
             arguments: call.arguments.as_str().into(),
+            thought_signature: call.thought_signature.clone(),
             ..Default::default()
         });
     }

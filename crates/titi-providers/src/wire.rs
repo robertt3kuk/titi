@@ -311,12 +311,18 @@ fn gemini_contents_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
                     parts.push(serde_json::json!({"text": m.content.as_str()}));
                 }
                 for call in &m.tool_calls {
-                    parts.push(serde_json::json!({
+                    let mut part = serde_json::json!({
                         "functionCall": {
                             "name": call.name.as_str(),
                             "args": input_of(&call.arguments),
                         },
-                    }));
+                    });
+                    if !call.thought_signature.is_empty() {
+                        // The signature belongs to the part, beside the call
+                        // it signs.
+                        part["thoughtSignature"] = Value::String(call.thought_signature.to_string());
+                    }
+                    parts.push(part);
                 }
                 if parts.is_empty() {
                     parts.push(serde_json::json!({"text": ""}));

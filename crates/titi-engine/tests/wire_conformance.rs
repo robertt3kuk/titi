@@ -487,11 +487,59 @@ fn gemini_sink() -> Vec<&'static str> {
     vec![
         r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"weighing it"}]}}]}"#,
         r#"data: {"candidates":[{"content":{"parts":[{"text":"before "}]}}]}"#,
-        r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"a.rs"}}}]}}]}"#,
+        r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"a.rs"}},"thoughtSignature":"sig-read"}]}}]}"#,
         r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"grep","args":{"pattern":"b"}}}]}}]}"#,
         r#"data: {"candidates":[{"content":{"parts":[{"text":" after"}]}}]}"#,
         r#"data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"cachedContentTokenCount":40}}"#,
     ]
+}
+
+/// Anthropic bills a cache *read* only when the prefix it has seen before is
+/// unchanged. The breakpoints sit on the system block, the last tool and the
+/// last message block; the first two must be byte-identical between the rounds
+/// of a turn, or every round pays full price.
+#[tokio::test]
+async fn the_anthropic_cache_prefix_is_stable_across_rounds() {
+    let (_events, fetch) = turn(
+        ApiKind::AnthropicMessages,
+        vec![anthropic_sink(), completions_done()],
+        &["read", "grep"],
+    )
+    .await;
+    let bodies = bodies(&fetch);
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(
+        bodies[0]["system"], bodies[1]["system"],
+        "the system block and its breakpoint are the same in both rounds"
+    );
+    assert_eq!(
+        bodies[0]["tools"], bodies[1]["tools"],
+        "so is the tool list and its breakpoint"
+    );
+    // The *marker* moves to the new end of the history each round — that is
+    // where the next write happens — but the *tokens* it covers must not: a
+    // cache read is a prefix match, and a prefix that changed is a miss.
+    assert_eq!(
+        strip_cache_control(&bodies[1]["messages"][0]),
+        strip_cache_control(&bodies[0]["messages"][0]),
+        "and the user turn the second round grew out of"
+    );
+}
+
+/// A body with every `cache_control` marker removed, so two rounds can be
+/// compared for what they actually send.
+fn strip_cache_control(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, value)| (key.clone(), strip_cache_control(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip_cache_control).collect()),
+        other => other.clone(),
+    }
 }
 
 #[tokio::test]
@@ -514,6 +562,22 @@ async fn gemini_keeps_every_call_and_its_arguments() {
     let results = tool_messages(&bodies[1], ApiKind::GeminiGenerateContent);
     assert_eq!(results.len(), 2, "{results:?}");
     assert_eq!(tool_events(&events).len(), 2, "{events:?}");
+
+    // A thinking model signs each part and requires the signature echoed with
+    // the call it belongs to, or the next request is rejected.
+    let signatures: Vec<String> = bodies[1]["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+        .filter_map(|part| part.get("thoughtSignature").map(|s| s.to_string()))
+        .collect();
+    assert_eq!(
+        signatures,
+        vec!["\"sig-read\"".to_owned()],
+        "the signature rides back on the part that carried the call: {}",
+        bodies[1]["contents"]
+    );
 }
 
 // ---- an error mid-stream ---------------------------------------------------
