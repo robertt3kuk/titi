@@ -187,7 +187,10 @@ pub(crate) enum PinnedAgents {
 const PINNED_ROWS: usize = 3;
 
 impl PinnedAgents {
-    /// The name the setting writes (omp's spellings).
+    /// The name the setting writes (omp's spellings). The resolver reads the
+    /// names through [`PinnedAgents::parse`]; this side is what the tests hold
+    /// the two to.
+    #[cfg(test)]
     pub(crate) fn id(self) -> &'static str {
         match self {
             PinnedAgents::Off => "off",
@@ -2258,6 +2261,7 @@ impl Chat {
             "keys" | "whoami" => self.keys(),
             "theme" => self.theme(args),
             "statusline" => self.statusline(args),
+            "changelog" => self.changelog(args),
             "mouse" => self.mouse(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
@@ -2738,6 +2742,21 @@ impl Chat {
     /// `/hotkeys`: every key the screen answers, grouped, one row each. The
     /// table is `keys.rs`'s, beside the `on_key` that answers those keys, so
     /// the listing and the screen cannot be written twice (`hotkey_lines`).
+    /// `/changelog`: what changed in this build, from the notes embedded in
+    /// it ([`crate::changelog`]). Bare, the newest few; `full`, all of them;
+    /// `last n`, n of them.
+    fn changelog(&mut self, args: &str) -> Applied {
+        match crate::changelog::parse_args(args) {
+            Ok(view) => {
+                for line in crate::changelog::render(view) {
+                    self.push(LineKind::Note, line);
+                }
+            }
+            Err(usage) => self.push(LineKind::Error, usage),
+        }
+        Applied::none()
+    }
+
     fn hotkeys(&mut self) -> Applied {
         // The vim rows only while the mode is on: a mode the config did not
         // ask for must not read as a binding the screen answers.
@@ -4163,6 +4182,20 @@ pub fn run(
     chat.show_stored_history();
     // `--continue` that found nothing: the screen says so rather than opening
     // on a welcome that reads as a resume which quietly did nothing.
+    // What changed since the last run, once: the version this build carries
+    // against the one the marker holds. A first run writes the marker and says
+    // nothing — nothing has changed *for* a user who has never run this.
+    let seen = crate::changelog::last_seen(&chat.agent_dir);
+    if settings.as_ref().is_none_or(|settings| {
+        !titi_config::settings::switch_off(settings, titi_config::settings::STARTUP_CHANGELOG_KEY)
+    }) {
+        if let Some(line) = crate::changelog::notice(seen.as_deref(), titi_tui::VERSION) {
+            chat.push(LineKind::Note, line);
+        }
+        if seen.as_deref() != Some(titi_tui::VERSION) {
+            crate::changelog::remember(&chat.agent_dir, titi_tui::VERSION);
+        }
+    }
     if let Some(note) = startup_note {
         chat.push(LineKind::Note, note);
     }
@@ -17035,6 +17068,46 @@ mod tests {
                 Duration::from_millis(200)
             ),
             "and it moves"
+        );
+    }
+
+    /// `/changelog` renders the notes this build carries, and an argument it
+    /// does not know gets the usage line rather than silence.
+    #[test]
+    fn the_changelog_command_renders_the_builds_notes() {
+        let notes = |chat: &Chat| {
+            chat.lines
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut chat = chat();
+        command(&mut chat, "/changelog");
+        let text = notes(&chat);
+        assert!(text.contains("changelog · Unreleased"), "{text}");
+        assert!(text.contains("- "), "the entries themselves: {text}");
+
+        // `full` is at least as much, and `last 1` no more.
+        let mut full = chat_with_theme(test_theme());
+        command(&mut full, "/changelog full");
+        assert!(notes(&full).len() >= text.len());
+
+        let mut last = chat_with_theme(test_theme());
+        command(&mut last, "/changelog last 1");
+        assert!(notes(&last).contains("changelog · "));
+
+        // Anything else is the usage line, as an error rather than a note.
+        let mut bad = chat_with_theme(test_theme());
+        command(&mut bad, "/changelog everything");
+        assert!(
+            bad.lines
+                .iter()
+                .any(|line| line.kind == LineKind::Error
+                    && line.text.contains("usage: /changelog")),
+            "{:#?}",
+            bad.lines.iter().map(|line| line.text.clone()).collect::<Vec<_>>()
         );
     }
 

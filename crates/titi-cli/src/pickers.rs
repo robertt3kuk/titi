@@ -207,6 +207,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },
     Command {
+        name: "changelog",
+        about: "what changed in this build (bare: the last three releases, full, last [n])",
+    },
+    Command {
         name: "mouse",
         about: "mouse reporting: off, wheel, buttons, all (drag selects, release copies)",
     },

@@ -127,6 +127,15 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// Whether a run says, once, that the build changed since the last one.
+///
+/// Unset means **on** (omp's `startup.changelogMode` defaults to `summary`,
+/// `modes/settings.ts:1116`). On, a version that moved since the last run
+/// leaves one line naming the change count and pointing at `/changelog`; the
+/// same version, or a first run, says nothing. omp's third mode, `expanded`
+/// (the notes themselves in full), is `/changelog` here.
+pub const STARTUP_CHANGELOG_KEY: &str = "startup.changelog";
+
 /// How the pinned list of live agents above the composer behaves.
 ///
 /// `off` hides it, `collapsed` (the default, omp's too —

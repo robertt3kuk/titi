@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod changelog;
 pub mod chat;
 pub mod composer;
 pub mod engine;
