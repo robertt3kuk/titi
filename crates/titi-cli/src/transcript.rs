@@ -586,7 +586,7 @@ pub(crate) fn transcript(
                 Vec::new(),
             )
         } else {
-            message_rows(line, inner, theme)
+            message_rows(line, inner, theme, chat.mermaid)
         };
         for text in texts {
             rows.push(TranscriptRow::Text(text));
@@ -916,6 +916,7 @@ pub(crate) fn message_rows(
     line: &TranscriptLine,
     width: usize,
     theme: &Theme,
+    mermaid: bool,
 ) -> (Vec<Line<'static>>, Vec<LinkRow>) {
     if line.kind == LineKind::Note
         && let Some((head, url, instructions)) = login_link(&line.text)
@@ -935,7 +936,7 @@ pub(crate) fn message_rows(
             width,
             theme,
         ),
-        LineKind::Assistant => reply_rows(&line.text, width, theme),
+        LineKind::Assistant => reply_rows(&line.text, width, theme, mermaid),
         LineKind::Tool => chip(tool_chip(&line.text), theme, width),
         LineKind::Diff => diff_rows(&line.text, theme, width),
         LineKind::Error => chip(
@@ -1140,7 +1141,7 @@ pub(crate) fn speech(
 /// its marker arrives, which is the renderer's own reading of partial markdown.
 /// [`Chat::assistant_rows`] is what keeps that affordable while the answer is
 /// still arriving.
-fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn reply_rows(text: &str, width: usize, theme: &Theme, mermaid: bool) -> Vec<Line<'static>> {
     if !has_markdown(text) {
         return speech(
             "titi",
@@ -1152,7 +1153,7 @@ fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
             theme,
         );
     }
-    let bodies = markdown_bodies(text, speech_width(width), theme);
+    let bodies = markdown_bodies(text, speech_width(width), theme, mermaid);
     message_block(
         "titi",
         ThemeColor::Accent,
@@ -1170,9 +1171,14 @@ fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
 /// back out as [`Style`]s before a row can be drawn: a span carries the colour,
 /// never the sequence. Only the renderer's own styling is applied — nothing here
 /// wraps a row in a style of its own, so the two cannot fight.
-fn markdown_bodies(text: &str, width: usize, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+fn markdown_bodies(
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    mermaid: bool,
+) -> Vec<Vec<Span<'static>>> {
     // `width` descends from a `u16` pane, so the cast only undoes the widening.
-    titi_tui::markdown::render_markdown(text, theme, width as u16)
+    titi_tui::markdown::render_markdown(text, theme, width as u16, mermaid)
         .into_iter()
         .map(|row| sgr_row(&row))
         .collect()
@@ -1513,7 +1519,7 @@ impl Chat {
         {
             return cached.rows.clone();
         }
-        let rows = reply_rows(text, width, theme);
+        let rows = reply_rows(text, width, theme, self.mermaid);
         if remember {
             self.reply_render = Some(ReplyRender {
                 source: text.to_owned(),

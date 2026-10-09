@@ -127,6 +127,15 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// Whether a mermaid `flowchart`/`graph` fence is drawn as a diagram instead
+/// of as its own source.
+///
+/// Unset means **on**, omp's own default (`tui.renderMermaid`,
+/// `modes/settings.ts:417`): a fence that parses is drawn, and a fence that
+/// does not — another diagram type, a parse error, a drawing wider than the
+/// pane — falls back to the fenced-code box, byte for byte what it was.
+pub const TUI_RENDER_MERMAID_KEY: &str = "tui.renderMermaid";
+
 /// The model a session starts on, when the config names one.
 ///
 /// `modelRoles` is omp's own map (`config/model-roles.ts:56`, where `default`

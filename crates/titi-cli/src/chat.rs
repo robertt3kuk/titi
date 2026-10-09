@@ -680,6 +680,10 @@ pub struct Chat {
     /// (`display.smoothStreaming`), how much of it is on screen, and when the
     /// last frame was. Unset is off, so the delta path is exactly what it was.
     pub(crate) smooth: bool,
+    /// Whether a mermaid `flowchart`/`graph` fence is drawn as a diagram
+    /// (`tui.renderMermaid`). Unset is on, so a fence that parses is a
+    /// drawing and one that does not is the code box it always was.
+    pub(crate) mermaid: bool,
     /// Characters of the running answer that are on screen. It only means
     /// anything while `smooth` is on and a turn is streaming.
     pub(crate) revealed: usize,
@@ -901,6 +905,7 @@ impl Chat {
             tree_filter: TreeFilter::default(),
             tight: false,
             smooth: false,
+            mermaid: true,
             revealed: 0,
             reveal_at: None,
             pinned: PinnedStrip::default(),
@@ -4156,6 +4161,9 @@ pub fn run(
         titi_config::settings::switch_on(settings, titi_config::settings::TUI_TIGHT_KEY)
     });
     chat.pinned = pinned_agents(settings.as_ref());
+    chat.mermaid = settings.as_ref().is_none_or(|settings| {
+        !titi_config::settings::switch_off(settings, titi_config::settings::TUI_RENDER_MERMAID_KEY)
+    });
     chat.smooth = settings.as_ref().is_some_and(|settings| {
         titi_config::settings::switch_on(
             settings,

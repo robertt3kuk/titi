@@ -47,12 +47,12 @@ fn golden_theme() -> Theme {
 
 /// Render and re-emit the raw markdown with all styling.
 fn golden_render(md: &str) -> String {
-    render_markdown(md, &golden_theme(), 40).join("\n")
+    render_markdown(md, &golden_theme(), 40, false).join("\n")
 }
 
 /// Render at a chosen pane width (the goldens otherwise use 40 columns).
 fn golden_render_w(md: &str, w: u16) -> Vec<String> {
-    render_markdown(md, &golden_theme(), w)
+    render_markdown(md, &golden_theme(), w, false)
 }
 
 #[test]

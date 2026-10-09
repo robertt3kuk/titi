@@ -697,6 +697,7 @@ fn a_tool_round_logs_the_call_its_output_and_the_answer() {
             tool_calls: vec![titi_providers::ToolCallRef {
                 call_id: "call-1".into(),
                 name: "read".into(),
+                ..Default::default()
             }],
         })
     );
@@ -4998,7 +4999,7 @@ fn the_geometry_is_one_rule() {
     let theme = test_theme();
     let long = "word ".repeat(30);
     let wrapped = |kind: LineKind, text: String, indent: usize| {
-        let rows = row_texts(&message_rows(&TranscriptLine { kind, text }, 60, &theme).0);
+        let rows = row_texts(&message_rows(&TranscriptLine { kind, text }, 60, &theme, false).0);
         assert!(rows.len() >= 2, "{kind:?} did not wrap: {rows:?}");
         for (at, row) in rows.iter().enumerate() {
             assert_eq!(
@@ -5045,6 +5046,7 @@ fn the_geometry_is_one_rule() {
             },
             60,
             &theme,
+            false,
         )
         .0,
     ] {
@@ -5069,6 +5071,7 @@ fn the_geometry_is_one_rule() {
             },
             60,
             &theme,
+            false,
         )
         .0,
     );
@@ -8334,7 +8337,7 @@ fn a_multi_line_note_is_one_row_per_line() {
         kind: LineKind::Note,
         text: "alpha\nbeta\n\ngamma".to_owned(),
     };
-    let rows = row_texts(&message_rows(&line, 40, &theme).0);
+    let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert!(rows[0].contains("alpha"), "{rows:?}");
     assert!(rows[1].contains("beta"), "{rows:?}");
@@ -8354,7 +8357,7 @@ fn a_long_note_wraps_within_the_width() {
         kind: LineKind::Note,
         text: words.clone(),
     };
-    let rows = row_texts(&message_rows(&line, 40, &theme).0);
+    let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
     assert!(rows.len() >= 8, "{rows:?}");
     for row in &rows {
         assert!(
@@ -8382,7 +8385,7 @@ fn errors_and_tool_chips_split_too() {
             kind,
             text: "first\nsecond".to_owned(),
         };
-        let rows = row_texts(&message_rows(&line, 40, &theme).0);
+        let rows = row_texts(&message_rows(&line, 40, &theme, false).0);
         assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
         assert!(rows[1].contains("second"), "{kind:?}: {rows:?}");
     }
@@ -8425,7 +8428,7 @@ fn span_with<'a>(rows: &'a [Line<'static>], needle: &str) -> &'a Span<'static> {
 }
 
 fn reply_rows_of(text: &str, width: usize) -> Vec<Line<'static>> {
-    message_rows(&assistant_line(text), width, &test_theme()).0
+    message_rows(&assistant_line(text), width, &test_theme(), false).0
 }
 
 /// A heading is rendered as the theme's heading, and its `#` run is syntax:
@@ -8686,7 +8689,7 @@ fn an_edit_result_is_drawn_as_its_file_and_its_diff() {
         "the diff line carries the detail, and only the detail"
     );
 
-    let rows = message_rows(&line, 80, &theme).0;
+    let rows = message_rows(&line, 80, &theme, false).0;
     let texts = row_texts(&rows);
     assert!(texts[0].contains("notes/kept.txt"), "{texts:?}");
     assert_eq!(texts[0], "   ✓ notes/kept.txt", "{texts:?}");
@@ -8788,7 +8791,7 @@ fn only_a_result_with_a_detail_becomes_a_diff_line() {
         // The chip the screen draws when there is no detail keeps saying
         // what it always said.
         if !expected {
-            let rows = message_rows(line, 80, &test_theme()).0;
+            let rows = message_rows(line, 80, &test_theme(), false).0;
             assert!(
                 row_texts(&rows)[0].starts_with("   ✓ "),
                 "{tool}: {:?}",
@@ -8810,6 +8813,7 @@ fn a_result_without_a_diff_is_the_chip_it_always_was() {
         },
         80,
         &theme,
+        false,
     )
     .0;
     assert_eq!(
@@ -8833,7 +8837,7 @@ fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
         kind: LineKind::Diff,
         text: "not a diff at all\nsecond line".to_owned(),
     };
-    let rows = message_rows(&line, 80, &theme).0;
+    let rows = message_rows(&line, 80, &theme, false).0;
     assert_eq!(
         row_texts(&rows)[..2],
         ["   ✓ not a diff at all", "     second line"],
@@ -8850,7 +8854,7 @@ fn a_diff_block_stays_inside_the_pane() {
         text: edit_result().to_owned(),
     };
     for width in [60usize, 80, 120] {
-        let rows = message_rows(&line, width, &test_theme()).0;
+        let rows = message_rows(&line, width, &test_theme(), false).0;
         let texts = row_texts(&rows);
         assert!(texts.len() > 4, "{width}: {texts:?}");
         for (at, row) in texts.iter().enumerate() {
@@ -8875,7 +8879,7 @@ fn a_very_long_diff_is_capped_and_says_so() {
         kind: LineKind::Diff,
         text,
     };
-    let rows = row_texts(&message_rows(&line, 80, &test_theme()).0);
+    let rows = row_texts(&message_rows(&line, 80, &test_theme(), false).0);
     // The chip row, `DIFF_MAX_ROWS` renderer rows, then the note.
     assert_eq!(rows.len(), DIFF_MAX_ROWS + 2, "{:?}", rows.len());
     let last = rows.last().expect("a note");
@@ -8898,7 +8902,7 @@ fn a_long_login_url_is_one_slice_per_row() {
         kind: LineKind::Note,
         text: format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
     };
-    let (rows, links) = message_rows(&line, 78, &theme);
+    let (rows, links) = message_rows(&line, 78, &theme, false);
     let texts = row_texts(&rows);
     assert!(
         links.len() >= 4,
@@ -8938,7 +8942,7 @@ fn a_short_login_url_is_one_row() {
         kind: LineKind::Note,
         text: format!("login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"),
     };
-    let (rows, links) = message_rows(&line, 78, &theme);
+    let (rows, links) = message_rows(&line, 78, &theme, false);
     assert_eq!(links.len(), 1, "{:?}", row_texts(&rows));
     assert_eq!(row_texts(&rows)[links[0].row], url);
     assert_eq!(links[0].url, url);
@@ -8972,7 +8976,7 @@ fn other_lines_get_no_link_rows() {
             kind,
             text: text.to_owned(),
         };
-        let (_, links) = message_rows(&line, 78, &theme);
+        let (_, links) = message_rows(&line, 78, &theme, false);
         assert!(links.is_empty(), "{kind:?} {text:?} grew a link: {links:?}");
     }
 }
@@ -11332,6 +11336,62 @@ fn a_session_switch_forgets_the_live_agents_it_left() {
     assert!(
         !frame.iter().any(|row| row.contains("alpha")),
         "the strip does not carry them over: {frame:#?}"
+    );
+}
+
+/// A mermaid fence in an answer reaches the screen as a diagram, and the
+/// setting is what decides: off, the same fence is the code box it always was.
+///
+/// This is the integration the module's own tests cannot show: the fence goes
+/// through the markdown renderer, the transcript and the frame.
+#[test]
+fn a_mermaid_fence_is_drawn_and_the_setting_turns_it_off() {
+    let fence = "```mermaid\nflowchart TD\n  A[Start] --> B[Done]\n```";
+    let frame = |mermaid: bool| {
+        let mut chat = chat_with_theme(test_theme());
+        chat.mermaid = mermaid;
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: fence.into(),
+        });
+        chat.on_event(EngineEvent::TurnFinished {
+            turn_id: TurnId(1),
+            reason: StopReason::Stop,
+        });
+        frame_rows(&mut chat, 80, 30)
+            .iter()
+            .map(|row| row.trim_end().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let drawn = frame(true);
+    assert!(
+        drawn.iter().any(|row| row.contains("Start")),
+        "the node text is drawn: {drawn:#?}"
+    );
+    assert!(
+        drawn
+            .iter()
+            .any(|row| row.contains('┌') || row.contains('+')),
+        "and a box: {drawn:#?}"
+    );
+    assert!(
+        !drawn.iter().any(|row| row.contains("flowchart TD")),
+        "the source is not drawn: {drawn:#?}"
+    );
+
+    let off = frame(false);
+    assert!(
+        off.iter().any(|row| row.contains("flowchart TD")),
+        "off, the fence is its own source, as it always was: {off:#?}"
+    );
+    assert!(
+        !off.iter().any(|row| row.contains('┌')),
+        "and no diagram: {off:#?}"
     );
 }
 

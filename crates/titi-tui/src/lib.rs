@@ -12,6 +12,7 @@ pub mod keybindings;
 pub mod keys;
 pub mod latex;
 pub mod markdown;
+pub(crate) mod mermaid;
 pub mod panels;
 pub mod recap;
 pub mod scrollbar;
