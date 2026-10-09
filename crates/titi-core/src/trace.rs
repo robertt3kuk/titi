@@ -36,6 +36,34 @@ use serde_json::Value;
 /// this module rather than a string two crates agree on by luck.
 pub const THINKING_CHARS_ATTR: &str = "titi.thinking_chars";
 
+/// The most thinking text one span keeps, head and tail together.
+///
+/// A trace keeps a round's reasoning for every model call, so the text is
+/// capped well below the 40 000-char tool-output cap: 8 KiB is a readable
+/// excerpt at a size a session's trace files can carry.
+pub const THINKING_CAP_CHARS: usize = 8 * 1024;
+
+/// Trims thinking to [`THINKING_CAP_CHARS`], keeping the head and the tail
+/// with a marker where the middle was.
+///
+/// The same head/tail shape the tool-output cap uses — the opening of a
+/// reasoning block is what names the intent, its close is where the decision
+/// is, and the middle is the least informative part of a long one. Counted in
+/// characters, so a multi-byte script cannot be cut mid-scalar.
+pub fn cap_thinking(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= THINKING_CAP_CHARS {
+        return text.to_owned();
+    }
+    let tail = THINKING_CAP_CHARS / 4;
+    let head = THINKING_CAP_CHARS - tail;
+    let left_out = chars.len() - THINKING_CAP_CHARS;
+    let mut out: String = chars[..head].iter().collect();
+    out.push_str(&format!("\n… [{left_out} characters left out] …\n"));
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
 /// The most trace files kept when [`Retention::default`] prunes.
 pub const MAX_TRACE_FILES: usize = 500;
 /// The oldest a trace file may be when [`Retention::default`] prunes, in days.
@@ -280,8 +308,10 @@ impl Span {
         self
     }
 
+    /// Records the round's reasoning, already masked by the caller and trimmed
+    /// to [`THINKING_CAP_CHARS`].
     pub fn with_thinking(mut self, text: impl Into<String>) -> Self {
-        self.thinking = Some(text.into());
+        self.thinking = Some(cap_thinking(&text.into()));
         self
     }
 }
@@ -905,6 +935,32 @@ mod tests {
             spans: vec![span("a", SpanKind::Llm, 1, 2)],
         };
         assert_eq!(trace.cost_micro_usd(), None);
+    }
+
+    #[test]
+    fn thinking_is_capped_at_the_head_and_tail() {
+        assert_eq!(cap_thinking("a short thought"), "a short thought");
+
+        let long = "x".repeat(THINKING_CAP_CHARS + 500);
+        let capped = cap_thinking(&long);
+        assert!(capped.contains("500 characters left out"), "got: {capped}");
+        let tail = THINKING_CAP_CHARS / 4;
+        assert!(capped.starts_with(&"x".repeat(THINKING_CAP_CHARS - tail)));
+        assert!(capped.ends_with(&"x".repeat(tail)));
+        assert!(capped.chars().count() < THINKING_CAP_CHARS + 64);
+
+        // The builder trims too, so a caller cannot store an unbounded block.
+        let span = Span::new("s1", "l", SpanKind::Llm, "chat", 0).with_thinking(long);
+        let text = span.thinking.unwrap_or_default();
+        assert!(text.contains("characters left out"));
+        assert!(text.chars().count() < THINKING_CAP_CHARS + 64);
+
+        // Counted in characters, so a multi-byte script stays valid UTF-8.
+        let wide = "思考".repeat(THINKING_CAP_CHARS / 2 + 10);
+        let capped = cap_thinking(&wide);
+        assert!(capped.contains("characters left out"));
+        assert!(!capped.contains('\u{FFFD}'));
+        assert!(capped.starts_with("思考") && capped.ends_with("思考"));
     }
 
     #[test]
