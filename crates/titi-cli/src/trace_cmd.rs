@@ -14,7 +14,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use titi_core::trace::{self, SpanKind, SpanStatus, TraceNode, TurnTrace};
+use titi_core::trace::{self, SpanKind, SpanMatch, SpanStatus, TraceNode, TurnTrace};
 
 /// The exit for a usage error: unknown option, bad `--turn`.
 const USAGE_EXIT: i32 = 2;
@@ -44,6 +44,8 @@ pub fn run(agent_dir: &Path) -> Option<()> {
 fn dispatch(agent_dir: &Path, args: &[String], out: &mut impl Write) -> i32 {
     let mut session: Option<String> = None;
     let mut turn: Option<u64> = None;
+    let mut search: Option<String> = None;
+    let mut all = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -61,6 +63,18 @@ fn dispatch(agent_dir: &Path, args: &[String], out: &mut impl Write) -> i32 {
                 }
                 index += 2;
             }
+            "--search" => {
+                let Some(text) = args.get(index + 1) else {
+                    let _ = writeln!(out, "trace: --search needs text to look for");
+                    return USAGE_EXIT;
+                };
+                search = Some(text.clone());
+                index += 2;
+            }
+            "--all" => {
+                all = true;
+                index += 1;
+            }
             flag if flag.starts_with('-') => {
                 let _ = writeln!(out, "trace: unknown option `{flag}`\n{}", usage());
                 return USAGE_EXIT;
@@ -74,6 +88,27 @@ fn dispatch(agent_dir: &Path, args: &[String], out: &mut impl Write) -> i32 {
                 index += 1;
             }
         }
+    }
+
+    if all && search.is_none() {
+        let _ = writeln!(
+            out,
+            "trace: --all only means something with --search\n{}",
+            usage()
+        );
+        return USAGE_EXIT;
+    }
+    if search.is_some() && turn.is_some() {
+        let _ = writeln!(out, "trace: --turn does not apply to --search");
+        return USAGE_EXIT;
+    }
+    if all && session.is_some() {
+        let _ = writeln!(out, "trace: --all reads every session; drop the session id");
+        return USAGE_EXIT;
+    }
+
+    if let Some(needle) = &search {
+        return search_and_print(agent_dir, session, needle, all, out);
     }
 
     let session = session.or_else(|| titi_cli_newest_session(agent_dir));
@@ -120,7 +155,65 @@ fn titi_cli_newest_session(agent_dir: &Path) -> Option<String> {
 }
 
 fn usage() -> &'static str {
-    "usage: titi trace [session] [--turn N]"
+    "usage: titi trace [session] [--turn N]\n       titi trace [--all] [session] --search <text>"
+}
+
+/// Prints the hits, one line each: `turn 3 · chat › read · result · …text…`.
+///
+/// The session is named on every line only when the search spanned more than
+/// one — with `--all`, two hits a screen apart must not be guessed at.
+fn render_matches(matches: &[SpanMatch], all: bool) -> String {
+    let mut out = String::new();
+    for hit in matches {
+        let session = if all {
+            format!("{} · ", hit.session_id)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{session}turn {} · {} · {} · {}\n",
+            hit.turn,
+            hit.path_line(),
+            hit.field.label(),
+            hit.snippet
+        ));
+    }
+    out
+}
+
+/// `--search`: a plain scan of the trace files, one hit per span.
+fn search_and_print(
+    agent_dir: &Path,
+    session: Option<String>,
+    needle: &str,
+    all: bool,
+    out: &mut impl Write,
+) -> i32 {
+    let scope: Option<String> = if all {
+        None
+    } else {
+        match session.or_else(|| titi_cli_newest_session(agent_dir)) {
+            Some(id) => Some(id),
+            None => {
+                let _ = writeln!(out, "trace: no session to search");
+                return MISSING_EXIT;
+            }
+        }
+    };
+    match trace::search(agent_dir, scope.as_deref(), needle) {
+        Ok(matches) if matches.is_empty() => {
+            let _ = writeln!(out, "trace: no spans match `{needle}`");
+            MISSING_EXIT
+        }
+        Ok(matches) => {
+            let _ = out.write_all(render_matches(&matches, all).as_bytes());
+            0
+        }
+        Err(error) => {
+            let _ = writeln!(out, "trace: {error}");
+            MISSING_EXIT
+        }
+    }
 }
 
 /// Renders turns as an indented tree, one blank line between turns.
@@ -138,6 +231,10 @@ fn render(turns: &[TurnTrace]) -> String {
         }
         out.push_str(&turn_header(trace));
         out.push('\n');
+        if let Some(summary) = turn_thinking(trace) {
+            out.push_str(&summary);
+            out.push('\n');
+        }
         let mut top = Vec::new();
         for node in trace.tree() {
             if node.span.kind == SpanKind::Turn {
@@ -148,7 +245,65 @@ fn render(turns: &[TurnTrace]) -> String {
         }
         render_nodes(&top, "", &mut out);
     }
+    // A session of several turns also gets its own line: the per-turn figures
+    // say where the thinking was, this says what it cost altogether.
+    if turns.len() > 1
+        && let Some(summary) = thinking_summary(
+            turns.iter().map(TurnTrace::thinking_chars).sum(),
+            turns.iter().map(TurnTrace::thinking_calls).sum(),
+            turns.iter().map(TurnTrace::reasoning_tokens).sum(),
+            turns.iter().map(TurnTrace::output_tokens).sum(),
+            turns.iter().map(TurnTrace::thinking_ms).sum(),
+        )
+    {
+        out.push('\n');
+        out.push_str(&format!("session · {summary}\n"));
+    }
     out
+}
+
+/// The turn's thinking line, when it recorded any.
+fn turn_thinking(trace: &TurnTrace) -> Option<String> {
+    thinking_summary(
+        trace.thinking_chars(),
+        trace.thinking_calls(),
+        trace.reasoning_tokens(),
+        trace.output_tokens(),
+        trace.thinking_ms(),
+    )
+}
+
+/// `thinking 3.1k chars over 4 calls · 22% of output tokens · 1.2s before the
+/// answer` — `None` when nothing in the turn recorded thinking.
+///
+/// The percentage is the provider's own reasoning tokens over the output
+/// tokens, so it is named only when the provider reported them: a share this
+/// build estimated would read as one the model reported.
+pub(crate) fn thinking_summary(
+    chars: u64,
+    calls: usize,
+    reasoning: u64,
+    output: u64,
+    ms: u64,
+) -> Option<String> {
+    if calls == 0 {
+        return None;
+    }
+    let mut line = format!(
+        "thinking {} chars over {calls} call{}",
+        human_tokens(chars),
+        if calls == 1 { "" } else { "s" }
+    );
+    if reasoning > 0 && output > 0 {
+        line.push_str(&format!(
+            " · {}% of output tokens",
+            reasoning * 100 / output
+        ));
+    }
+    if ms > 0 {
+        line.push_str(&format!(" · {} before the answer", human_ms(ms)));
+    }
+    Some(line)
 }
 
 fn turn_header(trace: &TurnTrace) -> String {
@@ -195,7 +350,7 @@ fn render_nodes(nodes: &[TraceNode], prefix: &str, out: &mut String) {
 /// The folded thinking of one span: a size line, then the text when it was
 /// recorded, capped.
 fn render_thinking(span: &titi_core::trace::Span, prefix: &str, out: &mut String) {
-    let Some(chars) = thinking_chars(span) else {
+    let Some(chars) = span.thinking_chars() else {
         return;
     };
     out.push_str(prefix);
@@ -214,17 +369,6 @@ fn render_thinking(span: &titi_core::trace::Span, prefix: &str, out: &mut String
         out.push_str(prefix);
         out.push_str(&format!("… {rest} more lines\n"));
     }
-}
-
-/// The thinking size: the recorded text's length, or the count the engine wrote
-/// when the text itself was left out.
-pub(crate) fn thinking_chars(span: &titi_core::trace::Span) -> Option<u64> {
-    if let Some(text) = &span.thinking {
-        return Some(text.chars().count() as u64);
-    }
-    span.attributes
-        .get(trace::THINKING_CHARS_ATTR)
-        .and_then(|value| value.as_u64())
 }
 
 fn span_line(span: &titi_core::trace::Span) -> String {
@@ -355,6 +499,7 @@ mod tests {
             out,
             "\
 turn 1 · 500ms · 1.5k in / 180 out · $0.0021 · 1 error
+thinking 28 chars over 1 call · 22% of output tokens
 ├─ llm chat gpt-4o · 190ms · in 1.2k (cached 1.0k) out 180 · 40 reasoning · $0.0021
 │  thinking · 28 chars
 │  first thought
@@ -386,6 +531,7 @@ turn 1 · 500ms · 1.5k in / 180 out · $0.0021 · 1 error
             out,
             "\
 turn 1 · 100ms
+thinking 842 chars over 1 call
 └─ llm chat gpt-4o · 40ms · in 0 out 0
    thinking · 842 chars
 "
@@ -469,6 +615,106 @@ turn 1 · 100ms
 └─ agent find-the-bug · 80ms
    └─ llm chat gpt-4o · 40ms · in 0 out 0
 "
+        );
+    }
+
+    /// One turn whose spans carry a searchable text: thinking on the model
+    /// call, arguments on the tool call under it.
+    fn search_fixture(dir: &Path, session: &str, turn: u64) {
+        let mut w = TraceWriter::open(dir, session, turn).unwrap_or_else(|e| panic!("{e}"));
+        let llm = Span::new(session, "l", SpanKind::Llm, "chat gpt-4o", 0)
+            .with_end_ms(10)
+            .with_thinking("let me check the parser");
+        let tool = Span::new(session, "r", SpanKind::Tool, "read", 11)
+            .with_parent("l")
+            .with_end_ms(20)
+            .with_attr(
+                trace::TOOL_ARGUMENTS_ATTR,
+                serde_json::json!({"path": "src/parse.rs"}),
+            );
+        for s in [llm, tool] {
+            w.append(&s).unwrap_or_else(|e| panic!("{e}"));
+        }
+        w.flush().unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn search_prints_the_turn_the_path_the_field_and_a_snippet() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        search_fixture(dir.path(), "s1", 1);
+        let (code, out) = run_into(dir.path(), &["s1", "--search", "parse"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "\
+turn 1 · chat gpt-4o · thinking · let me check the parser
+turn 1 · chat gpt-4o › read · arguments · {\"path\":\"src/parse.rs\"}
+"
+        );
+    }
+
+    #[test]
+    fn search_all_names_the_session_and_a_miss_is_not_a_silent_success() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        search_fixture(dir.path(), "s1", 1);
+        search_fixture(dir.path(), "s2", 2);
+        let (code, out) = run_into(dir.path(), &["--all", "--search", "parser"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("s1 · turn 1 · "), "{out}");
+        assert!(out.contains("\ns2 · turn 2 · "), "{out}");
+
+        let (code, out) = run_into(dir.path(), &["s1", "--search", "nothing here"]);
+        assert_eq!(code, MISSING_EXIT);
+        assert!(out.contains("no spans match"), "{out}");
+    }
+
+    #[test]
+    fn search_refuses_the_arguments_it_cannot_honour() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        search_fixture(dir.path(), "s1", 1);
+
+        let (code, out) = run_into(dir.path(), &["--all"]);
+        assert_eq!(code, USAGE_EXIT);
+        assert!(
+            out.contains("--all only means something with --search"),
+            "{out}"
+        );
+
+        let (code, out) = run_into(dir.path(), &["--search"]);
+        assert_eq!(code, USAGE_EXIT);
+        assert!(out.contains("--search needs text"), "{out}");
+
+        let (code, out) = run_into(dir.path(), &["s1", "--search", "x", "--turn", "1"]);
+        assert_eq!(code, USAGE_EXIT);
+        assert!(out.contains("does not apply"), "{out}");
+
+        let (code, out) = run_into(dir.path(), &["--all", "--search", "x", "s1"]);
+        assert_eq!(code, USAGE_EXIT);
+        assert!(out.contains("drop the session id"), "{out}");
+    }
+
+    #[test]
+    fn a_session_of_several_turns_sums_its_thinking() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        for turn in [1, 2] {
+            let mut w = TraceWriter::open(dir.path(), "s1", turn).unwrap_or_else(|e| panic!("{e}"));
+            w.append(&span("t", SpanKind::Turn, 0, 100))
+                .unwrap_or_else(|e| panic!("{e}"));
+            w.append(
+                &Span::new("s1", "l", SpanKind::Llm, "chat", 0)
+                    .with_parent("t")
+                    .with_end_ms(50)
+                    .with_thinking("x".repeat(10)),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            w.flush().unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        let (code, out) = run_into(dir.path(), &["s1"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("\nsession · thinking 20 chars over 2 calls\n"),
+            "{out}"
         );
     }
 

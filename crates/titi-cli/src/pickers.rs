@@ -1002,6 +1002,15 @@ pub(crate) struct TracePicker {
     tree: Vec<titi_core::trace::TraceNode>,
     /// How many spans the turn holds (the rows that stand for one).
     spans: usize,
+    /// How many of them the filter is showing.
+    kept: usize,
+    /// The `/` filter: the needle, and whether `/` has been pressed at all.
+    /// A filter with an empty query shows everything, the way an open prompt
+    /// in a pager does.
+    pub(crate) query: String,
+    pub(crate) filtering: bool,
+    /// The turn's thinking line, when it recorded any.
+    summary: Option<String>,
 }
 
 impl TracePicker {
@@ -1023,7 +1032,7 @@ impl TracePicker {
             Some(n) => return Err(format!("no turn {n} in this session's traces")),
             None => turns[0],
         };
-        let tree = read_tree(agent_dir, session_id, turn)?;
+        let (tree, summary, spans) = read_turn_view(agent_dir, session_id, turn)?;
         let mut picker = Self {
             rows: Vec::new(),
             selected: 0,
@@ -1033,26 +1042,30 @@ impl TracePicker {
             session_id: session_id.to_owned(),
             unfolded: std::collections::HashSet::new(),
             tree,
-            spans: 0,
+            spans,
+            kept: spans,
+            query: String::new(),
+            filtering: false,
+            summary,
         };
         picker.lay_out(None);
         Ok(picker)
     }
 
     /// The title the panel insets in its top rule: which turn of how many,
-    /// how big, and the keys that do something a reader cannot guess.
+    /// the query while one is being typed (right after the turn, where a
+    /// narrow box cannot truncate it), how many spans the filter is showing,
+    /// and the turn's thinking line when it has one.
     pub(crate) fn title(&self) -> String {
-        let mut title = format!(
-            "trace · turn {} of {} · {} spans",
-            self.turn,
-            self.turns.len(),
-            self.spans
-        );
-        if self.rows.iter().any(|row| row.toggles) {
-            title.push_str(" · enter folds thinking");
+        let mut title = format!("trace · turn {} of {}", self.turn, self.turns.len());
+        if self.filtering {
+            title.push_str(&format!(" · /{}", self.query));
+            title.push_str(&format!(" · {} of {} spans", self.kept, self.spans));
+        } else {
+            title.push_str(&format!(" · {} spans", self.spans));
         }
-        if self.turns.len() > 1 {
-            title.push_str(" · alt+f older turn");
+        if let Some(summary) = &self.summary {
+            title.push_str(&format!(" · {summary}"));
         }
         title
     }
@@ -1060,12 +1073,27 @@ impl TracePicker {
     /// Lays the rows out from the tree in hand, then puts the cursor back on
     /// `keep` when that span still has a row — a fold changes the rows under
     /// the cursor without moving it off the span it was on.
+    ///
+    /// While the filter has a query, a span is kept when it or any span below
+    /// it matches, so the tree stays whole: hiding a call would tear the
+    /// branch that answers it off the trunk. The spans that matched render
+    /// their thinking unfolded, which is where the match usually is.
     fn lay_out(&mut self, keep: Option<&str>) {
         let mut rows = Vec::new();
-        let mut spans = 0;
-        push_trace_rows(&self.tree, 0, &self.unfolded, &mut rows, &mut spans);
+        let mut kept = 0;
+        let needle = self.needle();
+        let matched = (!needle.is_empty()).then(|| matching_spans(&self.tree, needle));
+        push_trace_rows(
+            &self.tree,
+            0,
+            &self.unfolded,
+            matched.as_ref(),
+            needle,
+            &mut rows,
+            &mut kept,
+        );
         self.rows = rows;
-        self.spans = spans;
+        self.kept = kept;
         self.selected = keep
             .and_then(|id| {
                 self.rows
@@ -1073,6 +1101,12 @@ impl TracePicker {
                     .position(|row| row.span_id.as_deref() == Some(id))
             })
             .unwrap_or(0);
+    }
+
+    /// The query the rows are filtered by: empty while `/` has not been
+    /// pressed, whatever the string says then.
+    fn needle(&self) -> &str {
+        if self.filtering { &self.query } else { "" }
     }
 }
 
@@ -1108,9 +1142,9 @@ impl Chat {
     }
 
     /// Typing while the trace is up: arrows move, Enter folds or unfolds the
-    /// thinking under the cursor, alt+f walks to the next older turn, Esc
-    /// closes; anything else closes the panel and is handled as composer
-    /// input.
+    /// thinking under the cursor, `/` opens a filter, alt+f walks to the next
+    /// older turn, Esc closes the filter and then the panel; anything else
+    /// closes the panel and is handled as composer input.
     pub(crate) fn trace_picker_key(&mut self, key: Key, now: Instant) -> Applied {
         match key {
             Key::AltF => self.older_trace_turn(),
@@ -1123,8 +1157,26 @@ impl Chat {
                 Applied::none()
             }
             Key::Enter => self.toggle_trace_thinking(),
+            // `/` opens the filter; once it is open every character narrows it,
+            // so a second `/` is a character in the query, not a restart.
+            Key::Char('/') if !self.trace_filtering() => {
+                self.open_trace_filter();
+                Applied::none()
+            }
+            Key::Char(ch) if self.trace_filtering() => {
+                self.push_trace_query(ch);
+                Applied::none()
+            }
+            Key::Backspace if self.trace_filtering() => {
+                self.pop_trace_query();
+                Applied::none()
+            }
             Key::Esc => {
-                self.trace_picker = None;
+                // The filter is cleared first; the panel closes on the Esc
+                // after that, which is what a reader expects of a `/` prompt.
+                if !self.clear_trace_filter() {
+                    self.trace_picker = None;
+                }
                 Applied::none()
             }
             other => {
@@ -1132,6 +1184,72 @@ impl Chat {
                 self.on_key(other, now)
             }
         }
+    }
+
+    /// Whether the trace panel's `/` filter is open.
+    fn trace_filtering(&self) -> bool {
+        self.trace_picker
+            .as_ref()
+            .is_some_and(|picker| picker.filtering)
+    }
+
+    /// `/`: open the filter, or start it over if it was already open.
+    fn open_trace_filter(&mut self) {
+        if let Some(picker) = self.trace_picker.as_mut() {
+            picker.filtering = true;
+            picker.query.clear();
+            picker.lay_out(None);
+        }
+    }
+
+    /// A character into the filter: the rows narrow, and the cursor stays on
+    /// the span it was on when that span survives the narrowing.
+    fn push_trace_query(&mut self, ch: char) {
+        let Some(picker) = self.trace_picker.as_mut() else {
+            return;
+        };
+        let keep = picker
+            .rows
+            .get(picker.selected)
+            .and_then(|row| row.span_id.clone());
+        picker.query.push(ch);
+        picker.lay_out(keep.as_deref());
+    }
+
+    /// Backspace in the filter: the query loses its last character.
+    fn pop_trace_query(&mut self) {
+        let Some(picker) = self.trace_picker.as_mut() else {
+            return;
+        };
+        if picker.query.is_empty() {
+            return;
+        }
+        let keep = picker
+            .rows
+            .get(picker.selected)
+            .and_then(|row| row.span_id.clone());
+        picker.query.pop();
+        picker.lay_out(keep.as_deref());
+    }
+
+    /// Esc with a filter open: clear it and show the whole turn again, keeping
+    /// the panel. Returns whether it consumed the key — `false` means the
+    /// panel is not filtering, so the caller closes it.
+    fn clear_trace_filter(&mut self) -> bool {
+        let Some(picker) = self.trace_picker.as_mut() else {
+            return false;
+        };
+        if !picker.filtering {
+            return false;
+        }
+        let keep = picker
+            .rows
+            .get(picker.selected)
+            .and_then(|row| row.span_id.clone());
+        picker.filtering = false;
+        picker.query.clear();
+        picker.lay_out(keep.as_deref());
+        true
     }
 
     /// Moves the cursor to the next selectable row, skipping the lines of a
@@ -1191,11 +1309,13 @@ impl Chat {
             (picker.agent_dir.clone(), picker.session_id.clone(), turn)
         };
         let (dir, session, turn) = next;
-        match read_tree(&dir, &session, turn) {
-            Ok(tree) => {
+        match read_turn_view(&dir, &session, turn) {
+            Ok((tree, summary, spans)) => {
                 if let Some(picker) = self.trace_picker.as_mut() {
                     picker.turn = turn;
                     picker.tree = tree;
+                    picker.summary = summary;
+                    picker.spans = spans;
                     // Span ids are unique within a turn's file, not across
                     // turns: an unfolded id from the last turn could name a
                     // span here. Only the newest turn survives a change.
@@ -1212,28 +1332,79 @@ impl Chat {
     }
 }
 
-/// One turn's spans, as a forest.
-fn read_tree(
+/// One turn as the panel needs it: its tree, its thinking line, and how many
+/// spans it holds.
+fn read_turn_view(
     agent_dir: &std::path::Path,
     session_id: &str,
     turn: u64,
-) -> Result<Vec<titi_core::trace::TraceNode>, String> {
+) -> Result<(Vec<titi_core::trace::TraceNode>, Option<String>, usize), String> {
     let spans =
         titi_core::trace::read_turn(agent_dir, session_id, turn).map_err(|e| e.to_string())?;
-    Ok(titi_core::trace::build_tree(spans))
+    let trace = titi_core::trace::TurnTrace { turn, spans };
+    let summary = crate::trace_cmd::thinking_summary(
+        trace.thinking_chars(),
+        trace.thinking_calls(),
+        trace.reasoning_tokens(),
+        trace.output_tokens(),
+        trace.thinking_ms(),
+    );
+    let count = trace.spans.len();
+    Ok((titi_core::trace::build_tree(trace.spans), summary, count))
+}
+
+/// The span ids the filter keeps: every span that matches the needle, and
+/// every span above one that does — the branch a hit hangs from stays.
+fn matching_spans(
+    nodes: &[titi_core::trace::TraceNode],
+    needle: &str,
+) -> std::collections::HashSet<String> {
+    let mut keep = std::collections::HashSet::new();
+    mark_matching(nodes, needle, &mut keep);
+    keep
+}
+
+/// Marks every matching span and its ancestors; returns whether this subtree
+/// held a match.
+fn mark_matching(
+    nodes: &[titi_core::trace::TraceNode],
+    needle: &str,
+    keep: &mut std::collections::HashSet<String>,
+) -> bool {
+    let mut any = false;
+    for node in nodes {
+        let below = mark_matching(&node.children, needle, keep);
+        if below || titi_core::trace::span_match(&node.span, needle).is_some() {
+            keep.insert(node.span.span_id.clone());
+            any = true;
+        }
+    }
+    any
 }
 
 /// Depth-first rows for one turn's tree: a span's own row, its folded thinking
 /// row when it has one, and the thinking text when unfolded.
+///
+/// `keep` is the filter's set of span ids (`None` when nothing is filtered)
+/// and `needle` the query that produced it; a span the filter matched renders
+/// its thinking unfolded, because the match is usually in there. `kept` counts
+/// the spans the filter left showing.
 fn push_trace_rows(
     nodes: &[titi_core::trace::TraceNode],
     depth: usize,
     unfolded: &std::collections::HashSet<String>,
+    keep: Option<&std::collections::HashSet<String>>,
+    needle: &str,
     rows: &mut Vec<TraceRow>,
-    spans: &mut usize,
+    kept: &mut usize,
 ) {
     for node in nodes {
-        *spans += 1;
+        if let Some(keep) = keep
+            && !keep.contains(&node.span.span_id)
+        {
+            continue;
+        }
+        *kept += 1;
         let indent = "  ".repeat(depth);
         rows.push(TraceRow {
             text: format!(
@@ -1244,8 +1415,11 @@ fn push_trace_rows(
             span_id: Some(node.span.span_id.clone()),
             toggles: node.span.thinking.is_some(),
         });
-        if let Some(chars) = crate::trace_cmd::thinking_chars(&node.span) {
-            let open = unfolded.contains(&node.span.span_id);
+        if let Some(chars) = node.span.thinking_chars() {
+            let matched =
+                !needle.is_empty() && titi_core::trace::span_match(&node.span, needle).is_some();
+            let open =
+                unfolded.contains(&node.span.span_id) || (matched && node.span.thinking.is_some());
             let mark = match (node.span.thinking.is_some(), open) {
                 (true, true) => "▾",
                 (true, false) => "▸",
@@ -1278,7 +1452,15 @@ fn push_trace_rows(
                 }
             }
         }
-        push_trace_rows(&node.children, depth + 1, unfolded, rows, spans);
+        push_trace_rows(
+            &node.children,
+            depth + 1,
+            unfolded,
+            keep,
+            needle,
+            rows,
+            kept,
+        );
     }
 }
 

@@ -11056,7 +11056,10 @@ fn the_trace_panel_shows_the_turn_tree_with_thinking_folded() {
     let view = panel_view_for(&chat, 30, 100).expect("a panel");
     let title = view.title.clone().unwrap_or_default();
     assert!(title.contains("turn 1 of 1 · 4 spans"), "{title:?}");
-    assert!(title.contains("enter folds thinking"), "{title:?}");
+    assert!(
+        title.contains("thinking 28 chars over 1 call · 22% of output tokens"),
+        "{title:?}"
+    );
 }
 
 /// Enter folds and unfolds the thinking of the row it is on. A row with
@@ -11107,6 +11110,83 @@ fn enter_folds_and_unfolds_the_thinking_under_the_cursor() {
     assert_eq!(trace_rows(&chat).len(), 5);
     let picker = chat.trace_picker.as_ref().expect("open");
     assert_eq!(picker.rows[picker.selected].span_id.as_deref(), Some("llm"));
+}
+
+/// `/` narrows the panel to the spans the search would find, keeping the
+/// branch they hang from so the tree stays whole; a match inside a model
+/// call's thinking unfolds it; Esc clears the filter before it closes the
+/// panel.
+#[test]
+fn the_trace_filter_narrows_to_matching_spans_and_keeps_the_tree_whole() {
+    let mut chat = trace_chat(&[1]);
+    type_text(&mut chat, "/trace");
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(trace_rows(&chat).len(), 5);
+
+    // `/` opens the filter; until a character is typed it hides nothing.
+    chat.on_key(Key::Char('/'), Instant::now());
+    let picker = chat.trace_picker.as_ref().expect("open");
+    assert!(picker.filtering);
+    assert_eq!(picker.query, "");
+    assert_eq!(trace_rows(&chat).len(), 5);
+
+    // "read" matches the tool call only; the call it hangs from stays, with
+    // its folded thinking row.
+    for ch in "read".chars() {
+        chat.on_key(Key::Char(ch), Instant::now());
+    }
+    assert_eq!(
+        trace_rows(&chat),
+        [
+            "◆ turn 1 · 500ms",
+            "  ✦ chat gpt-4o · 190ms · in 1.2k (cached 1.0k) out 180 · 40 reasoning · $0.0021",
+            "    ▸ thinking · 28 chars",
+            "    ⚙ read · 30ms · ok",
+        ],
+        "the ancestors stay, the siblings go"
+    );
+    let view = panel_view_for(&chat, 30, 100).expect("a panel");
+    let title = view.title.clone().unwrap_or_default();
+    assert!(title.contains("3 of 4 spans"), "{title:?}");
+    assert!(title.contains("/read"), "{title:?}");
+
+    // Backspace takes the query back a character: "rea" still matches.
+    chat.on_key(Key::Backspace, Instant::now());
+    assert_eq!(
+        chat.trace_picker.as_ref().expect("open").query,
+        "rea",
+        "the last character went"
+    );
+    assert_eq!(trace_rows(&chat).len(), 4);
+
+    // Esc clears the filter and keeps the panel; the turn is whole again.
+    chat.on_key(Key::Esc, Instant::now());
+    let picker = chat.trace_picker.as_ref().expect("Esc cleared, not closed");
+    assert!(!picker.filtering);
+    assert_eq!(picker.query, "");
+    assert_eq!(trace_rows(&chat).len(), 5);
+
+    // A match inside the thinking of a model call unfolds it, so the line the
+    // query found is on screen.
+    chat.on_key(Key::Char('/'), Instant::now());
+    for ch in "second".chars() {
+        chat.on_key(Key::Char(ch), Instant::now());
+    }
+    let rows = trace_rows(&chat);
+    assert!(
+        rows.contains(&"    ▾ thinking · 28 chars".to_owned()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"      second thought".to_owned()),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|row| row.contains("read")), "{rows:?}");
+
+    // The second Esc closes the panel.
+    chat.on_key(Key::Esc, Instant::now());
+    chat.on_key(Key::Esc, Instant::now());
+    assert!(chat.trace_picker.is_none());
 }
 
 /// alt+f walks the session's turns newest first, wrapping; the title names
