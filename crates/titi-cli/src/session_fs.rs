@@ -150,11 +150,36 @@ fn ids_in_workspace(
     Some(ids.into_iter().collect())
 }
 
-/// Delete a session's JSONL file.  Callers must gate this behind an
-/// approval prompt — Esc never reaches here.
+/// Delete a session: its JSONL transcript and the side files that belong to it.
+///
+/// The transcript is the session; its trajectory and its traces are what the
+/// session recorded, and deleting one while leaving the others keeps exactly
+/// what the user asked to remove — a trajectory replayable after its session
+/// was "deleted" is not deleted. Callers must gate this behind an approval
+/// prompt — Esc never reaches here.
 pub fn delete_session_from(agent_dir: &std::path::Path, id: &str) -> Result<(), String> {
     let path = agent_dir.join("sessions").join(format!("{id}.jsonl"));
-    std::fs::remove_file(&path).map_err(|e| format!("{e}"))
+    std::fs::remove_file(&path).map_err(|e| format!("{e}"))?;
+    // A side file that is already gone is not an error — a session written
+    // before trajectories existed has none. One that cannot be removed is
+    // reported even though the transcript is already gone.
+    remove_if_present(&agent_dir.join("trajectories").join(format!("{id}.jsonl")))?;
+    remove_if_present(&titi_core::trace::session_dir(agent_dir, id))?;
+    Ok(())
+}
+
+/// Removes a file or a directory tree if it exists; a missing path is `Ok`.
+fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 /// [`delete_session_from`] against the real agent directory.
@@ -377,4 +402,45 @@ pub fn write_paste(workspace: &std::path::Path, seq: u32, body: &str) -> Result<
     }
     std::fs::write(dir.join(&name), body).map_err(|e| e.to_string())?;
     Ok(format!(".titi/pastes/{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("{e}"));
+        }
+        std::fs::write(path, "{}\n").unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_trajectory_and_its_traces() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let sessions = dir.path().join("sessions");
+        touch(&sessions.join("s1.jsonl"));
+        touch(&sessions.join("s2.jsonl"));
+        let trajectory = dir.path().join("trajectories").join("s1.jsonl");
+        touch(&trajectory);
+        let traces = titi_core::trace::session_dir(dir.path(), "s1");
+        touch(&traces.join("1.jsonl"));
+
+        delete_session_from(dir.path(), "s1").unwrap_or_else(|e| panic!("delete: {e}"));
+
+        assert!(!sessions.join("s1.jsonl").exists());
+        assert!(!trajectory.exists(), "the trajectory outlived its session");
+        assert!(!traces.exists(), "the traces outlived their session");
+        // A sibling session keeps everything of its own.
+        assert!(sessions.join("s2.jsonl").exists());
+    }
+
+    #[test]
+    fn deleting_a_session_with_no_side_files_is_still_a_success() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let sessions = dir.path().join("sessions");
+        touch(&sessions.join("s1.jsonl"));
+        delete_session_from(dir.path(), "s1").unwrap_or_else(|e| panic!("delete: {e}"));
+        assert!(!sessions.join("s1.jsonl").exists());
+    }
 }
