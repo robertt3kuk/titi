@@ -25,7 +25,7 @@ pub mod tool_agent;
 pub mod tool_loop;
 
 pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
-pub use agent_tool::{AgentTool, MAX_ANSWER_CHARS};
+pub use agent_tool::{AgentTool, BATCH_CONCURRENCY, MAX_ANSWER_CHARS, MAX_BATCH_TASKS};
 pub use agents::{
     AgentContext, AgentOutcome, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner,
 };

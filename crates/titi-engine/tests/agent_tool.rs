@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use smol_str::SmolStr;
 use titi_engine::{
-    AgentContext, AgentRequest, AgentRunner, AgentStatus, EngineCommand, EngineConfig, EngineEvent,
-    EngineRuntime, RegistryError, ResolvedModel, TransportResolver,
+    AgentContext, AgentRequest, AgentRunner, AgentStatus, BATCH_CONCURRENCY, EngineCommand,
+    EngineConfig, EngineEvent, EngineRuntime, MAX_ANSWER_CHARS, RegistryError, ResolvedModel,
+    TransportResolver,
 };
 use titi_providers::{
     BlockId, MockBody, MockTransport, StopReason, StreamEvent, ToolCallRef, Transport,
@@ -365,5 +367,396 @@ async fn an_empty_task_is_refused() {
             .iter()
             .any(|event| matches!(event, EngineEvent::AgentStarted { .. })),
         "and nothing was spawned: {events:?}"
+    );
+}
+
+// ---- the batch shape -------------------------------------------------------
+
+/// Both children must be running at once or this never returns: each waits at
+/// a barrier of two for the other to arrive. A batch that ran its children one
+/// at a time would hang here, which is why the test is bounded by a timeout.
+struct RendezvousRunner {
+    gate: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait]
+impl AgentRunner for RendezvousRunner {
+    async fn run(&self, request: AgentRequest, _context: AgentContext) -> Result<SmolStr, SmolStr> {
+        let briefed = request.task.starts_with("shared briefing");
+        self.gate.wait().await;
+        Ok(format!("{} met the other (briefed: {briefed})", request.name).into())
+    }
+}
+
+/// A batch runs its children at once, and the shared `context` reaches each of
+/// them as the head of its task.
+#[tokio::test]
+async fn a_batch_runs_its_children_at_once() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call(
+            "agent",
+            r#"{"context":"shared briefing","tasks":[{"task":"left","name":"Left"},{"task":"right","name":"Right"}]}"#,
+        )),
+        MockBody::Events(text("both done")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(RendezvousRunner {
+            gate: Arc::new(tokio::sync::Barrier::new(2)),
+        }),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        collect_until_terminal(&mut engine),
+    )
+    .await
+    .expect("the batch finished; a sequential batch would still be at the barrier");
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::AgentFinished { summary, .. } if summary.contains("briefed: true")
+        )),
+        "the shared context was prepended to the task: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolFinished { output, is_error: false, .. }
+                if output.contains("Left — completed") && output.contains("Right — completed")
+        )),
+        "one section per child, in the order asked for: {events:?}"
+    );
+}
+
+/// The bound is real: six children never have more than `BATCH_CONCURRENCY`
+/// alive at once, and they do run together.
+#[tokio::test]
+async fn a_batch_never_runs_more_than_the_bound() {
+    struct CountingRunner {
+        live: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for CountingRunner {
+        async fn run(
+            &self,
+            _request: AgentRequest,
+            _context: AgentContext,
+        ) -> Result<SmolStr, SmolStr> {
+            let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(live, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok("done".into())
+        }
+    }
+
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<String> = (1..=6)
+        .map(|index| format!(r#"{{"task":"piece {index}","name":"P{index}"}}"#))
+        .collect();
+    let args = format!(r#"{{"tasks":[{}]}}"#, tasks.join(","));
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call("agent", &args)),
+        MockBody::Events(text("all done")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(CountingRunner {
+            live: Arc::clone(&live),
+            peak: Arc::clone(&peak),
+        }),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        peak <= BATCH_CONCURRENCY,
+        "at most {BATCH_CONCURRENCY} children at once, saw {peak}: {events:?}"
+    );
+    assert!(peak > 1, "and they did run together, saw {peak}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::AgentFinished { .. }))
+            .count(),
+        6,
+        "every child finished"
+    );
+}
+
+/// Each child gets a section, in the order it was asked for, and however long
+/// the answers are the whole message fits `MAX_ANSWER_CHARS` with the cut
+/// stated.
+#[tokio::test]
+async fn a_batch_answers_with_one_capped_section_per_child() {
+    struct LongRunner;
+
+    #[async_trait]
+    impl AgentRunner for LongRunner {
+        async fn run(
+            &self,
+            request: AgentRequest,
+            _context: AgentContext,
+        ) -> Result<SmolStr, SmolStr> {
+            Ok(format!("{} says {}", request.name, "x".repeat(20_000)).into())
+        }
+    }
+
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call(
+            "agent",
+            r#"{"tasks":[{"task":"one","name":"First"},{"task":"two","name":"Second"},{"task":"three","name":"Third"}]}"#,
+        )),
+        MockBody::Events(text("all done")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(LongRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the tool finished");
+    for name in [
+        "First — completed",
+        "Second — completed",
+        "Third — completed",
+    ] {
+        assert!(output.contains(name), "missing {name:?} in {output}");
+    }
+    assert!(
+        output.chars().count() <= MAX_ANSWER_CHARS,
+        "the message fits the cap: {} chars",
+        output.chars().count()
+    );
+    assert!(
+        output.contains("answer truncated"),
+        "and the cut is stated: {output}"
+    );
+}
+
+/// A child that fails is a section, not an abort: its siblings in the same
+/// wave and the waves after it still run. omp's batch is
+/// `mapWithConcurrencyLimitAllSettled`, whose contract is that launched
+/// siblings always settle, and this follows it.
+#[tokio::test]
+async fn a_failing_child_does_not_stop_its_siblings() {
+    struct OneFails;
+
+    #[async_trait]
+    impl AgentRunner for OneFails {
+        async fn run(
+            &self,
+            request: AgentRequest,
+            _context: AgentContext,
+        ) -> Result<SmolStr, SmolStr> {
+            if request.name == "Broken" {
+                return Err("this one broke".into());
+            }
+            Ok(format!("{} is fine", request.name).into())
+        }
+    }
+
+    // Five children, one of them failing, with a bound of four: the failure is
+    // in the first wave, so the second wave only runs if a failure does not
+    // stop the batch.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call(
+            "agent",
+            r#"{"tasks":[{"task":"a","name":"Broken"},{"task":"b","name":"B"},{"task":"c","name":"C"},{"task":"d","name":"D"},{"task":"e","name":"E"}]}"#,
+        )),
+        MockBody::Events(text("done")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(OneFails),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::AgentFinished { .. }))
+            .count(),
+        5,
+        "every child ran: {events:?}"
+    );
+    let output = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::ToolFinished {
+                output, is_error, ..
+            } => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("the tool finished");
+    assert!(output.0.contains("Broken — failed"), "{:?}", output.0);
+    assert!(output.0.contains("this one broke"), "{:?}", output.0);
+    for name in [
+        "B — completed",
+        "C — completed",
+        "D — completed",
+        "E — completed",
+    ] {
+        assert!(output.0.contains(name), "missing {name:?}");
+    }
+    assert!(output.1, "the call is not wholly successful");
+}
+
+/// A cancelled batch stops every child it spawned, not only the first.
+#[tokio::test]
+async fn a_cancelled_batch_stops_every_child() {
+    let transport = Arc::new(MockTransport::new(vec![MockBody::Events(tool_call(
+        "agent",
+        r#"{"tasks":[{"task":"left","name":"Left"},{"task":"right","name":"Right"}]}"#,
+    ))]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(HangingRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    let mut started = 0;
+    while started < 2 {
+        let event = engine.recv().await.expect("an event");
+        if matches!(event, EngineEvent::AgentStarted { .. }) {
+            started += 1;
+        }
+        events.push(event);
+    }
+    engine.send(EngineCommand::Cancel).await.unwrap();
+    events.extend(collect_until_terminal(&mut engine).await);
+
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut stopped = 0;
+        while stopped < 2 {
+            let event = engine.recv().await.expect("an event");
+            if matches!(
+                event,
+                EngineEvent::AgentStatusChanged {
+                    status: AgentStatus::Aborted,
+                    ..
+                }
+            ) {
+                stopped += 1;
+            }
+            events.push(event);
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        stopped,
+        "both children were stopped with the turn: {events:?}"
+    );
+}
+
+/// Exactly one of `task` and `tasks`: both is a refusal, and nothing spawns.
+#[tokio::test]
+async fn both_shapes_at_once_are_refused() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call(
+            "agent",
+            r#"{"task":"one","tasks":[{"task":"two"}]}"#,
+        )),
+        MockBody::Events(text("ok")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(AnsweringRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolFinished { output, is_error: true, .. } if output.contains("not both")
+        )),
+        "both shapes are refused: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::AgentStarted { .. })),
+        "and nothing spawned: {events:?}"
+    );
+}
+
+/// Neither shape is refused too, as is an empty batch.
+#[tokio::test]
+async fn neither_shape_is_refused() {
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call("agent", r#"{"context":"only a context"}"#)),
+        MockBody::Events(text("ok")),
+    ]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(AnsweringRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "go".into() })
+        .await
+        .unwrap();
+    let events = collect_until_terminal(&mut engine).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolFinished { output, is_error: true, .. } if output.contains("needs a `task`")
+        )),
+        "neither shape is refused: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::AgentStarted { .. })),
+        "and nothing spawned: {events:?}"
     );
 }
