@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod advisor;
+pub mod agent_tool;
 pub mod agents;
 pub mod claims;
 pub mod compaction;
@@ -24,7 +25,10 @@ pub mod tool_agent;
 pub mod tool_loop;
 
 pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
-pub use agents::{AgentContext, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner};
+pub use agent_tool::{AgentTool, MAX_ANSWER_CHARS};
+pub use agents::{
+    AgentContext, AgentOutcome, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner,
+};
 pub use council::{
     Council, CouncilError, CouncilMember, CouncilReport, DEFAULT_BRIEFS, DroppedMember,
     MAX_MEMBERS, MIN_MEMBERS, MemberAnswer, SYNTHESIZER_BRIEF, council_report, run_council,

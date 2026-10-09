@@ -13,15 +13,27 @@ use titi_tui::theme::{Theme, ThemeColor};
 use crate::chat::{Chat, LoginMethod, fg, surface};
 use crate::pickers::ellipsis_label;
 
+/// The colours of the composer's border and its caption, one pair per state.
+///
+/// A state that means something keeps its own colour: needs-you is the warning
+/// token, a running turn the accent. `statusLine.sessionAccent` colours the
+/// *idle* border, which is the one omp's key names (its "editor border"), and
+/// it never overrides a state — running and needs-you say something the accent
+/// does not.
+pub(crate) fn composer_colors(chat: &Chat) -> (ThemeColor, ThemeColor) {
+    if chat.approval.is_some() || chat.pending_ask.is_some() || chat.login_for.is_some() {
+        (ThemeColor::Warning, ThemeColor::Warning)
+    } else if chat.turn_active {
+        (ThemeColor::Accent, ThemeColor::Accent)
+    } else if chat.status_line.session_accent {
+        (ThemeColor::Accent, ThemeColor::Dim)
+    } else {
+        (ThemeColor::Border, ThemeColor::Dim)
+    }
+}
+
 pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
-    let (border, caption_color) =
-        if chat.approval.is_some() || chat.pending_ask.is_some() || chat.login_for.is_some() {
-            (ThemeColor::Warning, ThemeColor::Warning)
-        } else if chat.turn_active {
-            (ThemeColor::Accent, ThemeColor::Accent)
-        } else {
-            (ThemeColor::Border, ThemeColor::Dim)
-        };
+    let (border, caption_color) = composer_colors(chat);
     // The mode the draft is in, when the vim keys are on, in the composer's
     // own border. `NORMAL` is the mode that swallows typing, so it is the one
     // the border shouts about; `INSERT` is the composer the screen always had.

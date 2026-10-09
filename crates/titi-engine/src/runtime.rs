@@ -1073,7 +1073,7 @@ impl EngineRuntime {
         config: EngineConfig,
         resolver: Arc<dyn TransportResolver>,
         runner: Option<Arc<dyn crate::agents::AgentRunner>>,
-        tools: ToolRegistry,
+        mut tools: ToolRegistry,
         trajectory: TrajectorySink,
     ) -> Engine {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
@@ -1180,6 +1180,19 @@ impl EngineRuntime {
                 findings.clone(),
             )
         });
+        // The model's own door to the supervisor, and the same spawn the
+        // surface's `SpawnAgent` command uses: one path, so a subagent the
+        // model asked for is a subagent the surface can focus, revive and
+        // stop like any other. A session with no supervisor gets no `agent`
+        // tool rather than one that refuses every call. The subagent's own
+        // registry is built below without this tool, which is what bounds
+        // nesting: a subagent cannot spawn a subagent, at any depth.
+        if let Some(agents) = &agents {
+            tools.register(Arc::new(crate::agent_tool::AgentTool::new(
+                agents.clone(),
+                config.agent_writes,
+            )));
+        }
         let runtime = Self {
             mode: config.mode,
             config,
@@ -1268,6 +1281,16 @@ impl EngineRuntime {
                                 // stopped, or the cancel waits for it to finish.
                                 self.config.interrupt.raise();
                                 let _ = self.events.send(EngineEvent::Cancelled { turn_id }).await;
+                            }
+                            // A subagent the turn spawned is the turn's work.
+                            // The abort flag alone would not reach it: the
+                            // tool call that spawned it is mid-await, and the
+                            // loop only reads the flag between calls. Stop
+                            // them here — the same stop `StopAgent` asks for —
+                            // so a cancelled turn does not leave an agent
+                            // running, and holding files, behind it.
+                            if let Some(agents) = &self.agents {
+                                agents.stop_all().await;
                             }
                             // Cancel is a stop, and taking `active` already stops
                             // the drain on the next `TurnDone`. Left in place the
@@ -1468,6 +1491,14 @@ impl EngineRuntime {
                                     Job::Loop(job) => job.timer.abort(),
                                     Job::Command(job) => job.cancel.cancel(),
                                 }
+                            }
+                            // The session's subagents go down with it: they
+                            // hold claims and their events have nowhere to go
+                            // once this loop ends, so leaving them running is
+                            // the same orphan the jobs above are not allowed
+                            // to become.
+                            if let Some(agents) = &self.agents {
+                                agents.stop_all().await;
                             }
                             break;
                         }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use smol_str::SmolStr;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use futures::StreamExt;
 use titi_providers::{ChatMessage, RequestCtx, Role, StreamEvent, WireRequest};
@@ -21,6 +21,17 @@ pub struct AgentRequest {
     pub task: SmolStr,
     pub kind: AgentKind,
     pub parent_id: Option<SmolStr>,
+}
+
+/// How a run ended, for a caller that waited on it.
+#[derive(Debug, Clone)]
+pub struct AgentOutcome {
+    pub status: AgentStatus,
+    pub summary: SmolStr,
+    /// True only for [`AgentStatus::Completed`]. Kept beside the status so a
+    /// caller that only wants "did it work" does not match on an enum whose
+    /// other arms are about *how* it did not.
+    pub success: bool,
 }
 
 #[derive(Clone)]
@@ -55,6 +66,7 @@ impl AgentContext {
         &self.agent_id
     }
 
+    /// The model's own text, as it arrives.
     pub async fn progress(&self, text: impl Into<SmolStr>) {
         let _ = self
             .events
@@ -106,6 +118,12 @@ struct AgentRecord {
     request: AgentRequest,
     status: AgentStatus,
     aborted: Arc<AtomicBool>,
+    /// How the run ended, once it has. The sender is kept here so
+    /// [`AgentSupervisor::stop`] can resolve a waiter at once instead of
+    /// leaving it on a runner that may never come back; the receiver is the
+    /// handle [`AgentSupervisor::wait`] hands out.
+    outcome_tx: watch::Sender<Option<AgentOutcome>>,
+    outcome_rx: watch::Receiver<Option<AgentOutcome>>,
 }
 
 #[derive(Clone)]
@@ -188,6 +206,15 @@ impl AgentSupervisor {
         };
         record.aborted.store(true, Ordering::SeqCst);
         record.status = AgentStatus::Aborted;
+        // A waiter must not be left on a runner that may be mid-request: the
+        // agent is over the moment it is stopped, whatever the model is still
+        // doing. The launch task's own send is skipped when it sees the abort
+        // flag, so this is the only outcome that waiter gets.
+        let _ = record.outcome_tx.send(Some(AgentOutcome {
+            status: AgentStatus::Aborted,
+            summary: "stopped".into(),
+            success: false,
+        }));
         drop(records);
         // A stopped agent must not leave its files locked.
         self.claims.release_all(agent_id);
@@ -199,6 +226,43 @@ impl AgentSupervisor {
             })
             .await;
         true
+    }
+
+    /// Stops every agent that is still running, for a cancel that reaches the
+    /// parent: a turn's children are the turn's, and one that outlives it is
+    /// an orphan holding claims.
+    pub async fn stop_all(&self) -> usize {
+        let running: Vec<SmolStr> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .filter(|(_, record)| {
+                    matches!(record.status, AgentStatus::Running | AgentStatus::Idle)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &running {
+            self.stop(id).await;
+        }
+        running.len()
+    }
+
+    /// Waits for `agent_id` to end and hands back how it ended.
+    ///
+    /// `None` when no such agent exists. The wait resolves for every way a run
+    /// can end, including [`Self::stop`], so a caller is never left waiting on
+    /// an agent that will not finish.
+    pub async fn wait(&self, agent_id: &str) -> Option<AgentOutcome> {
+        let mut outcome = self.records.lock().await.get(agent_id)?.outcome_rx.clone();
+        loop {
+            if let Some(done) = outcome.borrow().clone() {
+                return Some(done);
+            }
+            if outcome.changed().await.is_err() {
+                return None;
+            }
+        }
     }
 
     pub async fn revive(&self, agent_id: &str) -> bool {
@@ -221,12 +285,15 @@ impl AgentSupervisor {
 
     async fn launch(&self, request: AgentRequest) {
         let aborted = Arc::new(AtomicBool::new(false));
+        let (outcome_tx, outcome_rx) = watch::channel(None);
         self.records.lock().await.insert(
             request.id.clone(),
             AgentRecord {
                 request: request.clone(),
                 status: AgentStatus::Running,
                 aborted: Arc::clone(&aborted),
+                outcome_tx,
+                outcome_rx,
             },
         );
         let _ = self
@@ -240,6 +307,12 @@ impl AgentSupervisor {
             .await;
 
         let supervisor = self.clone();
+        let outcome_tx = self
+            .records
+            .lock()
+            .await
+            .get(&request.id)
+            .map(|record| record.outcome_tx.clone());
         tokio::spawn(async move {
             let context = AgentContext {
                 agent_id: request.id.clone(),
@@ -250,6 +323,9 @@ impl AgentSupervisor {
             };
             let result = supervisor.runner.run(request.clone(), context).await;
             if aborted.load(Ordering::SeqCst) {
+                // `stop` already resolved the outcome and said what happened;
+                // the runner may be reporting from a request it was mid-way
+                // through, and that is not the end of this agent.
                 return;
             }
             let (status, summary, success) = match result {
@@ -274,11 +350,21 @@ impl AgentSupervisor {
             let _ = supervisor
                 .events
                 .send(EngineEvent::AgentFinished {
-                    agent_id: request.id,
-                    summary,
+                    agent_id: request.id.clone(),
+                    summary: summary.clone(),
                     success,
                 })
                 .await;
+            // Last, so a waiter that wakes has the events already in the
+            // stream: `AgentFinished` before the tool call that spawned it
+            // returns.
+            if let Some(outcome_tx) = outcome_tx {
+                let _ = outcome_tx.send(Some(AgentOutcome {
+                    status,
+                    summary,
+                    success,
+                }));
+            }
         });
     }
 }

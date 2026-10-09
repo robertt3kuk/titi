@@ -56,13 +56,65 @@ pub enum Segment {
 }
 
 /// The glyph between two segments, and whether the whole line stays ASCII.
+///
+/// The set is omp's (`statusLine.separator`,
+/// `pi-tui/src/status-line/schema.ts:48`): `powerline`, `powerline-thin`,
+/// `slash`, `pipe`, `block`, `none`, `ascii` — with titi's own glyphs for
+/// each picked from the theme's symbol table, so a `nerd` symbol preset draws
+/// the Nerd Font forms and `unicode`/`ascii` draw the plain ones.
+///
+/// [`Separator::Ascii`] is a bundle, not just a glyph: it asks for ASCII
+/// throughout, separators **and** icons, for a terminal the default's glyphs
+/// do not fit. It stays the `ascii` preset's own choice — a key that names
+/// `ascii` asks for the same bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Separator {
-    /// The crate's thin powerline (`sep.powerlineThinLeft`), the default.
+    /// A thin chevron (`sep.powerlineThinLeft`), the default.
     Thin,
-    /// ASCII throughout — separators **and** icons — for a terminal the
-    /// default's glyphs do not fit.
+    /// A solid arrow (`sep.powerlineLeft`).
+    Powerline,
+    /// A slash (`sep.slash`).
+    Slash,
+    /// A pipe (`sep.pipe`).
+    Pipe,
+    /// A half block (`sep.block`).
+    Block,
+    /// Air (`sep.space`): the segments separate on whitespace alone.
+    None,
+    /// ASCII throughout — separators **and** icons.
     Ascii,
+}
+
+impl Separator {
+    /// Every value, in the order the settings list them.
+    pub const ALL: [Separator; 7] = [
+        Separator::Powerline,
+        Separator::Thin,
+        Separator::Slash,
+        Separator::Pipe,
+        Separator::Block,
+        Separator::None,
+        Separator::Ascii,
+    ];
+
+    /// The name the setting writes (omp's spellings).
+    pub fn id(self) -> &'static str {
+        match self {
+            Separator::Thin => "powerline-thin",
+            Separator::Powerline => "powerline",
+            Separator::Slash => "slash",
+            Separator::Pipe => "pipe",
+            Separator::Block => "block",
+            Separator::None => "none",
+            Separator::Ascii => "ascii",
+        }
+    }
+
+    /// The separator a setting name asks for; `None` for anything else, so a
+    /// typo in a cosmetic key leaves the line as its preset draws it.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sep| sep.id() == name)
+    }
 }
 
 /// How the line between the left and right groups reflects the context.
@@ -281,13 +333,42 @@ pub fn preset(preset: StatusLinePreset) -> &'static PresetDef {
 pub struct StatusLineStyle {
     pub preset: StatusLinePreset,
     pub context_line: ContextLine,
+    /// The separator between segments (`statusLine.separator`), overriding the
+    /// preset's own when a name is set. `None` is the preset's, which is what
+    /// an unset key leaves — the line the user already had, byte for byte.
+    pub separator: Option<Separator>,
+    /// Whether the editor's border and the line's own gap take the accent
+    /// (`statusLine.sessionAccent`).
+    ///
+    /// omp derives the colour from the session's *name* — a hash of it, tuned
+    /// to the theme's surface (`theme/session-color.ts:182`) — and uses it for
+    /// the brand and for the segments that name the session. titi has one
+    /// accent token per theme and no per-session palette, so that token is what
+    /// this spends; the state colours the two surfaces already have (running,
+    /// needs-you) are untouched, because those say something the accent does
+    /// not.
+    pub session_accent: bool,
+    /// Whether the status line paints the theme's own background
+    /// (`statusLine.transparent`).
+    ///
+    /// On, the row leaves its cells' background to the terminal, the way omp's
+    /// own key does. titi paints `ThemeBg::StatusLineBg` behind the whole
+    /// screen, so the row has to *clear* the background rather than simply not
+    /// set one, which is what makes the key visible at all.
+    pub transparent: bool,
 }
 
 impl StatusLineStyle {
     /// From the settings' own names. An unset name is the default and an
     /// unknown one falls back to it too: a typo in a cosmetic key must not
     /// change the screen, and must never refuse to start.
-    pub fn resolve(preset: Option<&str>, context_line: Option<&str>) -> Self {
+    pub fn resolve(
+        preset: Option<&str>,
+        context_line: Option<&str>,
+        separator: Option<&str>,
+        session_accent: bool,
+        transparent: bool,
+    ) -> Self {
         Self {
             preset: preset
                 .and_then(StatusLinePreset::from_id)
@@ -295,6 +376,9 @@ impl StatusLineStyle {
             context_line: context_line
                 .and_then(ContextLine::from_id)
                 .unwrap_or_default(),
+            separator: separator.and_then(Separator::parse),
+            session_accent,
+            transparent,
         }
     }
 }
@@ -406,8 +490,13 @@ pub fn render_status_line(
         return String::new();
     }
     let def = preset(style.preset);
-    let ascii = def.separator == Separator::Ascii;
-    let sep = separator_text(theme, def.separator);
+    // The key's separator, when one is named; the preset's otherwise, which is
+    // the byte-for-byte line this row has always drawn. The ASCII bundle is on
+    // when either of them asks for it: an `ascii` separator in a `default`
+    // preset still means "my terminal cannot draw the glyphs".
+    let sep_style = style.separator.unwrap_or(def.separator);
+    let ascii = sep_style == Separator::Ascii || def.separator == Separator::Ascii;
+    let sep = separator_text(theme, sep_style);
     // `embedded` moves the number out of the group and into the gauge's label,
     // so the context segment leaves the group — but only when the window is
     // known, because with no window there is no gauge and no label to carry it,
@@ -494,7 +583,7 @@ pub fn render_status_line(
         .max(min_gap);
     let fill = match style.context_line {
         ContextLine::Off => " ".repeat(gap),
-        mode => gauge(theme, ascii, gap, mode, snap),
+        mode => gauge(theme, ascii, style.session_accent, gap, mode, snap),
     };
     truncate_to_width(&format!("{left_s}{fill}{right_s}"), cells)
 }
@@ -526,6 +615,7 @@ fn embedded_label_cells(snap: &StatusSnapshot) -> usize {
 fn gauge(
     theme: &Theme,
     ascii: bool,
+    accent: bool,
     cells: usize,
     mode: ContextLine,
     snap: &StatusSnapshot,
@@ -590,8 +680,12 @@ fn gauge(
         while end < cells && (end < used) == lit && !(label_cells > 0 && end == label_start) {
             end += 1;
         }
+        // The lit part is the context's own token. The rest — the "gap" in
+        // omp's wording — is the accent when `sessionAccent` asks for it.
         let color = if lit {
             ThemeColor::BorderAccent
+        } else if accent {
+            ThemeColor::Accent
         } else {
             ThemeColor::Border
         };
@@ -794,9 +888,28 @@ fn set_part(
 /// The separator between two segments, as cells: a space, the glyph in the
 /// crate's separator colour, a space.
 fn separator_text(theme: &Theme, style: Separator) -> String {
+    // Two of the table's entries carry their own spaces (`sep.slash` is
+    // `" / "`), so those are spent whole; the rest are single glyphs and are
+    // padded here.
+    if style == Separator::None {
+        return " ".to_owned();
+    }
+    for (glyph, spaced) in [
+        (Separator::Slash, "sep.slash"),
+        (Separator::Pipe, "sep.pipe"),
+    ] {
+        if style == glyph {
+            let text = sym(theme, false, spaced);
+            let text = if text.is_empty() { " | " } else { text };
+            return theme.fg(ThemeColor::StatusLineSep, text);
+        }
+    }
     let glyph = match style {
         Separator::Thin => sym(theme, false, "sep.powerlineThinLeft"),
+        Separator::Powerline => sym(theme, false, "sep.powerlineLeft"),
+        Separator::Block => sym(theme, false, "sep.block"),
         Separator::Ascii => sym(theme, true, "sep.asciiLeft"),
+        Separator::Slash | Separator::Pipe | Separator::None => unreachable!("handled above"),
     };
     if glyph.is_empty() {
         " > ".to_owned()
@@ -1028,6 +1141,7 @@ mod tests {
         StatusLineStyle {
             preset,
             context_line: ContextLine::Off,
+            ..StatusLineStyle::default()
         }
     }
 
@@ -1173,6 +1287,7 @@ mod tests {
                 StatusLineStyle {
                     preset: StatusLinePreset::Ascii,
                     context_line: ContextLine::Embedded,
+                    ..StatusLineStyle::default()
                 },
                 &s,
             ));
@@ -1219,6 +1334,7 @@ mod tests {
                 StatusLineStyle {
                     preset: StatusLinePreset::Default,
                     context_line: mode,
+                    ..StatusLineStyle::default()
                 },
                 &snap(),
             );
@@ -1246,6 +1362,7 @@ mod tests {
             StatusLineStyle {
                 preset: StatusLinePreset::Default,
                 context_line: ContextLine::Embedded,
+                ..StatusLineStyle::default()
             },
             &s,
         ));
@@ -1266,6 +1383,7 @@ mod tests {
             StatusLineStyle {
                 preset: StatusLinePreset::Default,
                 context_line: ContextLine::Percentage,
+                ..StatusLineStyle::default()
             },
             &s,
         ));
@@ -1287,6 +1405,7 @@ mod tests {
                 StatusLineStyle {
                     preset: StatusLinePreset::Default,
                     context_line: ContextLine::Embedded,
+                    ..StatusLineStyle::default()
                 },
                 &s,
             ))
@@ -1324,6 +1443,7 @@ mod tests {
                 StatusLineStyle {
                     preset: StatusLinePreset::Default,
                     context_line: ContextLine::Percentage,
+                    ..StatusLineStyle::default()
                 },
                 &s,
             )
@@ -1376,6 +1496,7 @@ mod tests {
                         StatusLineStyle {
                             preset,
                             context_line,
+                            ..StatusLineStyle::default()
                         },
                         &s,
                     );
@@ -1397,6 +1518,7 @@ mod tests {
         let style = StatusLineStyle {
             preset: StatusLinePreset::Ascii,
             context_line: ContextLine::Embedded,
+            ..StatusLineStyle::default()
         };
         let line = visible(&render_status_line(&theme, 80, style, &s));
         assert!(line.contains("49% - 400"), "the number survives: {line:?}");
@@ -1415,16 +1537,18 @@ mod tests {
 
     #[test]
     fn an_unknown_name_falls_back_rather_than_failing() {
-        let style = StatusLineStyle::resolve(Some("nope"), Some("nope"));
+        let style =
+            StatusLineStyle::resolve(Some("nope"), Some("nope"), Some("nope"), false, false);
         assert_eq!(style, StatusLineStyle::default());
         assert_eq!(style.preset, StatusLinePreset::Default);
         assert_eq!(style.context_line, ContextLine::Off);
         assert_eq!(
-            StatusLineStyle::resolve(None, None),
+            StatusLineStyle::resolve(None, None, None, false, false),
             StatusLineStyle::default()
         );
         assert_eq!(
-            StatusLineStyle::resolve(Some("minimal"), Some("embedded")).context_line,
+            StatusLineStyle::resolve(Some("minimal"), Some("embedded"), None, false, false)
+                .context_line,
             ContextLine::Embedded
         );
     }
@@ -1472,5 +1596,105 @@ mod tests {
     fn porcelain_counts_unstaged_staged_untracked() {
         let src = " M a.rs\nM  b.rs\nMM c.rs\n?? d.rs\n!! ignored\n";
         assert_eq!(parse_porcelain(src), (2, 2, 1));
+    }
+    /// The separator catalog is omp's set with omp's names, and an unknown name
+    /// is nothing (the preset's own is what an unset key leaves).
+    #[test]
+    fn the_separators_are_omps_set() {
+        let ids: Vec<&str> = Separator::ALL.iter().map(|sep| sep.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "powerline",
+                "powerline-thin",
+                "slash",
+                "pipe",
+                "block",
+                "none",
+                "ascii"
+            ]
+        );
+        for sep in Separator::ALL {
+            assert_eq!(Separator::parse(sep.id()), Some(sep));
+        }
+        assert_eq!(Separator::parse("hoops"), None);
+        assert_eq!(Separator::parse(""), None);
+    }
+
+    /// A named separator replaces the preset's, and the ASCII bundle comes on
+    /// when either of them asks for it.
+    #[test]
+    fn a_named_separator_replaces_the_presets() {
+        let line =
+            |style: StatusLineStyle| visible(&render_status_line(&theme(), 120, style, &snap()));
+        let preset = style(StatusLinePreset::Full);
+        let default = line(preset);
+        assert!(default.contains("tit"), "{default}");
+
+        // A pipe between the segments, in the theme's own colour token.
+        let piped = line(StatusLineStyle {
+            separator: Some(Separator::Pipe),
+            ..preset
+        });
+        assert!(piped.contains(" │ "), "{piped}");
+        assert!(
+            !piped.contains(" > "),
+            "the preset's chevron is gone: {piped}"
+        );
+
+        // `none` separates on whitespace alone; the segments are all still
+        // there.
+        let air = line(StatusLineStyle {
+            separator: Some(Separator::None),
+            ..preset
+        });
+        assert!(!air.contains(" > ") && !air.contains("│"), "{air}");
+        assert!(air.contains("tit"), "{air}");
+
+        // `ascii` on a unicode preset is the whole bundle: the icons change
+        // with the separator.
+        let ascii = line(StatusLineStyle {
+            separator: Some(Separator::Ascii),
+            ..preset
+        });
+        assert!(ascii.contains(" > "), "{ascii}");
+    }
+
+    /// The session accent colours the *rest of the gauge's rule*, and nothing
+    /// else: the only difference between the two rows is the token that run
+    /// carries (the lit part keeps the context's own).
+    #[test]
+    fn the_session_accent_colours_the_gauges_rest() {
+        let theme = theme();
+        let mut snap = snap();
+        snap.context_window = Some(128_000);
+        snap.context_pct = Some(50);
+        let style = StatusLineStyle {
+            preset: StatusLinePreset::Full,
+            context_line: ContextLine::Embedded,
+            session_accent: true,
+            ..StatusLineStyle::default()
+        };
+        let on = render_status_line(&theme, 120, style, &snap);
+        let off = render_status_line(
+            &theme,
+            120,
+            StatusLineStyle {
+                session_accent: false,
+                ..style
+            },
+            &snap,
+        );
+        let accent = theme.get_fg_ansi(ThemeColor::Accent);
+        let border = theme.get_fg_ansi(ThemeColor::Border);
+        assert_ne!(accent, border, "the theme keeps the two tokens apart");
+        assert!(off.contains(&border), "unset: the gap is the border colour");
+        assert_ne!(on, off, "the key changes the row");
+        // Both tokens appear elsewhere too (the brand is the accent, the
+        // separators the border colour), so the comparison strips both: what
+        // is left is identical, and the difference *was* which token the
+        // gauge's rest carries.
+        let strip = |line: &str| line.replace(&accent, "").replace(&border, "");
+        assert_eq!(strip(&on), strip(&off));
     }
 }

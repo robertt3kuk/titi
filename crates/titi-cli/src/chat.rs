@@ -495,7 +495,7 @@ pub struct Chat {
     /// Which pre-built status line the masthead paints, and what its middle does
     /// with the context. Read from the settings at startup and changed by
     /// `/statusline`.
-    status_line: StatusLineStyle,
+    pub(crate) status_line: StatusLineStyle,
     reply: String,
     /// Bytes of `reply` already written to the session file. A tool call
     /// splits the turn's text into segments, and each is recorded once.
@@ -3921,7 +3921,33 @@ pub fn run(
         settings.as_ref(),
         titi_config::settings::STATUS_LINE_CONTEXT_LINE_KEY,
     );
-    chat.status_line = StatusLineStyle::resolve(preset.as_deref(), context_line.as_deref());
+    // The three keys `StatusLineStyle` carries beyond the preset: the
+    // separator (unset = the preset's own), the session accent and the
+    // transparent background (unset = off, so an unset key leaves the frame
+    // exactly as it was).
+    let separator = setting_string(
+        settings.as_ref(),
+        titi_config::settings::STATUS_LINE_SEPARATOR_KEY,
+    );
+    let session_accent = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_on(
+            settings,
+            titi_config::settings::STATUS_LINE_SESSION_ACCENT_KEY,
+        )
+    });
+    let transparent = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_on(
+            settings,
+            titi_config::settings::STATUS_LINE_TRANSPARENT_KEY,
+        )
+    });
+    chat.status_line = StatusLineStyle::resolve(
+        preset.as_deref(),
+        context_line.as_deref(),
+        separator.as_deref(),
+        session_accent,
+        transparent,
+    );
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
@@ -4799,7 +4825,16 @@ fn state_color(chat: &Chat) -> ThemeColor {
 fn masthead(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'static> {
     let snapshot = masthead_snapshot(chat);
     let line = Line::from(masthead_spans(chat, width, theme, &snapshot));
-    Paragraph::new(line).style(page(theme))
+    // `statusLine.transparent` leaves this row's background to the terminal.
+    // The screen already painted `StatusLineBg` behind every cell, so the row
+    // has to *clear* it (`Color::Reset`, which overrides what is under it)
+    // rather than simply not set one.
+    let style = if chat.status_line.transparent {
+        page(theme).bg(Color::Reset)
+    } else {
+        page(theme)
+    };
+    Paragraph::new(line).style(style)
 }
 
 /// One string out of the settings, when the layer that set it holds a string.
@@ -9800,7 +9835,7 @@ mod tests {
             .get(titi_config::settings::STATUS_LINE_PRESET_KEY)
             .and_then(|value| value.as_str().map(str::to_owned));
         assert_eq!(
-            StatusLineStyle::resolve(stored.as_deref(), None).preset,
+            StatusLineStyle::resolve(stored.as_deref(), None, None, false, false).preset,
             StatusLinePreset::Minimal
         );
     }
@@ -16268,6 +16303,148 @@ mod tests {
             title.contains("tree · 4 entries · 0 off this path"),
             "{title:?}"
         );
+    }
+
+    /// The three status-line keys, read from a real config file: the separator
+    /// by name, the accent and the transparent background as switches.
+    #[test]
+    fn the_status_line_keys_resolve_from_the_settings() {
+        let dir = tempfile::tempdir().expect("temp");
+        let project = tempfile::tempdir().expect("temp");
+        let settings = |text: &str| {
+            std::fs::write(dir.path().join("config.yml"), text).expect("write");
+            titi_config::settings::Settings::load(dir.path(), project.path(), &[]).expect("load")
+        };
+        let resolve = |text: &str| {
+            let settings = Some(settings(text));
+            let it = settings.as_ref();
+            StatusLineStyle::resolve(
+                setting_string(it, titi_config::settings::STATUS_LINE_PRESET_KEY).as_deref(),
+                setting_string(it, titi_config::settings::STATUS_LINE_CONTEXT_LINE_KEY).as_deref(),
+                setting_string(it, titi_config::settings::STATUS_LINE_SEPARATOR_KEY).as_deref(),
+                it.is_some_and(|settings| {
+                    titi_config::settings::switch_on(
+                        settings,
+                        titi_config::settings::STATUS_LINE_SESSION_ACCENT_KEY,
+                    )
+                }),
+                it.is_some_and(|settings| {
+                    titi_config::settings::switch_on(
+                        settings,
+                        titi_config::settings::STATUS_LINE_TRANSPARENT_KEY,
+                    )
+                }),
+            )
+        };
+
+        // Unset: the preset's own separator, no accent, no transparency — the
+        // frame this screen has always drawn.
+        let plain = resolve("theme:\n  dark: titanium\n");
+        assert_eq!(plain.separator, None);
+        assert!(!plain.session_accent && !plain.transparent);
+
+        let named = resolve(
+            "statusLine:\n  separator: slash\n  sessionAccent: true\n  transparent: true\n",
+        );
+        assert_eq!(
+            named.separator,
+            Some(titi_tui::status_bar::Separator::Slash)
+        );
+        assert!(named.session_accent && named.transparent);
+
+        // A typo in any of the three leaves that one as it was.
+        let typo =
+            resolve("statusLine:\n  separator: hoops\n  sessionAccent: maybe\n  transparent: 7\n");
+        assert_eq!(typo.separator, None);
+        assert!(!typo.session_accent && !typo.transparent);
+    }
+
+    /// The separator key replaces the glyph between the segments, and an unset
+    /// key leaves the row byte for byte what it was.
+    #[test]
+    fn the_separator_key_redraws_the_status_row() {
+        let mut plain = chat();
+        let before = frame_text(&mut plain);
+        assert!(before.contains(" > ") || before.contains('>'), "{before}");
+
+        let mut piped = chat();
+        piped.status_line.separator = Some(titi_tui::status_bar::Separator::Pipe);
+        let after = frame_text(&mut piped);
+        assert!(after.contains(" │ "), "{after}");
+        assert!(
+            !after.contains("tit > "),
+            "the preset's chevron is gone: {after}"
+        );
+
+        // And the row is otherwise the same length: the segments are all there.
+        let row = |frame: &str| frame.lines().next().unwrap_or_default().to_owned();
+        assert_eq!(
+            row(&before).chars().count(),
+            row(&after).chars().count(),
+            "the same cells, a different glyph"
+        );
+    }
+
+    /// `statusLine.sessionAccent` takes the idle editor border, and leaves the
+    /// states that mean something alone.
+    #[test]
+    fn the_session_accent_colours_the_composer_border() {
+        let chat_with_accent = || {
+            let mut chat = chat();
+            chat.status_line.session_accent = true;
+            chat
+        };
+        let mut chat = chat();
+        assert_eq!(
+            composer_colors(&chat),
+            (ThemeColor::Border, ThemeColor::Dim),
+            "idle, unset: the border it has always been"
+        );
+        chat.status_line.session_accent = true;
+        assert_eq!(
+            composer_colors(&chat),
+            (ThemeColor::Accent, ThemeColor::Dim),
+            "idle, asked for: the accent"
+        );
+
+        // A running turn keeps its own colour with the key on.
+        let mut running = chat_with_accent();
+        running.turn_active = true;
+        running.turn_started = Some(Instant::now());
+        assert_eq!(
+            composer_colors(&running),
+            (ThemeColor::Accent, ThemeColor::Accent),
+            "running is the accent pair, not the idle border"
+        );
+
+        // And needs-you is the warning, whatever the key says.
+        let mut asked = chat_with_accent();
+        asked.on_event(EngineEvent::AskRequested {
+            request_id: "ask-1".into(),
+            question: "which one?".into(),
+            options: vec!["a".into()],
+            multi: false,
+            free_text: false,
+        });
+        assert_eq!(composer_colors(&asked).0, ThemeColor::Warning);
+    }
+
+    /// `statusLine.transparent` leaves the status row's cells to the terminal,
+    /// where the rest of the screen keeps the theme's background.
+    #[test]
+    fn the_transparent_status_row_has_no_background() {
+        let theme = test_theme();
+        let page = bg(&theme, ThemeBg::StatusLineBg);
+
+        let mut plain = chat();
+        let colors = frame_colors(&mut plain, 60, 20);
+        assert_eq!(colors[0].1, page, "the row paints the theme's background");
+
+        let mut clear = chat();
+        clear.status_line.transparent = true;
+        let colors = frame_colors(&mut clear, 60, 20);
+        assert_eq!(colors[0].1, Color::Reset, "and clears it when asked");
+        assert_eq!(colors[60].1, page, "the row below it is untouched");
     }
 
     /// alt+f with no tree open does nothing: the key belongs to the panel, and

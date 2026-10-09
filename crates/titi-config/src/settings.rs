@@ -127,6 +127,30 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// The glyph between the status line's segments.
+///
+/// `powerline`, `powerline-thin`, `slash`, `pipe`, `block`, `none` or `ascii`
+/// (omp's set, `modes/settings.ts:174`); unset means the preset's own, which is
+/// the line a user already had, byte for byte. An unknown name leaves the
+/// preset's too.
+pub const STATUS_LINE_SEPARATOR_KEY: &str = "statusLine.separator";
+
+/// Whether the editor's border and the status line's gap take the accent.
+///
+/// Unset means **off**, so an unset key leaves the frame exactly as it was.
+/// omp's default is on (`modes/settings.ts:227`) and its colour is a hash of
+/// the session's *name*, tuned to the theme (`theme/session-color.ts:182`);
+/// titi has one accent token per theme and no per-session palette, so that token
+/// is what this spends.
+pub const STATUS_LINE_SESSION_ACCENT_KEY: &str = "statusLine.sessionAccent";
+
+/// Whether the status line leaves its background to the terminal.
+///
+/// Unset means **off** (omp's default too, `modes/settings.ts:239`): the row
+/// paints the theme's `StatusLineBg`. On, its cells are cleared instead, so the
+/// terminal's own background shows through that row.
+pub const STATUS_LINE_TRANSPARENT_KEY: &str = "statusLine.transparent";
+
 /// Which entries `/tree` opens showing.
 ///
 /// `default` (the whole tree, which is what it has always shown), `no-tools`
