@@ -19,25 +19,40 @@ its message never matched its content.
 Serialize:
 
 - Take the workspace commit lock **before** staging, release it **after** the
-  commit:
+  commit — and put the `git add` **inside** the lock, never before it. A
+  `git add` that runs before `mkdir` succeeds is staged for the whole checkout
+  to sweep:
 
   ```sh
   while ! mkdir "$(git rev-parse --git-dir)/titi-commit.lock" 2>/dev/null; do
     sleep 1
   done
+  git add <paths>                 # inside the lock, by explicit path
+  git diff --cached --name-only   # must print exactly what you staged
+  git commit -F - -- <paths>      # commit by pathspec, so nothing else in the
+                                  # index can ride along
+  git status --short -- <paths>   # must be empty afterwards
+  rmdir "$(git rev-parse --git-dir)/titi-commit.lock"
   ```
-  … commit … then `rmdir "$(git rev-parse --git-dir)/titi-commit.lock"`.
   The lock directory belongs to whoever created it; a stale one must be
   reported (to the holder or the user), never deleted.
 - Stage by explicit path. Never `git add -A`, `git add .`, or `git commit
   -am` — that is how sibling work gets swept in.
-- Before committing: `git status --short` — anything staged that you did not
-  stage is a stop sign.
+- Before committing: `git diff --cached --name-only` and `git status --short`
+  — anything staged that you did not stage is a stop sign.
+- Never `git commit --amend`, and never `reset` history another agent may be
+  building on.
 - Right after committing: `git show --stat --format='%h %s' HEAD`. If it shows
   a path you did not stage, say so in your report — do not rewrite the commit
-  to hide it, do not `reset` history another agent may be building on.
+  to hide it.
 - Never delete `.git/index.lock`: it means another agent is mid-commit. Wait
   and retry.
+
+Two commits in this session are misattributed by exactly this: `f3b11ef` swept
+the `agent_tool.rs`, `agents.rs`, `runtime.rs` and `tests/agent_tool.rs` that
+were staged for `c1b2260` — which then carried nothing but its changelog line —
+and several changelog lines landed in sibling commits beside the features they
+describe.
 
 1. `git status` and `git diff` — see exactly what changed. Unrelated hunks
    or files → split into separate commits (`git add -p` is interactive and
