@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use smol_str::SmolStr;
 use titi_genome::SharedGenome;
-use titi_providers::{ChatMessage, Role, StreamEvent, ToolCallRef};
+use titi_providers::{BlockId, ChatMessage, Role, StreamEvent, ToolCallRef};
 use titi_tools::{ApprovalMode, ApprovalTier, ToolHandler, ToolRegistry, ToolResult};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -18,41 +18,46 @@ pub(crate) struct PendingToolCall {
     pub arguments: String,
 }
 
+/// Gathers a response's tool calls as the provider streams them.
+///
+/// One slot per call, in the order the provider opened them, each keyed by the
+/// block id its deltas carry: a response may hold several calls and their
+/// deltas interleave. A single "current" slot — which is what this was — gave
+/// the first call's arguments to the second and then dropped one of the two
+/// entirely, so a model that asked for two files had one of them run.
 #[derive(Default)]
 pub(crate) struct ToolCallCollector {
-    current: Option<PendingToolCall>,
-    finished: Vec<PendingToolCall>,
+    open: Vec<(BlockId, PendingToolCall)>,
 }
 
 impl ToolCallCollector {
     pub fn observe(&mut self, event: &StreamEvent) {
         match event {
-            StreamEvent::ToolcallStart { call, .. } => {
-                self.current = Some(PendingToolCall {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    arguments: String::new(),
-                });
+            StreamEvent::ToolcallStart { id, call } => {
+                self.open.push((
+                    id.clone(),
+                    PendingToolCall {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: String::new(),
+                    },
+                ));
             }
-            StreamEvent::ToolcallDelta { json, .. } => {
-                if let Some(current) = &mut self.current {
-                    current.arguments.push_str(json);
+            StreamEvent::ToolcallDelta { id, json } => {
+                if let Some((_, pending)) = self.open.iter_mut().find(|(block, _)| block == id) {
+                    pending.arguments.push_str(json);
                 }
             }
-            StreamEvent::ToolcallEnd { .. } => {
-                if let Some(current) = self.current.take() {
-                    self.finished.push(current);
-                }
-            }
+            // A call is done when the turn is: `take` hands back every slot,
+            // opened and closed alike, in the order they were opened.
+            StreamEvent::ToolcallEnd { .. } => {}
             _ => {}
         }
     }
 
+    /// The response's calls, in the order the provider opened them.
     pub fn take(&mut self) -> Vec<PendingToolCall> {
-        if let Some(current) = self.current.take() {
-            self.finished.push(current);
-        }
-        std::mem::take(&mut self.finished)
+        self.open.drain(..).map(|(_, pending)| pending).collect()
     }
 }
 
@@ -699,6 +704,53 @@ mod tests {
     /// straight after `execute_tools`, with no refresh anywhere, and the stats
     /// of the update say no tree was listed. Without the fold-in the file is
     /// simply absent, and with a walk in its place `walked` is true.
+    /// Two calls in one response: their deltas interleave by block id, and a
+    /// single "current" slot gave the first call's arguments to the second and
+    /// then dropped one of the two entirely.
+    #[test]
+    fn two_tool_calls_of_one_response_are_both_kept() {
+        let mut collector = ToolCallCollector::default();
+        let first = BlockId::new("tool_0");
+        let second = BlockId::new("tool_1");
+        collector.observe(&StreamEvent::ToolcallStart {
+            id: first.clone(),
+            call: ToolCallRef {
+                call_id: "call-1".into(),
+                name: "read".into(),
+            },
+        });
+        collector.observe(&StreamEvent::ToolcallStart {
+            id: second.clone(),
+            call: ToolCallRef {
+                call_id: "call-2".into(),
+                name: "grep".into(),
+            },
+        });
+        // Interleaved: the second call's arguments arrive before the first's.
+        collector.observe(&StreamEvent::ToolcallDelta {
+            id: second.clone(),
+            json: r#"{"pattern":"b"}"#.into(),
+        });
+        collector.observe(&StreamEvent::ToolcallDelta {
+            id: first.clone(),
+            json: r#"{"path":"a.rs"}"#.into(),
+        });
+        collector.observe(&StreamEvent::ToolcallEnd { id: second });
+        collector.observe(&StreamEvent::ToolcallEnd { id: first });
+
+        let calls = collector.take();
+        assert_eq!(calls.len(), 2, "both calls survive: {calls:?}");
+        assert_eq!(calls[0].call_id, "call-1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(calls[1].call_id, "call-2");
+        assert_eq!(calls[1].name, "grep");
+        assert_eq!(
+            calls[1].arguments, r#"{"pattern":"b"}"#,
+            "each call keeps its own arguments"
+        );
+    }
+
     #[tokio::test]
     async fn a_tool_write_reaches_the_index_without_a_walk() {
         use titi_tools::{ApprovalMode, ToolRegistry};

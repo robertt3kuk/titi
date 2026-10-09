@@ -632,6 +632,60 @@ mod tests {
         );
     }
 
+    /// Two calls in one response, both in one chunk and then interleaved: the
+    /// block ids must keep them apart, because a consumer that keys on the id
+    /// is the only thing standing between the model and a lost call.
+    #[test]
+    fn completions_keeps_two_tool_calls_of_one_chunk() {
+        let mut s = state();
+        let policy = StreamDecodePolicy::default();
+        let ev = decode_completions_chunk(
+            &json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","function":{"name":"read","arguments":""}},
+                {"index":1,"id":"call_2","function":{"name":"grep","arguments":""}}
+            ]}}]}),
+            &mut s,
+            &policy,
+        );
+        let starts: Vec<(BlockId, String)> = ev
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolcallStart { id, call } => {
+                    Some((id.clone(), call.name.to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (BlockId("tool_0".into()), "read".to_owned()),
+                (BlockId("tool_1".into()), "grep".to_owned()),
+            ],
+            "one start per call, each with its own block: {ev:?}"
+        );
+
+        // Interleaved arguments, second call first.
+        let ev = decode_completions_chunk(
+            &json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"pattern\":\"b\"}"}}]}}]}),
+            &mut s,
+            &policy,
+        );
+        assert!(
+            matches!(&ev[0], StreamEvent::ToolcallDelta { id, .. } if id == &BlockId("tool_1".into())),
+            "the second call's delta carries the second call's id: {ev:?}"
+        );
+        let ev = decode_completions_chunk(
+            &json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.rs\"}"}}]}}]}),
+            &mut s,
+            &policy,
+        );
+        assert!(
+            matches!(&ev[0], StreamEvent::ToolcallDelta { id, .. } if id == &BlockId("tool_0".into())),
+            "and the first call's delta the first call's id: {ev:?}"
+        );
+    }
+
     #[test]
     fn completions_tool_call_with_partial_args() {
         let mut s = state();

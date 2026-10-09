@@ -74,7 +74,7 @@ def chunk(delta: dict, finish: str | None = None) -> dict:
     }
 
 
-def call(call_id: str, name: str, args: dict, index: int = 0) -> list[dict]:
+def call(call_id: str, name: str, args: dict, index: int = 0, finish: bool = True) -> list[dict]:
     """One tool call, its arguments in a single fragment.
 
     `index` numbers the call within the message: a provider that sends two
@@ -86,7 +86,7 @@ def call(call_id: str, name: str, args: dict, index: int = 0) -> list[dict]:
             "index": index, "id": call_id, "type": "function",
             "function": {"name": name, "arguments": json.dumps(args)},
         }]}),
-        chunk({}, "tool_calls"),
+        chunk({}, "tool_calls") if finish else chunk({}),
     ]
 
 
@@ -142,6 +142,10 @@ def script(last: dict) -> list[tuple[dict, float]]:
                 "agent",
                 {"name": "alpha", "task": "say alpha", "kind": "subagent"},
                 index=0,
+                # The finish_reason belongs to the message, not to one call:
+                # sending it after the first call ends the round there, and the
+                # second call never arrives.
+                finish=False,
             )
         ] + [
             (c, 0)
