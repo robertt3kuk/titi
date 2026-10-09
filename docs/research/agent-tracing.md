@@ -1,10 +1,14 @@
 # Agent tracing — Laminar-shaped spans for a titi session
 
-Status: **research + plan**. No code is written by this doc; it ends with a
+Status: **research + plan, with Phase A part 1 implemented.** It ends with a
 phased plan (A/B/C), the exact files each phase touches, and the decisions the
-owner has to make. Owner ask, 2026-10-09: *"We should be able to stack-trace
-the agents as Laminar does — at least minimally — and analyze the thinking part
-too if needed."*
+owner had to make — those were answered, and §6/§7 below are now the shapes the
+code uses: `crates/titi-core/src/trace.rs` (span model, writer, reader, tree,
+retention, thinking cap) and `crates/titi-cli/src/trace_cmd.rs` (`titi trace
+[session] [--turn N]`), committed 2026-10-09. The engine half of Phase A (the
+`SpanSink` in §7 A2–A5) is still to come. Owner ask, 2026-10-09: *"We should be
+able to stack-trace the agents as Laminar does — at least minimally — and
+analyze the thinking part too if needed."*
 
 Method: primary sources read over the network on 2026-10-09 (the OTel GenAI
 semantic conventions repo and `lmnr-ai/lmnr`), plus the titi tree at `27c06e5`.
@@ -310,15 +314,21 @@ the trace view useful immediately; 1 makes 3 possible; 4 and 5 are follow-ons.
 - **Caps.** Tool output is already capped to 40 000 chars
   (`tool_loop.rs:537 MAX_TOOL_OUTPUT`, head 30 000 + tail 10 000); `read`
   30 000 (`tools/fs.rs:300`), bash 64 KiB (`tools/pty.rs:34`), subagent answer
-  30 000 (`agent_tool.rs:51`). Thinking needs its own cap (proposal: 8 KiB
-  head+tail with a marker, mirroring `cap_output`) and span attribute values a
-  small byte cap.
-- **Retention.** The trajectory has **no** cap and no rotation; the in-memory
-  `events` vec grows unbounded (`trajectory.rs:186`), and deleting a session
-  leaves its trajectory behind (`session_fs.rs:155-158`). A trace file inherits
-  this unless rotation is added — an owner decision (§9).
-- **Location and permissions.** `~/.titi/agent/traces/<id>.jsonl`, never the
-  repo. Follow the trajectory: create 0600 and re-tighten on open. Agent dir via
+  30 000 (`agent_tool.rs:51`). Thinking is capped at **`THINKING_CAP_CHARS` =
+  8 KiB**, kept as its head and its tail with a `… [N characters left out] …`
+  marker — the tool cap's shape at a size a trace can carry per round, counted
+  in characters and enforced in `Span::with_thinking`
+  (`crates/titi-core/src/trace.rs`), so a caller cannot store an unbounded
+  block.
+- **Retention.** **Decided: bounded.** `MAX_TRACE_FILES` = 500 and
+  `MAX_TRACE_AGE_DAYS` = 30 are constants (no settings key — nothing else reads
+  retention yet); `trace::prune` runs once per session start (`main.rs`, before
+  the engine starts), and deleting a session deletes its traces and its
+  trajectory. That last part also closed the old leak where `delete_session_from`
+  removed only the transcript.
+- **Location and permissions.** `~/.titi/agent/traces/<session_id>/<turn>.jsonl`
+  — a directory per session, a file per turn — never the repo. The trajectory's
+  posture: 0600 on create and re-tightened on open. Agent dir via
   `titi_config::agent_dir()` (`titi-config/src/lib.rs:21-31`),
   `TITI_AGENT_DIR`-overridable.
 - **Default.** The trajectory is already on by default and local-only. Spans can
@@ -366,11 +376,15 @@ land before any export.
   trajectory. Mixing them would complicate both.
 - **Rejected: the session store.** Entries are replayed into the model's
   history; spans must never enter it.
-- **Chosen: `<agent_dir>/traces/<session_id>.jsonl`**, one line = **one finished
-  span**. Writing a span when it *ends* (not open/close pairs) means no pairing
-  state to corrupt, and a crash tears at most the last line — the trajectory's
-  exact machinery applies (`truncate_torn_tail`, 0600, buffered flush, `seq`,
-  `ts`). The reader tolerates a child whose parent is absent (a partially
+- **Chosen: `<agent_dir>/traces/<session_id>/<turn>.jsonl`** — one line = **one
+  finished span**, one file per turn inside a directory per session (so pruning
+  a session's traces is one `remove_dir_all`). Writing a span when it *ends*
+  (not open/close pairs) means no pairing state to corrupt, and a crash tears
+  at most the last line — the trajectory's exact machinery applies
+  (`truncate_torn_tail`, 0600 on create and on every open, a buffered writer
+  that flushes on drop). Ordering comes from `start_ms`/`end_ms` and the parent
+  ids, not from file position, so a child finished before its parent still
+  nests. The reader tolerates a child whose parent is absent (a partially
   flushed file still renders; a missing parent renders as a root). The flat
   trajectory stays untouched for GEPA and `/recap`.
 
@@ -391,18 +405,20 @@ turns** exactly as a Laminar session groups traces.
 **Span record** (typed core + an open attribute map so Phase C is mechanical):
 
 ```
-SpanRecord {
+Span {
   trace_id: String,          // session id
-  span_id: String,           // "s{n}" monotonic, or a uuid
+  span_id: String,           // unique within the session
   parent_span_id: Option<String>,
-  kind: SpanKind,            // Turn | Agent | Llm | Tool | Event | Compaction
+  kind: SpanKind,            // Turn | Llm | Tool | Agent | Event
   name: String,
   start_ms: u64, end_ms: u64,
   status: SpanStatus,        // Ok | Error | Cancelled
+  error: Option<String>,
   attributes: BTreeMap<String, Value>,  // gen_ai.* + titi.* (below)
-  input_tokens: u32, output_tokens: u32, cached_tokens: u32,
+  input_tokens: u64, output_tokens: u64,
+  cached_tokens: u64, reasoning_tokens: u64,
   cost_micro_usd: Option<u64>,
-  thinking: Option<String>,  // masked, capped; only on Llm spans
+  thinking: Option<String>,  // masked, capped at THINKING_CAP_CHARS; Llm only
 }
 ```
 
@@ -446,14 +462,15 @@ mid-turn.
 
 ## 7. Phase A — minimal, no new dependency
 
-Goal: every turn writes a span tree to `<agent_dir>/traces/<id>.jsonl`, and both
-`titi trace [session]` and `/trace` render it.
+Goal: every turn writes a span tree to
+`<agent_dir>/traces/<session_id>/<turn>.jsonl`, and both `titi trace [session]`
+and `/trace` render it.
 
 | # | Change | Files | Notes |
 | --- | --- | --- | --- |
-| A1 | `SpanRecord`/`SpanKind`/`SpanStatus` types + `TraceRecorder` writer + reader; reuse the trajectory's torn-tail/0600/flush/seq patterns | **new** `crates/titi-core/src/trace.rs`; `crates/titi-core/src/lib.rs` (add `pub mod trace;` + re-exports, mirroring `:16`) | decide whether to extract the shared file mechanics or copy the ~3 patterns (AGENTS allows ≤3 repeats) |
+| A1 | `Span`/`SpanKind`/`SpanStatus` types + `TraceWriter` + reader + tree + retention (done, `feb9e3c`/`1f6d718`) | **new** `crates/titi-core/src/trace.rs`; `crates/titi-core/src/lib.rs` (add `pub mod trace;` + re-exports, mirroring `:16`) | reuses the trajectory's torn-tail/0600/flush patterns rather than extracting them (the third repetition would be the trigger) |
 | A2 | A `SpanSink` (like `TrajectorySink`) threaded through the engine; open the recorder beside the trajectory | `crates/titi-engine/src/runtime.rs` (`EngineConfig`/`start_inner`, `:963-1059`), `crates/titi-engine/src/lib.rs`; `crates/titi-cli/src/engine.rs:992` | same `Arc<Mutex<Option<…>>>` shape as the trajectory |
-| A3 | LLM span: start/end, wire model, per-round usage, finish reason, attempt count, thinking buffer | `crates/titi-engine/src/runtime.rs:2491, 2709-2722, 2772-2865` | thinking text masked via `titi_memory::redact` and capped |
+| A3 | LLM span: start/end, wire model, per-round usage, finish reason, attempt count, thinking buffer | `crates/titi-engine/src/runtime.rs:2491, 2709-2722, 2772-2865` | thinking text masked via `titi_memory::redact` and capped at `THINKING_CAP_CHARS` |
 | A4 | Tool span: reuse `Prepared.started` + args + masked result | `crates/titi-engine/src/tool_loop.rs:202-211, 355-375` | nesting parent = the current LLM span's id |
 | A5 | Agent + Turn spans; real parent id; reattach the subagent tool sink | `crates/titi-engine/src/agents.rs:172-182, 286-368`; `crates/titi-engine/src/tool_agent.rs:141-142, 210-211` | detached goal/council/orchestrator runs stay outside Phase A (no span graph) |
 | A6 | `titi trace [session]` CLI tree (dur/tokens/cost/error, thinking folded) | **new** `crates/titi-cli/src/trace_cmd.rs`; `crates/titi-cli/src/main.rs` (short-circuit at `:81`, mirroring `genome_cmd`); resolve id via `session_fs.rs:62, 119` | bare = newest session |
