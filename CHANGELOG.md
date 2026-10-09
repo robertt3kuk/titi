@@ -19,6 +19,7 @@ All notable user-facing changes to titi, newest first.
 - Each turn carries a `<diff>` block: the working tree's changes next to the genome map, so the model sees its own edits.
 - `titi --login <provider>` signs in with OAuth in the browser and stores the subscription with its refresh token; a device-code flow is offered where the provider supports it, and bare `/login` opens a picker.
 - Screen switches read from the same settings layers: `statusLine.preset` and `statusLine.contextLine`, `notify.completion` / `notify.error` / `notify.ask` (desktop notifications, unset = on), `terminal.progress` (OSC 9;4, unset = on), `composer.tokenRate` (generation rate on the working row, unset = on), `genome.enabled` (unset = on) and `genome.limit` (1–64, default 24).
+- The model can hand one task to a subagent with the `agent` tool: it spawns through the same supervisor a `/agents`-style command would, the call returns when the subagent finishes, and its answer comes back as the tool's result (capped at 30 000 characters, with the cut stated in the text). A subagent cannot ask a question and cannot spawn a subagent of its own, and the tool is only offered to the model when the session has an agent model to run one on.
 
 ### Changed
 
