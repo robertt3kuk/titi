@@ -127,6 +127,20 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// The model a session starts on, when the config names one.
+///
+/// `modelRoles` is omp's own map (`config/model-roles.ts:56`, where `default`
+/// is the chat role), and titi already reads that map for its named roles
+/// (`roles.rs`), so the pin is its `default` entry rather than a second
+/// concept: `/settings` lists it with the rest, and one resolver shape reads
+/// both. The value is a model id as the catalog spells it (`provider/model`) —
+/// omp's role values are plain ids too; the `:effort` suffix belongs to a
+/// `/switch @role:effort` reference, not to a stored value.
+///
+/// Unset means the session starts on the first available model, exactly as it
+/// did before this key existed.
+pub const MODEL_DEFAULT_ROLE_KEY: &str = "modelRoles.default";
+
 /// Whether a streamed answer is revealed at a readable rate instead of in
 /// whatever bursts the provider sends.
 ///
@@ -666,6 +680,22 @@ fn lookup_nested(layer: &Value, key: &str) -> Option<Value> {
         current = index(current, seg)?;
     }
     Some(current.clone())
+}
+
+/// The model the config pins a session's start to, when it names one.
+///
+/// The leaf, not the map: a `modelRoles` map that names no `default` is simply
+/// unset here, where `/switch @default` would call the missing role an error.
+/// A user command that names a role is a question and deserves an error; a
+/// startup default is a preference, and an absent one is nothing to say.
+pub fn pinned_model(settings: &Settings) -> Option<String> {
+    let id = settings.get(MODEL_DEFAULT_ROLE_KEY)?;
+    let id = id.as_str()?.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_owned())
+    }
 }
 
 /// Whether an on-by-default switch is off at `key`.

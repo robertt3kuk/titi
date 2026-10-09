@@ -325,7 +325,7 @@ fn main() -> io::Result<()> {
     let continue_note = (continue_session
         && titi_cli::session_fs::newest_session(&titi_config::agent_dir()).is_none())
     .then(|| "continue: no session to resume · starting fresh".to_owned());
-    let (engine, models, session_id) =
+    let (engine, models, session_id, pin_note) =
         titi_cli::engine::start_engine_with(approval, mode, continue_session)
             .map_err(io::Error::other)?;
     let session_log =
@@ -341,7 +341,10 @@ fn main() -> io::Result<()> {
         );
     }
     if headless {
-        if let Some(note) = &continue_note {
+        // A headless run has no screen, so a pinned model that could not be
+        // honoured is said here, on stderr, beside the other startup lines.
+        // The screen carries the same note itself (`chat::run`).
+        for note in [&pin_note, &continue_note].into_iter().flatten() {
             eprintln!("{note}");
         }
         let code = match (goal, prompt) {
@@ -378,7 +381,9 @@ fn main() -> io::Result<()> {
         session_id,
         cast,
         theme,
-        continue_note,
+        // Two notes can be owed at once (`--continue` with nothing to resume,
+        // and a pinned model that is not available): each is its own line.
+        [pin_note, continue_note].into_iter().flatten().collect(),
     )
 }
 

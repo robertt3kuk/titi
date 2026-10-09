@@ -1498,7 +1498,14 @@ impl Chat {
                     log: Some(LogWrite {
                         role: Role::Assistant,
                         text: self.unrecorded_reply(),
-                        tool_calls: vec![titi_providers::ToolCallRef { call_id, name }],
+                        tool_calls: vec![titi_providers::ToolCallRef {
+                            call_id,
+                            name,
+                            // The struct grew a field (`arguments`); the shape
+                            // the other call sites use keeps this one honest
+                            // about the ones it does not set.
+                            ..Default::default()
+                        }],
                     }),
                 }
             }
@@ -4107,7 +4114,7 @@ pub fn run(
     session_id: String,
     mut cast: Option<crate::ompcast::CastWriter>,
     theme_name: Option<String>,
-    startup_note: Option<String>,
+    startup_notes: Vec<String>,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -4224,7 +4231,7 @@ pub fn run(
             crate::changelog::remember(&chat.agent_dir, titi_tui::VERSION);
         }
     }
-    if let Some(note) = startup_note {
+    for note in startup_notes {
         chat.push(LineKind::Note, note);
     }
     chat.catalog = catalog;

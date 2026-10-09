@@ -67,6 +67,45 @@ fn frame_version_is_optional_and_enforced() {
 /// events channel, so `printf … | titi --headless` sat there until the
 /// client's own timeout and never printed the switch. Now the command
 /// answers and a closed stdin ends the run.
+/// A headless run has no screen, so a pinned model that could not be honoured
+/// is said on stderr — the same line the screen would carry as a note — and the
+/// run starts on the model it would have used anyway.
+#[test]
+fn a_pinned_model_that_is_not_available_is_named_on_stderr() {
+    let dir = tempfile::tempdir().expect("temp");
+    std::fs::write(
+        dir.path().join("config.yml"),
+        "providers:\n  - id: fake\n    api: openai-completions\n    base_url: http://127.0.0.1:9/v1\n    credential_required: false\nmodels:\n  - id: fake/scripted\n    provider: fake\n    wire_model: fake\n    context_window: 32000\nmodelRoles:\n  default: nope/nope\n",
+    )
+    .expect("write the config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_titi"))
+        .arg("--headless")
+        .env("TITI_AGENT_DIR", dir.path())
+        .env("TITI_NO_GENOME", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    drop(child.stdin.take());
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let _ = child.wait();
+    let said = reader.join().expect("the reader thread");
+    assert!(
+        said.contains("modelRoles.default: nope/nope is not available"),
+        "the pin is named on stderr: {said:?}"
+    );
+    assert!(
+        said.contains("starting on fake/scripted"),
+        "and so is what the run started on: {said:?}"
+    );
+}
+
 #[test]
 fn a_lone_switch_model_answers_and_the_runner_exits() {
     let dir = tempfile::tempdir().expect("temp");

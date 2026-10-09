@@ -287,6 +287,33 @@ pub fn prefer_available_models(
     if ready.is_empty() { models } else { ready }
 }
 
+/// The model a session starts on, and the line owed when a pin could not be
+/// honoured.
+///
+/// A pin that is not available — an id the registry cannot resolve, whether it
+/// is unknown or keyless — is never a silent fallback: the session starts on
+/// the model it would have used anyway, and the caller is handed one line
+/// naming both, to show in the screen or print in a headless run. A pin that
+/// *is* available is the session's model, and the line is `None`.
+pub fn start_model(
+    models: &[String],
+    pinned: Option<&str>,
+    mut available: impl FnMut(&str) -> bool,
+) -> (String, Option<String>) {
+    let fallback = models.first().cloned().unwrap_or_default();
+    let Some(pinned) = pinned else {
+        return (fallback, None);
+    };
+    if available(pinned) {
+        return (pinned.to_owned(), None);
+    }
+    let note = format!(
+        "{}: {pinned} is not available · starting on {fallback}",
+        titi_config::settings::MODEL_DEFAULT_ROLE_KEY
+    );
+    (fallback, Some(note))
+}
+
 /// The model list a surface offers.
 ///
 /// The startup order comes first and never moves: it is the availability
@@ -766,7 +793,7 @@ pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
 }
 
 /// Starts the engine with the default approval policy, in agent mode.
-pub fn start_engine() -> Result<(Engine, ModelCatalog, String), String> {
+pub fn start_engine() -> Result<(Engine, ModelCatalog, String, Option<String>), String> {
     start_engine_with(ApprovalMode::Write, SessionMode::Agent, false)
 }
 
@@ -789,7 +816,7 @@ pub fn start_engine_with(
     approval_mode: ApprovalMode,
     mode: SessionMode,
     resume: bool,
-) -> Result<(Engine, ModelCatalog, String), String> {
+) -> Result<(Engine, ModelCatalog, String, Option<String>), String> {
     let config = load_registry_config();
     let models: Vec<String> = config
         .models
@@ -824,14 +851,31 @@ pub fn start_engine_with(
     // sit in front of one that can actually run. If none have a key, keep the
     // catalog order and let the first request say which credential is missing.
     let models = prefer_available_models(models, |id| registry.resolve(id).is_ok());
+    // The config may pin the model the session starts on (`modelRoles.default`).
+    // Unset is what it always was — the first available model — and a pin that
+    // cannot be honoured starts on that same model and owes one line saying so.
+    let pinned = titi_config::settings::Settings::load(
+        &titi_config::agent_dir(),
+        &crate::session_fs::current_workspace(),
+        &[],
+    )
+    .ok()
+    .and_then(|settings| titi_config::settings::pinned_model(&settings));
+    let (primary, pin_note) = start_model(&models, pinned.as_deref(), |id| {
+        registry.resolve(id).is_ok()
+    });
+    // The session's model leads the list a surface offers, so `/model`'s first
+    // row and the masthead cannot disagree about which model is in use.
+    let models = std::iter::once(primary.clone())
+        .chain(models.into_iter().filter(|id| *id != primary))
+        .collect::<Vec<String>>();
     let context_window = models
         .first()
         .and_then(|id| windows.iter().find(|(model, _)| model == id))
         .and_then(|(_, window)| *window);
-    let primary = models
-        .first()
-        .cloned()
-        .ok_or_else(|| "no models configured".to_owned())?;
+    if primary.is_empty() {
+        return Err("no models configured".to_owned());
+    }
     let mut engine_config = EngineConfig::new(primary.clone());
     engine_config.approval_mode = approval_mode;
     engine_config.mode = mode;
@@ -952,5 +996,46 @@ pub fn start_engine_with(
         EngineRuntime::start_with_session(engine_config, registry, None, tools, trajectory),
         catalog,
         session_id,
+        pin_note,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The session's starting model: unset is the first available one, a pin
+    /// that resolves is the session's, and a pin that does not is the default
+    /// again with one line naming both.
+    #[test]
+    fn a_pinned_model_is_the_start_or_a_named_notice() {
+        let models = vec!["openai/gpt-4.1".to_owned(), "local/llama".to_owned()];
+        let resolves = |id: &str| id == "local/llama";
+
+        // Unset: what it always was.
+        assert_eq!(
+            start_model(&models, None, resolves),
+            ("openai/gpt-4.1".to_owned(), None)
+        );
+        // Set and available: the session starts on it.
+        assert_eq!(
+            start_model(&models, Some("local/llama"), resolves),
+            ("local/llama".to_owned(), None)
+        );
+        // Set and not available: the default, and a line that names both the
+        // key, the id and what was used instead — never a silent fallback.
+        let (primary, note) = start_model(&models, Some("nope/nope"), resolves);
+        assert_eq!(primary, "openai/gpt-4.1");
+        let note = note.expect("a notice");
+        assert!(note.starts_with("modelRoles.default:"), "{note}");
+        assert!(note.contains("nope/nope"), "{note}");
+        assert!(note.contains("openai/gpt-4.1"), "{note}");
+        assert!(!note.contains('\n'), "one line: {note}");
+
+        // An empty list cannot be pinned either: the default is empty and the
+        // note still says what happened.
+        let (primary, note) = start_model(&[], Some("local/llama"), |_| false);
+        assert_eq!(primary, "");
+        assert!(note.expect("a notice").contains("local/llama"));
+    }
 }
