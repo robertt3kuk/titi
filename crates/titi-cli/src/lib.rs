@@ -21,6 +21,7 @@ pub mod session_fs;
 pub mod session_log;
 pub mod themes;
 pub mod title;
+pub mod trace_cmd;
 pub mod transcript;
 pub mod vim;
 pub mod welcome;

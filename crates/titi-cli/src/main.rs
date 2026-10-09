@@ -86,6 +86,12 @@ fn main() -> io::Result<()> {
     {
         return Ok(());
     }
+    // `titi trace` is a reader too: it prints the spans a session recorded and
+    // never reaches the engine, so it is short-circuited beside `titi genome`
+    // before the flag loop could mistake its session id for a prompt.
+    if titi_cli::trace_cmd::run(&titi_config::agent_dir()).is_some() {
+        return Ok(());
+    }
     let mut headless = false;
     let mut prompt: Option<String> = None;
     let mut goal: Option<String> = None;
@@ -325,6 +331,14 @@ fn main() -> io::Result<()> {
     let continue_note = (continue_session
         && titi_cli::session_fs::newest_session(&titi_config::agent_dir()).is_none())
     .then(|| "continue: no session to resume · starting fresh".to_owned());
+    // Trace retention runs once per session start, before anything is written:
+    // the traces directory is the engine's to grow, and a run that never
+    // starts a session adds nothing to prune. Best-effort — a directory that
+    // cannot be pruned is not a reason to refuse the session.
+    let _ = titi_core::trace::prune(
+        &titi_config::agent_dir(),
+        titi_core::trace::Retention::default(),
+    );
     let (engine, models, session_id, pin_note) =
         titi_cli::engine::start_engine_with(approval, mode, continue_session)
             .map_err(io::Error::other)?;
