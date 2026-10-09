@@ -74,7 +74,10 @@ fn a_configured_price_is_what_a_turn_costs() {
     );
     // 100 prompt tokens, 60 of them cached, and 10 out: 40 at $3/MTok, 60 at
     // $0.30/MTok and 10 at $15/MTok, in micro-dollars.
-    assert_eq!(price.cost_micro_usd(100, 60, 10), 40 * 3 + 60 * 300_000 / 1_000_000 + 10 * 15);
+    assert_eq!(
+        price.cost_micro_usd(100, 60, 10),
+        40 * 3 + 60 * 300_000 / 1_000_000 + 10 * 15
+    );
 }
 
 /// A price nobody can read is refused, and named: the model stays — unpriced,
