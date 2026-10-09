@@ -564,10 +564,20 @@ pub(crate) fn transcript(
         let base = rows.len();
         last_role = Some(line.kind.block_role());
         let (texts, line_links) = if line.kind == LineKind::Assistant {
-            (
-                chat.assistant_rows(newest_reply == Some(index), &line.text, inner, theme),
-                Vec::new(),
-            )
+            {
+                // The newest answer is the one still arriving, so it is the one
+                // the reveal paces (`display.smoothStreaming`); every other
+                // line is what it is.
+                let shown = if newest_reply == Some(index) {
+                    chat.revealed_prefix(&line.text)
+                } else {
+                    &line.text
+                };
+                (
+                    chat.assistant_rows(newest_reply == Some(index), shown, inner, theme),
+                    Vec::new(),
+                )
+            }
         } else if line.kind == LineKind::Fold {
             // The divider carries the fold's own chevron, which the state
             // above — not the line — decides.

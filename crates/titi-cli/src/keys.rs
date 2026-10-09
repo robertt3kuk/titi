@@ -1142,6 +1142,43 @@ impl Chat {
         self.arm_quit(now, EXIT_HINT)
     }
 
+    /// One reveal frame: how much of the running answer is on screen now.
+    ///
+    /// Off, this does nothing at all — the whole buffer is what the renderer
+    /// draws, exactly as before the key existed. On, the pure core decides,
+    /// with the *frames* read out of the time since the last one, so a tick
+    /// that arrives late reveals as much as it owes.
+    pub(crate) fn reveal_tick(&mut self, now: Instant) {
+        if !self.smooth || !self.turn_active {
+            return;
+        }
+        let elapsed = match self.reveal_at {
+            Some(at) => now.saturating_duration_since(at),
+            None => crate::reveal::FRAME,
+        };
+        self.reveal_at = Some(now);
+        self.revealed = crate::reveal::reveal(&self.reply, self.revealed, elapsed);
+    }
+
+    /// The text of the answer as the screen may draw it: the revealed prefix
+    /// while the key is on and the answer is still arriving, and the whole text
+    /// otherwise. Always cut at a character boundary.
+    pub(crate) fn revealed_prefix<'a>(&self, text: &'a str) -> &'a str {
+        if !self.smooth || !self.turn_active {
+            return text;
+        }
+        let at = crate::reveal::byte_at(text, self.revealed.min(text.chars().count()));
+        &text[..at]
+    }
+
+    /// Everything arrives at once: a tool call closes the answer's line, and
+    /// the turn's end, a failure and a cancel all mean there is nothing left
+    /// to pace. Nothing is ever left unrevealed past one of them.
+    pub(crate) fn reveal_all(&mut self) {
+        self.revealed = self.reply.chars().count();
+        self.reveal_at = None;
+    }
+
     /// An agent that reached the end of its life leaves the strip — and takes
     /// the view with it when its pane had it, so the screen never shows a pane
     /// that is gone.

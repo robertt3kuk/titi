@@ -611,7 +611,7 @@ pub struct Chat {
     /// with the context. Read from the settings at startup and changed by
     /// `/statusline`.
     pub(crate) status_line: StatusLineStyle,
-    reply: String,
+    pub(crate) reply: String,
     /// Bytes of `reply` already written to the session file. A tool call
     /// splits the turn's text into segments, and each is recorded once.
     recorded_reply: usize,
@@ -676,6 +676,15 @@ pub struct Chat {
     /// and its status row (`tui.tight`). Unset is off, so an unset key leaves
     /// every frame exactly as it was.
     pub(crate) tight: bool,
+    /// Whether a streamed answer is revealed at a readable rate
+    /// (`display.smoothStreaming`), how much of it is on screen, and when the
+    /// last frame was. Unset is off, so the delta path is exactly what it was.
+    pub(crate) smooth: bool,
+    /// Characters of the running answer that are on screen. It only means
+    /// anything while `smooth` is on and a turn is streaming.
+    pub(crate) revealed: usize,
+    /// When the last reveal frame happened, for the next one's frames.
+    pub(crate) reveal_at: Option<Instant>,
     /// How the pinned strip above the composer behaves
     /// (`display.pinnedAgents`), and whether its rows preview what the agent is
     /// doing (`display.subagentLivePreview`).
@@ -891,6 +900,9 @@ impl Chat {
             tree_picker: None,
             tree_filter: TreeFilter::default(),
             tight: false,
+            smooth: false,
+            revealed: 0,
+            reveal_at: None,
             pinned: PinnedStrip::default(),
             agents: Vec::new(),
             agent_focus: None,
@@ -1461,6 +1473,10 @@ impl Chat {
                 detail,
                 ..
             } => {
+                // The answer's line closes here, so it settles here too: a
+                // reveal still in flight would otherwise keep drawing into a
+                // line the tool call has already ended.
+                self.reveal_all();
                 self.phase = WorkPhase::Tool {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
@@ -4133,6 +4149,12 @@ pub fn run(
         titi_config::settings::switch_on(settings, titi_config::settings::TUI_TIGHT_KEY)
     });
     chat.pinned = pinned_agents(settings.as_ref());
+    chat.smooth = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_on(
+            settings,
+            titi_config::settings::DISPLAY_SMOOTH_STREAMING_KEY,
+        )
+    });
     // The vim keys, off unless `editor.vim` asks for them: a switch that
     // changes what typing does is not turned on by a config that says nothing.
     chat.vim = settings
@@ -4245,6 +4267,9 @@ pub fn run(
             reporter.report(state, None);
             reported = state;
         }
+        // The reveal's own frame, before the draw that shows it: the same tick
+        // the spinner and the progress row ride.
+        chat.reveal_tick(Instant::now());
         screen.terminal.draw(|frame| draw(frame, &mut chat))?;
         let flush = chat.take_output_flush();
         if !flush.is_empty() {

@@ -11335,6 +11335,181 @@ fn a_session_switch_forgets_the_live_agents_it_left() {
     );
 }
 
+/// `display.smoothStreaming` off — the default — is the delta path exactly as
+/// it was: the frame after a delta draws the whole buffer.
+#[test]
+fn smooth_streaming_off_is_the_frame_it_always_was() {
+    let mut chat = chat();
+    type_text(&mut chat, "hello");
+    chat.on_key(Key::Enter, Instant::now());
+    chat.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: "the whole answer".into(),
+    });
+    assert!(!chat.smooth, "unset is off");
+    let frame = frame_rows(&mut chat, 80, 24);
+    assert!(
+        frame.iter().any(|row| row.contains("the whole answer")),
+        "the whole buffer, at once: {frame:#?}"
+    );
+    // And the hundreds of frames a turn would tick change nothing.
+    for _ in 0..20 {
+        chat.reveal_tick(Instant::now());
+    }
+    let frame = frame_rows(&mut chat, 80, 24);
+    assert!(
+        frame.iter().any(|row| row.contains("the whole answer")),
+        "and still the whole buffer: {frame:#?}"
+    );
+}
+
+/// On, the reveal paces the text: the frame after a delta shows a prefix, the
+/// next frame more, and everything at a tool call — nothing is lost or held
+/// past the line's end.
+#[test]
+fn smooth_streaming_reveals_a_prefix_and_settles_at_a_tool_call() {
+    let mut pacing = chat_with_theme(test_theme());
+    pacing.smooth = true;
+    type_text(&mut pacing, "hello");
+    pacing.on_key(Key::Enter, Instant::now());
+    pacing.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: "abcdefghijklmnopqrstuvwxyz".into(),
+    });
+
+    // The first frame reveals the minimum, not the whole buffer.
+    let at = Instant::now();
+    pacing.reveal_tick(at);
+    pacing.reveal_tick(at + crate::reveal::FRAME);
+    let frame = frame_rows(&mut pacing, 80, 24);
+    assert!(
+        !frame.iter().any(|row| row.contains("abcdefghij")),
+        "a prefix, not the buffer: {frame:#?}"
+    );
+    assert!(
+        frame.iter().any(|row| row.contains("abc")),
+        "and at least the minimum step: {frame:#?}"
+    );
+    assert!(
+        !frame.iter().any(|row| row.contains("xyz")),
+        "the tail waits: {frame:#?}"
+    );
+
+    // Enough frames and the whole answer is there.
+    for step in 0..40 {
+        pacing.reveal_tick(at + crate::reveal::FRAME * (step + 2));
+    }
+    let frame = frame_rows(&mut pacing, 80, 24);
+    assert!(
+        frame
+            .iter()
+            .any(|row| row.contains("abcdefghijklmnopqrstuvwxyz")),
+        "caught up: {frame:#?}"
+    );
+
+    // A tool call closes the line, so a reveal still in flight settles: the
+    // line is whole from the frame the tool call lands in.
+    let mut chat = chat();
+    pacing.smooth = true;
+    type_text(&mut pacing, "hello");
+    pacing.on_key(Key::Enter, Instant::now());
+    pacing.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: "abcdefghijklmnopqrstuvwxyz".into(),
+    });
+    pacing.reveal_tick(at);
+    pacing.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: "call-1".into(),
+        name: "bash".into(),
+        detail: None,
+    });
+    let frame = frame_rows(&mut pacing, 80, 24);
+    assert!(
+        frame
+            .iter()
+            .any(|row| row.contains("abcdefghijklmnopqrstuvwxyz")),
+        "settled at the tool call: {frame:#?}"
+    );
+}
+
+/// The turn's end, a failure and a cancel settle too: a finished answer is
+/// whole, whatever the reveal had reached.
+#[test]
+fn a_finished_turn_is_never_left_half_revealed() {
+    let ended = |end: &str| {
+        let mut chat = chat_with_theme(test_theme());
+        chat.smooth = true;
+        type_text(&mut chat, "hello");
+        chat.on_key(Key::Enter, Instant::now());
+        chat.on_event(EngineEvent::StreamDelta {
+            turn_id: TurnId(1),
+            text: "abcdefghijklmnopqrstuvwxyz".into(),
+        });
+        chat.reveal_tick(Instant::now());
+        // A failure ends the turn only for the turn it names
+        // (`finish_turn`'s guard), so the engine's start has to be here for
+        // the failed case to reach the same settle the other two do.
+        chat.on_event(EngineEvent::TurnStarted {
+            turn_id: TurnId(1),
+            model: "openai/gpt-4.1".into(),
+        });
+        chat.turn_active = true;
+        match end {
+            "finished" => chat.on_event(EngineEvent::TurnFinished {
+                turn_id: TurnId(1),
+                reason: StopReason::Stop,
+            }),
+            "failed" => chat.on_event(EngineEvent::Failed {
+                turn_id: Some(TurnId(1)),
+                reason: titi_providers::ErrorReason::Rejected,
+                message: "no".into(),
+            }),
+            _ => chat.on_event(EngineEvent::Cancelled { turn_id: TurnId(1) }),
+        };
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("abcdefghijklmnopqrstuvwxyz")),
+            "{end}: the answer is whole after it: {frame:#?}"
+        );
+    };
+    ended("finished");
+    ended("failed");
+    ended("cancelled");
+}
+
+/// The prefix the screen slices is always a character boundary, whatever the
+/// reveal has reached — a multi-byte answer is never cut in half.
+#[test]
+fn the_revealed_prefix_never_splits_a_character() {
+    let mut chat = chat();
+    chat.smooth = true;
+    type_text(&mut chat, "hello");
+    chat.on_key(Key::Enter, Instant::now());
+    let answer = "aé世🎉z";
+    chat.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: answer.into(),
+    });
+    let at = Instant::now();
+    for step in 0..60 {
+        chat.reveal_tick(at + crate::reveal::FRAME * (step + 1));
+        let shown = chat.revealed_prefix(&chat.reply);
+        assert!(answer.starts_with(shown), "a prefix: {shown:?}");
+        assert_eq!(
+            shown.chars().count(),
+            chat.revealed.min(answer.chars().count())
+        );
+    }
+    assert_eq!(
+        chat.revealed_prefix(&chat.reply),
+        answer,
+        "and it ends whole"
+    );
+}
+
 /// `/changelog` renders the notes this build carries, and an argument it
 /// does not know gets the usage line rather than silence.
 #[test]

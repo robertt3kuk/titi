@@ -127,6 +127,18 @@ pub const COMPOSER_TOKEN_RATE_KEY: &str = "composer.tokenRate";
 /// (`pi-tui/src/vim.ts`, `modes/settings.ts:774`).
 pub const EDITOR_VIM_KEY: &str = "editor.vim";
 
+/// Whether a streamed answer is revealed at a readable rate instead of in
+/// whatever bursts the provider sends.
+///
+/// Unset means **off**, and this is where titi differs from omp on purpose:
+/// omp's `display.smoothStreaming` defaults to `true`
+/// (`modes/settings.ts:624`), and an unset key here never moves a pixel — so
+/// every existing frame, and every golden, is exactly what it was. One line,
+/// `display.smoothStreaming: true`, turns it on, and then the answer is paced
+/// at omp's rate (`crates/titi-cli/src/reveal.rs`) and settled in full at a
+/// tool call, at the turn's end, on a failure and on a cancel.
+pub const DISPLAY_SMOOTH_STREAMING_KEY: &str = "display.smoothStreaming";
+
 /// Whether a run says, once, that the build changed since the last one.
 ///
 /// Unset means **on** (omp's `startup.changelogMode` defaults to `summary`,
