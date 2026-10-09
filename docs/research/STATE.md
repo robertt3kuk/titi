@@ -654,6 +654,27 @@ next, and the two worker notes it could not see yet.
   headless answer path) and `015f8ed` (its test's mode bit) are on `master` with
   it.
 
+**Owner-blocked queue (2026-10-09).** Each of these needs a decision only the
+owner can take; none is a code question.
+
+- [ ] `medium` **Taimyr phase 3 — the watcher** — blocked on the owner's word
+  about the `notify` crate: the decision is written as phase 3's in
+  `docs/research/genome-incremental.md` §4, adding it goes through the
+  `dependency-update` procedure, and its health is **unverified offline**.
+  Phases 1, 2, 4 and 5 are in the tree.
+- [ ] `medium` **a `cargo audit` gate in CI** — `cargo audit` is not installed
+  and no advisory has ever been checked (BRAIN's dependency area says so
+  verbatim). Wiring it into `.github/workflows/ci.yml` needs a decision about
+  tolerating advisories that predate a fix, which is why it is here and not in
+  the workflow already.
+- [ ] `low` **a `model:` pin setting** — `9234d43` made a config's declared
+  models lead the catalog, so a session starts on the user's first declared
+  model, but nothing pins a model for a project the way omp's `modelRoles`
+  does; `/model` switches and does not persist.
+- [ ] `low` **GAP's open items** — `docs/research/omp-parity/GAP.md` is the
+  list, rolled up in `ee264b3`; whatever it still marks missing is the queue,
+  and nothing here duplicates it.
+
 **Landed in the wave that followed (2026-10-08 → 10-09), beyond this queue.**
 Genome per language: `714824d` split the scanner into one module per language
 behind a single table, `2b49fed` reports what each language's index rests on,
@@ -1229,3 +1250,87 @@ path), `titi-memory` unit +4 (the mask and the version refusal), `titi-secrets`
 unit +2 (its own). The `unwrap`/`expect` headers are unchanged at **6** of **95**
 `warning:` lines. All three gates ran in a clean detached worktree of this head
 with its own target directory.
+
+The surface wave (2026-10-09). Twenty-six commits, most of them the review's
+remaining surface items plus two real defects found while smoke-testing them.
+The agent tool is in: an `agent` tool registered on the session's registry when a
+supervisor exists, so the model's door and the surface's `SpawnAgent` command are
+one path (`AgentSupervisor::spawn`), the call blocks until `AgentSupervisor::wait`
+resolves on an outcome the launch task records on every exit path, and the
+subagent's summary comes back as the tool's message, capped with the cut stated
+in the text because that message enters the parent's context (`c1b2260`,
+`f73797a`). Three decisions are deliberate: **no depth** — a subagent cannot
+spawn a subagent at any depth, because the runtime builds a subagent's registry
+without this tool, where omp allows two levels (`task.maxRecursionDepth`); a
+subagent's work is **split from what it says** (`7a797c5`: the progress line
+moved off the transcript into its own event); and a batch of subagent tasks runs
+at once (`f73797a`). The surface around it: the pinned-agents strip above the
+composer and a focused agent's own pane (`07734bf`, `f6dff12`), `/changelog`
+(`f701704`), `tui.tight` (`771632f`), the `/tree` filter (`a001dac`), the status
+line's `separator`/`sessionAccent`/`transparent` keys with the two divergences
+from omp stated where the keys are defined (`f3b11ef`), vim mode (`0b9fbdf`,
+draft editing with the `tui.editor.*` keys the caret landed for), smooth
+revealing of a streamed answer (`387548a`), a search hit dated by the line that
+matched (`19ccd31`, `f43bd4f`), dotted keys read the way `/settings` prints them
+(`478c19d`), the chat tests moved beside `chat.rs` (`6a24f8c`), and the README's
+feature and key tables (`307c5ed`).
+
+**The real user bug this wave fixed** is `fe29a0f`: a response with **two tool
+calls delivered one**. `ToolCallCollector` held a single `current` slot and its
+`ToolcallDelta` arm ignored the block id, so the second `ToolcallStart`
+overwrote the first, every later delta was appended to whichever call was
+current, and the first `ToolcallEnd` pushed that one while the second found
+nothing — a model that asked for two files ran one, with the other's arguments
+grafted onto it. Every multi-call response lost a call before this. The provider
+decoders were checked family by family first and are correct (OpenAI completions
+keys by `index`, the Responses API by `output_index`, Anthropic by content-block
+`index`, Gemini per `functionCall` part); the loss was in the engine's collector,
+the one place that had to hold several calls. It now keeps one slot per call
+keyed by the block id its deltas carry, in the order the provider opened them,
+and `take` hands back every slot; the `ToolcallEnd` arm is gone, so a provider
+that never closes a call still gets an answer. Found by the pinned-agents PTY
+smoke (`pin agents` sends two `agent` calls; only `alpha` ever ran).
+
+**A behaviour change to know about** (`9234d43`): a config's declared models now
+**lead** the catalog, with the builtins behind them. Before, `registry_config_for`
+started from `default_registry_config()` and `merge_registry_config` appended the
+user's models, so `models.first()` — the primary — was always a builtin whenever
+the config declared anything the builtins did not, and `prefer_available_models`
+only reordered by "has a credential", which is not "the user can run it". A
+config that declares one model now runs on that model, and the subagent follows
+it through `agent_model = primary`. There is **no `model:` pin setting** yet —
+`/model` is how a session switches, and a pin is queued below.
+
+The two genome correctness fixes and the performance one: an ambiguous name is
+reported only within one crate (`858e332`), a file whose mtime is too fresh to
+trust is re-read rather than trusted (`743d6d5`, `3c5618a`, the second distrusting
+a record already taken), and an ignore rule is matched against the last path
+segment instead of a grid (`04d97d6`). `88c30a4` runs a response's read calls at
+once (a new `tests/tool_concurrency.rs`), `e62e4ec` numbers a scripted provider's
+tool calls so a multi-call response can be scripted at all, and `b35bdc1` forgets
+a session's live agents when the screen leaves it. `ee264b3` rolled the GAP
+statuses up.
+
+Attribution, recorded rather than rewritten, on the owner's word: `f3b11ef`
+carries the engine `agent` tool core (`agent_tool.rs`, `agents.rs`, `runtime.rs`,
+`tests/agent_tool.rs`) beside the TUI status-line keys it is named for — the
+files were staged for `c1b2260` without the commit lock and that commit swept
+the index, which is why `c1b2260` now carries only the changelog entry the
+feature was missing. Several changelog lines also landed in sibling commits
+beside the features they describe (`f701704`, `307c5ed`). The commit skill's
+lock rule was tightened for exactly this (`84b7dea`).
+
+In flight: **none** — the tree is clean and the workers are idle.
+
+The suite went 1972 → **2055 passed** (81 targets, 0 failed) at this wave's code
+tip: engine `tests/agent_tool.rs` +12, `tests/tool_concurrency.rs` +5 and
+`tests/registry_order.rs` +1 (three new targets), genome `tests/check.rs` +2 and
+`tests/index.rs` +2, and the unit tests — `titi-cli` +51 (the surface work, the
+biggest single block), `titi-config` +3, `titi-tui` +3, and one each in
+`titi-core`, `titi-engine`, `titi-genome` and `titi-providers`. The
+`unwrap`/`expect` headers are unchanged at **6** of **98** `warning:` lines
+(`shared.rs` 5, `theme/mod.rs` 1): the wave added four warning lines and no new
+`expect`. Two files this wave wrote came out hand-wrapped and needed their own
+`style:` commit (`706e1d0`) before the fmt job would pass; the sha pushed is
+re-gated **after** that fix, so the numbers above are the styled tree's, not the
+hand-wrapped one's.
