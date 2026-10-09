@@ -81,6 +81,7 @@ async fn a_tool_the_mode_withholds_is_refused_as_withheld_not_unknown() {
             call: titi_providers::ToolCallRef {
                 call_id: "call-1".into(),
                 name: "shell_probe".into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {
@@ -362,6 +363,7 @@ async fn duck_mode_searches_without_asking_for_approval() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "web_search".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {
@@ -442,6 +444,7 @@ async fn duck_mode_keeps_any_network_tool_whatever_it_is_called() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "fetch".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {

@@ -50,6 +50,7 @@ fn bash_call(call_id: &str, args: &str) -> MockBody {
             call: ToolCallRef {
                 call_id: call_id.into(),
                 name: "bash".into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {

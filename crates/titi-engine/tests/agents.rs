@@ -344,6 +344,7 @@ async fn a_subagent_with_write_access_does_not_park_on_approval() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "write".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {

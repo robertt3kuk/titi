@@ -127,6 +127,7 @@ impl AgentRunner for ToolAgentRunner {
             role: Role::User,
             content: request.task.clone(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }];
         let mut summary = String::new();
 
@@ -284,6 +285,7 @@ mod tests {
                     call: ToolCallRef {
                         call_id: "call-1".into(),
                         name: "write".into(),
+                        ..Default::default()
                     },
                 },
                 StreamEvent::ToolcallDelta {

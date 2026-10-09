@@ -27,6 +27,7 @@ pub fn entries_to_messages(entries: &[Entry]) -> Vec<titi_providers::ChatMessage
             },
             content: entry.content.clone().into(),
             tool_calls: entry.tool_calls.clone(),
+            ..Default::default()
         })
         .collect()
 }
@@ -1327,6 +1328,7 @@ mod tests {
         let call = titi_providers::ToolCallRef {
             call_id: "call-1".into(),
             name: "read".into(),
+            ..Default::default()
         };
         s.append_with_tool_calls(&sid, Role::Assistant, "", vec![call.clone()])
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1342,16 +1344,19 @@ mod tests {
                     role: titi_providers::Role::User,
                     content: "read Cargo.toml".into(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
                 titi_providers::ChatMessage {
                     role: titi_providers::Role::Assistant,
                     content: "".into(),
                     tool_calls: vec![call],
+                    ..Default::default()
                 },
                 titi_providers::ChatMessage {
                     role: titi_providers::Role::Tool,
                     content: "[package]".into(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 },
             ]
         );
@@ -1364,6 +1369,7 @@ mod tests {
         let call = titi_providers::ToolCallRef {
             call_id: "call-1".into(),
             name: "read".into(),
+            ..Default::default()
         };
         s.append(&sid, Role::User, "read Cargo.toml")
             .unwrap_or_else(|e| panic!("{e}"));

@@ -455,6 +455,7 @@ async fn a_tool_write_reaches_the_next_turns_map() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "write".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {
@@ -591,6 +592,7 @@ async fn restore_history_replaces_what_the_model_sees() {
         role: Role::User,
         content: "the turn we later rewound".into(),
         tool_calls: Vec::new(),
+        ..Default::default()
     }];
     let mut engine = EngineRuntime::start(
         config,
@@ -610,6 +612,7 @@ async fn restore_history_replaces_what_the_model_sees() {
                 role: Role::User,
                 content: "what survived the rewind".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             }],
         })
         .await
@@ -678,6 +681,7 @@ async fn touched_file_leads_the_next_projection() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "read".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {
@@ -758,11 +762,13 @@ async fn restored_history_is_replayed_before_the_prompt() {
             role: Role::User,
             content: "earlier question".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         },
         ChatMessage {
             role: Role::Assistant,
             content: "earlier answer".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         },
     ];
     let mut engine = EngineRuntime::start(
@@ -1176,6 +1182,7 @@ async fn cancel_returns_the_queued_prompts_instead_of_firing_them_later() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "shell_probe".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {
@@ -1317,6 +1324,7 @@ async fn a_cancelled_turn_sends_no_further_request() {
                 call: ToolCallRef {
                     call_id: "call-1".into(),
                     name: "shell_probe".into(),
+                    ..Default::default()
                 },
             },
             StreamEvent::ToolcallDelta {

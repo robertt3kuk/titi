@@ -71,6 +71,7 @@ fn echo_call() -> Vec<StreamEvent> {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: "echo".into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {
@@ -318,6 +319,7 @@ async fn a_cancelled_turn_still_reports_the_rounds_it_paid_for() {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: "shell_probe".into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {

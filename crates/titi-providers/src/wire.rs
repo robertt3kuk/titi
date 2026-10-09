@@ -73,17 +73,21 @@ fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
                         .map(|call| serde_json::json!({
                             "id": call.call_id.as_str(),
                             "type": "function",
-                            // `ChatMessage` carries the call's name and id but
-                            // not its arguments, which is the trade the
-                            // Responses path already makes; the API accepts an
-                            // empty string there.
-                            "function": {"name": call.name.as_str(), "arguments": ""},
+                            "function": {
+                                "name": call.name.as_str(),
+                                "arguments": call.arguments.as_str(),
+                            },
                         }))
                         .collect::<Vec<_>>(),
                 }));
             }
             Role::Tool => {
-                let id = pending.pop_front().unwrap_or_default();
+                // The result names its call; the order fallback is only for a
+                // history persisted before results carried an id.
+                let id = m
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| pending.pop_front().unwrap_or_default());
                 out.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": id.as_str(),
@@ -108,14 +112,11 @@ fn openai_messages_wire(req: &WireRequest) -> Vec<Value> {
 /// found for function call output with call_id …`), so the call the assistant
 /// made is replayed as a `function_call` item as well.
 ///
-/// [`ChatMessage`](crate::transport::ChatMessage) carries the call's name and
-/// id but not its arguments — `execute_tools` records the calls without them —
-/// so the replayed item carries `""`, which is what the API itself puts on a
-/// call item whose arguments have not streamed yet (`output_item.added`).
-///
-/// A tool result carries no call id either, but `execute_tools` appends one
-/// result per call in the order it recorded the calls, so each result takes
-/// the oldest still-unmatched call id of the assistant message in front of it.
+/// The replayed item carries the call's own arguments. A result names its call
+/// through `ChatMessage::tool_call_id`; for a history persisted before that
+/// field existed it falls back to the oldest still-unmatched call id of the
+/// assistant message in front of it, which is the order `execute_tools` wrote
+/// them in.
 fn responses_input_wire(req: &WireRequest) -> Vec<Value> {
     let mut out = Vec::with_capacity(req.messages.len() + 1);
     if let Some(sys) = &req.system {
@@ -140,11 +141,11 @@ fn responses_input_wire(req: &WireRequest) -> Vec<Value> {
                         "type": "function_call",
                         "call_id": call.call_id.as_str(),
                         "name": call.name.as_str(),
-                        "arguments": "",
+                        "arguments": call.arguments.as_str(),
                     }));
                 }
             }
-            Role::Tool => match pending.pop_front() {
+            Role::Tool => match m.tool_call_id.clone().or_else(|| pending.pop_front()) {
                 Some(call_id) => out.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id.as_str(),
@@ -214,8 +215,18 @@ fn ephemeral() -> Value {
 /// string: the breakpoint attaches to a block, and a shape that changed as
 /// the newest message aged into history would rewrite bytes the cache has
 /// already committed to.
+/// Anthropic's messages carry content *blocks*: an assistant turn that called
+/// tools has a `tool_use` block per call with its input, and a result is a
+/// `tool_result` block naming the call it answers. Writing either as plain
+/// text loses the call entirely, which is what this did.
+///
+/// A call's arguments are JSON text; the API wants an object, so they are
+/// parsed. **Unparseable arguments become `{}`** and nothing else — a call
+/// that never streamed valid JSON cannot be repaired into the input the model
+/// meant, and an object is the only shape this field accepts.
 fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
     let last = req.messages.len().saturating_sub(1);
+    let mut pending: VecDeque<SmolStr> = VecDeque::new();
     req.messages
         .iter()
         .enumerate()
@@ -225,25 +236,120 @@ fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
             // belongs where it sits in the history. The role does not exist
             // in this API, so it travels as user text rather than vanishing.
             let role = m.role.anthropic_role().unwrap_or("user");
-            let mut block = serde_json::json!({"type": "text", "text": m.content.as_str()});
-            if index == last {
+            let mut blocks: Vec<Value> = Vec::new();
+            match m.role {
+                Role::Assistant => {
+                    pending.clear();
+                    pending.extend(m.tool_calls.iter().map(|call| call.call_id.clone()));
+                    if !m.content.is_empty() {
+                        blocks
+                            .push(serde_json::json!({"type": "text", "text": m.content.as_str()}));
+                    }
+                    for call in &m.tool_calls {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.call_id.as_str(),
+                            "name": call.name.as_str(),
+                            "input": input_of(&call.arguments),
+                        }));
+                    }
+                }
+                Role::Tool => {
+                    let id = m
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| pending.pop_front().unwrap_or_default());
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": id.as_str(),
+                        "content": [{"type": "text", "text": m.content.as_str()}],
+                    }));
+                }
+                _ => blocks.push(serde_json::json!({"type": "text", "text": m.content.as_str()})),
+            }
+            if blocks.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": ""}));
+            }
+            if index == last
+                && let Some(block) = blocks.last_mut()
+            {
                 block["cache_control"] = ephemeral();
             }
-            serde_json::json!({"role": role, "content": [block]})
+            serde_json::json!({"role": role, "content": blocks})
         })
         .collect()
 }
 
+/// A call's arguments as the object the Anthropic and Gemini wires want.
+/// Unparseable text becomes `{}`; nothing else can be said about it.
+fn input_of(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Gemini's turns carry `parts`: a model turn that called tools has a
+/// `functionCall` part per call with its args, and a result is a
+/// `functionResponse` part named after the call it answers (this API pairs
+/// them by name, not by id). Writing either as text loses the call entirely.
+///
+/// Arguments are JSON text and this API wants an object; unparseable text
+/// becomes `{}` by the same rule as the Anthropic wire — see [`input_of`].
 fn gemini_contents_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
+    let mut pending: VecDeque<(SmolStr, SmolStr)> = VecDeque::new();
     req.messages
         .iter()
         .skip(folded)
         .map(|m| match m.role {
-            Role::Assistant => serde_json::json!(
-                {"role": "model", "parts": [{"text": m.content.as_str()}]}
-            ),
-            // User, Tool, and a compaction digest that sits mid-history all
-            // travel as user turns; this API has no other inbound role.
+            Role::Assistant => {
+                pending.clear();
+                pending.extend(
+                    m.tool_calls
+                        .iter()
+                        .map(|call| (call.call_id.clone(), call.name.clone())),
+                );
+                let mut parts: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    parts.push(serde_json::json!({"text": m.content.as_str()}));
+                }
+                for call in &m.tool_calls {
+                    parts.push(serde_json::json!({
+                        "functionCall": {
+                            "name": call.name.as_str(),
+                            "args": input_of(&call.arguments),
+                        },
+                    }));
+                }
+                if parts.is_empty() {
+                    parts.push(serde_json::json!({"text": ""}));
+                }
+                serde_json::json!({"role": "model", "parts": parts})
+            }
+            Role::Tool => {
+                // Named, not id'd: a result takes the name of the call it
+                // answers, by id when the result has one and by order
+                // otherwise.
+                let name = m
+                    .tool_call_id
+                    .clone()
+                    .and_then(|id| {
+                        pending
+                            .iter()
+                            .find(|(call_id, _)| *call_id == id)
+                            .map(|(_, name)| name.clone())
+                    })
+                    .or_else(|| pending.pop_front().map(|(_, name)| name))
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name.as_str(),
+                            "response": {"output": m.content.as_str()},
+                        },
+                    }],
+                })
+            }
+            // User, and a compaction digest that sits mid-history, travel as
+            // user turns; this API has no other inbound role.
             _ => serde_json::json!(
                 {"role": "user", "parts": [{"text": m.content.as_str()}]}
             ),
@@ -1183,11 +1289,13 @@ mod tests {
                 role: Role::User,
                 content: "hi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::Assistant,
                 content: "hello".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         r.max_tokens = Some(128);
@@ -1256,6 +1364,7 @@ mod tests {
             role: Role::User,
             content: "PROMPT-MARKER-9f3a".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         r
     }
@@ -1271,6 +1380,7 @@ mod tests {
                 role: Role::User,
                 content: "go".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::Assistant,
@@ -1279,22 +1389,29 @@ mod tests {
                     crate::stream::ToolCallRef {
                         call_id: "call_a".into(),
                         name: "read".into(),
+                        arguments: "{\"path\":\"a.rs\"}".into(),
+                        ..Default::default()
                     },
                     crate::stream::ToolCallRef {
                         call_id: "call_b".into(),
                         name: "grep".into(),
+                        arguments: "{\"pattern\":\"b\"}".into(),
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::Tool,
                 content: "a.rs".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::Tool,
                 content: "b".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         let body = body_of(ApiKind::OpenAiCompletions, &req);
@@ -1310,6 +1427,10 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_a");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "read");
+        assert_eq!(
+            calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}",
+            "the arguments the model asked with, not an empty string"
+        );
         assert_eq!(calls[1]["id"], "call_b");
         let ids: Vec<&str> = messages
             .iter()
@@ -1317,6 +1438,25 @@ mod tests {
             .map(|m| m["tool_call_id"].as_str().expect("a tool_call_id"))
             .collect();
         assert_eq!(ids, vec!["call_a", "call_b"], "each result takes its call");
+    }
+
+    /// A session file written before calls carried arguments and results
+    /// carried ids still loads: both fields default, so an old history replays
+    /// through the order fallback rather than failing to parse.
+    #[test]
+    fn an_old_session_entry_still_loads() {
+        let message: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":"","tool_calls":[{"call_id":"c1","name":"read"}]}"#,
+        )
+        .expect("an old assistant entry loads");
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].arguments, "");
+        assert!(message.tool_call_id.is_none());
+
+        let tool: ChatMessage =
+            serde_json::from_str(r#"{"role":"tool","content":"ok","tool_calls":[]}"#)
+                .expect("an old result loads");
+        assert!(tool.tool_call_id.is_none());
     }
 
     fn body_of(api: ApiKind, r: &WireRequest) -> Value {
@@ -1369,22 +1509,27 @@ mod tests {
                 crate::stream::ToolCallRef {
                     call_id: "call_a".into(),
                     name: "read".into(),
+                    ..Default::default()
                 },
                 crate::stream::ToolCallRef {
                     call_id: "call_b".into(),
                     name: "read".into(),
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         });
         r.messages.push(ChatMessage {
             role: Role::Tool,
             content: "OUTPUT-A".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         r.messages.push(ChatMessage {
             role: Role::Tool,
             content: "OUTPUT-B".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         // A result whose call was folded out of the history keeps its text
         // under a role the API accepts.
@@ -1392,6 +1537,7 @@ mod tests {
             role: Role::Tool,
             content: "OUTPUT-ORPHAN".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
 
         let body = body_of(ApiKind::OpenAiResponses, &r);
@@ -1428,7 +1574,9 @@ mod tests {
             tool_calls: vec![crate::stream::ToolCallRef {
                 call_id: "call_a".into(),
                 name: "read".into(),
+                ..Default::default()
             }],
+            ..Default::default()
         });
         let body = body_of(ApiKind::OpenAiResponses, &r);
         let input = body["input"].as_array().expect("input");
@@ -1610,11 +1758,13 @@ mod tests {
                 role: Role::System,
                 content: "you are titi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::User,
                 content: "hi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
@@ -1632,11 +1782,13 @@ mod tests {
                 role: Role::System,
                 content: "you are titi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::User,
                 content: "hi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         let hr = build_http_request(ApiKind::GeminiGenerateContent, "http://x", &r, None);
@@ -1660,21 +1812,25 @@ mod tests {
                 role: Role::System,
                 content: "you are titi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::User,
                 content: "first".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::System,
                 content: "3 earlier message(s) folded".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::User,
                 content: "second".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
@@ -1700,11 +1856,13 @@ mod tests {
                 role: Role::System,
                 content: "you are titi".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
             ChatMessage {
                 role: Role::System,
                 content: "and nothing else was said".into(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             },
         ];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
@@ -1732,6 +1890,7 @@ mod tests {
             role: Role::System,
             content: "you are titi".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }];
         let hr = build_http_request(ApiKind::AnthropicMessages, "http://x", &r, Some(&key("k")));
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
@@ -1750,6 +1909,7 @@ mod tests {
             role: Role::User,
             content: "x".into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }];
         let hr = build_http_request(ApiKind::OpenAiCompletions, "http://x", &r, None);
         let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
@@ -1794,11 +1954,13 @@ mod tests {
             role: Role::System,
             content: system.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         })
         .chain(history.iter().map(|(role, text)| ChatMessage {
             role: *role,
             content: (*text).into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }))
         .collect();
         r

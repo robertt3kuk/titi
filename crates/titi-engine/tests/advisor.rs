@@ -47,6 +47,7 @@ fn asked(text: &str) -> ChatMessage {
         role: Role::User,
         content: text.into(),
         tool_calls: Vec::new(),
+        ..Default::default()
     }
 }
 

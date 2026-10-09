@@ -131,6 +131,7 @@ pub fn decode_event(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .into(),
+                        ..Default::default()
                     };
                     events.push(StreamEvent::ToolcallStart {
                         id: block_id(kind, index),

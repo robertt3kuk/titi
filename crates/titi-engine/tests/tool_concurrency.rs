@@ -44,6 +44,7 @@ fn two_calls(first: (&str, &str), second: (&str, &str)) -> Vec<StreamEvent> {
             call: ToolCallRef {
                 call_id: id.clone().into(),
                 name: name.into(),
+                ..Default::default()
             },
         });
         events.push(StreamEvent::ToolcallDelta {

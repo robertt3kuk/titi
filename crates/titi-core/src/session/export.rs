@@ -167,6 +167,7 @@ mod tests {
             entry(Role::Assistant, "on it").with_tool_calls(vec![titi_providers::ToolCallRef {
                 call_id: "call-1".into(),
                 name: "read".into(),
+                ..Default::default()
             }]),
             entry(Role::Tool, "[package]\nname = \"titi\""),
             entry(Role::Assistant, "it is the workspace root"),

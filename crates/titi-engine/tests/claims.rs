@@ -60,6 +60,7 @@ fn write_call_events(path: &str, body: &str) -> Vec<StreamEvent> {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: "write".into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {

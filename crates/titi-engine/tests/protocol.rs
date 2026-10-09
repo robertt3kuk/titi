@@ -68,7 +68,9 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 tool_calls: vec![ToolCallRef {
                     call_id: "call-1".into(),
                     name: "read".into(),
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         },
         r#"{"RestoreHistory":{"messages":[{"role":"user","content":"earlier","tool_calls":[{"call_id":"call-1","name":"read"}]}]}}"#,

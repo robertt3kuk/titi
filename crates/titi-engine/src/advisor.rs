@@ -90,11 +90,13 @@ impl Advisor {
             role: Role::System,
             content: ADVISOR_BRIEF.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         wire.messages.push(ChatMessage {
             role: Role::User,
             content: consult_prompt(&transcript, question).into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         let ctx = RequestCtx {
             credential: resolved.credential,
@@ -202,6 +204,7 @@ mod tests {
             role,
             content: text.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }
     }
 

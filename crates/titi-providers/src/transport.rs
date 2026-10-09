@@ -37,17 +37,25 @@ impl std::fmt::Display for ApiKind {
 }
 
 /// A single conversation message in normalized (family-agnostic) form.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: SmolStr,
     /// Tool calls issued by the assistant in this message, if any.
     pub tool_calls: Vec<crate::stream::ToolCallRef>,
+    /// For a `Tool` message: the call this result answers.
+    ///
+    /// `None` on a message persisted before this field existed, and on every
+    /// message that is not a result. A wire builder falls back to pairing by
+    /// order only for those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<SmolStr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    #[default]
     System,
     User,
     Assistant,

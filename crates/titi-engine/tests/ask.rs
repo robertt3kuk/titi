@@ -62,6 +62,7 @@ fn tool_call(name: &str, args: &str) -> MockBody {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: name.into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {

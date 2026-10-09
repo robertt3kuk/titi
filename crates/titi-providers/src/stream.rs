@@ -25,12 +25,21 @@ impl std::fmt::Display for BlockId {
 }
 
 /// Reference to a tool being invoked inside a `toolcall_*` triplet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolCallRef {
     /// Provider-side call id (used for tool-result correlation).
     pub call_id: SmolStr,
     /// Tool name as declared in the request.
     pub name: SmolStr,
+    /// The arguments the model asked with, as JSON text.
+    ///
+    /// Empty on a `ToolcallStart`, which the provider emits before the
+    /// arguments arrive; the engine fills it from the collected deltas when it
+    /// records the assistant message, so a replayed history shows the model
+    /// what it actually asked for. Empty on a call that was persisted before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "SmolStr::is_empty")]
+    pub arguments: SmolStr,
 }
 
 /// Why the model finished the turn.

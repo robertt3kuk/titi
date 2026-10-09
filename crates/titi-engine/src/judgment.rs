@@ -446,6 +446,7 @@ impl JudgmentModel for RoleJudgmentModel {
             role: Role::User,
             content: prompt.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         let ctx = RequestCtx {
             credential: resolved.credential,

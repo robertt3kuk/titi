@@ -73,6 +73,7 @@ pub fn compact(
             role: Role::System,
             content: summary.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         },
     );
     Some(Compacted {
@@ -101,6 +102,7 @@ mod tests {
             role: Role::User,
             content: text.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -109,6 +111,7 @@ mod tests {
             role: Role::Tool,
             content: text.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -117,6 +120,7 @@ mod tests {
             role: Role::Assistant,
             content: text.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }
     }
 

@@ -112,6 +112,7 @@ fn chunk_events(
                     call: ToolCallRef {
                         call_id: SmolStr::from(format!("gemini_{index}")),
                         name: name.into(),
+                        ..Default::default()
                     },
                 });
                 let args = call

@@ -142,6 +142,7 @@ impl SessionNamer {
             role: Role::User,
             content: naming_prompt(first_message).into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         let ctx = RequestCtx {
             credential: resolved.credential,

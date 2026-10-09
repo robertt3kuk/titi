@@ -370,7 +370,10 @@ async fn finish(
     messages.push(ChatMessage {
         role: Role::Tool,
         content: result.output,
-        tool_calls: Vec::new(),
+        // The call this result answers, so a wire builder never has to guess
+        // by order.
+        tool_call_id: Some(result.call_id.clone()),
+        ..Default::default()
     });
 }
 
@@ -400,12 +403,18 @@ pub(crate) async fn execute_tools(
         assistant_calls.push(ToolCallRef {
             call_id: call.call_id.clone(),
             name: call.name.clone(),
+            // The arguments the model asked with, as they were streamed: a
+            // replayed history has to show the model what it actually asked
+            // for, not an empty string.
+            arguments: call.arguments.as_str().into(),
+            ..Default::default()
         });
     }
     messages.push(ChatMessage {
         role: Role::Assistant,
         content: assistant_text,
         tool_calls: assistant_calls,
+        ..Default::default()
     });
 
     // Calls are grouped: a run of read-tier, approval-free ones goes at once,
@@ -717,6 +726,7 @@ mod tests {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: "read".into(),
+                ..Default::default()
             },
         });
         collector.observe(&StreamEvent::ToolcallStart {
@@ -724,6 +734,7 @@ mod tests {
             call: ToolCallRef {
                 call_id: "call-2".into(),
                 name: "grep".into(),
+                ..Default::default()
             },
         });
         // Interleaved: the second call's arguments arrive before the first's.

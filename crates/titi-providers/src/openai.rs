@@ -232,6 +232,7 @@ fn completions_chunk_events(
                     call: ToolCallRef {
                         call_id: SmolStr::from(slot.call_id.clone()),
                         name: SmolStr::from(slot.name.clone()),
+                        ..Default::default()
                     },
                 });
             }
@@ -371,6 +372,7 @@ fn open_tool_call(state: &mut OpenAiStreamState, index: usize) -> Option<StreamE
         call: ToolCallRef {
             call_id: SmolStr::from(state.tools[index].call_id.clone()),
             name: SmolStr::from(state.tools[index].name.clone()),
+            ..Default::default()
         },
     })
 }
@@ -1004,7 +1006,8 @@ mod tests {
                 BlockId("tool_0".into()),
                 ToolCallRef {
                     call_id: "call_1".into(),
-                    name: "read".into()
+                    name: "read".into(),
+                    ..Default::default()
                 }
             )]
         );
@@ -1052,7 +1055,8 @@ mod tests {
                 BlockId("tool_0".into()),
                 ToolCallRef {
                     call_id: "call_2".into(),
-                    name: "read".into()
+                    name: "read".into(),
+                    ..Default::default()
                 }
             )]
         );
@@ -1147,14 +1151,16 @@ mod tests {
                     BlockId("tool_0".into()),
                     ToolCallRef {
                         call_id: "call_a".into(),
-                        name: "read".into()
+                        name: "read".into(),
+                        ..Default::default()
                     }
                 ),
                 (
                     BlockId("tool_1".into()),
                     ToolCallRef {
                         call_id: "call_b".into(),
-                        name: "grep".into()
+                        name: "grep".into(),
+                        ..Default::default()
                     }
                 ),
             ]
@@ -1215,7 +1221,8 @@ mod tests {
                 BlockId("tool_0".into()),
                 ToolCallRef {
                     call_id: "call_9".into(),
-                    name: "bash".into()
+                    name: "bash".into(),
+                    ..Default::default()
                 }
             )]
         );

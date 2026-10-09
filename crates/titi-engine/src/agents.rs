@@ -396,6 +396,7 @@ impl AgentRunner for StreamingAgentRunner {
             role: Role::User,
             content: request.task.clone(),
             tool_calls: Vec::new(),
+            ..Default::default()
         });
         let aborted = Arc::new(AtomicBool::new(false));
         let ctx = RequestCtx {

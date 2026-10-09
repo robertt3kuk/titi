@@ -72,6 +72,7 @@ fn tool_call_events_split(name: &str, fragments: &[&str]) -> Vec<StreamEvent> {
         call: ToolCallRef {
             call_id: "call-1".into(),
             name: name.into(),
+            ..Default::default()
         },
     }];
     for fragment in fragments {
@@ -96,6 +97,7 @@ fn tool_call_events(name: &str, args: &str) -> Vec<StreamEvent> {
             call: ToolCallRef {
                 call_id: "call-1".into(),
                 name: name.into(),
+                ..Default::default()
             },
         },
         StreamEvent::ToolcallDelta {

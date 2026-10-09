@@ -440,6 +440,7 @@ mod tests {
             role,
             content: text.into(),
             tool_calls: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -2428,6 +2429,7 @@ async fn run_turn(
                     role: Role::System,
                     content: system.clone(),
                     tool_calls: Vec::new(),
+                    ..Default::default()
                 });
             }
             // A resumed session replays its history before the new prompt.
@@ -2436,6 +2438,7 @@ async fn run_turn(
                 role: Role::User,
                 content: contextual_prompt.clone(),
                 tool_calls: Vec::new(),
+                ..Default::default()
             });
             let mut tool_rounds = 0;
             loop {
@@ -2451,6 +2454,7 @@ async fn run_turn(
                         role: Role::User,
                         content: text,
                         tool_calls: Vec::new(),
+                        ..Default::default()
                     });
                 }
                 // A turn accumulates tool results without bound; fold the oldest
@@ -2511,6 +2515,7 @@ async fn run_turn(
                                     role: Role::Assistant,
                                     content: text,
                                     tool_calls: Vec::new(),
+                                    ..Default::default()
                                 });
                             }
                             completed = true;
