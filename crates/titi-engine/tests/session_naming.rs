@@ -56,6 +56,7 @@ impl Transport for SlowTransport {
         Err(TransportError::Fatal {
             status: None,
             message: "too late".into(),
+            context_too_long: false,
         })
     }
 }

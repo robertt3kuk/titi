@@ -376,10 +376,12 @@ async fn a_cap_survives_a_switch_to_an_unpriced_model_and_says_so() {
         MockBody::Err(TransportError::Retryable {
             status: Some(429),
             message: "limited".into(),
+            retry_after: None,
         }),
         MockBody::Err(TransportError::Retryable {
             status: Some(429),
             message: "limited".into(),
+            retry_after: None,
         }),
     ]));
     let backup = Arc::new(MockTransport::new(vec![says_paid("backup", 11, 22)]));

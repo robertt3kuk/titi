@@ -40,6 +40,7 @@ impl TransportFactory for MapFactory {
             .get(provider.id.as_str())
             .cloned()
             .ok_or_else(|| TransportError::Fatal {
+                context_too_long: false,
                 status: None,
                 message: "missing test transport".into(),
             })
@@ -216,6 +217,7 @@ async fn engine_uses_registry_wire_model_and_credential() {
 async fn engine_falls_back_between_registry_providers() {
     let primary = Arc::new(MockTransport::new(vec![MockBody::Err(
         TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "limited".into(),
         },
@@ -396,6 +398,7 @@ async fn a_transport_failure_leaves_the_row_alone() {
     store_oauth_row("anthropic", dir.path(), "work", "old-access", now() - 10);
 
     let fetch = MockFetch::new(vec![Err(TransportError::Retryable {
+        retry_after: None,
         status: None,
         message: "connection reset".into(),
     })]);

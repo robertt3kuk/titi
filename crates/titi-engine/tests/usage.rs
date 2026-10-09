@@ -253,6 +253,7 @@ async fn reported_rounds_on_both_sides_of_a_fallback_are_summed() {
     let primary = Arc::new(MockTransport::new(vec![
         MockBody::Events(tool_round),
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(503),
             message: "overloaded".into(),
         }),

@@ -850,10 +850,12 @@ async fn queued_prompts_each_get_a_well_formed_frame() {
 async fn falls_back_after_transient_budget() {
     let primary = Arc::new(MockTransport::new(vec![
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "limited".into(),
         }),
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "limited".into(),
         }),
@@ -966,6 +968,7 @@ async fn a_retry_does_not_replay_the_first_attempt_thinking() {
 async fn exhausting_every_model_names_the_last_failure() {
     let limited = || {
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "rate limit reached for requests".into(),
         })
@@ -973,10 +976,12 @@ async fn exhausting_every_model_names_the_last_failure() {
     let primary = Arc::new(MockTransport::new(vec![limited(), limited()]));
     let backup = Arc::new(MockTransport::new(vec![
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(503),
             message: "overloaded".into(),
         }),
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(503),
             message: "overloaded".into(),
         }),
@@ -1014,6 +1019,7 @@ async fn exhausting_every_model_names_the_last_failure() {
 async fn transient_retries_back_off() {
     let limited = || {
         MockBody::Err(TransportError::Retryable {
+            retry_after: None,
             status: Some(429),
             message: "slow down".into(),
         })
@@ -1100,6 +1106,7 @@ async fn switch_model_answers_outside_a_turn() {
 async fn does_not_retry_permanent_errors() {
     let primary = Arc::new(MockTransport::new(vec![MockBody::Err(
         TransportError::Fatal {
+            context_too_long: false,
             status: Some(401),
             message: "unauthorized".into(),
         },

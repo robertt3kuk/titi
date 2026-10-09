@@ -811,12 +811,18 @@ mod tests {
                 "content": "pub fn fresh() {}\n",
             })
             .to_string(),
+            // A Gemini thinking model signs the part a call came on; this
+            // fixture is a plain write with nothing to echo.
+            thought_signature: SmolStr::default(),
         };
 
         let messages = execute_tools(
             TurnId(1),
             vec![call],
             SmolStr::new_inline("writing"),
+            // The thinking blocks the assistant message produced, which this
+            // fixture's stream did not carry.
+            Vec::new(),
             &tools,
             ApprovalMode::Yolo,
             &ApprovalWaiters::default(),
