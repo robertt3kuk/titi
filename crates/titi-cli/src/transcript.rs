@@ -1135,6 +1135,11 @@ pub(crate) fn speech(
 /// The assistant's answer as frame rows: markdown when the answer carries any,
 /// the plain block it has always been when it does not.
 ///
+/// A table is markdown with no other marker in it, which is what an answer made
+/// of one looks like: without the table check it would take the plain path and
+/// reach the screen as rows of `|`. A table that also *qualifies* for a chart
+/// is drawn with one, since both doors lead to the same renderer.
+///
 /// The answer is markdown from its first delta onwards, so the screen never
 /// shows the raw syntax and never swaps renderings mid-answer; a construct that
 /// is still half-typed (an unclosed fence, a lone `**`) renders literally until
@@ -1281,6 +1286,7 @@ fn sgr_colour(parts: &mut std::str::Split<'_, char>) -> Color {
 fn has_markdown(text: &str) -> bool {
     text.lines().any(markdown_block)
         || has_inline_markdown(text)
+        || titi_tui::markdown::has_table(text)
         || titi_tui::markdown::has_math(text)
 }
 
@@ -1583,5 +1589,66 @@ impl Chat {
             columns,
             rows,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use titi_tui::width::visible_width;
+
+    /// The dark slot the live screen lands on, built the way the screen builds
+    /// it, so the bars here are the bars a session draws.
+    fn theme() -> titi_tui::theme::Theme {
+        let options = titi_tui::theme::loader::CreateThemeOptions {
+            mode: Some(titi_tui::theme::ColorMode::Truecolor),
+            ..Default::default()
+        };
+        titi_tui::theme::loader::load_theme("titanium", &options).expect("built-in theme")
+    }
+
+    fn rows(text: &str, width: usize) -> Vec<String> {
+        reply_rows(text, width, &theme(), false)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// An answer that is nothing but a table is markdown: without this the
+    /// screen would show the pipes.
+    #[test]
+    fn a_table_only_answer_is_markdown() {
+        let table = "| Step | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |";
+        assert!(has_markdown(table), "a table is markdown");
+        assert!(titi_tui::markdown::has_table(table));
+        // …and a row of pipes without a delimiter is not a table.
+        assert!(!has_markdown("| not | a table |"));
+        assert!(!titi_tui::markdown::has_table("| not | a table |"));
+    }
+
+    /// The answer's rows are the rendered table and its chart, not its source.
+    #[test]
+    fn a_table_answer_draws_its_table_and_its_chart() {
+        let text = "| Step | Time |\n|---|---|\n| build | 120 ms |\n| test | 45 ms |\n| lint | 8 ms |\n| fmt | 2 ms |";
+        let out = rows(text, 60);
+        let joined = out.join("\n");
+        assert!(
+            !joined.contains("| Step |"),
+            "the table's own row must not reach the screen: {joined}"
+        );
+        assert!(joined.contains("Step"), "the header is drawn: {joined}");
+        assert!(
+            out.iter().any(|line| line.contains('█')),
+            "the chart is drawn under it: {joined}"
+        );
+        assert!(
+            out.iter().all(|line| visible_width(line) <= 60),
+            "every row fits the pane: {joined}"
+        );
     }
 }
