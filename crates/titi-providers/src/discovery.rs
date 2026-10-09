@@ -385,6 +385,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_server_is_neither_auth_nor_status() {
         let fetch = MockFetch::new(vec![Err(TransportError::Retryable {
+            retry_after: None,
             status: None,
             message: "request failed: connection refused".into(),
         })]);
@@ -405,6 +406,7 @@ mod tests {
     #[tokio::test]
     async fn a_transport_error_carrying_401_is_still_an_auth_error() {
         let fetch = MockFetch::new(vec![Err(TransportError::Fatal {
+            context_too_long: false,
             status: Some(401),
             message: "unauthorized".into(),
         })]);
