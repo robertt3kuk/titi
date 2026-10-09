@@ -4863,14 +4863,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if roster_h > 0 {
         frame.render_widget(roster(chat, &theme), cols[1]);
     }
-    let (body, photos, links) = if chat.lines.is_empty() {
-        (
+    // A focused agent's pane replaces the transcript body: its own text, which
+    // the engine streamed as `AgentProgress` and which never entered the
+    // parent's transcript.
+    let (body, photos, links) = match chat.focused_agent() {
+        Some(agent) => (
+            agent_pane(agent, cols[2].width, cols[2].height, &theme),
+            Vec::new(),
+            Vec::new(),
+        ),
+        None if chat.lines.is_empty() => (
             empty_state(chat, cols[2].width, cols[2].height, &theme),
             Vec::new(),
             Vec::new(),
-        )
-    } else {
-        transcript(chat, cols[2].width, cols[2].height, &theme)
+        ),
+        None => transcript(chat, cols[2].width, cols[2].height, &theme),
     };
     chat.transcript_top = cols[2].y;
     frame.render_widget(body, cols[2]);
@@ -4997,6 +5004,65 @@ fn pinned(chat: &Chat, theme: &Theme) -> Paragraph<'static> {
             format!("  … {hidden} more"),
             fg(theme, ThemeColor::Dim),
         )));
+    }
+    Paragraph::new(lines).style(page(theme))
+}
+
+/// The pane a focused agent has: its header, what it is doing, and the answer
+/// it has streamed so far.
+///
+/// This is the agent's text as the engine sent it — `AgentProgress` goes here
+/// and never into the parent's transcript, so a subagent's answer cannot be
+/// mistaken for the model's. The body follows the tail: the last rows of a long
+/// answer are what a reader watching it wants.
+fn agent_pane(agent: &PinnedAgent, width: u16, height: u16, theme: &Theme) -> Paragraph<'static> {
+    let elapsed = Instant::now().saturating_duration_since(agent.since);
+    let status = match agent.status {
+        titi_engine::AgentStatus::Running => "running".to_owned(),
+        other => format!("{other:?}").to_lowercase(),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", agent_glyph(agent.status, elapsed)),
+                fg(theme, agent_color(agent.status)),
+            ),
+            Span::styled(
+                format!(
+                    "agent {} · {status} · {:.1}s",
+                    agent.name,
+                    elapsed.as_secs_f64()
+                ),
+                fg(theme, ThemeColor::Accent),
+            ),
+        ]),
+        Line::from(Span::styled(
+            match agent.preview() {
+                Some(activity) => format!("  {activity}"),
+                None => "  (nothing yet)".to_owned(),
+            },
+            fg(theme, ThemeColor::Dim),
+        )),
+        Line::from(""),
+    ];
+    let room = (width as usize).saturating_sub(4).max(8);
+    let answer = agent.answer.trim();
+    if answer.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  waiting for its first words",
+            fg(theme, ThemeColor::Dim),
+        )));
+    } else {
+        let rows = wrap_plain(answer, room);
+        // The tail: the header takes three rows, so a long answer keeps its
+        // last ones on screen rather than its first.
+        let keep = (height as usize).saturating_sub(lines.len() + 1).max(1);
+        for row in rows.iter().skip(rows.len().saturating_sub(keep)) {
+            lines.push(Line::from(Span::styled(
+                row.clone(),
+                fg(theme, ThemeColor::Text),
+            )));
+        }
     }
     Paragraph::new(lines).style(page(theme))
 }
@@ -16805,13 +16871,46 @@ mod tests {
         assert_eq!(focus_of(&applied).as_deref(), Some("alpha"));
         assert_eq!(chat.agents.len(), 2);
         assert!(chat.focused_agent().is_some());
-        // The marker itself is drawn in
-        // `the_strip_lists_live_agents_and_they_leave_in_any_order`, where the
-        // strip's own frame is the subject.
+        // The pane: the agent's own header, its state, and — because it has
+        // said nothing yet — that it has said nothing yet.
+        let head = |rows: &[String]| rows.iter().take(6).cloned().collect::<Vec<_>>();
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("agent alpha · running")),
+            "the pane's header: {:#?}",
+            head(&frame)
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("waiting for its first words")),
+            "and its empty body says so: {:#?}",
+            head(&frame)
+        );
+        assert!(
+            !frame.iter().any(|row| row.contains("subagents (")),
+            "the transcript is not the body while a pane has it: {:#?}",
+            head(&frame)
+        );
 
         let applied = chat.on_key(Key::AltA, Instant::now());
         assert_eq!(focus_of(&applied).as_deref(), Some("beta"));
         assert_eq!(chat.agent_focus.as_deref(), Some("beta"));
+        let frame = frame_rows(&mut chat, 80, 24);
+        assert!(
+            frame.iter().any(|row| row.contains("agent beta · running")),
+            "the next agent's pane: {:#?}",
+            head(&frame)
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.contains("the second agent's answer")),
+            "the pane is its own streamed text: {:#?}",
+            head(&frame)
+        );
 
         // Round to the main turn: the screen's own move, and no command.
         let applied = chat.on_key(Key::AltA, Instant::now());
