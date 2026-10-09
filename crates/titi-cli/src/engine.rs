@@ -477,13 +477,18 @@ pub fn merge_registry_config(
             base.providers.push(provider);
         }
     }
-    for model in overlay.models {
-        if let Some(existing) = base.models.iter_mut().find(|item| item.id == model.id) {
-            *existing = model;
-        } else {
-            base.models.push(model);
+    // The user's own models lead the catalog. A config that declares a model
+    // means that model, and a builtin sitting in front of it would be the one
+    // the session runs on — and, through `agent_model`, the one a subagent
+    // asks for, which is how a one-provider config ends up with a subagent
+    // asking for an id the user never declared.
+    let mut models = overlay.models;
+    for model in base.models {
+        if !models.iter().any(|item| item.id == model.id) {
+            models.push(model);
         }
     }
+    base.models = models;
     base
 }
 
