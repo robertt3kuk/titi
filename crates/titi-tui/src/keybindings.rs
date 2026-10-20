@@ -156,7 +156,7 @@ pub const TUI_KEYBINDINGS: &[(&str, KeybindingDefinition)] = &[
         "tui.editor.deleteToLineEnd",
         KeybindingDefinition {
             default_keys: &["ctrl+k"],
-            description: "Delete to line end",
+            description: "Open the command palette on an empty draft; otherwise delete to end",
         },
     ),
     (
@@ -336,7 +336,7 @@ pub const APP_KEYBINDINGS: &[(&str, KeybindingDefinition)] = &[
         "app.thinking.cycle",
         KeybindingDefinition {
             default_keys: &["shift+tab"],
-            description: "Cycle thinking level",
+            description: "Cycle the session mode: agent, plan, duck",
         },
     ),
     (
