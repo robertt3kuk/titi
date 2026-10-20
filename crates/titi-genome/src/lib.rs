@@ -355,7 +355,7 @@ impl Genome {
     }
 
     /// [`Self::refresh_urgent`] over a listing the caller already took.
-    fn refresh_listed(
+    pub(crate) fn refresh_listed(
         &mut self,
         root: &Path,
         listed: &[scan::ListedFile],
@@ -392,6 +392,20 @@ impl Genome {
             reresolved,
             walked: true,
         }
+    }
+
+    /// Whether a refresh over `listed` would change nothing: the same root,
+    /// the same set of paths, no open buffer, and every file passing the
+    /// metadata gate. Answers from `&self`, so a caller can ask before it
+    /// pays for a private copy to update.
+    pub(crate) fn is_current(&self, root: &Path, listed: &[scan::ListedFile]) -> bool {
+        if self.root != root || !self.overlay.is_empty() || listed.len() != self.files.len() {
+            return false;
+        }
+        // Every listed file has a record (a file without one is stale), so
+        // equal counts of distinct paths mean no record is left over.
+        let distinct: HashSet<&str> = listed.iter().map(|file| file.path.as_str()).collect();
+        distinct.len() == self.files.len() && listed.iter().all(|file| !self.is_stale(file))
     }
 
     /// Fold exactly `paths` into the index, without walking.

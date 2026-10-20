@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- The per-turn check for files changed behind the code map's back is about half as expensive when nothing changed (3.6 ms instead of 6.6 ms on titi's tree, 11 ms instead of 23 ms on 5,000 files): the map is no longer copied just to be replaced by an identical one.
+
 - `grep` reads and matches files on all cores. The answer is byte for byte what it was (path order, the same 500-line cap and "more matches" count), but a search of 5,000 files takes about 53 ms instead of 94 ms and one of titi's own tree about 8 ms instead of 18 ms.
 
 - Every finished turn's footer row now ends with `copy · fork`, right-aligned and dim. A click on `copy` puts that turn's answer on the clipboard (every round of the turn's text, through the OS clipboard writer, or OSC 52 when there is none — the route a copy-by-selection takes); a click on `fork` starts a new session from the conversation as it stood at the end of that turn, and says so when the turn is the newest one (the whole session) or cannot be placed in the session file (the whole session too, with the reason). A footer too narrow to hold the actions beside its text, or one that wraps, draws without them. `/copy [n]` does the same copy from the keyboard — the newest answer, or the nth-last — and works with mouse reporting off.

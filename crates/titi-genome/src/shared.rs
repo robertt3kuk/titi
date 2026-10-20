@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{Genome, RefreshStats};
+use crate::{Genome, RefreshStats, scan};
 
 /// A [`Genome`] published as one value.
 ///
@@ -104,7 +104,27 @@ impl SharedGenome {
         root: impl AsRef<Path>,
         urgent: &[String],
     ) -> std::io::Result<RefreshStats> {
-        self.update(|genome| genome.refresh_urgent(root, urgent))
+        let root = root.as_ref();
+        let _sole_writer = self.writer.lock().expect("genome writer lock poisoned");
+        let listed = scan::list_files(root)?;
+        let current = self.snapshot();
+        // The common walk finds nothing: the copy, the publish and the swap
+        // of a graph for an identical one are skipped, and a reader's
+        // snapshot stays the current graph. [`Self::generation`] counts
+        // publishes, so it does not move either.
+        if current.is_current(root, &listed) {
+            let stats = RefreshStats {
+                total: current.files.len(),
+                walked: true,
+                ..RefreshStats::default()
+            };
+            self.record(stats);
+            return Ok(stats);
+        }
+        let mut next = (*current).clone();
+        let stats = next.refresh_listed(root, &listed, urgent);
+        self.publish(next, stats);
+        Ok(stats)
     }
 
     /// Run a targeted update — see [`Genome::apply_changes`] — and publish it.
@@ -127,10 +147,15 @@ impl SharedGenome {
         let _sole_writer = self.writer.lock().expect("genome writer lock poisoned");
         let mut next = (*self.snapshot()).clone();
         let stats = work(&mut next)?;
+        self.publish(next, stats);
+        Ok(stats)
+    }
+
+    /// Store `next` as the published graph and count it.
+    fn publish(&self, next: Genome, stats: RefreshStats) {
         *self.state.write().expect("genome lock poisoned") = Arc::new(next);
         self.generation.fetch_add(1, Ordering::Release);
         self.record(stats);
-        Ok(stats)
     }
 
     /// How many times this handle has published. Monotonic; `0` on a handle
@@ -179,6 +204,7 @@ impl SharedGenome {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
 
@@ -189,6 +215,97 @@ mod tests {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    /// Backdate a file past the racy-timestamp window, so the walk trusts its
+    /// metadata the way it does for a tree that has settled.
+    fn settle(root: &std::path::Path, rel: &str, age: std::time::Duration) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(rel))
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// A walk that finds nothing stale has nothing to publish: the graph is
+    /// not copied, the generation does not move and a reader's snapshot is
+    /// still the current one — while the update is still reported.
+    #[test]
+    fn a_refresh_that_finds_nothing_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hour = std::time::Duration::from_secs(3600);
+        write(root, "src/a.rs", "pub fn a() {}\n");
+        write(root, "src/b.rs", "pub fn b() { a(); }\n");
+        settle(root, "src/a.rs", hour);
+        settle(root, "src/b.rs", hour);
+
+        let live = SharedGenome::index(root).unwrap();
+        let before = live.snapshot();
+        let generation = live.generation();
+
+        let stats = live.refresh(root).unwrap();
+        assert!(stats.walked, "{stats:?}");
+        assert_eq!(
+            (stats.parsed, stats.removed, stats.content_unchanged),
+            (0, 0, 0)
+        );
+        assert!(!stats.graph_recomputed);
+        assert_eq!(stats.total, 2);
+        assert_eq!(live.last_stats(), Some(stats));
+        assert_eq!(live.generation(), generation, "nothing was published");
+        assert!(
+            Arc::ptr_eq(&before, &live.snapshot()),
+            "the graph readers hold was replaced by a copy of itself"
+        );
+    }
+
+    /// Whatever a walk does find still goes through a copy and a publish: an
+    /// edit, a new file, a removal, and the first walk of a root.
+    #[test]
+    fn a_refresh_that_finds_something_still_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hour = std::time::Duration::from_secs(3600);
+        write(root, "src/a.rs", "pub fn a() {}\n");
+        settle(root, "src/a.rs", hour);
+        let live = SharedGenome::index(root).unwrap();
+
+        let mut expect = live.generation();
+        let mut step = |what: &str| {
+            let before = live.snapshot();
+            let stats = live.refresh(root).unwrap();
+            expect += 1;
+            assert_eq!(live.generation(), expect, "{what}: {stats:?}");
+            assert!(!Arc::ptr_eq(&before, &live.snapshot()), "{what}");
+            stats
+        };
+
+        write(root, "src/a.rs", "pub fn a() {}\npub fn a2() {}\n");
+        settle(root, "src/a.rs", hour / 2);
+        assert_eq!(step("an edit").parsed, 1);
+        assert!(
+            live.snapshot().files["src/a.rs"]
+                .exports
+                .contains(&"a2".to_owned())
+        );
+
+        write(root, "src/new.rs", "pub fn fresh() {}\n");
+        settle(root, "src/new.rs", hour);
+        assert_eq!(step("a new file").parsed, 1);
+        assert!(live.snapshot().files.contains_key("src/new.rs"));
+
+        std::fs::remove_file(root.join("src/new.rs")).unwrap();
+        assert_eq!(step("a removal").removed, 1);
+        assert!(!live.snapshot().files.contains_key("src/new.rs"));
+
+        // A handle that never indexed has no root: its first walk publishes
+        // even over a tree with no source files in it.
+        let empty = tempfile::tempdir().unwrap();
+        let fresh = SharedGenome::new();
+        fresh.refresh(empty.path()).unwrap();
+        assert_eq!(fresh.generation(), 1);
     }
 
     /// The invariant a half-updated graph breaks: the three per-path maps are
