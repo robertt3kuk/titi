@@ -60,8 +60,13 @@ pub(crate) struct Mention<'a> {
 }
 
 /// The mention the caret sits in: a whitespace-delimited word that *starts*
-/// with `@`. `a@b` is an address and not a mention, and a space ends one.
+/// with `@`. `a@b` is an address and not a mention, and a space ends one. A
+/// slash-command line has none: its words are the command's own arguments
+/// (`/switch @review` names a role) and it is never sent with attachments.
 pub(crate) fn mention_at(input: &str, caret: usize) -> Option<Mention<'_>> {
+    if input.trim_start().starts_with('/') {
+        return None;
+    }
     let head = input.get(..caret.min(input.len()))?;
     let start = head
         .char_indices()

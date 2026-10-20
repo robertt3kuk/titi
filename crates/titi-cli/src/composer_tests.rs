@@ -95,6 +95,20 @@ fn an_at_opens_a_mention_only_at_a_word_start() {
     );
 }
 
+#[test]
+fn a_slash_command_line_never_opens_a_mention() {
+    // `/switch @review` names a model role, and a slash line is never sent
+    // with attachments, so a file picker there could only hijack its Enter.
+    let at = |input: &str| mention_at(input, input.len()).map(|m| m.start);
+    assert_eq!(at("/switch @review"), None);
+    assert_eq!(at("  /model @fast"), None);
+    assert_eq!(
+        at("run /tui-smoke on @README"),
+        Some(18),
+        "a skill mid-sentence is a prompt"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Ranking and the file list
 // ---------------------------------------------------------------------------
