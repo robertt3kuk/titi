@@ -558,20 +558,44 @@ pub(crate) fn picker_rows(chat: &Chat) -> Vec<PickRow> {
     let mut rows = Vec::new();
     if chat.input[..token.start].trim().is_empty() {
         rows.extend(
-            COMMANDS
-                .iter()
-                .filter(|command| command.name.starts_with(token.prefix))
-                .map(PickRow::Command),
+            rank_names(token.prefix, COMMANDS.iter().map(|command| command.name))
+                .into_iter()
+                .map(|at| PickRow::Command(&COMMANDS[at])),
         );
     }
     rows.extend(
-        chat.skills
-            .iter()
-            .enumerate()
-            .filter(|(_, skill)| skill.name.starts_with(token.prefix))
-            .map(|(index, _)| PickRow::Skill(index)),
+        rank_names(
+            token.prefix,
+            chat.skills.iter().map(|skill| skill.name.as_str()),
+        )
+        .into_iter()
+        .map(PickRow::Skill),
     );
     rows
+}
+
+/// Which of `names` the typed `prefix` keeps, best first: the name itself,
+/// then the names it starts, in the list's order, then — from two characters,
+/// because one letter matches nearly everything — the names it is a
+/// [`fuzzy_score`] subsequence of (`ctx` finds `context`), best score first.
+fn rank_names<'a>(prefix: &str, names: impl Iterator<Item = &'a str>) -> Vec<usize> {
+    let fuzzy = prefix.chars().count() >= 2;
+    let mut kept: Vec<(u8, i32, usize)> = names
+        .enumerate()
+        .filter_map(|(at, name)| {
+            if name == prefix {
+                Some((0, 0, at))
+            } else if name.starts_with(prefix) {
+                Some((1, 0, at))
+            } else if fuzzy {
+                fuzzy_score(prefix, name).map(|score| (2, -score, at))
+            } else {
+                None
+            }
+        })
+        .collect();
+    kept.sort_unstable();
+    kept.into_iter().map(|(_, _, at)| at).collect()
 }
 
 /// The most lines the picker above the composer may take: what is left of
@@ -1663,6 +1687,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     if chat.emoji_picker.is_visible() {
         return Some(emoji_panel(chat, total));
     }
+    if chat.compose.mention.is_visible() {
+        return Some(mention_panel(chat, total, width));
+    }
     if chat.history_picker.is_some() {
         return Some(history_panel(chat, total));
     }
@@ -2154,6 +2181,36 @@ fn login_panel(chat: &Chat, total: u16) -> PanelView {
     panel_view(None, lines, chat.login_picker, panel_body(total))
 }
 
+/// The `@file` picker: the workspace files the word matches, a path per row —
+/// cut from the front when it is too wide, because the file's name is the end.
+fn mention_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
+    let state = &chat.compose.mention;
+    let Some(picker) = state.picker.as_ref() else {
+        return panel_view(None, Vec::new(), None, panel_body(total));
+    };
+    let room = panel_label_room(width);
+    let lines: Vec<PanelLine> = picker
+        .matches
+        .iter()
+        .filter_map(|at| state.path_at(*at))
+        .map(|path| PanelLine::Row {
+            text: crate::composer::fit_tail(path, room),
+            accent: false,
+        })
+        .collect();
+    let title = if picker.query.is_empty() {
+        format!("files · {}", state.file_count())
+    } else {
+        format!(
+            "files · {} of {} · @{}",
+            lines.len(),
+            state.file_count(),
+            picker.query
+        )
+    };
+    panel_view(Some(title), lines, Some(picker.selected), panel_body(total))
+}
+
 /// The emoji suggestion picker: `:query` typed at the caret, one row per
 /// matching shortcode with its glyph. The rows are plain text, not the
 /// picker's pre-styled `item_rows` — the live host paints its own buffer, so
@@ -2436,27 +2493,45 @@ impl Chat {
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.emoji_picker.is_visible()
+            || self.compose.mention.is_visible()
             || self.picking()
     }
 
-    /// The prompts this session carried, newest first.
+    /// The prompts this session carried, newest first, as typed: the files
+    /// an `@path` attached are not part of them.
     fn prompt_history(&self) -> Vec<String> {
         let mut prompts: Vec<String> =
             crate::session_fs::session_history(&self.agent_dir, &self.session_id)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|message| message.role == titi_providers::Role::User)
-                .map(|message| message.content.to_string())
+                .map(|message| crate::history_nav::typed(&message.content).to_owned())
                 .filter(|text| !text.trim().is_empty())
                 .collect();
         prompts.reverse();
         prompts
     }
 
-    /// Ctrl+R, or ↑ at an empty composer: browse the prompts this session has
-    /// carried. An empty history says so instead of opening an empty panel.
+    /// What ↑ and Ctrl+R walk: this session's prompts, then the ones this
+    /// project's earlier sessions carried (read once per run), newest first.
+    pub(crate) fn history_entries(&mut self) -> Vec<String> {
+        let earlier = match self.compose.project_prompts.take() {
+            Some(earlier) => earlier,
+            None => crate::history_nav::project_prompts(
+                &self.agent_dir,
+                &self.workspace,
+                &self.session_id,
+            ),
+        };
+        let entries = crate::history_nav::merged(self.prompt_history(), &earlier);
+        self.compose.project_prompts = Some(earlier);
+        entries
+    }
+
+    /// Ctrl+R: browse the prompts this project has carried. An empty history
+    /// says so instead of opening an empty panel.
     pub(crate) fn open_history(&mut self) -> Applied {
-        let entries = self.prompt_history();
+        let entries = self.history_entries();
         if entries.is_empty() {
             self.push(
                 LineKind::Note,
@@ -2602,15 +2677,18 @@ impl Chat {
         self.picker = 0;
     }
 
-    /// Open or close the emoji picker to match the trailing `:query` under the
-    /// caret. It opens on 2+ name characters with at least one match, and a
-    /// slash list already up keeps it shut, so the two never show at once.
+    /// Open or close the pickers that follow the word under the caret. The
+    /// `@file` one first (see [`Chat::sync_mention_picker`]); then the emoji
+    /// picker, which opens on a trailing `:query` of 2+ name characters with at
+    /// least one match. A slash list already up keeps both shut, and the two
+    /// word pickers never show at once.
     pub(crate) fn sync_emoji_picker(&mut self) {
+        self.sync_mention_picker();
         // The query is the `:word` just before the caret, not at the end of
         // the draft: an emoji can be named mid-sentence.
         let query = titi_tui::emoji::trailing_query(&self.input[..self.caret()])
             .filter(|query| query.chars().count() >= 2)
-            .filter(|_| !self.picking())
+            .filter(|_| !self.picking() && !self.compose.mention.is_visible())
             .map(str::to_owned);
         match query {
             Some(query) => {
@@ -2621,6 +2699,70 @@ impl Chat {
             }
             None => self.emoji_picker.hide(),
         }
+    }
+
+    /// Follow the `@word` under the caret: the picker opens at a word-initial
+    /// `@` that some workspace file matches, narrows as the word grows and
+    /// closes when the word is gone. Questions, logins and approvals own the
+    /// composer, and the slash list owns a `/` word, so none of them sees it.
+    pub(crate) fn sync_mention_picker(&mut self) {
+        let free = self.login_for.is_none()
+            && self.pending_ask.is_none()
+            && self.approval.is_none()
+            && !self.picking();
+        let caret = self.caret();
+        let token = free
+            .then(|| crate::mention::mention_at(&self.input, caret))
+            .flatten();
+        let workspace = &self.workspace;
+        self.compose
+            .mention
+            .sync(token, || crate::mention::list_workspace_files(workspace));
+    }
+
+    /// The `@file` picker's own keys: the arrows move, Tab or Enter inserts the
+    /// highlighted path, Esc closes and leaves the text. Anything else is the
+    /// draft's (`None`).
+    pub(crate) fn mention_key(&mut self, key: Key) -> Option<Applied> {
+        match key {
+            Key::Up => self.compose.mention.move_selection(-1),
+            Key::Down => self.compose.mention.move_selection(1),
+            Key::Tab | Key::Enter => self.accept_mention(),
+            Key::Esc => {
+                self.compose.mention.dismiss();
+                self.disarm();
+            }
+            _ => return None,
+        }
+        Some(Applied::none())
+    }
+
+    /// Replace the `@query` under the caret with `@path` and a space — the
+    /// space is what closes the picker, since the caret is then past the word.
+    fn accept_mention(&mut self) {
+        let Some(path) = self.compose.mention.selected_path().map(str::to_owned) else {
+            return;
+        };
+        let caret = self.caret();
+        let Some(start) = crate::mention::mention_at(&self.input, caret).map(|token| token.start)
+        else {
+            return;
+        };
+        // A space that is already there is stepped over, not doubled.
+        let skip = self.input[caret..]
+            .chars()
+            .next()
+            .filter(|ch| ch.is_whitespace())
+            .map_or(0, char::len_utf8);
+        let insert = if skip > 0 {
+            format!("@{path}")
+        } else {
+            format!("@{path} ")
+        };
+        self.input.replace_range(start..caret, &insert);
+        self.set_caret(start + insert.len() + skip);
+        self.picker = 0;
+        self.sync_emoji_picker();
     }
 
     /// Typing while the emoji picker is up. Arrows move, Tab or Enter takes the

@@ -5940,6 +5940,8 @@ fn hotkey_spelling(key: Key) -> Option<&'static str> {
         Key::AltM => "alt+m",
         Key::AltF => "alt+f",
         Key::AltA => "alt+a",
+        Key::AltS => "alt+s",
+        Key::AltP => "alt+p",
         // Neither half-page key can be pressed any more: the crate's table
         // gives ctrl+u to the caret's own delete and ctrl+d to quit, and
         // `map_key` reaches the half-page arms after both.
@@ -10083,9 +10085,9 @@ fn ask(chat: &mut Chat, log: &Option<SessionLog>, prompt: &str) {
     record(chat, log, applied.log);
 }
 
-/// ↑ at an empty composer opens the browser over the session's own prompts,
-/// newest first; a query narrows it; Enter puts the chosen prompt in the
-/// composer and sends nothing; Esc leaves the text alone.
+/// Ctrl+R opens the browser over the project's prompts, newest first; a query
+/// narrows it; Enter puts the chosen prompt in the composer and sends nothing;
+/// Esc leaves the text alone. (↑ recalls in place now: see `composer_tests`.)
 #[test]
 fn the_history_browser_puts_a_past_prompt_in_the_composer_unsent() {
     let (_dir, mut chat) = history_chat();
@@ -10094,8 +10096,8 @@ fn the_history_browser_puts_a_past_prompt_in_the_composer_unsent() {
     ask(&mut chat, &log, "second prompt");
     assert!(chat.input.is_empty(), "a submit clears the composer");
 
-    // ↑ at the empty composer: the browser, not the transcript's scroll.
-    let opened = chat.on_key(Key::Up, Instant::now());
+    // Ctrl+R: the browser.
+    let opened = chat.on_key(Key::CtrlR, Instant::now());
     assert!(opened.effect.is_none(), "opening sends nothing");
     assert!(chat.history_picker.is_some(), "the browser is up");
     let frame = frame_rows(&mut chat, 80, 20).join("\n");

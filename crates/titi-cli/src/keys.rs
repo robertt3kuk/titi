@@ -21,6 +21,8 @@ use titi_tui::selection::Selection;
 use titi_engine::EngineCommand;
 
 use crate::chat::*;
+use crate::draft_stash::{DraftStash, worth_stashing};
+use crate::history_nav::{Held, Recall};
 use crate::pickers::*;
 use crate::transcript::*;
 
@@ -144,6 +146,9 @@ pub(crate) const PASTE_MENU_AFTER: u32 = 100;
 const CTRL_C_HINT: &str = "ctrl-c again to quit";
 const EXIT_HINT: &str = "press Enter again to quit";
 
+/// The note after a draft was put aside, on the hint row.
+const DRAFT_SAVED: &str = "draft saved · alt+p restores";
+
 // ---------------------------------------------------------------------------
 // What `/hotkeys` lists
 // ---------------------------------------------------------------------------
@@ -253,7 +258,7 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     Hotkey {
         group: HotkeyGroup::Composer,
         keys: "esc",
-        what: "clear the draft",
+        what: "clear the draft; a long one is stashed first — alt+p brings it back",
     },
     Hotkey {
         group: HotkeyGroup::Composer,
@@ -264,6 +269,26 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
         group: HotkeyGroup::Composer,
         keys: "paste",
         what: "insert what was pasted; a long paste becomes a marker",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "@",
+        what: "at a word start, pick a workspace file to attach; the prompt carries its text",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "↑ · ↓",
+        what: "recall earlier prompts of this project in place, with the caret on the draft's first line; ↓ ends on the unsent draft",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "alt+s",
+        what: "stash the draft and clear the box",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
+        keys: "alt+p",
+        what: "restore the newest stashed draft; a draft in the box is stashed in its place",
     },
     Hotkey {
         group: HotkeyGroup::Lists,
@@ -308,12 +333,7 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     Hotkey {
         group: HotkeyGroup::Lists,
         keys: "ctrl+r",
-        what: "browse this session's own prompts",
-    },
-    Hotkey {
-        group: HotkeyGroup::Lists,
-        keys: "↑",
-        what: "browse this session's own prompts, from an empty draft",
+        what: "browse and fuzzy-search this project's prompts",
     },
     Hotkey {
         group: HotkeyGroup::Lists,
@@ -333,7 +353,7 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     Hotkey {
         group: HotkeyGroup::Transcript,
         keys: "↑ · ↓",
-        what: "scroll the transcript a row, with text in the draft",
+        what: "scroll the transcript a row — with the caret below the draft's first line, or ↓ with no prompt recalled",
     },
     Hotkey {
         group: HotkeyGroup::Transcript,
@@ -555,6 +575,14 @@ impl Chat {
         if self.history_picker.is_some() {
             return self.history_picker_key(key, now);
         }
+        // The `@file` picker takes the keys that move or choose in it; every
+        // other key is the draft's own, and the sync after an edit keeps the
+        // picker in step with the word.
+        if self.compose.mention.is_visible()
+            && let Some(applied) = self.mention_key(key)
+        {
+            return applied;
+        }
         // The vim keys, when the mode is on: Normal's own vocabulary first —
         // it swallows printable keys — then Insert, which is the composer the
         // screen always had but for Esc. `None` is a key the mode does not
@@ -567,7 +595,18 @@ impl Chat {
                 self.disarm();
                 Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
             }
-            Key::CtrlC => self.arm_quit(now, CTRL_C_HINT),
+            Key::CtrlC => {
+                let applied = self.arm_quit(now, CTRL_C_HINT);
+                if applied.effect == Some(ChatEffect::Quit) {
+                    // Quitting is the other way a draft is lost; it keeps the
+                    // same safety net, silently — there is no screen left to
+                    // note it on.
+                    self.auto_stash_draft(false);
+                }
+                applied
+            }
+            Key::AltS => self.stash_draft(),
+            Key::AltP => self.restore_draft(),
             Key::CtrlR => self.open_history(),
             Key::CtrlX => self.open_session_picker(),
             Key::AltM => {
@@ -738,16 +777,20 @@ impl Chat {
                 Applied::none()
             }
             Key::Esc => self.escape(now),
-            // ↑ at an empty composer is the prompt history's (omp
-            // `app.history.search`); with text in the composer it scrolls the
-            // transcript, as it always has.
-            Key::Up if self.input.is_empty() => self.open_history(),
+            // ↑ with the caret on the draft's first line — or an empty draft —
+            // recalls the previous prompt in place, and ↓ walks forward to the
+            // draft that was there. Anywhere else they scroll the transcript,
+            // as they always have. Ctrl+R is the fuzzy browser.
             Key::Up => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                if !self.recall_older() {
+                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                }
                 Applied::none()
             }
             Key::Down => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                if !self.recall_newer() {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                }
                 Applied::none()
             }
             Key::PageUp => {
@@ -947,6 +990,7 @@ impl Chat {
         self.login_picker = None;
         self.model_picker = None;
         self.emoji_picker.hide();
+        self.compose.mention.sync(None, Vec::new);
         self.picker_hidden = false;
         let body = paste_body(text);
         let lines = body.lines().count();
@@ -1108,6 +1152,7 @@ impl Chat {
         let armed = self.esc_armed.take();
         self.disarm();
         if !self.input.is_empty() {
+            self.auto_stash_draft(true);
             self.clear_input();
             self.picker = 0;
             return Applied::none();
@@ -1117,6 +1162,135 @@ impl Chat {
         }
         self.esc_armed = Some(now);
         Applied::none()
+    }
+
+    /// Save the draft before it is thrown away, when it is worth saving
+    /// ([`worth_stashing`]): Esc says so on the hint row, a quit stays quiet. A
+    /// recalled prompt is not saved — history already has it.
+    pub(crate) fn auto_stash_draft(&mut self, say: bool) {
+        if self.compose.history.browsing(&self.input) {
+            return;
+        }
+        let text = self.expand_pastes(&self.input);
+        if !worth_stashing(&text) {
+            return;
+        }
+        match DraftStash::new(&self.agent_dir, &self.workspace).push(&text) {
+            Ok(()) if say => self.hint = DRAFT_SAVED.to_owned(),
+            Ok(()) => {}
+            Err(error) if say => {
+                self.push(LineKind::Error, format!("draft not saved: {error}"));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Alt+S: put the draft in the project's stash and clear the box. A stash
+    /// that cannot be written leaves the draft where it is.
+    fn stash_draft(&mut self) -> Applied {
+        self.disarm();
+        let text = self.expand_pastes(&self.input);
+        if text.trim().is_empty() {
+            self.hint = "nothing to stash".to_owned();
+            return Applied::none();
+        }
+        match DraftStash::new(&self.agent_dir, &self.workspace).push(&text) {
+            Ok(()) => {
+                self.replace_draft(String::new());
+                self.hint = DRAFT_SAVED.to_owned();
+            }
+            Err(error) => self.push(LineKind::Error, format!("draft not stashed: {error}")),
+        }
+        Applied::none()
+    }
+
+    /// Alt+P: the newest stashed draft comes back into the box. A draft that
+    /// is in the box goes onto the stash in the same write, so restoring
+    /// never loses it.
+    fn restore_draft(&mut self) -> Applied {
+        self.disarm();
+        let current = self.expand_pastes(&self.input);
+        let swapped = !current.trim().is_empty();
+        match DraftStash::new(&self.agent_dir, &self.workspace).take_newest(Some(&current)) {
+            Ok(Some(text)) => {
+                self.replace_draft(text);
+                self.hint = if swapped {
+                    "draft restored · yours is stashed".to_owned()
+                } else {
+                    "draft restored".to_owned()
+                };
+            }
+            Ok(None) => self.hint = "no stashed draft".to_owned(),
+            Err(error) => self.push(LineKind::Error, format!("draft not restored: {error}")),
+        }
+        Applied::none()
+    }
+
+    /// The draft becomes `text`, the caret at its end, every picker following.
+    fn replace_draft(&mut self, text: String) {
+        self.clear_input();
+        self.input = text;
+        self.caret_to_end();
+        self.picker = 0;
+        self.picker_hidden = false;
+        self.sync_emoji_picker();
+    }
+
+    /// ↑: the previous prompt into the draft. `false` leaves the key to the
+    /// transcript's scroll — the caret is below the draft's first line, or
+    /// there is no earlier prompt.
+    fn recall_older(&mut self) -> bool {
+        let browsing = self.compose.history.browsing(&self.input);
+        if !browsing {
+            if self.input[..self.caret()].contains('\n') {
+                return false;
+            }
+            let entries = self.history_entries();
+            if entries.is_empty() {
+                return false;
+            }
+            let held = Held {
+                text: self.input.clone(),
+                pastes: self.pastes.clone(),
+            };
+            self.compose.history.start(entries, held);
+        }
+        // At the oldest prompt the key stays here rather than scrolling.
+        if let Some(text) = self.compose.history.older() {
+            self.show_recalled(text);
+        }
+        true
+    }
+
+    /// ↓ while a recalled prompt is on screen and untouched: the next newer
+    /// one, and after the newest the draft the walk started from.
+    fn recall_newer(&mut self) -> bool {
+        if !self.compose.history.browsing(&self.input) {
+            return false;
+        }
+        match self.compose.history.newer() {
+            Some(Recall::Entry(text)) => self.show_recalled(text),
+            Some(Recall::Draft(held)) => {
+                self.input = held.text;
+                self.pastes = held.pastes;
+                self.caret_to_end();
+                self.picker = 0;
+                self.picker_hidden = false;
+                self.sync_emoji_picker();
+            }
+            None => return false,
+        }
+        true
+    }
+
+    /// A recalled prompt in the box. The command list stays shut for it —
+    /// a prompt that starts with `/` must not make ↑ walk the list instead.
+    fn show_recalled(&mut self, text: String) {
+        self.pastes.clear();
+        self.input = text;
+        self.caret_to_end();
+        self.picker = 0;
+        self.picker_hidden = true;
     }
 
     fn arm_quit(&mut self, now: Instant, hint: &str) -> Applied {
@@ -1289,6 +1463,8 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Char('m') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltM),
         KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltF),
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltA),
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltS),
+        KeyCode::Char('p') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltP),
         KeyCode::Char('r') if control => Some(Key::CtrlR),
         KeyCode::Char('w') if control => Some(Key::DeleteWord),
         // The two ends of the keyboard's own word delete: the macOS chord and

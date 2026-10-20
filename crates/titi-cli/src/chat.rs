@@ -349,6 +349,10 @@ pub enum Key {
     AltF,
     /// The pinned agents: alt+a moves the view through them and back.
     AltA,
+    /// Put the draft aside: alt+s.
+    AltS,
+    /// Bring the newest stashed draft back: alt+p.
+    AltP,
     /// `app.history.search`: ctrl+r.
     CtrlR,
     /// Delete the word before the caret: alt+backspace or ctrl+w.
@@ -861,6 +865,9 @@ pub struct Chat {
     pub(crate) history_picker: Option<HistoryPicker>,
     /// Which transcript sections are drawn, and how: the `/details` state.
     pub(crate) details: Details,
+    /// The `@file` picker, the shell-style prompt walk and the project's
+    /// earlier prompts (`crate::composer_state`).
+    pub(crate) compose: crate::composer_state::ComposerState,
 }
 
 impl Chat {
@@ -978,6 +985,7 @@ impl Chat {
             probe_bytes: None,
             history_picker: None,
             details: Details::new(),
+            compose: crate::composer_state::ComposerState::default(),
         }
     }
 
@@ -1995,6 +2003,7 @@ impl Chat {
         self.input.clear();
         self.pastes.clear();
         self.caret = 0;
+        self.compose.history.reset();
         // A half-typed vim command (`2d`) is about the draft that just went
         // away, so it goes with it.
         if let Some(state) = self.vim.as_mut() {
@@ -2029,7 +2038,11 @@ impl Chat {
         }
         // What the model reads: the markers swapped for the bodies they stand
         // for, so the whole paste is sent while the screen keeps the marker.
-        let text = self.expand_pastes(&draft);
+        let mut text = self.expand_pastes(&draft);
+        // Typed `@path`s that name workspace files travel with the prompt; the
+        // screen keeps only the `@path`.
+        let attached = crate::mention::attach(&self.workspace, &draft);
+        text.push_str(&attached.block);
         self.clear_input();
         self.disarm();
         // A message sent while a turn runs is steering, drawn under the turn
@@ -2040,6 +2053,9 @@ impl Chat {
             LineKind::User
         };
         self.push(kind, draft.clone());
+        for note in attached.notes {
+            self.push(LineKind::Note, note);
+        }
         let log = Some(LogWrite::text(Role::User, text.clone()));
         if self.turn_active {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
@@ -2749,7 +2765,11 @@ impl Chat {
                 titi_providers::Role::Assistant => LineKind::Assistant,
                 titi_providers::Role::System | titi_providers::Role::Tool => continue,
             };
-            let text = message.content.trim();
+            let text = if kind == LineKind::User {
+                crate::mention::without_attachments(&message.content).trim()
+            } else {
+                message.content.trim()
+            };
             if text.is_empty() {
                 continue;
             }
@@ -2797,6 +2817,11 @@ impl Chat {
                 format!("/{}  {}", command.name, command.about),
             );
         }
+        self.push(
+            LineKind::Note,
+            "keys  @file attaches a file · ↑ ↓ recall prompts · alt+s stashes the draft · alt+p restores it · /hotkeys lists them all"
+                .to_owned(),
+        );
         Applied::none()
     }
 
@@ -5866,3 +5891,7 @@ fn record(chat: &mut Chat, session_log: &Option<SessionLog>, write: Option<LogWr
 #[cfg(test)]
 #[path = "chat_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "composer_tests.rs"]
+mod composer_tests;

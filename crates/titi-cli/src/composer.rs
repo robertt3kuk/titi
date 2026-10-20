@@ -141,10 +141,6 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
 }
 
 fn composer_caption(chat: &Chat) -> String {
-    let ctx = match chat.context_percent {
-        Some(percent) => format!("{percent}%  ·  "),
-        None => String::new(),
-    };
     let keys = if let Some(ask) = &chat.pending_ask {
         if ask.answering() {
             "enter sends  ·  esc cancels"
@@ -157,6 +153,8 @@ fn composer_caption(chat: &Chat) -> String {
         }
     } else if chat.approval.is_some() {
         "y allow  ·  n refuse"
+    } else if chat.compose.mention.is_visible() {
+        "↑↓ move  ·  tab inserts  ·  esc closes"
     } else if chat.emoji_picker.is_visible() {
         "↑↓ move  ·  tab takes  ·  esc closes"
     } else if chat.model_picker.is_some() {
@@ -182,7 +180,7 @@ fn composer_caption(chat: &Chat) -> String {
     } else {
         "enter sends  ·  /model  ·  ctrl-c quits"
     };
-    format!("{ctx}{keys}")
+    keys.to_owned()
 }
 
 pub(crate) fn wrap_plain(text: &str, width: usize) -> Vec<String> {

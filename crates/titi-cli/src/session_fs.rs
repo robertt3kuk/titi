@@ -286,7 +286,7 @@ pub fn newest_session_in(
 /// sessions are this project's", so it does not create an index to do it:
 /// `SessionStore::new` would, and an agent directory that has none is
 /// answered from its files alone, which is what the caller falls back to.
-fn ids_in_workspace(
+pub(crate) fn ids_in_workspace(
     agent_dir: &std::path::Path,
     workspace: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {
