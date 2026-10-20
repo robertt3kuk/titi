@@ -814,3 +814,51 @@ async fn neither_shape_is_refused() {
         "and nothing spawned: {events:?}"
     );
 }
+
+/// The schema the model is sent keeps every parameter of the call, with the
+/// sentence that says what it means; trimming the wording for size must not
+/// trim a parameter out. The batch entries are checked too: they are the
+/// shape `tasks` is read in.
+#[tokio::test]
+async fn the_agent_schema_keeps_every_parameter_and_its_description() {
+    let transport = Arc::new(MockTransport::new(vec![MockBody::Events(text("ok"))]));
+    let mut engine = EngineRuntime::start_with_agents_and_tools(
+        EngineConfig::new("primary"),
+        resolver(Arc::clone(&transport) as _),
+        Arc::new(AnsweringRunner),
+        ToolRegistry::new(),
+    );
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    collect_until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    let spec = requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "agent")
+        .expect("the agent tool is offered");
+    assert!(!spec.description.trim().is_empty());
+    let properties = spec.parameters["properties"].as_object().unwrap();
+    let described = |schema: &serde_json::Value| {
+        schema["description"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    for name in ["task", "name", "kind", "tasks", "context"] {
+        let property = properties
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` is no longer a parameter"));
+        assert!(described(property), "`{name}` lost its description");
+    }
+    assert_eq!(properties.len(), 5, "{:?}", properties.keys());
+    let entry = &properties["tasks"]["items"];
+    assert_eq!(entry["required"], serde_json::json!(["task"]));
+    let entry_properties = entry["properties"].as_object().unwrap();
+    for name in ["task", "name", "kind"] {
+        assert!(entry_properties.contains_key(name), "batch entry `{name}`");
+    }
+    assert_eq!(entry_properties.len(), 3);
+}

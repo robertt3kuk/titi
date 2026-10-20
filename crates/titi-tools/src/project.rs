@@ -783,12 +783,12 @@ impl ToolHandler for ProjectTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "project".into(),
-                description: "Run the project's own test, lint, typecheck, build or format \
-                              check, with the command its files imply: Cargo, npm/pnpm/yarn/bun \
-                              (only scripts that exist), Go, Python, or Makefile targets. \
-                              `list` shows what was detected and the exact command per action \
-                              and runs nothing. `check` runs typecheck, lint, then test, each \
-                              reported on its own. A failure leads with the errors."
+                description: "Run the project's test, lint, typecheck, build or format check \
+                              with the command its files imply: Cargo, npm/pnpm/yarn/bun \
+                              (scripts that exist), Go, Python, Makefile. `list` shows what was \
+                              detected and each action's command, running nothing; `check` \
+                              runs typecheck, lint, then test, each reported on its own. A \
+                              failure leads with the errors."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -801,16 +801,15 @@ impl ToolHandler for ProjectTool {
                         },
                         "path": {
                             "type": "string",
-                            "description": "A file or directory in the workspace; the nearest \
-                                            package above it is the one that runs. Default: \
-                                            the workspace root."
+                            "description": "File or directory; the nearest package above it \
+                                            runs. Default: the workspace root."
                         },
                         "filter": {
                             "type": "string",
-                            "description": "Narrows `test` (and the test step of `check`) to \
-                                            tests whose name matches: `cargo test <filter>`, \
-                                            `pytest -k`, `go test -run`, or the test \
-                                            script's own pattern argument."
+                            "description": "Narrows `test` (and `check`'s test step) to \
+                                            matching test names (`cargo test <filter>`, \
+                                            `pytest -k`, `go test -run`, the script's pattern \
+                                            argument)."
                         }
                     },
                     "required": ["action"]

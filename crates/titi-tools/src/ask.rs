@@ -224,14 +224,12 @@ impl ToolHandler for AskTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "ask".into(),
-                description: "Ask the user a question and wait for their answer. Use it when \
-                              the task turns on something only they know — a preference, a \
-                              credential, which of two designs they want — instead of guessing. \
-                              Offer `options` when the choices are enumerable; the user can \
-                              always answer in their own words unless `free_text` is false. \
-                              The turn stops until they answer or cancel it, so ask one thing \
-                              at a time and do not use it to confirm what you can verify \
-                              yourself."
+                description: "Ask the user a question and wait. Use it when the task turns on \
+                              something only they know (a preference, a credential, which of \
+                              two designs) rather than guessing or confirming what you can \
+                              verify. Offer `options` when the choices are enumerable. The \
+                              turn stops until they answer or cancel, so ask one thing at a \
+                              time."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -243,19 +241,18 @@ impl ToolHandler for AskTool {
                         "options": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "The choices, in the order to show them. Omit for a \
+                            "description": "The choices, in display order. Omit for a \
                                             free-text question."
                         },
                         "multi": {
                             "type": "boolean",
-                            "description": "Whether the user may choose more than one option. \
-                                            Default false."
+                            "description": "Allow more than one choice. Default false."
                         },
                         "free_text": {
                             "type": "boolean",
-                            "description": "Whether the user may answer in their own words \
-                                            besides the options. Default true; set false only \
-                                            when the list really is exhaustive."
+                            "description": "Allow free-text answers besides the options. \
+                                            Default true; false only if the options are \
+                                            exhaustive."
                         }
                     },
                     "required": ["question"]

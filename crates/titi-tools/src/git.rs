@@ -95,8 +95,8 @@ impl ToolHandler for GitTool {
                         },
                         "staged": {
                             "type": "boolean",
-                            "description": "diff only: show the staged changes instead of the \
-                                            unstaged ones. Default false."
+                            "description": "diff only: staged changes instead of unstaged. \
+                                            Default false."
                         }
                     },
                     "required": ["op"]

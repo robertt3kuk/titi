@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- The tool descriptions the model is sent every turn are 11% shorter (10.9 KB instead of 12.2 KB, about 340 tokens per request). Only wording that repeated itself or another field went; every parameter and the guidance on when to use each tool stayed, and a test now fails if one is lost.
+
 - The per-turn check for files changed behind the code map's back is about half as expensive when nothing changed (3.6 ms instead of 6.6 ms on titi's tree, 11 ms instead of 23 ms on 5,000 files): the map is no longer copied just to be replaced by an identical one.
 
 - `grep` reads and matches files on all cores. The answer is byte for byte what it was (path order, the same 500-line cap and "more matches" count), but a search of 5,000 files takes about 53 ms instead of 94 ms and one of titi's own tree about 8 ms instead of 18 ms.

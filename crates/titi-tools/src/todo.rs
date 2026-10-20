@@ -140,14 +140,12 @@ impl ToolHandler for TodoTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "todo".into(),
-                description: "A checklist for multi-step work in this session. Use it when a \
-                    task takes three or more steps or the user asks for several things: write \
-                    the whole list before you start, keep exactly one item in_progress, and \
-                    mark each item completed as soon as it is done, not all at the end. Every \
-                    answer shows the list with each item's number. update sets one item's \
-                    status by that number; write replaces the whole list, which is how to add, \
-                    drop or reorder items; view shows it again. Mark an item cancelled when it \
-                    no longer applies. Skip the list for a single quick step."
+                description: "A checklist for multi-step work (three or more steps, or several \
+                    requests): write the whole list first, keep exactly one item in_progress, \
+                    mark each completed as soon as it is done. Every answer shows the list \
+                    with item numbers. `update` sets one item's status by number; `write` \
+                    replaces the list (to add, drop or reorder); `view` shows it. Mark an item \
+                    cancelled when it no longer applies. Skip it for a single step."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -155,16 +153,16 @@ impl ToolHandler for TodoTool {
                         "op": {
                             "type": "string",
                             "enum": ["write", "update", "view"],
-                            "description": "write replaces the list, update sets one item's status, view shows the list."
+                            "description": "What to do with the list."
                         },
                         "items": {
                             "type": "array",
-                            "description": "For write: the whole list in order, at most 50 items.",
+                            "description": "For write: the whole list in order, at most 50.",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "content": { "type": "string", "description": "One short, specific step." },
-                                    "status": { "type": "string", "enum": status, "description": "Defaults to pending." }
+                                    "status": { "type": "string", "enum": status, "description": "Default pending." }
                                 },
                                 "required": ["content"]
                             }

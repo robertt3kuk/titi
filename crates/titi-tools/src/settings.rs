@@ -36,7 +36,7 @@ impl ToolHandler for SettingsTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "settings".into(),
-                description: "Read or write configuration settings. Pass a key to read its current value. Pass key and value to write. Scope can be 'global' or 'project' (defaults to the layer where it is already set, or 'project' if new). Approval, 'privacy', 'providers', 'models' and credentials (keys, tokens, secrets, passwords) are refused.".into(),
+                description: "Read a configuration setting by dotted `key`, or write it with `value`. `scope` is 'global' or 'project' (default: the layer where the key is already set, else 'project'). Approval, privacy, providers, models and credentials (keys, tokens, secrets, passwords) are refused.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

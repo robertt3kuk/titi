@@ -128,20 +128,14 @@ impl ToolHandler for AgentTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "agent".into(),
-                description: "Hand one task to a subagent and wait for its answer, or \
-                              hand several at once with `tasks`. A subagent has its own \
-                              context and its own tool loop, and reports back with what it \
-                              found; the call returns when it finishes, so the next thing \
-                              you say can rely on its answer. Use it for work that would \
-                              flood this context — searching a tree, reading many files, a \
-                              self-contained edit — not for something one tool call already \
-                              answers. To run several agents at once, pass them in one \
-                              call as `tasks`: separate `agent` calls in one response run \
-                              one after another, and a batch runs its children together \
-                              (at most four in flight) and answers with one section per \
-                              child, so use it when the pieces are independent of each \
-                              other. A subagent cannot \
-                              ask you anything and cannot spawn subagents of its own."
+                description: "Hand a task to a subagent and wait for its answer; `tasks` hands \
+                              over several at once. A subagent has its own context and tool \
+                              loop; it cannot ask you or spawn subagents. Use it for work that \
+                              would flood this context (searching a tree, reading many files, \
+                              a self-contained edit), not for what one tool call answers. \
+                              Separate `agent` calls in one response run in turn; a `tasks` \
+                              batch runs together (at most four in flight), one answer section \
+                              per child, so use it for independent pieces."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -149,26 +143,24 @@ impl ToolHandler for AgentTool {
                         "task": {
                             "type": "string",
                             "description": "What the subagent is to do, in full. It cannot \
-                                            see this conversation, so name the files, the \
-                                            goal and what to report back."
+                                            see this conversation: name the files, the goal \
+                                            and what to report back."
                         },
                         "name": {
                             "type": "string",
-                            "description": "Short label for the transcript, e.g. `Scout`. \
-                                            Defaults to `Subagent`."
+                            "description": "Transcript label, e.g. `Scout`. Default `Subagent`."
                         },
                         "kind": {
                             "type": "string",
                             "enum": ["subagent", "advisor"],
                             "description": "`subagent` (default) does the work; `advisor` \
-                                            is for a second opinion on a plan."
+                                            gives a second opinion on a plan."
                         },
                         "tasks": {
                             "type": "array",
-                            "description": "A batch instead of one `task`: each entry is \
-                                            `{task, name?, kind?}`. Exactly one of `task` \
-                                            and `tasks` is required. The children run at \
-                                            once and the answer carries a section per child.",
+                            "description": "A batch instead of `task`: each entry is `{task, \
+                                            name?, kind?}`. Exactly one of `task` and `tasks` \
+                                            is required.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -182,10 +174,9 @@ impl ToolHandler for AgentTool {
                         },
                         "context": {
                             "type": "string",
-                            "description": "A shared briefing for a batch, prepended to \
-                                            every task in `tasks`. It is the place to put \
-                                            the goal and the interfaces the children share, \
-                                            so each `task` need only say its own piece."
+                            "description": "Briefing prepended to every task in `tasks`: the \
+                                            goal and interfaces the children share, so each \
+                                            `task` says only its own piece."
                         }
                     },
                     "additionalProperties": false

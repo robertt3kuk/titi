@@ -383,12 +383,11 @@ impl ToolHandler for ReadFileTool {
             spec: ToolSpec {
                 name: "read".into(),
                 description: format!(
-                    "Read a UTF-8 file from the workspace: the whole file, or a line range \
-                     with offset and limit; a directory lists its entries. A range that \
-                     leaves lines out starts with a `[lines A-B of N]` line. One read \
-                     answers at most {READ_MAX_CHARS} characters, and {READ_MAX_LINES} \
-                     lines without a limit; past that the header says which offset to \
-                     read on from."
+                    "Read a UTF-8 file: the whole file, or `limit` lines from `offset`; a \
+                     directory lists its entries. A range that leaves lines out starts with \
+                     `[lines A-B of N]`. One read answers at most {READ_MAX_CHARS} characters \
+                     and, without a limit, {READ_MAX_LINES} lines; past that the header names \
+                     the offset to continue from."
                 )
                 .into(),
                 parameters: serde_json::json!({
@@ -398,13 +397,12 @@ impl ToolHandler for ReadFileTool {
                         "offset": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "First line to read, 1-based. Default 1."
+                            "description": "First line, 1-based. Default 1."
                         },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "How many lines to read from offset. \
-                                            Default: to the end of the file."
+                            "description": "Lines to read. Default: to the end."
                         }
                     },
                     "required": ["path"]
@@ -539,9 +537,9 @@ impl ToolHandler for EditFileTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "edit".into(),
-                description: "Replace old_string with new_string in a file. old_string must \
-                              match exactly and occur once — include surrounding lines to make it \
-                              unique — or pass replace_all to change every occurrence."
+                description: "Replace `old_string` with `new_string` in a file. `old_string` \
+                              must match exactly and occur once (add surrounding lines to make \
+                              it unique), or pass `replace_all`."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -551,7 +549,7 @@ impl ToolHandler for EditFileTool {
                         "new_string": { "type": "string" },
                         "replace_all": {
                             "type": "boolean",
-                            "description": "Replace every occurrence instead of exactly one."
+                            "description": "Replace every occurrence."
                         }
                     },
                     "required": ["path", "old_string", "new_string"]
@@ -706,12 +704,12 @@ impl ToolHandler for GlobTool {
                 name: "glob".into(),
                 description: format!(
                     "List workspace files matching a glob, sorted, at most \
-                     {GLOB_MAX_RESULTS}. `*` and `?` stay inside one directory, `**/` \
-                     spans any number of directories (none included), `[abc]` is one \
-                     of those characters and `{{rs,toml}}` one of those alternatives. \
-                     Without a `/` the pattern matches the file name in any directory \
-                     (`*.rs`); with one it matches the path from the workspace root \
-                     (`src/**/*.rs`). Text with no wildcard matches any path containing it."
+                     {GLOB_MAX_RESULTS}. `*` and `?` stay in one directory, `**/` spans \
+                     directories (or none), `[abc]` is one of those characters, \
+                     `{{rs,toml}}` one of those alternatives. Without a `/` the pattern \
+                     matches the file name in any directory (`*.rs`); with one, the path from \
+                     the workspace root (`src/**/*.rs`). Text with no wildcard matches any \
+                     path containing it."
                 )
                 .into(),
                 parameters: serde_json::json!({
@@ -719,8 +717,7 @@ impl ToolHandler for GlobTool {
                     "properties": {
                         "pattern": {
                             "type": "string",
-                            "description": "A glob such as `**/*.rs`, `*.{md,toml}` or \
-                                            `crates/*/Cargo.toml`, or plain text."
+                            "description": "A glob (`**/*.rs`, `*.{md,toml}`) or plain text."
                         }
                     },
                     "required": ["pattern"]
@@ -929,10 +926,9 @@ impl ToolHandler for GrepTool {
             spec: ToolSpec {
                 name: "grep".into(),
                 description: format!(
-                    "Search workspace files for lines matching a regular expression \
-                     (Rust regex syntax; a plain word matches itself). Answers \
-                     `path:line:text` in path order, at most {GREP_MAX_MATCHES} lines. \
-                     Credential files and files that are not UTF-8 are skipped."
+                    "Search workspace files for lines matching a regex (Rust syntax; a plain \
+                     word matches itself). Answers `path:line:text` in path order, at most \
+                     {GREP_MAX_MATCHES} lines. Credential and non-UTF-8 files are skipped."
                 )
                 .into(),
                 parameters: serde_json::json!({
@@ -940,23 +936,21 @@ impl ToolHandler for GrepTool {
                     "properties": {
                         "pattern": {
                             "type": "string",
-                            "description": "Regular expression matched against each line. \
-                                            Escape `( ) [ ] { } . * + ? | ^ $ \\` with `\\` \
-                                            to match the character itself."
+                            "description": "Regex per line; escape metacharacters with `\\` to \
+                                            match them literally."
                         },
                         "path": {
                             "type": "string",
-                            "description": "File or directory to search. \
-                                            Default: the workspace."
+                            "description": "File or directory. Default: the workspace."
                         },
                         "glob": {
                             "type": "string",
-                            "description": "Search only files matching this glob, as the \
-                                            glob tool reads it: `*.rs`, `src/**/*.toml`."
+                            "description": "Only files matching this glob (`*.rs`, \
+                                            `src/**/*.toml`), read as the glob tool does."
                         },
                         "ignore_case": {
                             "type": "boolean",
-                            "description": "Match regardless of case. Default false."
+                            "description": "Ignore case. Default false."
                         }
                     },
                     "required": ["pattern"]
@@ -1145,17 +1139,15 @@ impl ToolHandler for BashTool {
                         "command": { "type": "string" },
                         "pty": {
                             "type": "boolean",
-                            "description": "Run under a terminal, so the command sees a tty. \
-                                            Default false: without it output comes back \
-                                            unwrapped and uncoloured."
+                            "description": "Run under a terminal (tty). Default false: output \
+                                            comes back unwrapped and uncoloured."
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Deadline in seconds, 1..3600, default 300. Past it \
-                                            the command and everything it started are killed \
-                                            and the call is an error. Start a server or a \
-                                            watcher in the background (`cmd &`) instead of \
-                                            waiting on it."
+                            "description": "Seconds, 1..3600, default 300; past it the command \
+                                            and everything it started are killed and the call \
+                                            is an error. Run servers and watchers in the \
+                                            background (`cmd &`) instead of waiting."
                         }
                     },
                     "required": ["command"]
