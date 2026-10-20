@@ -47,7 +47,7 @@ fn main() -> std::io::Result<()> {
 }
 
 async fn bench_tree(label: &str, root: &Path, read_path: &str, runs: usize) {
-    let cases: [(&str, &str, Value); 6] = [
+    let cases: [(&str, &str, Value); 8] = [
         ("glob_rs", "glob", json!({"pattern": "**/*.rs"})),
         ("glob_name", "glob", json!({"pattern": "*.toml"})),
         ("grep_rare", "grep", json!({"pattern": "fn_3_10_0\\("})),
@@ -56,6 +56,15 @@ async fn bench_tree(label: &str, root: &Path, read_path: &str, runs: usize) {
             "grep",
             json!({"pattern": "pub (fn|struct)", "glob": "*.rs"}),
         ),
+        // Every file is read and nothing matches: the cost of reading and
+        // matching alone.
+        (
+            "grep_miss",
+            "grep",
+            json!({"pattern": "zz_no_such_text_zz"}),
+        ),
+        // Hits far past the 500-line cap, so the cap logic is on the path.
+        ("grep_dense", "grep", json!({"pattern": "fn|let|use"})),
         (
             "grep_nocase",
             "grep",

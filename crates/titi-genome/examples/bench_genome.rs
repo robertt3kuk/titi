@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use titi_genome::Genome;
+use titi_genome::{Genome, SharedGenome};
 
 /// Prompt-map line budget the engine uses (`genome_limit` default).
 const MAP_LIMIT: usize = 24;
@@ -60,6 +60,14 @@ fn bench_tree(label: &str, root: &Path, runs: usize) -> std::io::Result<()> {
         genome.refresh(root).map(|s| s.parsed).unwrap_or(0)
     });
     emit(&format!("genome.{label}.refresh_noop"), &times, None);
+
+    // The engine's path: a refresh through the publish point, which works on a
+    // private copy of the graph.
+    let shared = SharedGenome::index(root)?;
+    let times = repeat(runs.max(5), || {
+        shared.refresh(root).map(|s| s.parsed).unwrap_or(0)
+    });
+    emit(&format!("genome.{label}.refresh_shared_noop"), &times, None);
 
     // One edited file: a probe file in the tree's root that is rewritten with
     // growing content, so its size changes and the stat gate cannot clear it,
