@@ -350,8 +350,18 @@ impl Genome {
         urgent: &[String],
     ) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
-        self.root = root.to_path_buf();
         let listed = scan::list_files(root)?;
+        Ok(self.refresh_listed(root, &listed, urgent))
+    }
+
+    /// [`Self::refresh_urgent`] over a listing the caller already took.
+    fn refresh_listed(
+        &mut self,
+        root: &Path,
+        listed: &[scan::ListedFile],
+        urgent: &[String],
+    ) -> RefreshStats {
+        self.root = root.to_path_buf();
         // A path with an open buffer is part of the workspace even when it is
         // not on disk yet, so it is kept rather than swept as a removal.
         let known: HashSet<String> = listed
@@ -360,7 +370,7 @@ impl Genome {
             .chain(self.overlay.keys().cloned())
             .collect();
 
-        let absorbed = self.absorb(&listed, &known, urgent);
+        let absorbed = self.absorb(listed, &known, urgent);
         let gone: Vec<String> = self
             .files
             .keys()
@@ -373,7 +383,7 @@ impl Genome {
         let removed = gone.len();
         let graph_recomputed = absorbed.graph_moved || removed > 0;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
-        Ok(RefreshStats {
+        RefreshStats {
             parsed: absorbed.parsed,
             removed,
             total: self.files.len(),
@@ -381,7 +391,7 @@ impl Genome {
             graph_recomputed,
             reresolved,
             walked: true,
-        })
+        }
     }
 
     /// Fold exactly `paths` into the index, without walking.
@@ -519,6 +529,48 @@ impl Genome {
         fs::read_to_string(self.root.join(path)).ok()
     }
 
+    /// Whether `file`, as the walk lists it, has to be read again.
+    fn is_stale(&self, file: &scan::ListedFile) -> bool {
+        // An open buffer is always stale, whatever the clock says: its text is
+        // the file as the editor has it, and the record it has to replace was
+        // parsed from something else.
+        if self.overlay.contains_key(&file.path) {
+            return true;
+        }
+        // A file whose mtime is this fresh is not trusted by its metadata: the
+        // filesystem's timestamp tick can swallow a second write inside it,
+        // leaving size and mtime exactly as they were - the case the content
+        // hash exists to settle, but the hash only runs once the file is read,
+        // and this is the gate in front of that read. git's own index calls
+        // this the racy-timestamp case and re-checks the file; so does this.
+        // The cost is one re-read of whatever was written in the last couple
+        // of seconds, and nothing at all for a settled tree. An mtime in the
+        // future (a skewed clock) is no better: the elapsed age is an error
+        // there, and that is not settled.
+        let settled = file.mtime.elapsed().is_ok_and(|age| age >= RACY_MTIME);
+        if !settled {
+            return true;
+        }
+        let Some(record) = self.files.get(&file.path) else {
+            return true;
+        };
+        if record.size != file.size || record.mtime != file.mtime {
+            return true;
+        }
+        // The metadata matches, and that is still not enough. The file above
+        // is settled *now*; the record may have been taken while it was not.
+        // Sequence that metadata alone loses: write at T, walk at T+0.5 (racy,
+        // so it is read; the record holds mtime T), a second same-length write
+        // at T+0.9 inside the same tick (mtime still T), walk at T+3 - the
+        // file has aged out, size and mtime match, and the second write is
+        // never read by anything again. So the record answers for its own
+        // clock: one taken inside the window is re-read on every walk until it
+        // is replaced by one taken outside it, and the hash then decides
+        // whether anything moved. That is at most one extra read for a file
+        // that was just written, and none for a settled tree.
+        record.mtime + RACY_MTIME > record.read_at
+    }
+
     /// Parse what moved in `listed` and fold it into `files`.
     ///
     /// `known` is every path that exists after this update and feeds import
@@ -541,51 +593,8 @@ impl Genome {
             .filter(|file| !self.files.contains_key(&file.path))
             .map(|file| file.path.clone())
             .collect();
-        let stale: Vec<&scan::ListedFile> = listed
-            .iter()
-            .filter(|file| {
-                // An open buffer is always stale, whatever the clock says: its
-                // text is the file as the editor has it, and the record it has
-                // to replace was parsed from something else.
-                if self.overlay.contains_key(&file.path) {
-                    return true;
-                }
-                // A file whose mtime is this fresh is not trusted by its
-                // metadata: the filesystem's timestamp tick can swallow a
-                // second write inside it, leaving size and mtime exactly as
-                // they were - the case the content hash exists to settle, but
-                // the hash only runs once the file is read, and this is the
-                // gate in front of that read. git's own index calls this the
-                // racy-timestamp case and re-checks the file; so does this.
-                // The cost is one re-read of whatever was written in the last
-                // couple of seconds, and nothing at all for a settled tree.
-                // An mtime in the future (a skewed clock) is no better: the
-                // elapsed age is an error there, and that is not settled.
-                let settled = file.mtime.elapsed().is_ok_and(|age| age >= RACY_MTIME);
-                if !settled {
-                    return true;
-                }
-                let Some(record) = self.files.get(&file.path) else {
-                    return true;
-                };
-                if record.size != file.size || record.mtime != file.mtime {
-                    return true;
-                }
-                // The metadata matches, and that is still not enough. The file
-                // above is settled *now*; the record may have been taken while
-                // it was not. Sequence that metadata alone loses: write at T,
-                // walk at T+0.5 (racy, so it is read; the record holds mtime
-                // T), a second same-length write at T+0.9 inside the same tick
-                // (mtime still T), walk at T+3 - the file has aged out, size
-                // and mtime match, and the second write is never read by
-                // anything again. So the record answers for its own clock: one
-                // taken inside the window is re-read on every walk until it is
-                // replaced by one taken outside it, and the hash then decides
-                // whether anything moved. That is at most one extra read for a
-                // file that was just written, and none for a settled tree.
-                record.mtime + RACY_MTIME > record.read_at
-            })
-            .collect();
+        let stale: Vec<&scan::ListedFile> =
+            listed.iter().filter(|file| self.is_stale(file)).collect();
         let stale = prioritize(stale, urgent);
         let records = parse_batch(&stale, known, &self.files, &self.overlay);
 
