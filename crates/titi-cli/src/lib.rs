@@ -19,6 +19,7 @@ pub mod login;
 pub(crate) mod mention;
 pub(crate) mod mode_cycle;
 pub mod ompcast;
+pub(crate) mod palette;
 pub mod pickers;
 pub mod recap;
 pub mod reveal;

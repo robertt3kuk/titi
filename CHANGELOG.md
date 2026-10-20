@@ -6,6 +6,10 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `ctrl+k` on an empty draft opens a command palette: one fuzzy list of every slash command, the panels (models, themes, sessions, history, tree, status line preset, login) and every setting titi knows by name. Enter runs a command that needs nothing, leaves `/btw ` (and the like) in the composer for the text, opens the panel, or — for a setting — says its value and which config layer it came from and offers its words (`true`/`false`, the status line presets, …) to save to the agent config. A draft with text keeps the readline meaning: `ctrl+k` deletes from the caret to the end.
+
+- Commands that take one of a few words list them. `/theme `, `/details `, `/mouse `, `/genome ` and `/statusline ` (a space after the name) show the choices under the composer with the one in force marked `✓ current`; the list narrows as you type, Tab writes the highlighted word into the draft, the arrows plus Enter pick it, and a command typed out in full is still sent as typed. The palette reaches the same lists.
+
 - `shift+tab` cycles the session mode agent → plan → duck → agent through the same `SetMode` the `/plan`, `/duck` and `/done` commands send, and the composer's top border carries a `─ plan ─` or `─ duck ─` badge while the mode is not agent.
 
 - `titi` opens its first frame about three times sooner in a repo with a code map. The map's first index (a full parse of the tree, about a second of CPU on titi's own repo) used to run before anything was drawn; it now runs in the background, and the first prompt waits for it, so its map is still the whole tree.

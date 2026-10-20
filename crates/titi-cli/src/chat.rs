@@ -351,6 +351,8 @@ pub enum Key {
     AltA,
     /// Put the draft aside: alt+s.
     AltS,
+    /// The command palette on an empty draft, delete-to-end otherwise: ctrl+k.
+    CtrlK,
     /// Step the session mode agent → plan → duck → agent: shift+tab.
     ShiftTab,
     /// Bring the newest stashed draft back: alt+p.
@@ -844,7 +846,7 @@ pub struct Chat {
     pub(crate) transcript_top: u16,
     /// The mouse preset this run has enabled. `/mouse` changes it, and the
     /// way out disables mouse reporting whatever it is.
-    mouse_preset: MousePreset,
+    pub(crate) mouse_preset: MousePreset,
     /// Sequences to write before the next frame, outside ratatui's diff: the
     /// mouse preset switching over, an OSC 11 query, an OSC 52 copy.
     pub(crate) output_flush: String,
@@ -870,6 +872,8 @@ pub struct Chat {
     /// The `@file` picker, the shell-style prompt walk and the project's
     /// earlier prompts (`crate::composer_state`).
     pub(crate) compose: crate::composer_state::ComposerState,
+    /// The Ctrl+K palette and the value lists (`crate::palette`).
+    pub(crate) palette: crate::palette::PaletteState,
 }
 
 impl Chat {
@@ -988,6 +992,7 @@ impl Chat {
             history_picker: None,
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
+            palette: crate::palette::PaletteState::default(),
         }
     }
 
@@ -5897,6 +5902,10 @@ mod tests;
 #[cfg(test)]
 #[path = "composer_tests.rs"]
 mod composer_tests;
+
+#[cfg(test)]
+#[path = "palette_tests.rs"]
+mod palette_tests;
 
 #[cfg(test)]
 #[path = "mode_cycle_tests.rs"]

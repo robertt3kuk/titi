@@ -257,6 +257,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     },
     Hotkey {
         group: HotkeyGroup::Composer,
+        keys: "ctrl+k",
+        what: "open the command palette on an empty draft; with a draft, delete from the caret to the end",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
         keys: "shift+tab",
         what: "cycle the mode: agent, plan, duck, agent — a plan or duck badge shows on the composer",
     },
@@ -577,6 +582,12 @@ impl Chat {
         if self.emoji_picker.is_visible() {
             return self.emoji_picker_key(key, now);
         }
+        if self.palette.values.is_some() {
+            return self.values_key(key, now);
+        }
+        if self.palette.list.is_some() {
+            return self.palette_key(key, now);
+        }
         if self.history_picker.is_some() {
             return self.history_picker_key(key, now);
         }
@@ -593,6 +604,10 @@ impl Chat {
         // screen always had but for Esc. `None` is a key the mode does not
         // own, and it falls through to the match below.
         if let Some(applied) = self.vim_key(key) {
+            return applied;
+        }
+        // The argument list under `/command `: its own arrows, Tab and Esc.
+        if let Some(applied) = self.arg_picker_key(key) {
             return applied;
         }
         match key {
@@ -612,6 +627,7 @@ impl Chat {
             }
             Key::AltS => self.stash_draft(),
             Key::AltP => self.restore_draft(),
+            Key::CtrlK => self.ctrl_k(),
             Key::ShiftTab => self.cycle_mode(),
             Key::CtrlR => self.open_history(),
             Key::CtrlX => self.open_session_picker(),
@@ -1471,6 +1487,7 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltA),
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltS),
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::ALT) => Some(Key::AltP),
+        KeyCode::Char('k') if control => Some(Key::CtrlK),
         KeyCode::Char('r') if control => Some(Key::CtrlR),
         KeyCode::Char('w') if control => Some(Key::DeleteWord),
         // The two ends of the keyboard's own word delete: the macOS chord and

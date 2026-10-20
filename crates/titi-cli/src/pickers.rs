@@ -601,7 +601,7 @@ fn rank_names<'a>(prefix: &str, names: impl Iterator<Item = &'a str>) -> Vec<usi
 /// The most lines the picker above the composer may take: what is left of
 /// the screen after the masthead, one line of conversation and the composer,
 /// capped so a tall window never lets a picker eat the session it sits in.
-fn panel_body(total: u16) -> usize {
+pub(crate) fn panel_body(total: u16) -> usize {
     // Two of the room belongs to the box's rules, so the panel on screen is the
     // same height it was before it had a frame.
     ((total as usize)
@@ -716,7 +716,7 @@ fn panel_slice(len: usize, selected: usize, room: usize) -> PanelWindow {
 }
 
 /// A panel from its lines: the window around the selected line.
-fn panel_view(
+pub(crate) fn panel_view(
     title: Option<String>,
     lines: Vec<PanelLine>,
     selected: Option<usize>,
@@ -1663,6 +1663,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     if chat.paste_menu.is_some() {
         return Some(paste_panel(chat, total));
     }
+    if let Some(view) = crate::palette::palette_view(chat, total) {
+        return Some(view);
+    }
     if chat.theme_picker.is_some() {
         return Some(theme_panel(chat, total));
     }
@@ -2489,10 +2492,12 @@ impl Chat {
             || self.tree_picker.is_some()
             || self.trace_picker.is_some()
             || self.paste_menu.is_some()
+            || self.palette.is_open()
             || self.pending_ask.is_some()
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.emoji_picker.is_visible()
+            || self.arg_rows().is_some()
             || self.compose.mention.is_visible()
             || self.picking()
     }

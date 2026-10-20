@@ -5942,6 +5942,7 @@ fn hotkey_spelling(key: Key) -> Option<&'static str> {
         Key::AltA => "alt+a",
         Key::AltS => "alt+s",
         Key::AltP => "alt+p",
+        Key::CtrlK => "ctrl+k",
         Key::ShiftTab => "shift+tab",
         // Neither half-page key can be pressed any more: the crate's table
         // gives ctrl+u to the caret's own delete and ctrl+d to quit, and
