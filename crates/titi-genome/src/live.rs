@@ -43,7 +43,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -124,6 +124,37 @@ pub struct GenomeHandle {
     tx: Sender<Request>,
     progress: Arc<Progress>,
     worker: Arc<Worker>,
+    ready: Arc<Ready>,
+}
+
+/// Whether the first index has been published. A handle from
+/// [`GenomeHandle::spawn`] is born ready; one from
+/// [`GenomeHandle::spawn_deferred`] opens it when the worker's first walk ends.
+#[derive(Default)]
+struct Ready {
+    done: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Ready {
+    fn open(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.opened.notify_all();
+    }
+
+    fn wait(&self) {
+        let Ok(mut done) = self.done.lock() else {
+            return;
+        };
+        while !*done {
+            match self.opened.wait(done) {
+                Ok(next) => done = next,
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 /// How far the worker is behind what the handle has been asked to do.
@@ -175,6 +206,7 @@ impl Clone for GenomeHandle {
             tx: self.tx.clone(),
             progress: Arc::clone(&self.progress),
             worker: Arc::clone(&self.worker),
+            ready: Arc::clone(&self.ready),
         }
     }
 }
@@ -191,13 +223,63 @@ impl GenomeHandle {
     pub fn spawn(root: impl AsRef<Path>, options: Options) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let genome = SharedGenome::index(&root)?;
+        let ready = Arc::new(Ready::default());
+        ready.open();
+        Self::start(genome, root, options, ready, false)
+    }
+
+    /// Start the worker and let it do the first index, returning at once.
+    ///
+    /// [`Self::spawn`] makes its caller pay for the cold walk, which on a real
+    /// tree is hundreds of milliseconds of parsing in front of whatever the
+    /// caller does next — for a terminal UI, the first frame. This moves that
+    /// walk onto the worker thread; the graph stays complete by *waiting*, not
+    /// by being empty: [`Self::wait_ready`] blocks until the first index is
+    /// published, and a caller that renders a map calls it first, so no one is
+    /// handed a graph with nothing in it.
+    ///
+    /// A `root` that cannot be listed is refused here, as `spawn` refuses it;
+    /// one that vanishes during the walk leaves an empty graph that the next
+    /// resync fills.
+    pub fn spawn_deferred(root: impl AsRef<Path>, options: Options) -> io::Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::read_dir(&root)?;
+        Self::start(
+            SharedGenome::new(),
+            root,
+            options,
+            Arc::new(Ready::default()),
+            true,
+        )
+    }
+
+    /// Blocks until the first index has been published. Immediate for a handle
+    /// from [`Self::spawn`] and for every call after the first walk.
+    pub fn wait_ready(&self) {
+        self.ready.wait();
+    }
+
+    fn start(
+        genome: SharedGenome,
+        root: PathBuf,
+        options: Options,
+        ready: Arc<Ready>,
+        first_index: bool,
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let progress = Arc::new(Progress::default());
         let worker_genome = genome.clone();
         let worker_progress = Arc::clone(&progress);
+        let worker_ready = Arc::clone(&ready);
         let join = thread::Builder::new()
             .name("titi-genome-index".to_owned())
-            .spawn(move || run(rx, root, worker_genome, worker_progress, options))?;
+            .spawn(move || {
+                if first_index {
+                    let _ = worker_genome.refresh(&root);
+                    worker_ready.open();
+                }
+                run(rx, root, worker_genome, worker_progress, options);
+            })?;
         Ok(Self {
             genome,
             tx: tx.clone(),
@@ -206,6 +288,7 @@ impl GenomeHandle {
                 tx,
                 join: Mutex::new(Some(join)),
             }),
+            ready,
         })
     }
 
@@ -817,6 +900,54 @@ mod tests {
         assert!(live.quiesce(Duration::from_secs(5)));
         assert_eq!(live.pending(), 0, "idle again once it answered");
         assert!(live.snapshot().0.files.contains_key("src/one.rs"));
+    }
+
+    /// The first index moves off the caller's thread without a reader ever
+    /// seeing an empty graph: `wait_ready` returns only once the whole tree is
+    /// published, and a request sent before then is folded in behind it.
+    #[test]
+    fn a_deferred_handle_is_whole_once_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        heavy_tree(root, 12);
+        let live = GenomeHandle::spawn_deferred(root, patient()).unwrap();
+
+        live.wait_ready();
+        let (graph, generation) = live.snapshot();
+        assert_eq!(graph.files.len(), 12, "every file is in the first graph");
+        assert!(generation >= 1);
+        assert_eq!(live.pending(), 0);
+
+        write(root, "src/after.rs", "pub fn after() {}\n");
+        assert!(live.request(Request::Changed(vec!["src/after.rs".to_owned()])));
+        assert!(live.quiesce(Duration::from_secs(30)));
+        assert!(live.snapshot().0.files.contains_key("src/after.rs"));
+    }
+
+    /// A request made while the first walk is still running is not lost: the
+    /// worker takes it after the walk, so a waiter is answered with a graph
+    /// that holds both.
+    #[test]
+    fn a_request_sent_before_the_first_index_lands_is_folded_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        heavy_tree(root, 12);
+        let live = GenomeHandle::spawn_deferred(root, patient()).unwrap();
+        write(root, "src/early.rs", "pub fn early() {}\n");
+        assert!(live.request(Request::Changed(vec!["src/early.rs".to_owned()])));
+        assert!(live.quiesce(Duration::from_secs(30)));
+        let files = live.snapshot().0.files.len();
+        assert!(files >= 12, "the first walk landed before the answer");
+        assert!(live.snapshot().0.files.contains_key("src/early.rs"));
+    }
+
+    /// A root that cannot be listed is refused up front, as `spawn` refuses
+    /// it, rather than left as a handle that will never have a graph.
+    #[test]
+    fn a_deferred_handle_refuses_an_unreadable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-here");
+        assert!(GenomeHandle::spawn_deferred(&missing, Options::default()).is_err());
     }
 
     /// While a window is open — the batch accepted, the parse not started —

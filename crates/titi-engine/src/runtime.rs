@@ -171,6 +171,9 @@ async fn genome_map(
     let genome = genome.filter(|_| root.is_some())?.clone();
     let touched = Arc::clone(touched);
     run_off_thread(move || {
+        // The first index runs on the handle's worker; a map rendered before
+        // it lands would be an empty graph, which `pending` cannot describe.
+        genome.wait_ready();
         let touched: Vec<String> = touched.blocking_lock().snapshot();
         let mut urgent = touched.clone();
         urgent.reverse();
@@ -327,6 +330,38 @@ mod tests {
         .expect("a map");
         assert!(!settled.contains("pending="), "{settled}");
         assert!(settled.contains("src_0.rs"), "{settled}");
+    }
+
+    /// A handle whose first index is still running is not an empty map: the
+    /// turn waits for the walk and renders the whole tree.
+    #[tokio::test]
+    async fn a_deferred_index_renders_the_whole_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for index in 0..150 {
+            let mut body = String::new();
+            for line in 0..120 {
+                body.push_str(&format!("    let value_{line} = {line}_u64;\n"));
+            }
+            std::fs::write(
+                root.join(format!("src_{index}.rs")),
+                format!("pub fn f_{index}() {{\n{body}}}\n"),
+            )
+            .unwrap();
+        }
+        let genome =
+            GenomeHandle::spawn_deferred(root, titi_genome::live::Options::default()).unwrap();
+        let map = genome_map(
+            Some(root.to_path_buf()),
+            200,
+            Some(&genome),
+            &TouchedSink::default(),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("a map");
+        assert!(!map.contains("pending="), "{map}");
+        assert_eq!(map.matches("src_").count(), 150, "{map}");
     }
 
     /// No root, no map — the guard the duck mode relies on.
@@ -1126,18 +1161,17 @@ impl EngineRuntime {
         // cache and findings bus, so it cannot write a file the parent holds,
         // its reads warm the parent's cache, and the parent can read what it
         // learned.
-        // The index is built once, here, and its worker started behind it: a
-        // root that cannot be read leaves the session without a map, which is
-        // the same degradation the per-turn refresh already had, and a cold
-        // start is a full walk either way — doing it now rather than inside
-        // the first turn is what lets the first turn's map be a snapshot
-        // instead of a walk. It is built before the subagent runner below so
-        // that runner can fold its own writes in the same way the main turn
-        // does.
-        let genome = config
-            .genome_root
-            .as_ref()
-            .and_then(|root| GenomeHandle::spawn(root, titi_genome::live::Options::default()).ok());
+        // The index is built once, from here, by its worker: a root that cannot
+        // be read leaves the session without a map, which is the same
+        // degradation the per-turn refresh already had. The cold walk runs on
+        // the worker rather than on this thread, because this thread is on the
+        // path to the surface's first frame; `genome_map` waits for it, so the
+        // first turn's map is still a snapshot instead of a walk. The handle
+        // exists before the subagent runner below so that runner can fold its
+        // own writes in the same way the main turn does.
+        let genome = config.genome_root.as_ref().and_then(|root| {
+            GenomeHandle::spawn_deferred(root, titi_genome::live::Options::default()).ok()
+        });
         // The model's questions reach the surface through this door, and the
         // answers come back as commands. Installed here because it is the only
         // place both ends exist at once: the registry that holds the tool, and
