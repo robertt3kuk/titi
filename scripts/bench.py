@@ -307,6 +307,127 @@ def bench_startup(binary, ws, env, runs):
     return out
 
 
+RESUME_PROMPTS = ["markdown table", "hello", "chart table", "latex math", "wide text", "think"]
+
+
+def pty_resume(binary, ws, env, settle=1.5):
+    """`titi --continue` on a 120x40 PTY over a long session: time to the
+    first byte, then to the screen going quiet (the history drawn), then the
+    latency and size of the repaint for ten typed characters and ten PageUps."""
+    rows, cols = 40, 120
+    start = time.perf_counter()
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.chdir(ws)
+        os.execve(binary, [binary, "--continue"], env)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def drain(quiet, limit):
+        """Read until `quiet` seconds pass with no bytes (or `limit` total).
+        Returns (ms to first byte, ms to last byte, bytes)."""
+        began = time.perf_counter()
+        first = last = None
+        size = 0
+        while time.perf_counter() - began < limit:
+            ready, _, _ = select.select([fd], [], [], quiet)
+            if not ready:
+                break
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            now = (time.perf_counter() - began) * 1e3
+            first = now if first is None else first
+            last = now
+            size += len(data)
+        return first, last, size
+
+    # The screen never goes quiet (an animation or spinner repaints), so the
+    # history counts as drawn once a full screen of bytes has arrived.
+    seen = 0
+    first_byte = drawn = None
+    while time.perf_counter() - start < 15 and (drawn is None or time.perf_counter() - start < drawn / 1e3 + settle):
+        ready, _, _ = select.select([fd], [], [], 0.02)
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        now = (time.perf_counter() - start) * 1e3
+        first_byte = now if first_byte is None else first_byte
+        seen += len(data)
+        if drawn is None and seen >= 4000:
+            drawn = now
+    settled = drawn or 0.0
+    first_byte_abs = first_byte or 0.0
+    key_first, key_last, key_bytes = [], [], []
+    for _ in range(10):
+        os.write(fd, b"x")
+        first, last, size = drain(0.05, 5)
+        key_first.append(first or 0.0)
+        key_last.append(last or 0.0)
+        key_bytes.append(size)
+    page_first, page_last, page_bytes = [], [], []
+    for _ in range(10):
+        os.write(fd, b"\x1b[5~")
+        first, last, size = drain(0.05, 5)
+        page_first.append(first or 0.0)
+        page_last.append(last or 0.0)
+        page_bytes.append(size)
+    os.write(fd, b"\x03")
+    os.write(fd, b"\x04")
+    end = time.perf_counter() + 5
+    result = None
+    while time.perf_counter() < end:
+        try:
+            got = os.wait4(pid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if got[0]:
+            result = got[2]
+            break
+        try:
+            select.select([fd], [], [], 0.05)
+            os.read(fd, 65536)
+        except OSError:
+            pass
+    if result is None:
+        os.kill(pid, signal.SIGKILL)
+        result = os.wait4(pid, 0)[2]
+    os.close(fd)
+    row = rusage_row(result)
+    return {
+        "first_byte_ms": first_byte_abs,
+        "history_drawn_ms": settled,
+        "key_repaint_ms": statistics.median(key_last),
+        "key_repaint_bytes": statistics.median(key_bytes),
+        "pageup_repaint_ms": statistics.median(page_last),
+        "pageup_repaint_bytes": statistics.median(page_bytes),
+        **row,
+    }
+
+
+def bench_resume(binary, ws, env, runs, turns):
+    """Build a session of `turns` turns (markdown, tables, maths, wide text) and
+    reopen it in the TUI."""
+    env = dict(env, TITI_NO_GENOME="1")
+    session = Headless(binary, ws, env)
+    session.ready()
+    for i in range(turns):
+        session.turn(f"{RESUME_PROMPTS[i % len(RESUME_PROMPTS)]} {uuid.uuid4().hex[:8]}")
+    session.close()
+    samples = [pty_resume(binary, ws, env) for _ in range(runs)]
+    out = {"turns": turns}
+    for key in samples[0]:
+        out[key] = summarize([s[key] for s in samples])
+    return out
+
+
 class Headless:
     """`titi --headless` on pipes; events arrive on a reader thread."""
 
@@ -525,8 +646,11 @@ def bench_prompt(binary, ws, env, provider):
 
 # ---------------------------------------------------------------- examples
 
+EXAMPLE_DIR = None
+
+
 def bench_example(name, extra):
-    binary = os.path.join(target_dir(), "release", "examples", name)
+    binary = os.path.join(EXAMPLE_DIR or os.path.join(target_dir(), "release", "examples"), name)
     return run_json_lines([binary, *extra], ROOT)
 
 
@@ -585,6 +709,14 @@ def report(results):
     for suite, title in (("genome", "Genome"), ("tools", "Tools"), ("render", "Render")):
         if suite in results:
             out += [f"## {title}", "", example_table(results[suite]), ""]
+    if "resume" in results:
+        r = results["resume"]
+        body = [
+            [key, *[f(r[key][k]) for k in ("n", "min", "median", "p95")]]
+            for key in r
+            if isinstance(r[key], dict)
+        ]
+        out += [f"## Resumed session ({r['turns']} turns, TUI 120x40)", "", table(["case", "n", "min", "median", "p95"], body), ""]
     if "streaming" in results:
         body = []
         for mode in ("genome", "no_genome"):
@@ -636,13 +768,16 @@ def main():
     parser.add_argument("--out", help="write the results as JSON here")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--bin", help="titi binary to measure (default: target/release/titi)")
+    parser.add_argument("--example-dir", help="directory holding the bench_* example binaries (default: target/release/examples)")
     parser.add_argument("--only", help="comma list of suites to run")
     parser.add_argument("--requests", default=DEFAULT_REQUESTS, help="provider request log (read only)")
     parser.add_argument("--agent-template", default="/tmp/titi-qa/run/agent", help="agent dir to copy SOUL.md etc. from")
     args = parser.parse_args()
-    suites = args.only.split(",") if args.only else ["startup", "genome", "tools", "render", "streaming", "prompt"]
+    suites = args.only.split(",") if args.only else ["startup", "genome", "tools", "render", "resume", "streaming", "prompt"]
     runs = 3 if args.quick else 7
 
+    global EXAMPLE_DIR
+    EXAMPLE_DIR = os.path.abspath(args.example_dir) if args.example_dir else None
     cargo = cargo_bin()
     if not args.skip_build:
         build(cargo)
@@ -667,6 +802,9 @@ def main():
         if "startup" in suites:
             log("startup")
             results["startup"] = bench_startup(binary, ws, env, runs)
+        if "resume" in suites:
+            log("resume")
+            results["resume"] = bench_resume(binary, ws, env, max(2, runs // 2), 60 if args.quick else 200)
         if {"streaming", "prompt"} & set(suites):
             provider = Provider(args.requests)
         if "streaming" in suites:
