@@ -39,6 +39,16 @@
 
 Статусы ведутся в [STATE.md](STATE.md) — единая точка возобновления.
 
+## Cross-cutting research (not one of the 20 themes)
+
+- [omp-parity/GAP.md](omp-parity/GAP.md) — what omp has and titi lacks, ranked; per-entry status.
+- [empryo-parity/README.md](empryo-parity/README.md) — ideas from Empryo's public docs, ranked; per-entry status.
+- [perf/README.md](perf/README.md) — `scripts/bench.py` method, baseline, hotspots and measured fixes.
+- [agent-tracing.md](agent-tracing.md) — span model, viewer, engine sink; phases B/C owner-gated.
+- [genome-incremental.md](genome-incremental.md) — Taimyr incremental index; phase 3 (watcher) owner-gated.
+- [prompt-cache.md](prompt-cache.md) — prompt-cache measurements and the open A/B decision.
+- [product-review.md](product-review.md) — product review notes.
+
 ## Граф зависимостей тем
 
 ```mermaid
