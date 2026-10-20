@@ -351,7 +351,7 @@ impl Genome {
     ) -> std::io::Result<RefreshStats> {
         let root = root.as_ref();
         let listed = scan::list_files(root)?;
-        Ok(self.refresh_listed(root, &listed, urgent))
+        Ok(self.refresh_listed(root, &listed, urgent, usize::MAX))
     }
 
     /// [`Self::refresh_urgent`] over a listing the caller already took.
@@ -360,6 +360,7 @@ impl Genome {
         root: &Path,
         listed: &[scan::ListedFile],
         urgent: &[String],
+        max_workers: usize,
     ) -> RefreshStats {
         self.root = root.to_path_buf();
         // A path with an open buffer is part of the workspace even when it is
@@ -370,7 +371,7 @@ impl Genome {
             .chain(self.overlay.keys().cloned())
             .collect();
 
-        let absorbed = self.absorb(listed, &known, urgent);
+        let absorbed = self.absorb(listed, &known, urgent, max_workers);
         let gone: Vec<String> = self
             .files
             .keys()
@@ -459,7 +460,7 @@ impl Genome {
             .chain(listed.iter().map(|file| file.path.clone()))
             .collect();
 
-        let absorbed = self.absorb(&listed, &known, paths);
+        let absorbed = self.absorb(&listed, &known, paths, usize::MAX);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
@@ -505,7 +506,7 @@ impl Genome {
             .chain(std::iter::once(path.to_owned()))
             .collect();
         self.overlay.insert(path.to_owned(), source.to_owned());
-        let absorbed = self.absorb(&[listed], &known, &[path.to_owned()]);
+        let absorbed = self.absorb(&[listed], &known, &[path.to_owned()], usize::MAX);
         let graph_recomputed = absorbed.graph_moved;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
@@ -598,6 +599,7 @@ impl Genome {
         listed: &[scan::ListedFile],
         known: &HashSet<String>,
         urgent: &[String],
+        max_workers: usize,
     ) -> Absorption {
         // Every path this update adds. It is the only way a specifier that
         // named nothing can come to name something — the candidates a specifier
@@ -610,7 +612,7 @@ impl Genome {
         let stale: Vec<&scan::ListedFile> =
             listed.iter().filter(|file| self.is_stale(file)).collect();
         let stale = prioritize(stale, urgent);
-        let records = parse_batch(&stale, known, &self.files, &self.overlay);
+        let records = parse_batch(&stale, known, &self.files, &self.overlay, max_workers);
 
         // A parse can only move the graph by changing the tuple the graph is
         // built from. `exports` and `imports` are compared exactly; `refs` are
@@ -955,6 +957,30 @@ fn prioritize<'a>(
     stale
 }
 
+/// Parse threads for the first walk of a fresh index.
+///
+/// The first walk runs while the surface that started the engine is still
+/// drawing its first frame, and a parse thread per core leaves that thread
+/// competing for a core. On a ten-core host under load the first frame took
+/// 111 ms with every core parsing and 51 ms with two left free, against 34 ms
+/// with no index at all, while the index took no longer (docs/research/perf).
+/// Later walks have no one waiting on a frame and use every core.
+pub(crate) fn first_walk_workers() -> usize {
+    first_walk_workers_for(
+        std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(1),
+    )
+}
+
+/// [`first_walk_workers`] for a host with `cores` cores: two are left free
+/// from eight cores upwards and one below that, and a single parser always
+/// remains.
+fn first_walk_workers_for(cores: usize) -> usize {
+    let free = if cores >= 8 { 2 } else { 1 };
+    cores.saturating_sub(free).max(1)
+}
+
 /// Reads and parses the stale files, spreading them over the available cores.
 ///
 /// Parsing is the only expensive step of a refresh and every file is
@@ -970,10 +996,12 @@ fn parse_batch(
     known: &HashSet<String>,
     previous: &HashMap<String, FileRecord>,
     overlay: &HashMap<String, String>,
+    max_workers: usize,
 ) -> Vec<(FileRecord, bool)> {
     let workers = std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
+        .min(max_workers)
         .min(stale.len());
     if workers <= 1 {
         return stale
@@ -1129,7 +1157,7 @@ mod tests {
 
     use std::collections::{HashMap, HashSet};
 
-    use super::{parse_batch, prioritize, scan};
+    use super::{first_walk_workers_for, parse_batch, prioritize, scan};
 
     fn listed(path: &str) -> scan::ListedFile {
         scan::ListedFile {
@@ -1204,7 +1232,7 @@ mod tests {
         let stale: Vec<&scan::ListedFile> = files.iter().collect();
         let known: HashSet<String> = files.iter().map(|file| file.path.clone()).collect();
 
-        let records = parse_batch(&stale, &known, &HashMap::new(), &HashMap::new());
+        let records = parse_batch(&stale, &known, &HashMap::new(), &HashMap::new(), usize::MAX);
 
         assert_eq!(records.len(), 64);
         for ((record, parsed), file) in records.iter().zip(&files) {
@@ -1221,5 +1249,56 @@ mod tests {
                 record.exports
             );
         }
+    }
+
+    /// The first walk leaves cores to the thread that started it: always at
+    /// least one worker, never all of the cores once there is more than one,
+    /// and two cores kept back from eight upwards, where one is not enough to
+    /// keep a busy host's terminal responsive (see docs/research/perf).
+    #[test]
+    fn the_first_walk_leaves_cores_to_its_starter() {
+        let workers: Vec<usize> = [1, 2, 4, 6, 8, 10, 16]
+            .into_iter()
+            .map(first_walk_workers_for)
+            .collect();
+        assert_eq!(workers, [1, 1, 3, 5, 6, 8, 14]);
+    }
+
+    /// Capping the threads changes how the work is shared, never its result.
+    #[test]
+    fn a_capped_parse_returns_what_an_uncapped_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for at in 0..40 {
+            let body: String = (0..=at % 7)
+                .map(|n| format!("pub fn f_{at}_{n}() {{}}\n"))
+                .collect();
+            let path = format!("f{at}.rs");
+            std::fs::write(dir.path().join(&path), &body).unwrap();
+            files.push(scan::ListedFile {
+                abs: dir.path().join(&path),
+                path,
+                size: body.len() as u64,
+                mtime: SystemTime::UNIX_EPOCH,
+            });
+        }
+        let stale: Vec<&scan::ListedFile> = files.iter().collect();
+        let known: HashSet<String> = files.iter().map(|file| file.path.clone()).collect();
+        let exports = |max_workers: usize| -> Vec<(String, Vec<String>)> {
+            parse_batch(
+                &stale,
+                &known,
+                &HashMap::new(),
+                &HashMap::new(),
+                max_workers,
+            )
+            .into_iter()
+            .map(|(record, _)| (record.path, record.exports))
+            .collect()
+        };
+        let all = exports(usize::MAX);
+        assert_eq!(all.len(), 40);
+        assert_eq!(exports(1), all);
+        assert_eq!(exports(3), all);
     }
 }

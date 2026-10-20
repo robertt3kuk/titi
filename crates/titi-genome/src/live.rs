@@ -275,7 +275,7 @@ impl GenomeHandle {
             .name("titi-genome-index".to_owned())
             .spawn(move || {
                 if first_index {
-                    let _ = worker_genome.refresh(&root);
+                    let _ = worker_genome.refresh_first_walk(&root);
                     worker_ready.open();
                 }
                 run(rx, root, worker_genome, worker_progress, options);

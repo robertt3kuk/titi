@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `titi` paints its first frame sooner in a repo with a code map on a busy machine (median 115 ms instead of 77 ms in a 10-core test, against 34 ms without the map): the map's first index leaves two cores (one on a small machine) to the thread that is drawing, and takes no longer to finish.
+
 - The tool descriptions the model is sent every turn are 11% shorter (10.9 KB instead of 12.2 KB, about 340 tokens per request). Only wording that repeated itself or another field went; every parameter and the guidance on when to use each tool stayed, and a test now fails if one is lost.
 
 - The per-turn check for files changed behind the code map's back is about half as expensive when nothing changed (3.6 ms instead of 6.6 ms on titi's tree, 11 ms instead of 23 ms on 5,000 files): the map is no longer copied just to be replaced by an identical one.

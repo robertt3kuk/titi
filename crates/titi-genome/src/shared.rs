@@ -104,7 +104,22 @@ impl SharedGenome {
         root: impl AsRef<Path>,
         urgent: &[String],
     ) -> std::io::Result<RefreshStats> {
-        let root = root.as_ref();
+        self.refresh_capped(root.as_ref(), urgent, usize::MAX)
+    }
+
+    /// The first walk of an index a surface is waiting on: [`Self::refresh`]
+    /// on fewer parse threads than there are cores — see
+    /// [`crate::first_walk_workers`] for why.
+    pub(crate) fn refresh_first_walk(&self, root: &Path) -> std::io::Result<RefreshStats> {
+        self.refresh_capped(root, &[], crate::first_walk_workers())
+    }
+
+    fn refresh_capped(
+        &self,
+        root: &Path,
+        urgent: &[String],
+        max_workers: usize,
+    ) -> std::io::Result<RefreshStats> {
         let _sole_writer = self.writer.lock().expect("genome writer lock poisoned");
         let listed = scan::list_files(root)?;
         let current = self.snapshot();
@@ -122,7 +137,7 @@ impl SharedGenome {
             return Ok(stats);
         }
         let mut next = (*current).clone();
-        let stats = next.refresh_listed(root, &listed, urgent);
+        let stats = next.refresh_listed(root, &listed, urgent, max_workers);
         self.publish(next, stats);
         Ok(stats)
     }
