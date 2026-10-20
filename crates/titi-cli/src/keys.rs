@@ -257,6 +257,11 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     },
     Hotkey {
         group: HotkeyGroup::Composer,
+        keys: "shift+tab",
+        what: "cycle the mode: agent, plan, duck, agent — a plan or duck badge shows on the composer",
+    },
+    Hotkey {
+        group: HotkeyGroup::Composer,
         keys: "esc",
         what: "clear the draft; a long one is stashed first — alt+p brings it back",
     },
@@ -607,6 +612,7 @@ impl Chat {
             }
             Key::AltS => self.stash_draft(),
             Key::AltP => self.restore_draft(),
+            Key::ShiftTab => self.cycle_mode(),
             Key::CtrlR => self.open_history(),
             Key::CtrlX => self.open_session_picker(),
             Key::AltM => {
@@ -1479,6 +1485,7 @@ pub(crate) fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Key> {
         KeyCode::Esc => Some(Key::Esc),
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
+        KeyCode::BackTab => Some(Key::ShiftTab),
         KeyCode::Tab => Some(Key::Tab),
         KeyCode::PageUp => Some(Key::PageUp),
         KeyCode::PageDown => Some(Key::PageDown),

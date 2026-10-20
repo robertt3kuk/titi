@@ -351,6 +351,8 @@ pub enum Key {
     AltA,
     /// Put the draft aside: alt+s.
     AltS,
+    /// Step the session mode agent → plan → duck → agent: shift+tab.
+    ShiftTab,
     /// Bring the newest stashed draft back: alt+p.
     AltP,
     /// `app.history.search`: ctrl+r.
@@ -760,7 +762,7 @@ pub struct Chat {
     money_spent_micro: u64,
     money_budget_micro: Option<u64>,
     /// The mode the engine confirmed it is in.
-    mode: SessionMode,
+    pub(crate) mode: SessionMode,
     /// Membership in the local hub, when `/join` connected.
     hub: HubSession,
     /// Whether the roster panel is shown (`/hub`).
@@ -2269,7 +2271,7 @@ impl Chat {
 
     /// A leading slash is a command when the first word has no extra slash.
     /// `/tmp/photo.png` stays a prompt, because that is a path.
-    fn slash(&mut self, text: &str) -> Option<Applied> {
+    pub(crate) fn slash(&mut self, text: &str) -> Option<Applied> {
         if let Some(applied) = self.switch_model(text) {
             return Some(applied);
         }
@@ -5895,3 +5897,7 @@ mod tests;
 #[cfg(test)]
 #[path = "composer_tests.rs"]
 mod composer_tests;
+
+#[cfg(test)]
+#[path = "mode_cycle_tests.rs"]
+mod mode_cycle_tests;

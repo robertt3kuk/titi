@@ -17,6 +17,7 @@ pub mod hub;
 pub mod keys;
 pub mod login;
 pub(crate) mod mention;
+pub(crate) mod mode_cycle;
 pub mod ompcast;
 pub mod pickers;
 pub mod recap;

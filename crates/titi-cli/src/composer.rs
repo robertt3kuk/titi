@@ -8,6 +8,7 @@
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use titi_engine::protocol::SessionMode;
 use titi_tui::theme::{Theme, ThemeColor};
 
 use crate::chat::{Chat, LoginMethod, fg, surface};
@@ -59,7 +60,7 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
             fg(theme, caption_color),
         )),
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(fg(theme, border))
@@ -69,6 +70,15 @@ pub(crate) fn composer(chat: &Chat, width: u16, theme: &Theme) -> Paragraph<'sta
         // character.
         .padding(Padding::horizontal(if chat.tight { 0 } else { 1 }))
         .style(surface(theme));
+    // The session mode, on the top rule, whenever it is not the plain agent:
+    // a composer that will only plan or only talk should say so where the
+    // draft is typed. The label is the engine's own word for the mode.
+    if chat.mode != SessionMode::Agent {
+        block = block.title_top(Line::from(Span::styled(
+            format!("─ {} ─", chat.mode.label()),
+            fg(theme, ThemeColor::Accent).add_modifier(Modifier::BOLD),
+        )));
+    }
     let inner = (width as usize)
         .saturating_sub(if chat.tight { 4 } else { 6 })
         .max(4);
