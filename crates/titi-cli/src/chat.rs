@@ -869,6 +869,8 @@ pub struct Chat {
     probe_bytes: Option<Vec<u8>>,
     /// The Ctrl+R / ↑ browser over this session's own prompts; `None` = closed.
     pub(crate) history_picker: Option<HistoryPicker>,
+    /// The session's usage by the model that ran each turn (`/usage`).
+    pub(crate) usage_ledger: titi_tui::status::UsageLedger,
     /// Which transcript sections are drawn, and how: the `/details` state.
     pub(crate) details: Details,
     /// The `@file` picker, the shell-style prompt walk and the project's
@@ -993,6 +995,7 @@ impl Chat {
             probe_sent: None,
             probe_bytes: None,
             history_picker: None,
+            usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
             palette: crate::palette::PaletteState::default(),
@@ -1809,6 +1812,14 @@ impl Chat {
                         self.session_cost_partial = true;
                     }
                 }
+                let model = self.model.clone();
+                self.usage_ledger.add(
+                    &model,
+                    prompt_tokens,
+                    cached_tokens,
+                    completion_tokens,
+                    cost_micro_usd,
+                );
                 self.session_prompt_tokens += prompt_tokens;
                 self.session_completion_tokens += completion_tokens;
                 self.session_cached_tokens += cached_tokens;
@@ -2386,6 +2397,11 @@ impl Chat {
                 String::new()
             }
         };
+        // The per-model breakdown comes first so the session's own line stays
+        // the last thing said, as it always was.
+        for line in self.usage_ledger.lines() {
+            self.push(LineKind::Note, line);
+        }
         let text = format!(
             "Turn: {} prompt{} + {} completion. Session: {}{} / {}{}.",
             self.last_prompt_tokens,

@@ -195,6 +195,153 @@ impl TurnFooter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Usage by model
+// ---------------------------------------------------------------------------
+
+/// What one model has been billed for in a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelTotals {
+    /// Prompt tokens, cached ones included.
+    pub prompt: u64,
+    /// The part of `prompt` the provider served from its cache.
+    pub cached: u64,
+    pub completion: u64,
+    /// Micro-dollars of the turns that had a price.
+    pub cost_micro: u64,
+    /// Turns that reported a price.
+    pub priced_turns: u32,
+    /// Turns that did not, so the money is a floor when this is above zero.
+    pub unpriced_turns: u32,
+}
+
+impl ModelTotals {
+    fn add(&mut self, other: &ModelTotals) {
+        self.prompt += other.prompt;
+        self.cached += other.cached;
+        self.completion += other.completion;
+        self.cost_micro += other.cost_micro;
+        self.priced_turns += other.priced_turns;
+        self.unpriced_turns += other.unpriced_turns;
+    }
+
+    /// The share of the prompt the provider's cache served, in whole percent.
+    /// `None` before any prompt: a hit rate over nothing is not zero.
+    pub fn hit_rate(&self) -> Option<u64> {
+        (self.prompt > 0).then(|| (self.cached * 100 + self.prompt / 2) / self.prompt)
+    }
+
+    /// One row's figures: `3.4k prompt · 2.9k cached · 250 out · $0.004 · 85%
+    /// hit`. The money is absent for a model that was never priced, and a
+    /// `+` marks the sum of a model priced on only some of its turns.
+    fn figures(&self) -> String {
+        let tokens = |n: u64| compact_tokens(u32::try_from(n).unwrap_or(u32::MAX));
+        let mut parts = vec![
+            format!("{} prompt", tokens(self.prompt)),
+            format!("{} cached", tokens(self.cached)),
+            format!("{} out", tokens(self.completion)),
+        ];
+        if self.priced_turns > 0 {
+            let floor = if self.unpriced_turns > 0 { "+" } else { "" };
+            parts.push(format!(
+                "{}{floor}",
+                format_usd(self.cost_micro, TURN_COST_DECIMALS)
+            ));
+        }
+        if let Some(rate) = self.hit_rate() {
+            parts.push(format!("{rate}% hit"));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// A session's usage broken down by the model that ran each turn, in the
+/// order the models first appeared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageLedger {
+    rows: Vec<(String, ModelTotals)>,
+}
+
+impl UsageLedger {
+    /// Book one turn's report to `model`. A turn that fell back to another
+    /// model mid-way is booked whole to the model it ended on: the engine
+    /// reports one figure per turn, so a finer split would be invented.
+    pub fn add(
+        &mut self,
+        model: &str,
+        prompt: u32,
+        cached: u32,
+        completion: u32,
+        cost_micro: Option<u64>,
+    ) {
+        let at = match self.rows.iter().position(|(name, _)| name == model) {
+            Some(at) => at,
+            None => {
+                self.rows.push((model.to_owned(), ModelTotals::default()));
+                self.rows.len() - 1
+            }
+        };
+        let totals = &mut self.rows[at].1;
+        totals.prompt += u64::from(prompt);
+        totals.cached += u64::from(cached);
+        totals.completion += u64::from(completion);
+        match cost_micro {
+            Some(cost) => {
+                totals.cost_micro += cost;
+                totals.priced_turns += 1;
+            }
+            None => totals.unpriced_turns += 1,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// One model's totals.
+    pub fn model(&self, model: &str) -> Option<&ModelTotals> {
+        self.rows
+            .iter()
+            .find_map(|(name, totals)| (name == model).then_some(totals))
+    }
+
+    /// Every model's totals added together.
+    pub fn total(&self) -> ModelTotals {
+        let mut total = ModelTotals::default();
+        for (_, totals) in &self.rows {
+            total.add(totals);
+        }
+        total
+    }
+
+    /// The breakdown as note lines: a heading, a row per model, and a total
+    /// row when more than one model ran (with one, the row is the total).
+    pub fn lines(&self) -> Vec<String> {
+        if self.rows.is_empty() {
+            return Vec::new();
+        }
+        let mut named: Vec<(&str, String)> = self
+            .rows
+            .iter()
+            .map(|(name, totals)| (name.as_str(), totals.figures()))
+            .collect();
+        if self.rows.len() > 1 {
+            named.push(("total", self.total().figures()));
+        }
+        let width = named
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec!["usage by model · hit = cached share of the prompt".to_owned()];
+        for (name, figures) in named {
+            let pad = width - name.chars().count();
+            lines.push(format!("{name}{:pad$}  {figures}", ""));
+        }
+        lines
+    }
+}
+
 /// The most decimals a money figure may grow to before it counts as zero: one
 /// micro-dollar, the unit the engine's cost arithmetic keeps.
 const MAX_COST_DECIMALS: usize = 6;
@@ -1109,6 +1256,88 @@ mod tests {
         assert_eq!(compact_tokens(128_000), "128k");
         assert_eq!(compact_tokens(1_200_000), "1.2M");
         assert_eq!(compact_tokens(128_000_000), "128M");
+    }
+
+    // ---- Usage by model ---------------------------------------------------
+
+    #[test]
+    fn the_ledger_books_each_turn_to_its_model() {
+        let mut ledger = UsageLedger::default();
+        assert!(ledger.is_empty());
+        assert!(ledger.lines().is_empty(), "nothing reported, nothing said");
+        ledger.add("openai/gpt-4.1", 1_000, 800, 40, Some(2_000));
+        ledger.add("anthropic/sonnet", 2_000, 0, 100, None);
+        ledger.add("openai/gpt-4.1", 3_000, 2_200, 60, Some(3_000));
+
+        let gpt = ledger.model("openai/gpt-4.1").expect("gpt row");
+        assert_eq!(
+            (gpt.prompt, gpt.cached, gpt.completion),
+            (4_000, 3_000, 100)
+        );
+        assert_eq!(gpt.cost_micro, 5_000);
+        assert_eq!(gpt.hit_rate(), Some(75));
+        let sonnet = ledger.model("anthropic/sonnet").expect("sonnet row");
+        assert_eq!(sonnet.hit_rate(), Some(0), "a cold cache is 0%, not absent");
+        assert_eq!(sonnet.priced_turns, 0);
+
+        let total = ledger.total();
+        assert_eq!(
+            (total.prompt, total.cached, total.completion),
+            (6_000, 3_000, 200)
+        );
+        assert_eq!(total.hit_rate(), Some(50));
+        assert!(ledger.model("nobody").is_none());
+    }
+
+    #[test]
+    fn a_hit_rate_over_no_prompt_is_absent_and_rounds_to_the_nearest_percent() {
+        assert_eq!(ModelTotals::default().hit_rate(), None);
+        let mut ledger = UsageLedger::default();
+        ledger.add("m", 3, 2, 0, None);
+        assert_eq!(ledger.total().hit_rate(), Some(67), "2/3 rounds up");
+    }
+
+    #[test]
+    fn the_ledger_lines_name_every_model_and_total_only_when_there_are_two() {
+        let mut ledger = UsageLedger::default();
+        ledger.add("openai/gpt-4.1", 3_400, 2_900, 250, Some(4_000));
+        let one = ledger.lines();
+        assert_eq!(one.len(), 2, "a heading and the one model: {one:?}");
+        assert_eq!(
+            one[1],
+            "openai/gpt-4.1  3.4k prompt · 2.9k cached · 250 out · $0.004 · 85% hit"
+        );
+
+        ledger.add("local/qwen", 1_000, 0, 90, None);
+        let two = ledger.lines();
+        assert_eq!(two.len(), 4, "heading, two models, total: {two:?}");
+        assert!(two[2].starts_with("local/qwen"), "{two:?}");
+        assert!(
+            !two[2].contains('$'),
+            "an unpriced model states no money: {two:?}"
+        );
+        assert!(two[3].starts_with("total"), "{two:?}");
+        assert!(
+            two[3].contains("$0.004+"),
+            "the total keeps the priced part, as a floor: {two:?}"
+        );
+        assert!(two[3].contains("66% hit"), "{two:?}");
+        // Every row's figures start in the column after the longest name.
+        let name_width = "openai/gpt-4.1".chars().count();
+        for row in &two[1..] {
+            let gap: String = row.chars().skip(name_width).take(2).collect();
+            assert_eq!(gap, "  ", "{two:?}");
+            assert_ne!(row.chars().nth(name_width + 2), Some(' '), "{two:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_priced_on_only_some_turns_shows_a_floor() {
+        let mut ledger = UsageLedger::default();
+        ledger.add("m", 100, 0, 10, Some(10_000));
+        ledger.add("m", 100, 0, 10, None);
+        let rows = ledger.lines();
+        assert!(rows[1].contains("$0.01+"), "{rows:?}");
     }
 
     // ---- Render -----------------------------------------------------------

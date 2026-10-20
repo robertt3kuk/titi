@@ -31,6 +31,8 @@ pub mod themes;
 pub mod title;
 pub mod trace_cmd;
 pub mod transcript;
+#[cfg(test)]
+mod usage_tests;
 pub mod vim;
 pub mod wallclock;
 pub mod welcome;

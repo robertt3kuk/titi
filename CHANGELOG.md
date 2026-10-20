@@ -14,6 +14,8 @@ All notable user-facing changes to titi, newest first.
 
 - `shift+tab` cycles the session mode agent → plan → duck → agent through the same `SetMode` the `/plan`, `/duck` and `/done` commands send, and the composer's top border carries a `─ plan ─` or `─ duck ─` badge while the mode is not agent.
 
+- `/usage` also breaks the session down by model: prompt, cached, completion and cost per model, with the cache hit rate (cached share of the prompt) per model and in total once a second model has run. A turn that fell back to another model mid-way is counted to the model it ended on.
+
 - `titi` opens its first frame about three times sooner in a repo with a code map. The map's first index (a full parse of the tree, about a second of CPU on titi's own repo) used to run before anything was drawn; it now runs in the background, and the first prompt waits for it, so its map is still the whole tree.
 
 - A turn no longer repeats context the model already has. The code map and the working-tree diff are sent only when they differ from the newest copy in the conversation, instead of being pasted onto every message: a 9-turn session that edited one file sent 583 KB of requests before and 494 KB now (the last request 69 KB, down from 93 KB), and the gap widens with every turn.
