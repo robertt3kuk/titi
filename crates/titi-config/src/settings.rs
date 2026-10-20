@@ -234,6 +234,15 @@ pub const STATUS_LINE_SESSION_ACCENT_KEY: &str = "statusLine.sessionAccent";
 /// terminal's own background shows through that row.
 pub const STATUS_LINE_TRANSPARENT_KEY: &str = "statusLine.transparent";
 
+/// Whether the status line shows the agent's edit counter (`✎ +1 ~2`: files
+/// the agent created and edited this session).
+///
+/// Unset means **on**; `false` hides the segment. The counter is hidden on its
+/// own while nothing has been edited, so this is for a user who never wants
+/// it. Read by the surface and applied through
+/// `titi_tui::status_bar::StatusLineStyle::hide_edits`.
+pub const STATUS_LINE_EDIT_COUNTER_KEY: &str = "statusLine.editCounter";
+
 /// Which entries `/tree` opens showing.
 ///
 /// `default` (the whole tree, which is what it has always shown), `no-tools`

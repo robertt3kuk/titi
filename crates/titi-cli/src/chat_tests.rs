@@ -2412,7 +2412,12 @@ fn the_welcome_states_a_fact_whole_or_not_at_all() {
 
     // The session on screen keeps its mark whole; its name gives the room up.
     let long_session = WelcomeFacts {
-        sessions: vec![("s".repeat(room), true)],
+        sessions: vec![WelcomeSession {
+            title: Some("s".repeat(room)),
+            age: Some("2m".to_owned()),
+            turns: "4 turns".to_owned(),
+            current: true,
+        }],
         ..facts.clone()
     };
     let row = row_with_label(&welcome_fact_rows(&long_session, 0, room, &grays), "recent");
@@ -2423,23 +2428,74 @@ fn the_welcome_states_a_fact_whole_or_not_at_all() {
     assert_eq!(titi_tui::width::visible_width(&row), room, "{row}");
 }
 
-/// A session is named on the welcome the way the switcher names it.
-#[test]
-fn the_welcome_names_a_session_as_the_switcher_does() {
-    let (_dir, mut chat) = welcome_chat();
-    let store = titi_core::session::SessionStore::new(&chat.agent_dir).expect("session store");
-    let named = store
-        .create(titi_core::session::SessionMeta {
-            title: Some("named".to_owned()),
-            source: Some("cli".to_owned()),
-            ..Default::default()
+/// Writes a stored session of `prompts`, last written `age` ago.
+fn stored_session(chat: &Chat, id: &str, prompts: &[&str], age: Duration) {
+    let dir = chat.agent_dir.join("sessions");
+    std::fs::create_dir_all(&dir).expect("sessions dir");
+    let body: String = prompts
+        .iter()
+        .map(|prompt| {
+            let entry = serde_json::json!({
+                "id": id, "parent_id": null, "role": "user", "content": prompt, "ts": 1
+            });
+            format!("{entry}\n")
         })
-        .expect("create");
-    chat.session_id = named.clone();
-    let frame = welcome_at(&mut chat, 80, 20);
+        .collect();
+    let path = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&path, body).expect("write the session");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open the session")
+        .set_modified(std::time::SystemTime::now() - age)
+        .expect("age the session");
+}
+
+/// A recent session is named by what it was asked, not by its id: the first
+/// prompt on one line, how long ago it was last written, and its turns.
+#[test]
+fn the_welcome_names_a_session_by_what_it_was_asked() {
+    let (_dir, mut chat) = welcome_chat();
+    stored_session(
+        &chat,
+        "aaa111",
+        &["fix the flaky\ntest in parser", "and again"],
+        Duration::from_secs(120),
+    );
+    stored_session(
+        &chat,
+        "bbb222",
+        &["add a --json flag to the exporter tool and document it in the readme"],
+        Duration::from_secs(3 * 3600),
+    );
+    stored_session(&chat, "ccc333", &[], Duration::from_secs(5 * 86_400));
+    chat.session_id = "aaa111".to_owned();
+
+    let frame = welcome_at(&mut chat, 120, 36);
+    for expected in [
+        "recent   fix the flaky test in parser  2m · 2 turns  ✓ current",
+        "add a --json flag to the exporter tool and docume…  3h · 1 turn",
+        "untitled  5d · 0 turns",
+    ] {
+        assert!(frame.contains(expected), "{expected:?} in:\n{frame}");
+    }
+    for id in ["aaa111", "bbb222", "ccc333"] {
+        assert!(!frame.contains(id), "{id} is not a name: {frame}");
+    }
+
+    // A narrow pane gives the turn count and the age up before the title, and
+    // cuts a long title at its end behind an ellipsis, the mark whole.
+    let narrow = welcome_at(&mut chat, 60, 36);
+    assert!(narrow.contains("fix the flaky test in parser"), "{narrow}");
+    assert!(narrow.contains("✓ current"), "{narrow}");
+    let cut = narrow
+        .lines()
+        .find(|row| row.contains("add a --json"))
+        .unwrap_or_else(|| panic!("the long title is shown: {narrow}"));
+    assert!(cut.contains('…'), "{cut}");
     assert!(
-        frame.contains(&session_row_text(&named, true)),
-        "the welcome marks the session on screen the way the switcher does: {frame}"
+        !cut.contains("document it in the readme"),
+        "the end of the title is what goes: {cut}"
     );
 }
 
@@ -4354,12 +4410,12 @@ fn the_default_status_line_is_todays_line() {
         (
             80,
             None,
-            r#" titi  ready                                 blue-otter > ⬢ glm-5.3-flash >     "#,
+            r#" titi  ready > 📁 ~/…/titi/crates/titi-cli   blue-otter > ⬢ glm-5.3-flash >     "#,
         ),
         (
             80,
             Some(42),
-            r#" titi  ready                                 blue-otter > ⬢ glm-5.3-flash >  42%"#,
+            r#" titi  ready > 📁 ~/…/titi/crates/titi-cli   blue-otter > ⬢ glm-5.3-flash >  42%"#,
         ),
         (
             120,
@@ -4376,6 +4432,104 @@ fn the_default_status_line_is_todays_line() {
         let line = masthead_at(&chat, width, &snapshot_for(&chat, percent));
         assert_eq!(line, expected, "{width} at {percent:?}");
     }
+}
+
+/// The edit counter follows the tool calls the screen saw: a file that did not
+/// exist is created, one that did is edited, each path once, and a call that
+/// failed or only read changed nothing.
+#[test]
+fn the_edit_counter_counts_what_the_agents_tools_changed() {
+    let dir = tempfile::tempdir().expect("temp");
+    let existing = dir.path().join("README.md");
+    std::fs::write(&existing, "# hi\n").expect("write");
+    let fresh = dir.path().join("fresh.txt");
+    let denied = dir.path().join("denied.txt");
+    let mut chat = chat();
+    let call = |chat: &mut Chat, id: &str, name: &str, path: &std::path::Path, is_error: bool| {
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: id.into(),
+            name: name.into(),
+            detail: Some(format!("{name} {}", path.display()).into()),
+        });
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: id.into(),
+            output: "ok".into(),
+            is_error,
+            detail: None,
+        });
+    };
+    let painted = |chat: &Chat| masthead_at(chat, 160, &snapshot_for(chat, None));
+    assert_eq!(masthead_snapshot(&chat).edits, (0, 0));
+    assert!(!painted(&chat).contains('✎'), "hidden at zero");
+
+    call(&mut chat, "c1", "read", &existing, false);
+    call(&mut chat, "c2", "write", &denied, true);
+    assert_eq!(masthead_snapshot(&chat).edits, (0, 0));
+
+    call(&mut chat, "c3", "write", &fresh, false);
+    call(&mut chat, "c4", "edit", &existing, false);
+    call(&mut chat, "c5", "hashline_edit", &existing, false);
+    call(&mut chat, "c6", "edit", &fresh, false);
+    assert_eq!(masthead_snapshot(&chat).edits, (1, 1));
+    assert!(painted(&chat).contains("✎ +1 ~1"), "{}", painted(&chat));
+
+    chat.status_line.hide_edits = true;
+    assert!(!painted(&chat).contains('✎'), "the key hides it");
+}
+
+/// `statusLine.editCounter: false` is what hides the counter, and unset leaves
+/// it showing.
+#[test]
+fn the_edit_counter_key_reads_from_the_settings() {
+    let dir = tempfile::tempdir().expect("temp");
+    let load = |text: &str| {
+        std::fs::write(dir.path().join("config.yml"), text).expect("write config");
+        titi_config::settings::Settings::load(dir.path(), dir.path(), &[]).expect("settings")
+    };
+    let key = titi_config::settings::STATUS_LINE_EDIT_COUNTER_KEY;
+    assert!(titi_config::settings::switch_off(
+        &load("statusLine:\n  editCounter: false\n"),
+        key
+    ));
+    assert!(!titi_config::settings::switch_off(
+        &load("statusLine:\n  editCounter: true\n"),
+        key
+    ));
+    assert!(!titi_config::settings::switch_off(
+        &load("tui:\n  tight: true\n"),
+        key
+    ));
+}
+
+/// The status line's cost is the footer's own ledger: absent until a turn is
+/// priced, `$0.04` after, and a floor (`~$0.04`) once a turn went unpriced.
+#[test]
+fn the_status_line_states_the_session_cost_as_the_footer_does() {
+    let mut unpriced = chat();
+    let usage = |chat: &mut Chat, cost: Option<u64>| {
+        chat.on_event(EngineEvent::TurnUsage {
+            turn_id: TurnId(1),
+            prompt_tokens: 1_000,
+            completion_tokens: 50,
+            cached_tokens: 0,
+            cost_micro_usd: cost,
+        });
+    };
+    let painted = |chat: &Chat| masthead_at(chat, 160, &snapshot_for(chat, None));
+    assert!(!painted(&unpriced).contains('$'));
+
+    usage(&mut unpriced, None);
+    assert!(!painted(&unpriced).contains('$'), "nothing priced yet");
+
+    let mut chat = chat();
+    usage(&mut chat, Some(40_000));
+    assert!(painted(&chat).contains(" $0.04"), "{}", painted(&chat));
+    assert!(!painted(&chat).contains("~$"));
+
+    usage(&mut chat, None);
+    assert!(painted(&chat).contains("~$0.04"), "{}", painted(&chat));
 }
 
 /// A preset is a row of the table, and the row decides the segments: what
@@ -4635,8 +4789,18 @@ fn a_narrow_masthead_gives_up_in_the_documented_order() {
     let git_gone = steps(145);
     assert!(!git_gone.contains("master"), "{git_gone}");
     assert!(git_gone.contains("titi-cli"), "the path stays: {git_gone}");
-    let path_gone = steps(125);
-    assert!(!path_gone.contains("titi-cli"), "{path_gone}");
+    // The directory is shortened in the middle before it is dropped, so the
+    // path is still named — by its leaf — a step after it stopped fitting whole.
+    let squeezed = steps(125);
+    assert!(
+        squeezed.contains("~/…/") && squeezed.contains("titi-cli"),
+        "{squeezed}"
+    );
+    let path_gone_at = (96..125u16)
+        .rev()
+        .find(|width| !steps(*width).contains("titi-cli"))
+        .expect("the path goes at some width");
+    let path_gone = steps(path_gone_at);
     assert!(
         path_gone.contains("a-very-long-sessi"),
         "the name stays: {path_gone}"
@@ -4706,7 +4870,10 @@ fn the_frame_masthead_stands_in_order() {
         );
         last = at;
     }
-    assert!(!row.contains('…'), "nothing is cut at 100 columns: {row:?}");
+    assert!(
+        row.contains("openai-codex/gpt-5.5"),
+        "the model is whole at 100 columns: {row:?}"
+    );
 }
 
 /// A row of the status line, as the text a terminal would show.
@@ -12642,6 +12809,9 @@ fn sessions_query_finds_the_matching_line_and_enter_switches() {
         "which postgres index does the planner pick",
     );
 
+    // A line in the transcript keeps the welcome (whose recent rows now name
+    // sessions by their first prompt) out of the frame this test reads.
+    chat.push(LineKind::Note, "searching".to_owned());
     command(&mut chat, "/sessions kafka");
     let frame = frame_text(&mut chat);
     assert!(frame.contains("kafka-talk"), "{frame}");

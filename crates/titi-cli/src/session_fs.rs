@@ -84,6 +84,155 @@ pub fn list_sessions() -> Vec<String> {
     list_sessions_from(&titi_config::agent_dir())
 }
 
+/// How much of a session file the welcome reads: the first prompt and a fair
+/// count of turns, never the whole transcript of a long session.
+const BRIEF_WINDOW: u64 = 128 * 1024;
+
+/// The longest title kept, in characters. The welcome cuts it again to fit its
+/// row; this only keeps a pasted prompt from being carried around whole.
+const BRIEF_TITLE_CHARS: usize = 80;
+
+/// What the welcome says about a stored session: the first thing the user
+/// asked, how long ago it was last written, and how many turns it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBrief {
+    /// The first prompt on one line, cut with `…`. `None` while the session
+    /// has none, or when its first entry is larger than the window read.
+    pub title: Option<String>,
+    /// User prompts counted in the window read.
+    pub turns: usize,
+    /// The window ended before the file did, so `turns` is a floor.
+    pub turns_open: bool,
+    /// When the file was last written.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+impl SessionBrief {
+    /// `4 turns`, `1 turn`, `12+ turns` when the count is a floor.
+    pub fn turns_label(&self) -> String {
+        let more = if self.turns_open { "+" } else { "" };
+        let noun = if self.turns == 1 && !self.turns_open {
+            "turn"
+        } else {
+            "turns"
+        };
+        format!("{}{more} {noun}", self.turns)
+    }
+
+    /// How long ago the session was last written, as [`relative_age`] words
+    /// it; `None` when the file's time is unknown.
+    pub fn age(&self, now: std::time::SystemTime) -> Option<String> {
+        let modified = self.modified?;
+        Some(relative_age(
+            now.duration_since(modified).unwrap_or_default(),
+        ))
+    }
+}
+
+/// `now`, `2m`, `3h`, `yesterday`, `5d`: one unit, the largest that fits.
+pub fn relative_age(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0..60 => "now".to_owned(),
+        60..3_600 => format!("{}m", secs / 60),
+        3_600..86_400 => format!("{}h", secs / 3_600),
+        86_400..172_800 => "yesterday".to_owned(),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// A prompt as a one-line title: whitespace collapsed to single spaces, cut
+/// with `…` past [`BRIEF_TITLE_CHARS`]. `None` for a prompt with no words.
+pub fn prompt_title(prompt: &str) -> Option<String> {
+    let line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= BRIEF_TITLE_CHARS {
+        return Some(line);
+    }
+    let head: String = line.chars().take(BRIEF_TITLE_CHARS - 1).collect();
+    Some(format!("{}…", head.trim_end()))
+}
+
+/// The last brief read of each session file, valid while its modification time
+/// and length stand: the welcome draws every 50 ms and must not reread files.
+type BriefStamp = (Option<std::time::SystemTime>, u64);
+static BRIEFS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (BriefStamp, SessionBrief)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The brief of session `id`: at most the first [`BRIEF_WINDOW`] bytes of its
+/// file, and nothing at all when the file is unchanged since the last read.
+pub fn session_brief(agent_dir: &std::path::Path, id: &str) -> SessionBrief {
+    let path = agent_dir.join("sessions").join(format!("{id}.jsonl"));
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .map(|meta| (meta.modified().ok(), meta.len()));
+    if let Some(stamp) = stamp
+        && let Ok(cache) = BRIEFS.lock()
+        && let Some((seen, brief)) = cache.get(&path)
+        && *seen == stamp
+    {
+        return brief.clone();
+    }
+    let brief = read_brief(&path);
+    if let Some(stamp) = stamp
+        && let Ok(mut cache) = BRIEFS.lock()
+    {
+        cache.insert(path, (stamp, brief.clone()));
+    }
+    brief
+}
+
+fn read_brief(path: &std::path::Path) -> SessionBrief {
+    use std::io::Read;
+    let mut brief = SessionBrief {
+        title: None,
+        turns: 0,
+        turns_open: false,
+        modified: std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok(),
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return brief;
+    };
+    let mut window = Vec::new();
+    if file
+        .take(BRIEF_WINDOW + 1)
+        .read_to_end(&mut window)
+        .is_err()
+    {
+        return brief;
+    }
+    if window.len() as u64 > BRIEF_WINDOW {
+        // Whole lines only: the last one is cut wherever the window ended.
+        brief.turns_open = true;
+        let end = window
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        window.truncate(end);
+    }
+    for line in String::from_utf8_lossy(&window).lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        brief.turns += 1;
+        if brief.title.is_none() {
+            brief.title = entry
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .and_then(prompt_title);
+        }
+    }
+    brief
+}
+
 /// The session a `--continue` or `session.autoResume` launch resumes: the
 /// newest session recorded in the workspace titi is running in.
 ///
@@ -442,5 +591,152 @@ mod tests {
         touch(&sessions.join("s1.jsonl"));
         delete_session_from(dir.path(), "s1").unwrap_or_else(|e| panic!("delete: {e}"));
         assert!(!sessions.join("s1.jsonl").exists());
+    }
+
+    /// One `user` entry as the session file writes it.
+    fn user_line(text: &str) -> String {
+        serde_json::json!({
+            "id": "e", "parent_id": null, "role": "user", "content": text, "ts": 1
+        })
+        .to_string()
+    }
+
+    fn write_session(agent_dir: &std::path::Path, id: &str, lines: &[String]) {
+        let dir = agent_dir.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n") + "\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn a_title_is_the_first_prompt_on_one_line() {
+        assert_eq!(
+            prompt_title("  fix the\n\nflaky   test\tplease "),
+            Some("fix the flaky test please".to_owned())
+        );
+        assert_eq!(prompt_title(" \n\t "), None);
+        let long = "word ".repeat(40);
+        let title = prompt_title(&long).unwrap_or_default();
+        assert!(
+            title.ends_with("word…") && title.chars().count() <= 80,
+            "{title}"
+        );
+        let exact = "x".repeat(80);
+        assert_eq!(prompt_title(&exact), Some(exact));
+    }
+
+    #[test]
+    fn a_brief_reads_the_first_prompt_and_counts_the_turns() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let assistant = serde_json::json!({
+            "id": "a", "parent_id": "e", "role": "assistant", "content": "hi", "ts": 2
+        })
+        .to_string();
+        write_session(
+            dir.path(),
+            "s1",
+            &[
+                user_line("read the readme\nand summarise it"),
+                assistant.clone(),
+                user_line("now run the tests"),
+            ],
+        );
+        let brief = session_brief(dir.path(), "s1");
+        assert_eq!(
+            brief.title.as_deref(),
+            Some("read the readme and summarise it")
+        );
+        assert_eq!((brief.turns, brief.turns_open), (2, false));
+        assert_eq!(brief.turns_label(), "2 turns");
+
+        write_session(dir.path(), "s2", &[user_line("one")]);
+        assert_eq!(session_brief(dir.path(), "s2").turns_label(), "1 turn");
+
+        // No prompt yet: no title, and zero turns.
+        write_session(dir.path(), "s3", &[assistant]);
+        let empty = session_brief(dir.path(), "s3");
+        assert_eq!((empty.title.as_deref(), empty.turns), (None, 0));
+        assert_eq!(empty.turns_label(), "0 turns");
+
+        // A file that is gone is an empty brief, not a failure.
+        assert_eq!(session_brief(dir.path(), "nope").title, None);
+    }
+
+    #[test]
+    fn a_brief_never_reads_past_its_window() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        // 200 prompts of ~1 KiB: well past the 128 KiB window.
+        let lines: Vec<String> = (0..200)
+            .map(|n| user_line(&format!("prompt {n} {}", "x".repeat(1_000))))
+            .collect();
+        write_session(dir.path(), "big", &lines);
+        let brief = session_brief(dir.path(), "big");
+        assert!(brief.turns_open, "the window ended first");
+        assert!(brief.turns > 100 && brief.turns < 200, "{}", brief.turns);
+        assert!(
+            brief.turns_label().contains("+ turns"),
+            "{}",
+            brief.turns_label()
+        );
+        assert!(
+            brief
+                .title
+                .as_deref()
+                .is_some_and(|t| t.starts_with("prompt 0 x"))
+        );
+
+        // A first entry larger than the whole window cannot be parsed: the
+        // session reads as untitled rather than as a cut sentence.
+        write_session(dir.path(), "huge", &[user_line(&"y".repeat(200_000))]);
+        let huge = session_brief(dir.path(), "huge");
+        assert_eq!((huge.title, huge.turns, huge.turns_open), (None, 0, true));
+    }
+
+    #[test]
+    fn a_changed_file_is_read_again() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        write_session(dir.path(), "s", &[user_line("first")]);
+        assert_eq!(session_brief(dir.path(), "s").turns, 1);
+        write_session(dir.path(), "s", &[user_line("first"), user_line("second")]);
+        assert_eq!(session_brief(dir.path(), "s").turns, 2);
+    }
+
+    #[test]
+    fn ages_read_in_the_largest_unit() {
+        use std::time::Duration;
+        let age = |secs: u64| relative_age(Duration::from_secs(secs));
+        assert_eq!(age(0), "now");
+        assert_eq!(age(59), "now");
+        assert_eq!(age(60), "1m");
+        assert_eq!(age(2 * 60 + 30), "2m");
+        assert_eq!(age(59 * 60), "59m");
+        assert_eq!(age(3_600), "1h");
+        assert_eq!(age(3 * 3_600 + 59), "3h");
+        assert_eq!(age(23 * 3_600 + 3_599), "23h");
+        assert_eq!(age(86_400), "yesterday");
+        assert_eq!(age(47 * 3_600), "yesterday");
+        assert_eq!(age(2 * 86_400), "2d");
+        assert_eq!(age(5 * 86_400 + 1), "5d");
+
+        let now = std::time::SystemTime::now();
+        let brief = |modified| SessionBrief {
+            title: None,
+            turns: 0,
+            turns_open: false,
+            modified,
+        };
+        assert_eq!(
+            brief(Some(now - Duration::from_secs(180)))
+                .age(now)
+                .as_deref(),
+            Some("3m")
+        );
+        assert_eq!(
+            brief(Some(now + Duration::from_secs(60)))
+                .age(now)
+                .as_deref(),
+            Some("now")
+        );
+        assert_eq!(brief(None).age(now), None);
     }
 }

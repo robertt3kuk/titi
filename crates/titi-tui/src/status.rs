@@ -647,6 +647,82 @@ impl StatusLine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent edit counter
+// ---------------------------------------------------------------------------
+
+/// The tools whose success changes a file, by the name the engine reports.
+const EDIT_TOOLS: [&str; 3] = ["write", "edit", "hashline_edit"];
+
+/// Files this session's agent created and edited, each counted once.
+///
+/// Fed from the events a surface already sees: the call's chip names the path
+/// when the call starts (`write notes/a.txt`, `edit src/lib.rs`), and only a
+/// call that finishes without an error counts — a denied or failed write
+/// changed nothing. Whether the file was new is read at the start, before the
+/// tool runs, because afterwards it exists either way. A path stays in one
+/// set: once the agent has created a file, editing it again is not a second
+/// file.
+#[derive(Debug, Clone, Default)]
+pub struct AgentEdits {
+    /// Calls started and not finished: `(call id, path, existed before)`.
+    pending: Vec<(String, String, bool)>,
+    created: std::collections::HashSet<String>,
+    edited: std::collections::HashSet<String>,
+}
+
+impl AgentEdits {
+    /// A tool call started. `exists` says whether the path is already a file;
+    /// it is asked only for a call that edits files.
+    pub fn started(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        detail: Option<&str>,
+        exists: impl FnOnce(&str) -> bool,
+    ) {
+        if !EDIT_TOOLS.contains(&tool) {
+            return;
+        }
+        let Some(path) = detail.and_then(edited_path) else {
+            return;
+        };
+        let existed = exists(&path);
+        self.pending.push((call_id.to_owned(), path, existed));
+    }
+
+    /// A tool call finished.
+    pub fn finished(&mut self, call_id: &str, is_error: bool) {
+        let Some(at) = self.pending.iter().position(|(id, ..)| id == call_id) else {
+            return;
+        };
+        let (_, path, existed) = self.pending.swap_remove(at);
+        if is_error || self.created.contains(&path) {
+            return;
+        }
+        if existed {
+            self.edited.insert(path);
+        } else {
+            self.edited.remove(&path);
+            self.created.insert(path);
+        }
+    }
+
+    /// `(created, edited)`.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.created.len(), self.edited.len())
+    }
+}
+
+/// The path out of an edit tool's chip (`write a.txt`, `edit ./a.txt`), with
+/// a leading `./` dropped so the two spellings of one file are one path.
+fn edited_path(detail: &str) -> Option<String> {
+    let (_, path) = detail.split_once(' ')?;
+    let path = path.trim();
+    let path = path.strip_prefix("./").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,5 +1241,63 @@ mod tests {
         assert_eq!(format_rate(0.4), "~<1 tok/s");
         assert_eq!(format_rate(1.4), "~1 tok/s");
         assert_eq!(format_rate(41.6), "~42 tok/s");
+    }
+
+    /// One call through the tracker: started on `path`, finished.
+    fn edit_call(
+        edits: &mut AgentEdits,
+        call_id: &str,
+        tool: &str,
+        chip: &str,
+        existed: bool,
+        is_error: bool,
+    ) {
+        edits.started(call_id, tool, Some(chip), |_| existed);
+        edits.finished(call_id, is_error);
+    }
+
+    #[test]
+    fn nothing_edited_counts_nothing() {
+        let mut edits = AgentEdits::default();
+        assert_eq!(edits.counts(), (0, 0));
+        // Reads and shell commands are not edits, whatever their chip says.
+        edit_call(&mut edits, "a", "read", "read a.txt", true, false);
+        edit_call(&mut edits, "b", "bash", "bash touch a.txt", false, false);
+        assert_eq!(edits.counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_new_file_is_created_and_an_existing_one_edited() {
+        let mut edits = AgentEdits::default();
+        edit_call(&mut edits, "a", "write", "write new.txt", false, false);
+        edit_call(&mut edits, "b", "edit", "edit README.md", true, false);
+        edit_call(&mut edits, "c", "hashline_edit", "edit lib.rs", true, false);
+        assert_eq!(edits.counts(), (1, 2));
+    }
+
+    #[test]
+    fn a_path_is_counted_once() {
+        let mut edits = AgentEdits::default();
+        edit_call(&mut edits, "a", "edit", "edit README.md", true, false);
+        edit_call(&mut edits, "b", "edit", "edit ./README.md", true, false);
+        assert_eq!(edits.counts(), (0, 1), "two spellings, one file");
+        // Created, then edited: still the one created file.
+        edit_call(&mut edits, "c", "write", "write n.txt", false, false);
+        edit_call(&mut edits, "d", "edit", "edit n.txt", true, false);
+        edit_call(&mut edits, "e", "write", "write n.txt", true, false);
+        assert_eq!(edits.counts(), (1, 1));
+    }
+
+    #[test]
+    fn a_failed_or_unfinished_call_counts_nothing() {
+        let mut edits = AgentEdits::default();
+        edit_call(&mut edits, "a", "write", "write n.txt", false, true);
+        edits.started("b", "edit", Some("edit r.md"), |_| true);
+        assert_eq!(edits.counts(), (0, 0), "denied, and still running");
+        // A result for a call that never started is not a path.
+        edits.finished("ghost", false);
+        edits.started("c", "write", None, |_| true);
+        edits.finished("c", false);
+        assert_eq!(edits.counts(), (0, 0));
     }
 }

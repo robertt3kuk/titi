@@ -798,6 +798,9 @@ pub struct Chat {
     /// and not the bill. A session that switches from a priced model to a
     /// local one says so rather than quietly dropping the earlier turns.
     session_cost_partial: bool,
+    /// Files the agent created and edited this session, for the status line's
+    /// `✎ +N ~M`.
+    agent_edits: titi_tui::status::AgentEdits,
     /// The running turn ended in a failure the screen showed. It holds until
     /// the next turn starts, so the tab title says the turn broke rather than
     /// that it is your turn.
@@ -956,6 +959,7 @@ impl Chat {
             turn_cost_micro: None,
             session_cost_micro: None,
             session_cost_partial: false,
+            agent_edits: titi_tui::status::AgentEdits::default(),
             turn_failed: false,
             last_title: None,
             terminal: TerminalFeatures::default(),
@@ -1489,6 +1493,10 @@ impl Chat {
                 detail,
                 ..
             } => {
+                self.agent_edits
+                    .started(&call_id, &name, detail.as_deref(), |path| {
+                        Path::new(path).exists()
+                    });
                 // The answer's line closes here, so it settles here too: a
                 // reveal still in flight would otherwise keep drawing into a
                 // line the tool call has already ended.
@@ -1600,6 +1608,7 @@ impl Chat {
                 detail,
                 ..
             } => {
+                self.agent_edits.finished(&call_id, is_error);
                 // Only the call that owns the row may end it: a late
                 // `ToolFinished` for another call must not wipe the elapsed
                 // time of the one still running.
@@ -4238,6 +4247,13 @@ pub fn run(
         transparent,
         chat.tight,
     );
+    // The edit counter shows unless `statusLine.editCounter` is false.
+    chat.status_line.hide_edits = settings.as_ref().is_some_and(|settings| {
+        titi_config::settings::switch_off(
+            settings,
+            titi_config::settings::STATUS_LINE_EDIT_COUNTER_KEY,
+        )
+    });
     // A resumed session already has a name; the engine only announces one it
     // has just made, so read the one it has (the same index `/sessions` and the
     // switcher read) instead of showing no name for the whole run.
@@ -5358,6 +5374,13 @@ pub(crate) fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
     snapshot.context_window = chat.context_window;
     snapshot.tokens = (chat.session_prompt_tokens > 0 || chat.session_completion_tokens > 0)
         .then_some((chat.session_prompt_tokens, chat.session_completion_tokens));
+    snapshot.edits = chat.agent_edits.counts();
+    // The same floor rule `/usage` states: a session whose only priced total
+    // is zero while some turn went unpriced has no figure worth showing.
+    snapshot.cost_micro = chat
+        .session_cost_micro
+        .filter(|micro| *micro > 0 || !chat.session_cost_partial);
+    snapshot.cost_partial = chat.session_cost_partial;
     snapshot
 }
 

@@ -15,8 +15,8 @@
 //! What this crate does **not** paint, and why: omp's `nerd`/`custom` presets
 //! need Nerd Font glyphs and a user-written segment list, and its `status`,
 //! `stream`, `vim`, `subagent`, `cache_*`, `token_rate` and `time*` segments
-//! have no fact behind them here. `cost` and `pr` have none either — titi
-//! tracks no spend and opens no pull request — so the snapshot carries neither.
+//! have no fact behind them here. `pr` has none either — titi opens no pull
+//! request — so the snapshot carries none.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -53,6 +53,11 @@ pub enum Segment {
     Tokens,
     /// The context window fill: the `NNN%` slot, or the gauge's label.
     Context,
+    /// Files the agent created (`+N`) and edited (`~M`) this session, hidden
+    /// while both are zero.
+    Edits,
+    /// What the session's priced turns have cost, hidden until one is priced.
+    Cost,
 }
 
 /// The glyph between two segments, and whether the whole line stays ASCII.
@@ -221,11 +226,13 @@ pub struct PresetDef {
 }
 
 /// The default preset's shed order: the git state first (the most cells for the
-/// least actionable fact), then the directory, the session's name, the mode and
-/// the loop count.
+/// least actionable fact), then the edit counter, the directory, the cost, the
+/// session's name, the mode and the loop count.
 const DEFAULT_DROP: &[Segment] = &[
     Segment::Git,
+    Segment::Edits,
     Segment::Path,
+    Segment::Cost,
     Segment::Session,
     Segment::Mode,
     Segment::Loops,
@@ -243,10 +250,16 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Loops,
                 Segment::Path,
                 Segment::Git,
+                Segment::Edits,
             ],
-            right: &[Segment::Session, Segment::Model, Segment::Context],
+            right: &[
+                Segment::Session,
+                Segment::Model,
+                Segment::Cost,
+                Segment::Context,
+            ],
             separator: Separator::Thin,
-            about: "the mark and the state, the mode, the directory, git, the name, the model, the context",
+            about: "the mark and the state, the mode, the directory, git, the edit counter, the name, the model, the cost, the context",
             drop: DEFAULT_DROP,
         },
     ),
@@ -280,19 +293,23 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Loops,
                 Segment::Path,
                 Segment::Git,
+                Segment::Edits,
             ],
             right: &[
                 Segment::Session,
                 Segment::Model,
                 Segment::Tokens,
+                Segment::Cost,
                 Segment::Context,
             ],
             separator: Separator::Thin,
             about: "every fact titi has, token totals and the git branch included",
             drop: &[
                 Segment::Git,
+                Segment::Edits,
                 Segment::Path,
                 Segment::Tokens,
+                Segment::Cost,
                 Segment::Session,
                 Segment::Loops,
                 Segment::Mode,
@@ -309,8 +326,14 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Loops,
                 Segment::Path,
                 Segment::Git,
+                Segment::Edits,
             ],
-            right: &[Segment::Session, Segment::Model, Segment::Context],
+            right: &[
+                Segment::Session,
+                Segment::Model,
+                Segment::Cost,
+                Segment::Context,
+            ],
             separator: Separator::Ascii,
             about: "the default set in ASCII glyphs and separators",
             drop: DEFAULT_DROP,
@@ -362,6 +385,10 @@ pub struct StatusLineStyle {
     /// screen, so the row has to *clear* the background rather than simply not
     /// set one, which is what makes the key visible at all.
     pub transparent: bool,
+    /// Whether the agent's edit counter is hidden
+    /// (`statusLine.editCounter` set to false). Off is the counter showing,
+    /// which is also what [`StatusLineStyle::default`] means.
+    pub hide_edits: bool,
 }
 
 impl StatusLineStyle {
@@ -387,6 +414,7 @@ impl StatusLineStyle {
             session_accent,
             transparent,
             tight,
+            hide_edits: false,
         }
     }
 }
@@ -402,6 +430,13 @@ const SESSION_SLOT: usize = 18;
 
 /// Cells the `NNN%` context slot always occupies: ` 3%`, `42%`, `100%`.
 const CONTEXT_SLOT: usize = 4;
+
+/// Cells the directory may take before it is shortened in the middle.
+const PATH_SLOT: usize = 40;
+
+/// The least a squeezed directory is worth: below this `~/…/leaf` says less
+/// than leaving it out, so the shed order drops it instead.
+const PATH_MIN: usize = 12;
 
 /// Snapshot of the values a preset can paint. Empty optionals hide.
 #[derive(Debug, Clone, PartialEq)]
@@ -434,6 +469,13 @@ pub struct StatusSnapshot {
     /// Session token totals, `(prompt, completion)`, as the engine has summed
     /// them. `None` before the first turn reports any.
     pub tokens: Option<(u32, u32)>,
+    /// Files the agent created and edited this session, `(created, edited)`.
+    pub edits: (usize, usize),
+    /// What the session's priced turns have cost, in micro-dollars. `None`
+    /// until a turn is priced: `$0.00` would be a figure nobody computed.
+    pub cost_micro: Option<u64>,
+    /// Some turn went unpriced, so `cost_micro` is a floor, not the bill.
+    pub cost_partial: bool,
     /// Right-group session title.
     pub session_name: String,
 }
@@ -455,6 +497,9 @@ impl Default for StatusSnapshot {
             context_pct: None,
             context_window: None,
             tokens: None,
+            edits: (0, 0),
+            cost_micro: None,
+            cost_partial: false,
             session_name: String::new(),
         }
     }
@@ -467,7 +512,7 @@ impl Default for StatusSnapshot {
 /// reader's.
 pub fn live_snapshot(model: &str, session_name: &str) -> StatusSnapshot {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let path = abbreviate_path(&cwd.to_string_lossy(), 40);
+    let path = fold_home_dirs(&cwd.to_string_lossy(), &HOMES);
     let git = git_info(&cwd);
     StatusSnapshot {
         model: model.to_owned(),
@@ -510,7 +555,9 @@ pub fn render_status_line(
     // known, because with no window there is no gauge and no label to carry it,
     // and the group must keep showing the slot it always did.
     let absorbed = style.context_line == ContextLine::Embedded && snap.context_window.is_some();
-    let kept = |seg: &Segment| !(absorbed && *seg == Segment::Context);
+    let kept = |seg: &Segment| {
+        !(absorbed && *seg == Segment::Context) && !(style.hide_edits && *seg == Segment::Edits)
+    };
 
     let mut left: Vec<(Segment, String)> = def
         .left
@@ -544,17 +591,32 @@ pub fn render_status_line(
     };
 
     // What the line gives up, in order, when the pane is too narrow: the
-    // preset's shed list, then the model's provider prefix, then the model
-    // itself, cut with an ellipsis so a cut can never be read as a whole id.
+    // preset's shed list — with the directory first shortened in the middle,
+    // which says more than dropping it — then the model's provider prefix,
+    // then the model itself, cut in the middle with an ellipsis so a cut can
+    // never be read as a whole id.
     let mut shed: Vec<Segment> = Vec::new();
     let mut shortened = false;
+    let mut squeezed = false;
     loop {
         let left_s = join(&left, &sep);
         let right_s = join(&right, &sep);
-        if visible_width(&left_s) + min_gap + visible_width(&right_s) <= cells {
+        let used = visible_width(&left_s) + min_gap + visible_width(&right_s);
+        if used <= cells {
             break;
         }
         if let Some(next) = def.drop.iter().find(|seg| !shed.contains(seg)) {
+            if *next == Segment::Path && !squeezed {
+                squeezed = true;
+                let shown = ellipsize_path(&snap.path, PATH_SLOT);
+                let target = visible_width(&shown).saturating_sub(used - cells);
+                if target >= PATH_MIN
+                    && let Some(text) = path_part(theme, ascii, &ellipsize_path(&snap.path, target))
+                {
+                    set_part(&mut left, &mut right, Segment::Path, text);
+                    continue;
+                }
+            }
             shed.push(*next);
             left.retain(|(seg, _)| seg != next);
             right.retain(|(seg, _)| seg != next);
@@ -698,7 +760,7 @@ fn gauge(
         // The lit part is the context's own token. The rest — the "gap" in
         // omp's wording — is the accent when `sessionAccent` asks for it.
         let color = if lit {
-            ThemeColor::BorderAccent
+            fill_color(snap.context_pct)
         } else if accent {
             ThemeColor::Accent
         } else {
@@ -708,6 +770,17 @@ fn gauge(
         at = end;
     }
     out
+}
+
+/// The colour the gauge's lit cells take: the context's own token while there
+/// is room, the warning token from 60% and the error token past 85%, so a
+/// window about to overflow reads as such without anyone reading the number.
+fn fill_color(context_pct: Option<u8>) -> ThemeColor {
+    match context_pct {
+        Some(pct) if pct > 85 => ThemeColor::Error,
+        Some(pct) if pct >= 60 => ThemeColor::Warning,
+        _ => ThemeColor::BorderAccent,
+    }
 }
 
 /// The rule's own glyph: the box-drawing bar the crate's frames use, or the
@@ -743,7 +816,7 @@ fn segment_text(seg: Segment, theme: &Theme, ascii: bool, snap: &StatusSnapshot)
         Segment::Loops => snap
             .loops
             .map(|loops| theme.fg(snap.state_color, &format!("{loops} loop(s)"))),
-        Segment::Path => path_part(theme, ascii, &snap.path),
+        Segment::Path => path_part(theme, ascii, &ellipsize_path(&snap.path, PATH_SLOT)),
         Segment::Git => git_part(theme, ascii, snap),
         Segment::Session => session_part(theme, &snap.session_name),
         Segment::Tokens => snap
@@ -760,7 +833,38 @@ fn segment_text(seg: Segment, theme: &Theme, ascii: bool, snap: &StatusSnapshot)
                 )
             }),
         Segment::Context => Some(context_part(theme, snap)),
+        Segment::Edits => edits_part(theme, ascii, snap),
+        Segment::Cost => cost_part(theme, snap),
     }
+}
+
+/// `✎ +1 ~2`: files the agent created and edited. Hidden while both are zero;
+/// the ASCII line says `edit` where the pencil would be.
+fn edits_part(theme: &Theme, ascii: bool, snap: &StatusSnapshot) -> Option<String> {
+    let (created, edited) = snap.edits;
+    if created == 0 && edited == 0 {
+        return None;
+    }
+    let mark = if ascii { "edit" } else { "✎" };
+    Some(format!(
+        "{} {} {}",
+        theme.fg(ThemeColor::Muted, mark),
+        theme.fg(ThemeColor::StatusLineStaged, &format!("+{created}")),
+        theme.fg(ThemeColor::StatusLineDirty, &format!("~{edited}")),
+    ))
+}
+
+/// `$0.04`, with a `~` in front when some turn went unpriced and the figure is
+/// the least the session cost. Hidden until a priced turn has run.
+fn cost_part(theme: &Theme, snap: &StatusSnapshot) -> Option<String> {
+    let micro = snap.cost_micro?;
+    let total = crate::status::format_usd(micro, crate::status::SESSION_COST_DECIMALS);
+    let text = if snap.cost_partial {
+        format!("~{total}")
+    } else {
+        total
+    };
+    Some(theme.fg(ThemeColor::StatusLineCost, &text))
 }
 
 /// The model with its icon.
@@ -773,8 +877,8 @@ fn model_part(theme: &Theme, ascii: bool, model: &str) -> String {
     }
 }
 
-/// The model cut to `room` cells, with an ellipsis: the last resort, when even
-/// the short form does not fit beside the rest of the line.
+/// The model cut to `room` cells with an ellipsis in the middle: the last
+/// resort, when even the short form does not fit beside the rest of the line.
 fn fitted_model(theme: &Theme, ascii: bool, model: &str, room: usize) -> String {
     let icon = sym(theme, ascii, "icon.model");
     let prefix = if icon.is_empty() {
@@ -783,8 +887,8 @@ fn fitted_model(theme: &Theme, ascii: bool, model: &str, room: usize) -> String 
         format!("{icon} ")
     };
     let room = room.saturating_sub(visible_width(&prefix));
-    let head = truncate_to_width(&short_model(model), room.saturating_sub(1));
-    theme.fg(ThemeColor::Muted, &format!("{prefix}{head}…"))
+    let shown = middle_ellipsis(&short_model(model), room.max(1));
+    theme.fg(ThemeColor::Muted, &format!("{prefix}{shown}"))
 }
 
 /// The working directory, hidden when empty.
@@ -950,21 +1054,108 @@ pub fn short_model(id: &str) -> String {
     id.rsplit('/').next().unwrap_or(id).to_owned()
 }
 
-fn abbreviate_path(raw: &str, max_len: usize) -> String {
-    let mut s = raw.to_owned();
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(rest) = s.strip_prefix(&home)
-    {
-        s = format!("~{rest}");
+/// `path` with `home` folded to `~`: only the home directory itself or a path
+/// under it, never a sibling that merely starts with the same letters
+/// (`/home/ann` is not `/home/anna`'s `~`).
+pub fn fold_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|home| !home.is_empty())
+    else {
+        return path.to_owned();
+    };
+    match path.strip_prefix(home) {
+        Some("") => "~".to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
     }
-    let count = s.chars().count();
-    if count <= max_len {
-        return s;
+}
+
+/// What `$HOME` names, and where it really points: a symlinked home (macOS's
+/// `/tmp`, an automounted `/home`) puts the working directory under the real
+/// path, which never starts with the name.
+static HOMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    std::env::var("HOME")
+        .map(|home| home_dirs(&home))
+        .unwrap_or_default()
+});
+
+fn home_dirs(home: &str) -> Vec<String> {
+    let mut homes = vec![home.to_owned()];
+    if let Ok(real) = std::fs::canonicalize(home) {
+        let real = real.to_string_lossy().into_owned();
+        if real != home {
+            homes.push(real);
+        }
     }
-    let chars: Vec<char> = s.chars().collect();
-    let keep = max_len.saturating_sub(1);
-    let start = chars.len().saturating_sub(keep);
-    format!("…{}", chars[start..].iter().collect::<String>())
+    homes
+}
+
+/// [`fold_home`] against each of `homes` in turn.
+fn fold_home_dirs(path: &str, homes: &[String]) -> String {
+    homes
+        .iter()
+        .map(|home| fold_home(path, Some(home)))
+        .find(|folded| folded != path)
+        .unwrap_or_else(|| path.to_owned())
+}
+
+/// `text` in at most `width` cells, the cut in the middle: `gpt-5…flash`. The
+/// two ends are what tells one id from another, so both are kept.
+pub fn middle_ellipsis(text: &str, width: usize) -> String {
+    if visible_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let keep = width - 1;
+    let tail_cells = keep / 2;
+    let head = truncate_to_width(text, keep - tail_cells);
+    let mut tail = String::new();
+    let mut cells = 0;
+    for ch in text.chars().rev() {
+        let w = visible_width(ch.encode_utf8(&mut [0; 4]));
+        if cells + w > tail_cells {
+            break;
+        }
+        cells += w;
+        tail.insert(0, ch);
+    }
+    format!("{head}…{tail}")
+}
+
+/// A path in at most `width` cells. A path that does not fit keeps its first
+/// directory (`~`) and as much of its tail as fits, joined by `…`
+/// (`~/…/crates/titi-cli`), so the leaf — the part that says which project —
+/// survives; a leaf too long for even that is cut in the middle.
+pub fn ellipsize_path(path: &str, width: usize) -> String {
+    if visible_width(path) <= width {
+        return path.to_owned();
+    }
+    let (head, rest) = match path.strip_prefix('/') {
+        Some(rest) => {
+            let first = rest.split('/').next().unwrap_or_default();
+            (format!("/{first}"), &rest[first.len()..])
+        }
+        None => {
+            let first = path.split('/').next().unwrap_or_default();
+            (first.to_owned(), &path[first.len()..])
+        }
+    };
+    let components: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    let mut tail = String::new();
+    for part in components.iter().rev() {
+        let next = format!("/{part}{tail}");
+        if visible_width(&head) + visible_width("/…") + visible_width(&next) > width {
+            break;
+        }
+        tail = next;
+    }
+    if tail.is_empty() {
+        return middle_ellipsis(path, width);
+    }
+    format!("{head}/…{tail}")
 }
 
 struct GitInfo {
@@ -1487,7 +1678,8 @@ mod tests {
             0,
             "100% lights every cell: {all:?}"
         );
-        assert!(lit(&all, ThemeColor::BorderAccent) > 0, "{all:?}");
+        // Past 85% the rule is in the error token, not the context's own.
+        assert!(lit(&all, ThemeColor::Error) > 0, "{all:?}");
         assert_ne!(none, all);
     }
 
@@ -1717,5 +1909,260 @@ mod tests {
         // gauge's rest carries.
         let strip = |line: &str| line.replace(&accent, "").replace(&border, "");
         assert_eq!(strip(&on), strip(&off));
+    }
+
+    /// The status line at one context share, the gauge embedded.
+    fn gauge_paint(pct: u8) -> String {
+        let mut s = snap();
+        s.git_branch = None;
+        s.context_window = Some(128_000);
+        s.context_pct = Some(pct);
+        render_status_line(
+            &theme(),
+            120,
+            StatusLineStyle {
+                preset: StatusLinePreset::Full,
+                context_line: ContextLine::Embedded,
+                ..StatusLineStyle::default()
+            },
+            &s,
+        )
+    }
+
+    #[test]
+    fn the_gauge_warms_with_the_fill() {
+        assert_eq!(fill_color(None), ThemeColor::BorderAccent);
+        assert_eq!(fill_color(Some(0)), ThemeColor::BorderAccent);
+        assert_eq!(fill_color(Some(59)), ThemeColor::BorderAccent);
+        assert_eq!(fill_color(Some(60)), ThemeColor::Warning);
+        assert_eq!(fill_color(Some(85)), ThemeColor::Warning);
+        assert_eq!(fill_color(Some(86)), ThemeColor::Error);
+        assert_eq!(fill_color(Some(100)), ThemeColor::Error);
+
+        // And the painted rule's lit run carries exactly that token.
+        let theme = theme();
+        let rule = theme.symbol("boxRound.horizontal").to_owned();
+        let run = |line: &str, color: ThemeColor| {
+            let open = theme
+                .fg(color, "\u{1}")
+                .split('\u{1}')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            line.contains(&format!("{open}{rule}"))
+        };
+        let colors = [
+            ThemeColor::BorderAccent,
+            ThemeColor::Warning,
+            ThemeColor::Error,
+        ];
+        for (pct, expected) in [(59, 0), (60, 1), (85, 1), (86, 2)] {
+            let line = gauge_paint(pct);
+            for (at, color) in colors.iter().enumerate() {
+                assert_eq!(run(&line, *color), at == expected, "{pct}%: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_gauge_label_keeps_its_own_colour_whatever_the_fill() {
+        let theme = theme();
+        let label = theme.get_fg_ansi(ThemeColor::StatusLineContext);
+        for pct in [10, 70, 95] {
+            let line = gauge_paint(pct);
+            assert!(line.contains(&label), "{pct}%: {line:?}");
+            assert!(visible(&line).contains(&format!("{pct}% · 128k")));
+        }
+    }
+
+    #[test]
+    fn the_edit_counter_follows_git_and_hides_at_zero() {
+        let theme = theme();
+        let paint = |edits: (usize, usize), style: StatusLineStyle| {
+            let mut s = snap();
+            s.edits = edits;
+            visible(&render_status_line(&theme, 140, style, &s))
+        };
+        let default = style(StatusLinePreset::Default);
+
+        let line = paint((1, 1), default);
+        assert!(line.contains("✎ +1 ~1"), "{line:?}");
+        assert!(
+            line.find("main")
+                .is_some_and(|git| line.find('✎').is_some_and(|edits| edits > git)),
+            "after git: {line:?}"
+        );
+
+        let created_only = paint((3, 0), default);
+        assert!(created_only.contains("✎ +3 ~0"), "{created_only:?}");
+
+        let zero = paint((0, 0), default);
+        assert!(!zero.contains('✎'), "{zero:?}");
+
+        // The key hides it; the line is then the zero line.
+        let hidden = paint(
+            (2, 2),
+            StatusLineStyle {
+                hide_edits: true,
+                ..default
+            },
+        );
+        assert_eq!(hidden, zero);
+
+        // The ASCII line stays printable.
+        let ascii = paint((1, 2), style(StatusLinePreset::Ascii));
+        assert!(
+            ascii.contains("edit +1 ~2") && ascii.is_ascii(),
+            "{ascii:?}"
+        );
+
+        // `minimal` and `compact` never carried it.
+        assert!(!paint((1, 1), style(StatusLinePreset::Minimal)).contains('✎'));
+        assert!(!paint((1, 1), style(StatusLinePreset::Compact)).contains('✎'));
+    }
+
+    #[test]
+    fn the_session_cost_is_a_floor_when_a_turn_went_unpriced() {
+        let theme = theme();
+        let paint = |micro: Option<u64>, partial: bool| {
+            let mut s = snap();
+            s.cost_micro = micro;
+            s.cost_partial = partial;
+            visible(&render_status_line(
+                &theme,
+                140,
+                style(StatusLinePreset::Default),
+                &s,
+            ))
+        };
+        assert!(paint(Some(40_000), false).contains(" $0.04"), "priced");
+        assert!(
+            !paint(Some(40_000), false).contains("~$"),
+            "priced: no tilde"
+        );
+        assert!(paint(Some(40_000), true).contains("~$0.04"), "floor");
+        assert!(!paint(None, false).contains('$'), "nothing priced");
+        assert!(!paint(None, true).contains('$'), "unpriced only: hidden");
+        // A model priced at zero is a figure, and prints as one.
+        assert!(paint(Some(0), false).contains("$0.00"));
+    }
+
+    #[test]
+    fn only_the_home_directory_and_what_is_under_it_folds_to_a_tilde() {
+        let home = Some("/Users/ann");
+        assert_eq!(fold_home("/Users/ann", home), "~");
+        assert_eq!(fold_home("/Users/ann/proj/titi", home), "~/proj/titi");
+        assert_eq!(fold_home("/Users/anna/proj", home), "/Users/anna/proj");
+        assert_eq!(fold_home("/tmp/x", home), "/tmp/x");
+        assert_eq!(fold_home("/Users/ann/x", Some("/Users/ann/")), "~/x");
+        assert_eq!(fold_home("/x", Some("/")), "/x");
+        assert_eq!(fold_home("/x", Some("")), "/x");
+        assert_eq!(fold_home("/x", None), "/x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_home_folds_through_its_real_path() {
+        let base = std::env::temp_dir().join(format!("titi-home-{}", std::process::id()));
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(real.join("ws")).expect("create dirs");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let homes = home_dirs(&link.to_string_lossy());
+        let real_ws = std::fs::canonicalize(real.join("ws")).expect("canonical");
+        assert_eq!(
+            fold_home_dirs(&real_ws.to_string_lossy(), &homes),
+            "~/ws",
+            "{homes:?}"
+        );
+        assert_eq!(
+            fold_home_dirs(&link.join("ws").to_string_lossy(), &homes),
+            "~/ws"
+        );
+        assert_eq!(fold_home_dirs("/elsewhere", &homes), "/elsewhere");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_middle_ellipsis_keeps_both_ends_in_the_width() {
+        assert_eq!(middle_ellipsis("gpt-5.5", 7), "gpt-5.5");
+        assert_eq!(middle_ellipsis("gpt-5.5-codex-max", 9), "gpt-…-max");
+        assert_eq!(middle_ellipsis("gpt-5.5-codex-max", 1), "…");
+        assert_eq!(middle_ellipsis("gpt-5.5-codex-max", 0), "");
+        for width in 1..20 {
+            let cut = middle_ellipsis("openai-codex/gpt-5.5-codex-max", width);
+            assert!(visible_width(&cut) <= width, "{width}: {cut:?}");
+            assert!(cut.contains('…'), "{width}: {cut:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_root_and_its_leaf() {
+        let path = "~/proj/titi/crates/titi-cli/src";
+        assert_eq!(ellipsize_path(path, 40), path);
+        assert_eq!(ellipsize_path(path, 20), "~/…/titi-cli/src");
+        assert_eq!(ellipsize_path(path, 12), "~/…/src");
+        assert_eq!(
+            ellipsize_path("/var/lib/docker/overlay/layer", 20),
+            "/var/…/overlay/layer"
+        );
+        // A leaf that does not fit even alone is cut in the middle.
+        let cut = ellipsize_path("~/proj/a-very-long-directory-name", 14);
+        assert!(visible_width(&cut) <= 14 && cut.contains('…'), "{cut:?}");
+        for width in 1..45 {
+            assert!(visible_width(&ellipsize_path(path, width)) <= width);
+        }
+    }
+
+    /// The masthead at 60 cells: whatever is left of the directory and the
+    /// model is either whole or marked with an ellipsis, never a bare cut
+    /// like `open -codex/gpt-5.5`.
+    #[test]
+    fn a_narrow_masthead_marks_every_cut_with_an_ellipsis() {
+        let theme = theme();
+        let mut s = snap();
+        s.model = "openai-codex/gpt-5.5-codex-max".to_owned();
+        s.path = "~/proj/titi/crates/titi-cli/src/deep".to_owned();
+        s.mode = None;
+        s.loops = None;
+        s.git_branch = None;
+        s.session_name.clear();
+        for width in 24..=120u16 {
+            let line = visible(&render_status_line(
+                &theme,
+                width,
+                style(StatusLinePreset::Default),
+                &s,
+            ));
+            assert!(
+                visible_width(&line) <= usize::from(width),
+                "{width}: {line:?}"
+            );
+            let model_whole = line.contains("gpt-5.5-codex-max");
+            let model_marked = line.contains('…');
+            assert!(
+                model_whole || model_marked || !line.contains("gpt"),
+                "{width}: a model cut without an ellipsis: {line:?}"
+            );
+            let path_whole = line.contains("~/proj/titi/crates/titi-cli/src/deep");
+            assert!(
+                path_whole || line.contains('…') || !line.contains("~/"),
+                "{width}: a path cut without an ellipsis: {line:?}"
+            );
+        }
+
+        // At 60 cells the directory is squeezed rather than dropped: the model
+        // stays whole (the id the live frame once showed as `open -codex/…`)
+        // and the leaf of the path is still there.
+        s.model = "openai-codex/gpt-5.5".to_owned();
+        let line = visible(&render_status_line(
+            &theme,
+            60,
+            style(StatusLinePreset::Default),
+            &s,
+        ));
+        assert!(line.contains("openai-codex/gpt-5.5"), "{line:?}");
+        assert!(line.contains("~/…/") && line.contains("/deep"), "{line:?}");
+        assert!(visible_width(&line) <= 60, "{line:?}");
     }
 }

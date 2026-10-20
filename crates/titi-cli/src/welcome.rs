@@ -23,7 +23,7 @@ const WELCOME_SESSIONS: usize = 3;
 
 /// The widest the facts block grows: on a wide pane it stays a block a glance
 /// takes in, not a row stretched to the far edge.
-const WELCOME_MEASURE: usize = 60;
+const WELCOME_MEASURE: usize = 72;
 
 /// The TITI mark: two block-grid T's, ti·ti, in the grid omp draws its own
 /// mark in. The first T's leg fades at the foot, so the pair reads as two
@@ -62,8 +62,21 @@ pub(crate) struct WelcomeFacts {
     pub(crate) credential: Option<String>,
     pub(crate) path: String,
     pub(crate) git: Option<WelcomeGit>,
-    /// Recent sessions, newest first, and whether the screen is already on one.
-    pub(crate) sessions: Vec<(String, bool)>,
+    /// Recent sessions, newest first.
+    pub(crate) sessions: Vec<WelcomeSession>,
+}
+
+/// One recent session as a row of the welcome says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WelcomeSession {
+    /// The first prompt on one line; `None` is a session that has none yet.
+    pub(crate) title: Option<String>,
+    /// `2m`, `3h`, `yesterday`, `5d`.
+    pub(crate) age: Option<String>,
+    /// `4 turns`.
+    pub(crate) turns: String,
+    /// Whether the screen is already on this session.
+    pub(crate) current: bool,
 }
 
 /// The git fact of the welcome, in the same shape the masthead states it.
@@ -102,15 +115,22 @@ fn welcome_facts(chat: &Chat) -> WelcomeFacts {
             staged: snapshot.git_staged,
             untracked: snapshot.git_untracked,
         }),
-        sessions: chat
-            .session_choices()
-            .into_iter()
-            .take(WELCOME_SESSIONS)
-            .map(|id| {
-                let current = id == chat.session_id;
-                (id, current)
-            })
-            .collect(),
+        sessions: {
+            let now = std::time::SystemTime::now();
+            chat.session_choices()
+                .into_iter()
+                .take(WELCOME_SESSIONS)
+                .map(|id| {
+                    let brief = crate::session_fs::session_brief(&chat.agent_dir, &id);
+                    WelcomeSession {
+                        age: brief.age(now),
+                        turns: brief.turns_label(),
+                        title: brief.title,
+                        current: id == chat.session_id,
+                    }
+                })
+                .collect()
+        },
     }
 }
 
@@ -383,7 +403,9 @@ pub(crate) fn welcome_fact_rows(
         rows.push(Line::from(welcome_with_tail(spans, credential, room)));
     }
     if WelcomePart::Dir.shown(level) && !facts.path.is_empty() {
-        let spans = welcome_fact("dir", &facts.path, room, grays);
+        let path =
+            titi_tui::status_bar::ellipsize_path(&facts.path, room.saturating_sub(WELCOME_LABEL));
+        let spans = welcome_fact("dir", &path, room, grays);
         let git = facts.git.as_ref().map(|git| {
             let mut tail = vec![Span::styled("  ·  ", grays.faded())];
             tail.extend(welcome_git(git, grays));
@@ -392,27 +414,87 @@ pub(crate) fn welcome_fact_rows(
         rows.push(Line::from(welcome_with_tail(spans, git, room)));
     }
     if WelcomePart::Sessions.shown(level) {
-        for (at, (name, current)) in facts.sessions.iter().enumerate() {
+        for (at, session) in facts.sessions.iter().enumerate() {
             // The first row carries the label; the rest align under it, so a
             // list of sessions reads as one fact rather than several.
             let label = if at == 0 { "recent" } else { "" };
-            // The same mark in the same words as the switcher's row: one namer,
-            // so a session is never named two ways on one screen. Its room is
-            // taken off the name, which keeps an ellipsis, not off the mark.
-            let mark = if *current { "  ✓ current" } else { "" };
-            let mut spans = welcome_fact(
-                label,
-                name,
-                room.saturating_sub(titi_tui::width::visible_width(mark)),
-                grays,
-            );
-            if !mark.is_empty() {
-                spans.push(Span::styled(mark, grays.faded()));
-            }
-            rows.push(Line::from(spans));
+            rows.push(Line::from(welcome_session_row(label, session, room, grays)));
         }
     }
     rows
+}
+
+/// The least a session's title keeps before its age and turn count give way.
+const WELCOME_TITLE_MIN: usize = 16;
+
+/// One recent session: its title, then how long ago and how many turns, then
+/// the mark when the screen is already on it.
+///
+/// The title is what a person recognises a session by, so the details go first
+/// when the row is tight — the turn count, then the age — and the title is cut
+/// last, at its end behind an ellipsis. The mark is the same one in the same
+/// words as the switcher's row and is never cut.
+fn welcome_session_row(
+    label: &str,
+    session: &WelcomeSession,
+    room: usize,
+    grays: &WelcomeGrays,
+) -> Vec<Span<'static>> {
+    let width = titi_tui::width::visible_width;
+    let mark = if session.current { "  ✓ current" } else { "" };
+    let value_room = room.saturating_sub(WELCOME_LABEL + width(mark));
+    let title = session.title.as_deref().unwrap_or("untitled");
+    let keep = width(title).min(WELCOME_TITLE_MIN);
+    let details = match &session.age {
+        Some(age) => [
+            format!("  {age} · {}", session.turns),
+            format!("  {age}"),
+            String::new(),
+        ],
+        None => [format!("  {}", session.turns), String::new(), String::new()],
+    };
+    // The fullest details that leave the whole title; failing that, the
+    // fullest that leave it its minimum, and the title is cut to what remains.
+    let leaves = |detail: &String, least: usize| value_room.saturating_sub(width(detail)) >= least;
+    let detail = details
+        .iter()
+        .find(|detail| leaves(detail, width(title)))
+        .or_else(|| details.iter().find(|detail| leaves(detail, keep)))
+        .cloned()
+        .unwrap_or_default();
+    let title_style = if session.title.is_some() {
+        grays.bright()
+    } else {
+        grays.faded()
+    };
+    let mut spans = vec![
+        Span::styled(
+            titi_tui::width::truncate_to_width(&format!("{label:<WELCOME_LABEL$}"), WELCOME_LABEL),
+            grays.faded(),
+        ),
+        Span::styled(
+            fit_head(title, value_room.saturating_sub(width(&detail))),
+            title_style,
+        ),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled(detail, grays.faded()));
+    }
+    if !mark.is_empty() {
+        spans.push(Span::styled(mark, grays.faded()));
+    }
+    spans
+}
+
+/// `text` in at most `width` cells, cut at its end behind an ellipsis.
+fn fit_head(text: &str, width: usize) -> String {
+    if titi_tui::width::visible_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}…", titi_tui::width::truncate_to_width(text, width - 1))
 }
 
 /// The chords the live screen answers to, and no others: the model picker's
