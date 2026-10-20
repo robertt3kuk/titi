@@ -1437,6 +1437,9 @@ impl EngineRuntime {
                         EngineCommand::RunGraph { task } => {
                             self.spawn_graph(task, primary_model.clone());
                         }
+                        EngineCommand::RunReview { edited } => {
+                            self.spawn_review(edited, primary_model.clone());
+                        }
                         EngineCommand::MemoryList => {
                             if let Some(agent_dir) = self.config.agent_dir.clone() {
                                 let output = run_off_thread(move || {
@@ -2190,6 +2193,62 @@ impl EngineRuntime {
                     report: crate::goal_report(&outcome).into(),
                 })
                 .await;
+        });
+    }
+
+    /// `/review` picks the files to judge, then asks a fresh reviewer with
+    /// read-only tools about them. With nothing changed no model is called.
+    /// Like `/goal` it runs beside the turn and never queues a prompt.
+    fn spawn_review(&self, edited: Vec<SmolStr>, model: SmolStr) {
+        let events = self.events.clone();
+        let Some(root) = self.config.workspace_root.clone() else {
+            tokio::spawn(async move {
+                let _ = events
+                    .send(EngineEvent::ReviewFinished {
+                        report: crate::ReviewReport::nothing("review: no workspace to review"),
+                    })
+                    .await;
+            });
+            return;
+        };
+        let policy = self.config.sensitive.clone();
+        let mut tools = ToolRegistry::new();
+        for tool in titi_tools::workspace_tools_with_interrupt(
+            &root,
+            self.config.read_cache.clone(),
+            policy.clone(),
+            self.config.interrupt.clone(),
+        ) {
+            tools.register(Arc::from(tool));
+        }
+        tools.retain_tiers(&[ApprovalTier::Read]);
+        // Fresh claims and touched set: the reviewer's reads are not the
+        // session's, and must not reorder its repository map.
+        let runner = crate::tool_agent::ToolAgentRunner::new(
+            Arc::clone(&self.resolver),
+            model,
+            tools,
+            Claims::new(),
+            TouchedSink::default(),
+        )
+        .with_approval_mode(ApprovalMode::Write)
+        .with_max_rounds(crate::REVIEW_ROUNDS)
+        .with_mask_ips(self.config.mask_ips);
+        let reviewer = crate::AgentReviewer::new(Arc::new(runner), "reviewer");
+        tokio::spawn(async move {
+            let edited: Vec<String> = edited.iter().map(ToString::to_string).collect();
+            let scope = {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || crate::select_scope(&root, &edited, &policy))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let report = match scope {
+                Some(scope) => crate::review_change(&reviewer, &scope).await,
+                None => crate::ReviewReport::nothing("nothing to review"),
+            };
+            let _ = events.send(EngineEvent::ReviewFinished { report }).await;
         });
     }
 

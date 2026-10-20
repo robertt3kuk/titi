@@ -128,6 +128,15 @@ fn every_engine_command_round_trips_through_its_fixture() {
         r#"{"RunCouncil":{"question":"why?"}}"#,
     );
     command(
+        EngineCommand::RunReview {
+            edited: vec!["a.rs".into()],
+        },
+        r#"{"RunReview":{"edited":["a.rs"]}}"#,
+    );
+    // A frame from a client that predates the field still reads.
+    let bare: EngineCommand = serde_json::from_str(r#"{"RunReview":{}}"#).unwrap();
+    assert_eq!(bare, EngineCommand::RunReview { edited: Vec::new() });
+    command(
         EngineCommand::RunGraph {
             task: "ship it".into(),
         },
@@ -397,6 +406,28 @@ fn every_engine_event_round_trips_through_its_fixture() {
             report: "verdict".into(),
         },
         r#"{"CouncilFinished":{"report":"verdict"}}"#,
+    );
+    event(
+        EngineEvent::ReviewFinished {
+            report: titi_engine::ReviewReport {
+                verdict: Some(titi_engine::Verdict::Fail),
+                reason: "missing test".into(),
+                findings: vec![titi_engine::ReviewFinding {
+                    file: Some("a.rs".into()),
+                    line: Some(2),
+                    text: "uncovered".into(),
+                }],
+                files: vec!["a.rs".into()],
+                raw: "VERDICT: FAIL".into(),
+            },
+        },
+        r#"{"ReviewFinished":{"report":{"verdict":"FAIL","reason":"missing test","findings":[{"file":"a.rs","line":2,"text":"uncovered"}],"files":["a.rs"],"raw":"VERDICT: FAIL"}}}"#,
+    );
+    event(
+        EngineEvent::ReviewFinished {
+            report: titi_engine::ReviewReport::nothing("nothing to review"),
+        },
+        r#"{"ReviewFinished":{"report":{"verdict":null,"reason":"nothing to review","findings":[],"files":[],"raw":""}}}"#,
     );
     event(
         EngineEvent::GraphFinished {

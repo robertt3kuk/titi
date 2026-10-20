@@ -5,6 +5,7 @@
 pub mod advisor;
 pub mod agent_tool;
 pub mod agents;
+pub mod change_review;
 pub mod claims;
 pub mod compaction;
 pub mod council;
@@ -29,6 +30,10 @@ pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
 pub use agent_tool::{AgentTool, BATCH_CONCURRENCY, MAX_ANSWER_CHARS, MAX_BATCH_TASKS};
 pub use agents::{
     AgentContext, AgentOutcome, AgentRequest, AgentRunner, AgentSupervisor, StreamingAgentRunner,
+};
+pub use change_review::{
+    FileChange, MAX_REVIEW_FILES, REVIEW_MARKER, REVIEW_ROUNDS, ReviewFinding, ReviewReport,
+    ReviewScope, ScopeSource, review_change, select_scope,
 };
 pub use council::{
     Council, CouncilError, CouncilMember, CouncilReport, DEFAULT_BRIEFS, DroppedMember,

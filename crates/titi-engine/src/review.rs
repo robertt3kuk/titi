@@ -13,7 +13,8 @@ use crate::agents::{AgentContext, AgentRequest, AgentRunner};
 use crate::protocol::AgentKind;
 
 /// What a reviewer concluded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Verdict {
     Pass,
     Fail,

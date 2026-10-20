@@ -116,6 +116,13 @@ pub enum EngineCommand {
     RunGraph {
         task: SmolStr,
     },
+    /// Independent review of what the session changed: a fresh reviewer with
+    /// read-only tools judges `edited` (the files the surface saw the agent
+    /// write), else the uncommitted `git diff HEAD`. This is not a chat turn.
+    RunReview {
+        #[serde(default)]
+        edited: Vec<SmolStr>,
+    },
     /// Report what currently fills the context window, part by part.
     DescribeContext,
     /// Fold the history now, whatever the threshold says. `focus` is free
@@ -355,6 +362,11 @@ pub enum EngineEvent {
     /// `/council` finished. `report` is the block the surface shows.
     CouncilFinished {
         report: SmolStr,
+    },
+    /// `/review` finished. With nothing to review `report.verdict` is `None`
+    /// and no model ran.
+    ReviewFinished {
+        report: crate::change_review::ReviewReport,
     },
     /// An orchestrator graph finished. `report` is the block the surface
     /// shows: one line per node entered, then the final verdict.
