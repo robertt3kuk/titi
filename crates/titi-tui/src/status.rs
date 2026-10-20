@@ -712,6 +712,14 @@ impl AgentEdits {
     pub fn counts(&self) -> (usize, usize) {
         (self.created.len(), self.edited.len())
     }
+
+    /// Every created and edited path, sorted: what a reviewer is asked to
+    /// read.
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.created.iter().chain(&self.edited).cloned().collect();
+        paths.sort();
+        paths
+    }
 }
 
 /// The path out of an edit tool's chip (`write a.txt`, `edit ./a.txt`), with
@@ -1299,5 +1307,16 @@ mod tests {
         edits.started("c", "write", None, |_| true);
         edits.finished("c", false);
         assert_eq!(edits.counts(), (0, 0));
+    }
+
+    #[test]
+    fn the_edited_paths_are_every_created_and_edited_file_sorted() {
+        let mut edits = AgentEdits::default();
+        assert!(edits.paths().is_empty());
+        edit_call(&mut edits, "a", "edit", "edit src/b.rs", true, false);
+        edit_call(&mut edits, "b", "write", "write new.txt", false, false);
+        edit_call(&mut edits, "c", "edit", "edit ./src/a.rs", true, false);
+        edit_call(&mut edits, "d", "write", "write failed.txt", false, true);
+        assert_eq!(edits.paths(), ["new.txt", "src/a.rs", "src/b.rs"]);
     }
 }
