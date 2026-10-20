@@ -459,15 +459,43 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// The privacy the runtime tools read with: the user's credential policy and
+/// whether addresses are masked too, from the same settings (`privacy.*`).
+struct Privacy {
+    policy: titi_tools::SensitivePolicy,
+    mask_ips: bool,
+}
+
+impl Privacy {
+    fn load(agent_dir: &Path, workspace: &Path) -> Self {
+        let settings =
+            titi_config::settings::Settings::load(agent_dir, workspace, &[]).unwrap_or_default();
+        let (policy, mask_ips) = crate::engine::privacy_policy(&settings);
+        Self { policy, mask_ips }
+    }
+
+    /// The same pass a tool result gets before it reaches the model.
+    fn mask(&self, text: &str) -> titi_memory::redact::Redaction {
+        if self.mask_ips {
+            titi_memory::redact::redact_for_model(text)
+        } else {
+            titi_memory::redact::redact(text)
+        }
+    }
+}
+
 /// The attachment block for the `@path`s of `draft`, and what to tell the
 /// user about it.
 ///
 /// A small text file is inlined whole; a longer one is inlined up to
 /// [`MAX_INLINE_LINES`] lines / [`MAX_INLINE_BYTES`] bytes with a `[truncated`
-/// marker that tells the model to read the rest; a binary or credential file
-/// is only named. A path outside the workspace is refused outright and never
-/// opened, and a word that is no file at all is left alone.
-pub(crate) fn attach(workspace: &Path, draft: &str) -> Attachments {
+/// marker that tells the model to read the rest; a binary file, or one the
+/// user's credential policy blocks, is only named. What is inlined is masked
+/// exactly as a `read` result is, and the note says when something was. A path
+/// outside the workspace is refused outright and never opened, and a word that
+/// is no file at all is left alone.
+pub(crate) fn attach(workspace: &Path, agent_dir: &Path, draft: &str) -> Attachments {
+    let mut privacy: Option<Privacy> = None;
     let mut block = String::new();
     let mut notes = Vec::new();
     let mut summary: Vec<String> = Vec::new();
@@ -496,7 +524,16 @@ pub(crate) fn attach(workspace: &Path, draft: &str) -> Attachments {
             continue;
         }
         attached += 1;
-        if titi_tools::sensitive::is_sensitive(Path::new(shown)) {
+        let privacy = privacy.get_or_insert_with(|| Privacy::load(agent_dir, workspace));
+        // The link's own name and where it leads are both judged: a link
+        // called `notes.txt` that points at `.env` is still `.env`.
+        let target = workspace
+            .canonicalize()
+            .ok()
+            .and_then(|root| real.strip_prefix(root).ok().map(Path::to_path_buf));
+        if privacy.policy.blocks(Path::new(shown))
+            || target.is_some_and(|target| privacy.policy.blocks(&target))
+        {
             block.push_str(&format!(
                 "<file path=\"{shown}\" note=\"not inlined: looks like credentials\"/>\n"
             ));
@@ -517,17 +554,23 @@ pub(crate) fn attach(workspace: &Path, draft: &str) -> Attachments {
                 lines,
                 truncated,
             } => {
-                budget = budget.saturating_sub(text.len());
-                let text = text.trim_end_matches('\n');
+                let masked = privacy.mask(&text);
+                budget = budget.saturating_sub(masked.text.len());
+                let text = masked.text.trim_end_matches('\n');
+                let hidden = if masked.removed > 0 {
+                    format!(" · masked {}", masked.removed)
+                } else {
+                    String::new()
+                };
                 if truncated {
                     block.push_str(&format!(
                         "<file path=\"{shown}\" truncated=\"true\">\n{text}\n[truncated · {} · first {lines} lines shown · read {shown} for the rest]\n</file>\n",
                         human_size(size)
                     ));
-                    summary.push(format!("{shown} · first {lines} lines"));
+                    summary.push(format!("{shown} · first {lines} lines{hidden}"));
                 } else {
                     block.push_str(&format!("<file path=\"{shown}\">\n{text}\n</file>\n"));
-                    summary.push(format!("{shown} · {lines} lines"));
+                    summary.push(format!("{shown} · {lines} lines{hidden}"));
                 }
             }
             Body::Binary => {

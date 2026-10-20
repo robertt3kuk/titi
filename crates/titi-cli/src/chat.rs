@@ -2041,7 +2041,7 @@ impl Chat {
         let mut text = self.expand_pastes(&draft);
         // Typed `@path`s that name workspace files travel with the prompt; the
         // screen keeps only the `@path`.
-        let attached = crate::mention::attach(&self.workspace, &draft);
+        let attached = crate::mention::attach(&self.workspace, &self.agent_dir, &draft);
         text.push_str(&attached.block);
         self.clear_input();
         self.disarm();

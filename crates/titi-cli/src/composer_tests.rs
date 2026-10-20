@@ -45,6 +45,12 @@ fn write(root: &Path, rel: &str, body: &str) {
     std::fs::write(path, body).expect("write");
 }
 
+/// `mention::attach` with no settings to speak of: an agent directory that
+/// does not exist leaves the built-in privacy policy.
+fn attach_here(workspace: &Path, draft: &str) -> mention::Attachments {
+    mention::attach(workspace, Path::new("/nonexistent-titi-agent"), draft)
+}
+
 fn files(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
@@ -334,7 +340,7 @@ fn paths_outside_the_workspace_are_refused_and_never_read() {
     std::os::unix::fs::symlink(outer.path().join("secret.txt"), ws.join("link.txt")).expect("link");
 
     for spelled in ["@../secret.txt", "@sub/../../secret.txt"] {
-        let attached = mention::attach(&ws, spelled);
+        let attached = attach_here(&ws, spelled);
         assert!(attached.block.is_empty(), "{spelled}: {}", attached.block);
         assert_eq!(
             attached.notes,
@@ -342,23 +348,23 @@ fn paths_outside_the_workspace_are_refused_and_never_read() {
         );
     }
     let absolute = format!("@{}", outer.path().join("secret.txt").display());
-    let attached = mention::attach(&ws, &absolute);
+    let attached = attach_here(&ws, &absolute);
     assert!(
         attached.block.is_empty() && attached.notes.len() == 1,
         "{attached:?}"
     );
-    let home = mention::attach(&ws, "@~/notes");
+    let home = attach_here(&ws, "@~/notes");
     assert!(home.block.is_empty() && home.notes.len() == 1, "{home:?}");
     #[cfg(unix)]
     {
-        let linked = mention::attach(&ws, "@link.txt");
+        let linked = attach_here(&ws, "@link.txt");
         assert!(
             linked.block.is_empty() && !linked.block.contains("SECRET"),
             "a link out of the workspace is not followed: {linked:?}"
         );
         assert_eq!(linked.notes.len(), 1);
     }
-    let fine = mention::attach(&ws, "@in.txt");
+    let fine = attach_here(&ws, "@in.txt");
     assert!(fine.block.contains("inside"));
 }
 
@@ -369,7 +375,7 @@ fn a_long_file_is_cut_at_the_cap_with_a_marker() {
         .map(|n| format!("line {n}\n"))
         .collect();
     write(dir.path(), "long.txt", &body);
-    let attached = mention::attach(dir.path(), "read @long.txt");
+    let attached = attach_here(dir.path(), "read @long.txt");
     assert!(
         attached.block.contains("truncated=\"true\""),
         "{}",
@@ -390,7 +396,7 @@ fn a_long_file_is_cut_at_the_cap_with_a_marker() {
 
     // The byte cap: one enormous line is dropped rather than shown half.
     write(dir.path(), "wide.txt", &"x".repeat(MAX_INLINE_BYTES * 3));
-    let wide = mention::attach(dir.path(), "@wide.txt");
+    let wide = attach_here(dir.path(), "@wide.txt");
     assert!(
         wide.block.len() < MAX_INLINE_BYTES * 2,
         "{}",
@@ -401,7 +407,7 @@ fn a_long_file_is_cut_at_the_cap_with_a_marker() {
     // A file exactly at the caps is whole.
     let exact: String = (1..=MAX_INLINE_LINES).map(|n| format!("{n}\n")).collect();
     write(dir.path(), "exact.txt", &exact);
-    let whole = mention::attach(dir.path(), "@exact.txt");
+    let whole = attach_here(dir.path(), "@exact.txt");
     assert!(!whole.block.contains("[truncated"), "{}", whole.block);
 }
 
@@ -411,7 +417,7 @@ fn binary_credential_and_missing_files_are_named_or_left_alone() {
     std::fs::write(dir.path().join("pic.bin"), [0u8, 159, 146, 150, 0]).expect("bin");
     write(dir.path(), ".env", "API_KEY=sk-test");
     write(dir.path(), "a.txt", "alpha\n");
-    let attached = mention::attach(
+    let attached = attach_here(
         dir.path(),
         "@pic.bin @.env @nope.txt @a.txt. me@a.txt @a.txt",
     );
@@ -436,7 +442,7 @@ fn binary_credential_and_missing_files_are_named_or_left_alone() {
         attached.block
     );
     assert_eq!(
-        mention::attach(dir.path(), "no mentions here"),
+        attach_here(dir.path(), "no mentions here"),
         mention::Attachments::default()
     );
 }
@@ -449,7 +455,7 @@ fn too_many_files_name_the_rest_instead_of_inlining_them() {
         write(dir.path(), &format!("f{n}.txt"), "x\n");
         draft.push_str(&format!("@f{n}.txt "));
     }
-    let attached = mention::attach(dir.path(), &draft);
+    let attached = attach_here(dir.path(), &draft);
     assert_eq!(
         attached.block.matches("<file path=").count(),
         8,
@@ -994,4 +1000,114 @@ fn hotkeys_and_help_list_the_new_keys() {
         all.iter().any(|row| row.starts_with("keys  @file")),
         "/help ends with the keys line: {all:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Privacy: the same policy and masking a `read` gets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_users_credential_policy_decides_what_an_at_path_may_inline() {
+    let ws = tempfile::tempdir().expect("ws");
+    let agent = tempfile::tempdir().expect("agent");
+    write(
+        agent.path(),
+        "config.yml",
+        "privacy:\n  sensitive: [\"*.vault\"]\n  allow: [\".env\"]\n",
+    );
+    write(ws.path(), "team.vault", "TOP SECRET PLAN");
+    write(ws.path(), ".env", "PLAIN=allowed by the user");
+    write(ws.path(), "plain.txt", "fine");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(ws.path().join("team.vault"), ws.path().join("notes.txt"))
+        .expect("link");
+    let attached = mention::attach(ws.path(), agent.path(), "@team.vault @.env @plain.txt");
+    assert!(
+        attached
+            .block
+            .contains("<file path=\"team.vault\" note=\"not inlined: looks like credentials\"/>"),
+        "{}",
+        attached.block
+    );
+    assert!(!attached.block.contains("TOP SECRET"), "{}", attached.block);
+    #[cfg(unix)]
+    {
+        let linked = mention::attach(ws.path(), agent.path(), "@notes.txt");
+        assert!(
+            linked
+                .block
+                .contains("<file path=\"notes.txt\" note=\"not inlined")
+                && !linked.block.contains("TOP SECRET"),
+            "a link to a blocked file is blocked: {}",
+            linked.block
+        );
+    }
+    assert!(
+        attached.block.contains("allowed by the user"),
+        "the user's allow list opens .env"
+    );
+    assert!(attached.block.contains("<file path=\"plain.txt\">"));
+    assert!(
+        attached
+            .notes
+            .iter()
+            .any(|n| n.contains("@team.vault looks like credentials"))
+    );
+}
+
+#[test]
+fn an_inlined_body_is_masked_like_a_tool_result_and_the_note_says_so() {
+    let ws = workspace_with_files();
+    let agent = tempfile::tempdir().expect("agent");
+    let mut chat = chat_in(ws.path(), agent.path());
+    write(
+        ws.path(),
+        "settings.toml",
+        "api_key = \"sk-test-0123456789abcdefghijklmnop\"\nhost = \"10.1.2.3\"\nname = \"ok\"\n",
+    );
+    type_text(&mut chat, "check @settings.toml now");
+    let applied = press(&mut chat, Key::Enter);
+    let sent = submitted(&applied);
+    assert!(sent.contains("name = \"ok\""), "{sent}");
+    assert!(
+        !sent.contains("sk-test-0123456789abcdefghijklmnop"),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains("10.1.2.3"),
+        "addresses are masked as for any tool: {sent}"
+    );
+    let log = applied.log.expect("logged").text;
+    assert!(
+        !log.contains("sk-test-"),
+        "the log carries what the model read"
+    );
+    assert!(
+        chat.lines.iter().any(|l| l
+            .text
+            .starts_with("attached settings.toml · 3 lines · masked ")),
+        "{:?}",
+        chat.lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
+    // The draft on screen is what was typed.
+    assert!(
+        chat.lines
+            .iter()
+            .any(|l| l.kind == LineKind::User && l.text == "check @settings.toml now")
+    );
+}
+
+#[test]
+fn privacy_mask_ips_off_still_masks_secrets_but_keeps_addresses() {
+    let ws = tempfile::tempdir().expect("ws");
+    let agent = tempfile::tempdir().expect("agent");
+    write(agent.path(), "config.yml", "privacy:\n  maskIps: false\n");
+    write(
+        ws.path(),
+        "a.toml",
+        "api_key = \"sk-test-0123456789abcdefghijklmnop\"\nhost = \"10.1.2.3\"\n",
+    );
+    let attached = mention::attach(ws.path(), agent.path(), "@a.toml");
+    assert!(!attached.block.contains("sk-test-"), "{}", attached.block);
+    assert!(attached.block.contains("10.1.2.3"), "{}", attached.block);
 }
