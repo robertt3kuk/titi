@@ -95,31 +95,122 @@ cores; the files are cut into contiguous path-ordered slices and a 15k-line
 Fix (`87e15b7`): threads claim the next file from a shared counter, in list
 order (so `prioritize` still takes the urgent files first).
 
+### 5. `grep` read and matched every file on one thread (fixed)
+
+Evidence: 92–95 ms over 5,000 small files whatever the pattern (a miss
+included) and 17–20 ms over this repository; `glob` over the same trees is
+4.6 and 2.0 ms, so the walk is not where the time goes: it is
+`read_to_string` and a regex call per line, one file after another.
+
+Fix (`a470151`): the walk only lists files, in the order the answer lists them
+(name order per directory, credential and glob filters applied). Threads claim
+files from a shared counter and the results are folded in listing order, so
+the lines, the 500-line cap and the "more matches" count are those of the
+sequential walk. A file formats no more lines than the folded prefix still has
+room for, which keeps a dense pattern from formatting what the cap discards.
+Trees under 16 files stay on the calling thread. A test keeps the old
+sequential walk as an oracle and compares byte for byte on a tree that crosses
+the cap mid-file and holds every kind of skipped file.
+
+Result: 1.8× on 5,000 files (94 → 52 ms) and 2.2× on this repository
+(18 → 8 ms), well short of the core count. The serial part (directory listing,
+sort, `stat`) and the host's load are in it; the rest was not profiled.
+
+### 6. A refresh that found nothing still copied the graph (fixed)
+
+Evidence: through `SharedGenome` (the engine's path) a no-op refresh cost 6.5 ms
+here and 23 ms at 5,000 files, against 3.4 and 10.4 ms for the same walk on an
+in-place `Genome`: the difference is the copy of the whole graph that is made
+before anyone knows whether the walk changes it.
+
+Fix (`4a78144`): list the tree first and ask the published snapshot whether the
+listing is current (same root, same path set, no open buffer, every file past
+the metadata gate). If it is, no copy and no publish: the generation does not
+move and readers keep the same `Arc`. Anything else takes the old path. Result:
+6.5 → 3.4 ms and 23 → 11 ms, equal to the in-place numbers; what remains is the
+walk.
+
+### 7. The first walk competed with the thread that draws (fixed)
+
+Evidence: with the index on, the first frame was still ~95–120 ms against
+~34 ms without it (fix 1 moved the index off the caller, not off the cores).
+A sweep of the number of parse threads, 30 launches per row on this 10-core
+host at load 8–14, first frame in ms:
+
+| parse threads | all (10) | 9 | 8 | 7 | 5 | 4 | no index |
+|---|---|---|---|---|---|---|---|
+| median first frame | 111 | 78 | 51 | 41 | 35 | 34 | 34 |
+
+(Two sweeps: the column for 8 comes from the first, where "all" measured 97.)
+The cost to the index (`bench_genome --quick`, `index_cold`, median of 3,
+repo / 5k, ms): 238 / 400 on every core, 223 / 341 on 8, 224 / 369 on 6,
+281 / 426 on 4.
+
+Fix (`546f8ef`): the first walk of a deferred handle parses on two fewer
+threads than cores from eight cores up, one fewer below that. Later walks and
+the synchronous `spawn` use every core. One free core, as first proposed, only
+recovered a third of the gap; two free cores is where the first frame is within
+~20 ms of having no index and the index is not slower. The sweep is one
+machine under load: on an idle one the gap is smaller and the constant in
+`first_walk_workers_for` is the place to retune.
+
+### 8. Tool schemas carried repeated wording (trimmed, 11%)
+
+Fix (`e3a3623`): wording that repeated itself or another field went: a tool
+description restating its parameter (`ask` `free_text`, `todo` `op`), the same
+example in a description and its parameter (`glob`, `grep`, `read`), a second
+sentence paraphrasing the first (`agent`, `project`, `settings`). Every
+parameter, enum, default, limit and "when to use it" sentence stayed. Tests pin
+which parameters each tool has and which carry a description, and a byte
+ceiling. The result is 12,239 → 10,881 bytes per request (−11%, ~340 tokens) —
+not the 20% asked for. What is left in the big five (`agent`, `todo`, `ask`,
+`project`, `grep`: 4.3 KB) is guidance on when and how to call them, and
+cutting it is a behaviour change to be judged with the model in the loop, not a
+wording fix.
+
 ### Found, not fixed
 
-* **Tool schemas are 11.3 KB — 47% of the first request, ~2.8k tokens, sent on
-  every request.** `agent` (2.1 KB), `todo` (1.5 KB), `ask` (1.1 KB) and `grep`
-  (0.9 KB) lead; 17 tools in all. They are static and cache well, but they
-  fill the context window from the first turn. The descriptions are prose the
-  model leans on, so shortening them is a product decision, not a refactor;
-  exposing the rarely used ones (`settings`, `memory`, `git_commit`,
-  `diagnose`, `hashline_edit`) on demand would save ~2.4 KB without touching a
-  word.
+* **Tool schemas are still 10.9 KB — 46% of the first request, ~2.7k tokens,
+  sent on every request.** See the proposal below.
 * **The system prompt is 9.4 KB in a repo like this one** (`AGENTS.md` and the
   skill list ride in it). Constant per session, so cheap for the cache, but it
   is a fixed cost of every request.
 * **The genome costs ~48 MB of resident memory** on this repo (59 MB with it,
-  11.6 MB without) and `refresh` copies the whole graph into a private value on
-  every update, which is why a no-op refresh is 3.7 ms here and 13 ms at 5,000
-  files. Skipping the copy when the walk finds nothing stale would remove it.
-* **`grep` over 5,000 small files takes ~100 ms** (a miss included): one thread,
-  one `read_to_string` and a per-line regex call per file. Parallel reads with
-  the cap applied in path order should cut it by about the core count
-  [inference, not tried].
-* After fix 1 the first frame with the genome on is still ~95 ms against 34 ms
-  without it; the likely cause is the indexer's threads competing with the
-  startup thread for cores [inference]. Leaving one core free for the first
-  walk is untried.
+  11.6 MB without). Fix 6 removed the per-turn copy but not the graph itself.
+* **`grep` over 5,000 files is still ~52 ms**, ten times what listing the same
+  files costs (`glob`, 4.6 ms). The gap to the core count is not explained and
+  was not profiled. A no-op refresh is now only its walk (3.4 ms here, 11 ms at
+  5,000 files).
+
+### Proposal: load the rarely used tools on demand (not implemented)
+
+This is a product decision, so it is measured here and not built. After fix 8
+the schemas of five tools that most turns never call are 2,225 bytes, 20.4% of
+the 10,881 sent per request:
+
+| tool | bytes |
+|---|---|
+| `settings` | 632 |
+| `memory` | 616 |
+| `hashline_edit` | 446 |
+| `git_commit` | 349 |
+| `diagnose` | 182 |
+| **together** | **2,225** |
+
+Offering them behind one small tool that lists the unloaded ones and loads a
+schema when the model asks (a catalogue of five names and one line each, ~300
+bytes) would send ~8.96 KB instead of 10.88 KB: −1.9 KB per request net (−17.7%,
+~480 tokens), −27% against the 12.2 KB baseline with fix 8 included. Over the
+9-request session that is ~17 KB of the 490 KB sent. Two things to weigh
+first: a schema added mid-session changes the tools block, which in the usual
+provider layout comes before the conversation in the cache prefix [inference,
+not measured here], so the turn that loads one would pay for the
+prefix again; and the model has to know to ask, which is a behaviour to test
+with a real model rather than the scripted provider. A cheaper first step,
+needing no meta tool: `web_search` (215 bytes) is offered even when no search
+provider is configured, where every call answers "no provider configured";
+leaving it out of that registry costs nothing.
+
 
 ### Measured and fine
 
@@ -219,6 +310,68 @@ stale-copy columns stop growing. "Fresh" is the copy in the newest user message,
 | repaint, one typed character | 1.2 | 1.2 |
 | repaint, one PageUp | 1.3 | 1.4 |
 | session CPU | 171 | 157 |
+
+### Wave 2 — grep, no-op refresh, tool schemas, first walk
+
+Baseline `a7b1352` (master when this wave started) against after `546f8ef`.
+Both binaries were run back to back, alternating, two rounds; latencies are
+the minimum of each round's runs unless a row says median, so each cell shows
+the two rounds. Three rows are new in `bench.py` (`7a28fe0`):
+`refresh_shared_noop`, `grep_miss`, `grep_dense`. Host load average 8–16.
+
+#### `grep` (`tools` suite, min of 15 runs, ms)
+
+| case | repo, baseline | repo, after | 5k files, baseline | 5k files, after |
+|---|---|---|---|---|
+| rare pattern | 18.2 / 18.2 | 8.6 / 8.7 | 92.4 / 94.1 | 52.8 / 51.9 |
+| `pub (fn\|struct)` in `*.rs` | 14.8 / 15.0 | 7.2 / 6.2 | 50.3 / 51.0 | 29.1 / 29.1 |
+| miss (no hit anywhere) | 17.3 / 17.4 | 8.2 / 8.2 | 93.5 / 95.3 | 52.4 / 53.6 |
+| dense (hits far past the cap) | 20.4 / 20.7 | 9.5 / 8.3 | 94.5 / 95.8 | 52.5 / 51.7 |
+| ignore case | 19.7 / 20.0 | 9.0 / 8.1 | 94.9 / 97.3 | 52.7 / 50.0 |
+
+`glob` (2.0 / 4.6 ms) and `read` (0.15 ms) did not move.
+
+#### Genome refresh through the publish point (min of 7 runs, ms)
+
+| case | baseline | after |
+|---|---|---|
+| repo `refresh_shared_noop` | 6.7 / 6.3 | 3.4 / 3.4 |
+| 5k `refresh_shared_noop` | 22.8 / 23.0 | 11.4 / 10.5 |
+| repo / 5k in-place `refresh_noop` (no copy to begin with) | 3.4 / 10.4–10.7 | 3.4 / 10.4–11.0 |
+| repo / 5k `refresh_one_edit` | 4.9 / 47–51 | 4.8 / 48 |
+
+The shared no-op now costs what the in-place one does: the walk.
+
+#### Startup (TUI on a 120x40 PTY, ms)
+
+| case | baseline | after |
+|---|---|---|
+| first frame, genome on, median (`bench.py`, 7 launches) | 119.7 / 124.6 | 101.0 / 94.8 |
+| first frame, genome on, median (40 alternating launches) | 117 / 112 | 69 / 84 |
+| first frame, genome off, median | 33.7 / 32.2 | 35.5 / 36.5 |
+| first byte, genome on, median | 15.0 / 15.0 | 15.3 / 18.5 |
+| session CPU, genome on, median | 1226 / 1154 | 1134 / 1119 |
+| headless first token (`streaming`, min of 7) | 241 / 225 | 227 / 211 |
+
+The index itself did not get slower (the last row waits for it).
+
+#### Tool schemas (`prompt` suite, bytes)
+
+| | baseline | after |
+|---|---|---|
+| `tools` per request (18 tools) | 12,239 | 10,881 |
+| `tools`, summed over the 9-request session | 110,151 | 97,929 |
+| request 1, total / est. tokens | 24,878 / 6,219 | 23,520 / 5,880 |
+| request 9, total / est. tokens | 70,051 / 17,512 | 68,693 / 17,173 |
+| whole session, total / est. tokens | 502,395 / 125,598 | 490,173 / 122,543 |
+
+Per tool (bytes of the schema as sent): `agent` 2,010 → 1,552, `todo` 1,397 →
+1,194, `ask` 1,091 → 888, `project` 968 → 884, `grep` 846 → 732, `read` 697 →
+624, `glob` 687 → 618, `bash` 614 → 561, `edit` 536 → 479, `settings` 676 →
+632, `git` 480 → 462. `memory`, `hashline_edit`, `git_commit`, `write`,
+`web_search`, `fetch`, `diagnose` are unchanged (`memory` lives in
+`titi-memory`). The baseline is larger than the first table's 11,270 because
+the `project` tool (968 B) landed in between.
 
 ## Limits
 
