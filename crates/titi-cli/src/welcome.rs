@@ -21,6 +21,9 @@ use crate::pickers::model_rows;
 /// Recent sessions the welcome names before it stops.
 const WELCOME_SESSIONS: usize = 3;
 
+/// Newest session files looked at to find [`WELCOME_SESSIONS`] with a prompt.
+const WELCOME_SCAN: usize = 20;
+
 /// The widest the facts block grows: on a wide pane it stays a block a glance
 /// takes in, not a row stretched to the far edge.
 const WELCOME_MEASURE: usize = 72;
@@ -115,20 +118,24 @@ fn welcome_facts(chat: &Chat) -> WelcomeFacts {
             staged: snapshot.git_staged,
             untracked: snapshot.git_untracked,
         }),
+        // Only a session that was asked something is a recent one: an empty
+        // file (a launch that quit unused, the screen's own fresh session)
+        // says nothing, and would crowd out one that does.
         sessions: {
             let now = std::time::SystemTime::now();
             chat.session_choices()
                 .into_iter()
-                .take(WELCOME_SESSIONS)
-                .map(|id| {
+                .take(WELCOME_SCAN)
+                .filter_map(|id| {
                     let brief = crate::session_fs::session_brief(&chat.agent_dir, &id);
-                    WelcomeSession {
+                    (brief.turns > 0).then(|| WelcomeSession {
                         age: brief.age(now),
                         turns: brief.turns_label(),
                         title: brief.title,
                         current: id == chat.session_id,
-                    }
+                    })
                 })
+                .take(WELCOME_SESSIONS)
                 .collect()
         },
     }

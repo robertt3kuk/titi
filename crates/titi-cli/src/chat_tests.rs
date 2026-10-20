@@ -2468,20 +2468,47 @@ fn the_welcome_names_a_session_by_what_it_was_asked() {
         &["add a --json flag to the exporter tool and document it in the readme"],
         Duration::from_secs(3 * 3600),
     );
+    // Empty sessions — a launch that quit unused, the newest of all — are not
+    // recent ones: they are skipped, and the next session with a prompt fills
+    // the slot.
     stored_session(&chat, "ccc333", &[], Duration::from_secs(5 * 86_400));
+    stored_session(&chat, "ddd444", &[], Duration::from_secs(10));
+    stored_session(
+        &chat,
+        "eee555",
+        &["write the changelog"],
+        Duration::from_secs(6 * 86_400),
+    );
+    stored_session(
+        &chat,
+        "fff666",
+        &["a fourth, which is one too many"],
+        Duration::from_secs(7 * 86_400),
+    );
     chat.session_id = "aaa111".to_owned();
 
     let frame = welcome_at(&mut chat, 120, 36);
     for expected in [
         "recent   fix the flaky test in parser  2m · 2 turns  ✓ current",
         "add a --json flag to the exporter tool and docume…  3h · 1 turn",
-        "untitled  5d · 0 turns",
+        "write the changelog  6d · 1 turn",
     ] {
         assert!(frame.contains(expected), "{expected:?} in:\n{frame}");
     }
-    for id in ["aaa111", "bbb222", "ccc333"] {
+    assert!(
+        !frame.contains("untitled"),
+        "empty sessions are skipped: {frame}"
+    );
+    assert!(!frame.contains("fourth"), "three rows at most: {frame}");
+    for id in ["aaa111", "bbb222", "ccc333", "ddd444", "eee555"] {
         assert!(!frame.contains(id), "{id} is not a name: {frame}");
     }
+
+    // The session on screen is listed only once it has a prompt of its own.
+    chat.session_id = "ddd444".to_owned();
+    let frame = welcome_at(&mut chat, 120, 36);
+    assert!(!frame.contains("✓ current"), "{frame}");
+    chat.session_id = "aaa111".to_owned();
 
     // A narrow pane gives the turn count and the age up before the title, and
     // cuts a long title at its end behind an ellipsis, the mark whole.
