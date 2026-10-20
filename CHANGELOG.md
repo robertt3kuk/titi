@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `grep` reads and matches files on all cores. The answer is byte for byte what it was (path order, the same 500-line cap and "more matches" count), but a search of 5,000 files takes about 53 ms instead of 94 ms and one of titi's own tree about 8 ms instead of 18 ms.
+
 - Every finished turn's footer row now ends with `copy · fork`, right-aligned and dim. A click on `copy` puts that turn's answer on the clipboard (every round of the turn's text, through the OS clipboard writer, or OSC 52 when there is none — the route a copy-by-selection takes); a click on `fork` starts a new session from the conversation as it stood at the end of that turn, and says so when the turn is the newest one (the whole session) or cannot be placed in the session file (the whole session too, with the reason). A footer too narrow to hold the actions beside its text, or one that wraps, draws without them. `/copy [n]` does the same copy from the keyboard — the newest answer, or the nth-last — and works with mouse reporting off.
 
 - `/errors` lists every error this session showed, newest first, with its time and where it came from (`provider`, `tool` or `titi`); Enter opens the whole message, which the transcript row cuts to a line, and Esc closes. The log keeps the newest 200. The status line shows `⚠ N` for the errors that arrived since you last opened the panel, and nothing while there are none. Alt+R stays with the keybinding table's `app.retry`, so the panel is the command only.

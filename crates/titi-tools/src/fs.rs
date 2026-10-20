@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -1019,17 +1020,18 @@ impl ToolHandler for GrepTool {
             files,
             policy: &self.policy,
         };
-        let mut hits = Hits::default();
+        let mut files = Vec::new();
         if start.is_file() {
             if let Some(path) = &path
                 && let Err(error) = readable_path(&self.root, path, &self.policy)
             {
                 return err(error);
             }
-            grep_file(&root, &start, &query, &mut hits);
+            files.extend(grep_candidate(&root, start, &query));
         } else {
-            grep_walk(&root, &start, &query, &mut hits);
+            grep_walk(&root, &start, &query, &mut files);
         }
+        let mut hits = grep_files(&files, &query);
         if hits.more > 0 {
             hits.lines.push(format!("… {} more matches", hits.more));
         }
@@ -1044,12 +1046,46 @@ struct GrepQuery<'a> {
     policy: &'a SensitivePolicy,
 }
 
+/// A file a grep reads: where it is, and how the answer names it.
+struct GrepFile {
+    path: PathBuf,
+    shown: String,
+}
+
+/// What one file contributes: its matches in line order, as many formatted as
+/// were asked for, and how many there were in all.
+#[derive(Default)]
+struct FileHits {
+    lines: Vec<String>,
+    count: usize,
+}
+
 /// The hits a grep answers with, and a count of those past
-/// [`GREP_MAX_MATCHES`], which are counted but never formatted.
+/// [`GREP_MAX_MATCHES`], which are counted but never shown.
 #[derive(Default)]
 struct Hits {
     lines: Vec<String>,
     more: usize,
+}
+
+impl Hits {
+    /// Lines still to show before the cap.
+    fn room(&self) -> usize {
+        GREP_MAX_MATCHES.saturating_sub(self.lines.len())
+    }
+
+    /// Fold in the next file's matches, which come after every one so far.
+    fn absorb(&mut self, file: FileHits) {
+        let unformatted = file.count - file.lines.len();
+        for line in file.lines {
+            if self.lines.len() < GREP_MAX_MATCHES {
+                self.lines.push(line);
+            } else {
+                self.more += 1;
+            }
+        }
+        self.more += unformatted;
+    }
 }
 
 /// How a finished piped run reads to the model: the output for a success, and
@@ -1259,7 +1295,8 @@ fn walk(root: &Path, dir: &Path, filter: &PathFilter, out: &mut Vec<String>) {
     }
 }
 
-fn grep_walk(root: &Path, dir: &Path, query: &GrepQuery, hits: &mut Hits) {
+/// The files a grep reads under `dir`, in the order its answer lists them.
+fn grep_walk(root: &Path, dir: &Path, query: &GrepQuery, out: &mut Vec<GrepFile>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1281,41 +1318,120 @@ fn grep_walk(root: &Path, dir: &Path, query: &GrepQuery, hits: &mut Hits) {
             {
                 continue;
             }
-            grep_walk(root, &path, query, hits);
+            grep_walk(root, &path, query, out);
             continue;
         }
-        grep_file(root, &path, query, hits);
+        out.extend(grep_candidate(root, path, query));
     }
 }
 
-/// One file's hits, unless it holds credentials, falls outside the glob, or
-/// is not UTF-8.
-fn grep_file(root: &Path, path: &Path, query: &GrepQuery, hits: &mut Hits) {
-    let relative = path.strip_prefix(root).unwrap_or(path);
+/// `path` as a file to read, unless it holds credentials or falls outside the
+/// glob.
+fn grep_candidate(root: &Path, path: PathBuf, query: &GrepQuery) -> Option<GrepFile> {
+    let relative = path.strip_prefix(root).unwrap_or(&path);
     if query.policy.blocks(relative) {
-        return;
+        return None;
     }
     let shown = slash_path(relative);
-    if !query.files.matches(&shown) {
-        return;
+    query
+        .files
+        .matches(&shown)
+        .then_some(GrepFile { path, shown })
+}
+
+/// Files a thread is worth starting for: reading a handful is quicker than
+/// spawning anything.
+const GREP_FILES_PER_WORKER: usize = 16;
+
+/// The answer of a grep over `files`, which are in listing order.
+///
+/// Threads claim files one at a time from a shared counter and read and match
+/// them independently. Their results are folded into the answer strictly in
+/// listing order, so the lines, the cap and the "more" count are those of a
+/// single thread reading the files one after another.
+fn grep_files(files: &[GrepFile], query: &GrepQuery) -> Hits {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(files.len().div_ceil(GREP_FILES_PER_WORKER));
+    if workers <= 1 {
+        let mut hits = Hits::default();
+        for file in files {
+            hits.absorb(grep_file(file, query, hits.room()));
+        }
+        return hits;
     }
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
+    struct Folded {
+        /// One slot per file, filled as its reader finishes.
+        slots: Vec<Option<FileHits>>,
+        /// Files already folded into `hits`: all of `slots[..merged]`.
+        merged: usize,
+        hits: Hits,
+    }
+    let next = AtomicUsize::new(0);
+    let folded = Mutex::new(Folded {
+        slots: files.iter().map(|_| None).collect(),
+        merged: 0,
+        hits: Hits::default(),
+    });
+    // Lines the files not yet folded can still add, as far as the folded
+    // prefix knows: a file formats no more than this, because the lines it
+    // would format past it cannot be among the first `GREP_MAX_MATCHES`.
+    let room = AtomicUsize::new(GREP_MAX_MATCHES);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(at) else {
+                        return;
+                    };
+                    let found = grep_file(file, query, room.load(Ordering::Relaxed));
+                    let mut guard = folded.lock().unwrap_or_else(PoisonError::into_inner);
+                    let Folded {
+                        slots,
+                        merged,
+                        hits,
+                    } = &mut *guard;
+                    if let Some(slot) = slots.get_mut(at) {
+                        *slot = Some(found);
+                    }
+                    while let Some(found) = slots.get_mut(*merged).and_then(Option::take) {
+                        hits.absorb(found);
+                        *merged += 1;
+                    }
+                    room.store(hits.room(), Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    folded
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hits
+}
+
+/// One file's matches: every one counted, at most `keep` formatted. Empty for
+/// a file that is not UTF-8.
+fn grep_file(file: &GrepFile, query: &GrepQuery, keep: usize) -> FileHits {
+    let mut found = FileHits::default();
+    let Ok(content) = fs::read_to_string(&file.path) else {
+        return found;
     };
     for (index, line) in content.lines().enumerate() {
         if !query.regex.is_match(line) {
             continue;
         }
-        if hits.lines.len() < GREP_MAX_MATCHES {
-            hits.lines.push(format!(
-                "{shown}:{}:{}",
+        found.count += 1;
+        if found.lines.len() < keep {
+            found.lines.push(format!(
+                "{}:{}:{}",
+                file.shown,
                 index + 1,
                 excerpt(line, &query.regex)
             ));
-        } else {
-            hits.more += 1;
         }
     }
+    found
 }
 
 /// Characters of one hit line a grep answer shows.
@@ -2313,6 +2429,149 @@ mod tests {
             result.output.contains("unclosed group"),
             "{}",
             result.output
+        );
+    }
+
+    /// The answer a one-thread, file-by-file walk gave before grep read files
+    /// in parallel: the oracle the parallel path must match byte for byte.
+    fn sequential_grep(root: &Path, start: &Path, regex: &Regex, files: &PathFilter) -> String {
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            regex: &Regex,
+            files: &PathFilter,
+            lines: &mut Vec<String>,
+            more: &mut usize,
+        ) {
+            let mut entries: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    let name = entry.file_name();
+                    if name == "target" || name == ".git" || name == "node_modules" {
+                        continue;
+                    }
+                    walk(root, &path, regex, files, lines, more);
+                    continue;
+                }
+                let relative = path.strip_prefix(root).unwrap();
+                if SensitivePolicy::default().blocks(relative) {
+                    continue;
+                }
+                let shown = slash_path(relative);
+                if !files.matches(&shown) {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (index, line) in content.lines().enumerate() {
+                    if !regex.is_match(line) {
+                        continue;
+                    }
+                    if lines.len() < GREP_MAX_MATCHES {
+                        lines.push(format!("{shown}:{}:{}", index + 1, excerpt(line, regex)));
+                    } else {
+                        *more += 1;
+                    }
+                }
+            }
+        }
+        let (mut lines, mut more) = (Vec::new(), 0);
+        walk(root, start, regex, files, &mut lines, &mut more);
+        if more > 0 {
+            lines.push(format!("… {more} more matches"));
+        }
+        lines.join("\n")
+    }
+
+    /// Reading files on several threads must not show: same lines, same
+    /// order, same cap, same "more" count as the sequential walk, on a tree
+    /// whose hits cross the cap in the middle of a file and that holds every
+    /// kind of file grep skips.
+    #[tokio::test]
+    async fn parallel_grep_answers_exactly_what_a_sequential_walk_does() {
+        let root = temp_root();
+        for dir in 0..20 {
+            let dir_path = root.join(format!("d{dir:02}"));
+            fs::create_dir_all(dir_path.join("sub")).unwrap();
+            for file in 0..15 {
+                let hits = (dir * 15 + file) % 7;
+                let mut body = String::new();
+                for n in 0..hits + 2 {
+                    body.push_str(&format!("line {n} Hit number {n}\nplain {n}\n"));
+                }
+                fs::write(dir_path.join(format!("f{file:02}.txt")), body).unwrap();
+            }
+            fs::write(dir_path.join("sub/deep.rs"), "fn hit() {}\n").unwrap();
+        }
+        // Sorts between `d00` and `d01` when read by name, and holds hits.
+        fs::create_dir_all(root.join("d00-x")).unwrap();
+        fs::write(root.join("d00-x/y.txt"), "Hit in the odd name\n").unwrap();
+        fs::write(root.join("a.md"), "hit first\n").unwrap();
+        fs::write(root.join("z.md"), "hit last\n").unwrap();
+        fs::write(root.join("empty.txt"), "").unwrap();
+        let long = format!("{}Hit{}", "x".repeat(900), "y".repeat(900));
+        fs::write(root.join("d05/long.txt"), format!("{long}\n")).unwrap();
+        fs::write(root.join("d06/blob.bin"), b"\xff\xfehit\n").unwrap();
+        fs::write(root.join(".env"), "hit=1\n").unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/i.js"), "hit\n").unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/out.txt"), "hit\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("d01"), root.join("linked")).unwrap();
+
+        let canonical = fs::canonicalize(&root).unwrap();
+        let grep = GrepTool {
+            root: root.clone(),
+            policy: SensitivePolicy::default(),
+        };
+        let cases = [
+            // Past the cap, crossing it inside a file.
+            (r"hit", false, "", None),
+            (r"hit", true, "", None),
+            // Under the cap.
+            (r"Hit number 0", false, "", None),
+            (r"deep|fn hit", false, "*.rs", None),
+            // Nothing matches.
+            (r"zz_no_such_text", false, "", None),
+            // A subdirectory as the start.
+            (r"hit", true, "", Some("d03")),
+        ];
+        for (pattern, ignore_case, glob, path) in cases {
+            let mut args = serde_json::json!({"pattern": pattern, "ignore_case": ignore_case});
+            if !glob.is_empty() {
+                args["glob"] = glob.into();
+            }
+            let start = match path {
+                Some(path) => {
+                    args["path"] = path.into();
+                    canonical.join(path)
+                }
+                None => canonical.clone(),
+            };
+            let regex = regex::RegexBuilder::new(pattern)
+                .case_insensitive(ignore_case)
+                .build()
+                .unwrap();
+            let expected =
+                sequential_grep(&canonical, &start, &regex, &PathFilter::new(glob).unwrap());
+            let result = grep.invoke(args.clone()).await;
+            assert!(!result.is_error, "{args}: {}", result.output);
+            assert_eq!(result.output.as_ref(), expected, "{args}");
+        }
+        let all = grep
+            .invoke(serde_json::json!({"pattern": "hit", "ignore_case": true}))
+            .await;
+        assert!(
+            all.output.contains("more matches"),
+            "the fixture must cross the cap"
         );
     }
 
