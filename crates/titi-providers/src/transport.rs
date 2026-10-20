@@ -200,20 +200,25 @@ impl TransportError {
     /// The same error, with the model's window named when the request was too
     /// long for it. A person reading the failure needs the number the fold is
     /// trying to fit into.
-    pub fn naming_the_window(self, window: u64) -> Self {
+    pub fn naming_the_window(self, window: u64, folded: bool) -> Self {
         match self {
             TransportError::Fatal {
                 status,
                 message,
                 context_too_long: true,
-            } => TransportError::Fatal {
-                status,
-                message: format!(
-                    "{message} (this model's window is {window} tokens; the history was folded and the request was still too long)"
-                )
-                .into(),
-                context_too_long: true,
-            },
+            } => {
+                let what = if folded {
+                    "the history was folded and the request was still too long"
+                } else {
+                    "nothing in the history could be folded to make room"
+                };
+                TransportError::Fatal {
+                    status,
+                    message: format!("{message} (this model's window is {window} tokens; {what})")
+                        .into(),
+                    context_too_long: true,
+                }
+            }
             other => other,
         }
     }

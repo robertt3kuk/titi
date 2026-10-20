@@ -77,6 +77,21 @@ pub fn cap_thinking(text: &str) -> String {
     out
 }
 
+/// The most characters of trace digest `titi trace --analyze` will send.
+///
+/// A digest is compact by construction — one line per span with short
+/// excerpts of the text a span carries — so a turn of any ordinary size fits
+/// well inside this. The cap is what makes the command's cost bounded and
+/// sayable: past it the digest is refused with its own size named rather than
+/// trimmed into something that no longer describes the turn.
+pub const ANALYSIS_CAP_CHARS: usize = 32 * 1024;
+
+/// Characters of one model call's reasoning the digest carries.
+pub const DIGEST_THINKING_CHARS: usize = 700;
+
+/// Characters of one tool call's arguments or result the digest carries.
+pub const DIGEST_TOOL_CHARS: usize = 300;
+
 /// The most trace files kept when [`Retention::default`] prunes.
 pub const MAX_TRACE_FILES: usize = 500;
 /// The oldest a trace file may be when [`Retention::default`] prunes, in days.
@@ -104,6 +119,14 @@ pub enum TraceError {
         /// The turn whose file is missing.
         turn: u64,
     },
+    /// A turn's digest is larger than [`ANALYSIS_CAP_CHARS`], so it is refused
+    /// rather than trimmed into a description of something else.
+    DigestTooLarge {
+        /// The turn whose digest was asked for.
+        turn: u64,
+        /// How many characters the digest came to.
+        chars: usize,
+    },
 }
 
 impl fmt::Display for TraceError {
@@ -120,6 +143,13 @@ impl fmt::Display for TraceError {
             }
             TraceError::NotFound { session, turn } => {
                 write!(f, "no trace for session {session} turn {turn}")
+            }
+            TraceError::DigestTooLarge { turn, chars } => {
+                write!(
+                    f,
+                    "the digest of turn {turn} is {chars} chars, over the \
+                     {ANALYSIS_CAP_CHARS}-char analysis cap"
+                )
             }
         }
     }
@@ -626,6 +656,290 @@ pub fn sessions(agent_dir: &Path) -> Result<Vec<String>, TraceError> {
     Ok(ids)
 }
 
+/// The file one turn's analysis is stored in, beside the turn's spans.
+///
+/// The name is a contract between the writer (`titi trace --analyze`), the
+/// reader (`/trace`'s panel row, `read_analysis`) and the retention sweep
+/// ([`prune`]), so it is spelled here once.
+pub fn analysis_path(agent_dir: &Path, session_id: &str, turn: u64) -> PathBuf {
+    session_dir(agent_dir, session_id).join(format!("{turn}.analysis.md"))
+}
+
+/// Stores one turn's analysis, private from the moment it exists, replacing an
+/// earlier one.
+///
+/// The posture is the trace's: 0600 on create and on every write, so an
+/// analysis that names files and failures is not world-readable in the agent
+/// directory. Written in one `write_all` after the file is opened, so a crash
+/// leaves either the previous analysis or the new one, never half of each.
+pub fn write_analysis(
+    agent_dir: &Path,
+    session_id: &str,
+    turn: u64,
+    text: &str,
+) -> Result<PathBuf, TraceError> {
+    let dir = session_dir(agent_dir, session_id);
+    fs::create_dir_all(&dir).map_err(TraceError::Io)?;
+    let path = analysis_path(agent_dir, session_id, turn);
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(TraceError::Io)?;
+    // `mode` is only consulted at creation: a file an earlier build made 0644
+    // keeps those bits until someone says otherwise.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(TraceError::Io)?;
+    }
+    file.write_all(text.as_bytes()).map_err(TraceError::Io)?;
+    file.flush().map_err(TraceError::Io)?;
+    Ok(path)
+}
+
+/// A turn's stored analysis, or `None` when the turn has none.
+pub fn read_analysis(
+    agent_dir: &Path,
+    session_id: &str,
+    turn: u64,
+) -> Result<Option<String>, TraceError> {
+    let path = analysis_path(agent_dir, session_id, turn);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(TraceError::Io(error)),
+    }
+}
+
+/// One turn as a compact digest a model can read: the span tree with each
+/// span's duration, tokens, cost, status and attributes, the reasoning a
+/// model call recorded, and a short excerpt of what each tool was asked and
+/// answered.
+///
+/// Refused — not trimmed — past [`ANALYSIS_CAP_CHARS`]: every line here is
+/// already an excerpt, so a digest over the cap is a much larger turn than the
+/// command is meant to pay for, and the caller is told its size.
+///
+/// The text is what the trace holds, which its writer already masked; the
+/// caller masks again before it leaves the machine (the rule this module
+/// states at the top).
+pub fn analysis_digest(trace: &TurnTrace) -> Result<String, TraceError> {
+    let text = digest_text(trace);
+    let chars = text.chars().count();
+    if chars > ANALYSIS_CAP_CHARS {
+        return Err(TraceError::DigestTooLarge {
+            turn: trace.turn,
+            chars,
+        });
+    }
+    Ok(text)
+}
+
+/// The digest text itself, uncapped — [`analysis_digest`] is the entry point
+/// that enforces the cap.
+fn digest_text(trace: &TurnTrace) -> String {
+    let mut out = format!(
+        "turn {} · {} · in {} out {}",
+        trace.turn,
+        ms_label(trace.duration_ms()),
+        trace.input_tokens(),
+        trace.output_tokens()
+    );
+    out.push_str(&cached_label(
+        trace.spans.iter().map(|s| s.cached_tokens).sum(),
+    ));
+    out.push_str(&cost_label(trace.cost_micro_usd()));
+    out.push_str(&errors_label(trace.errors()));
+    out.push('\n');
+    if let Some(summary) = thinking_line(trace) {
+        out.push_str(&summary);
+        out.push('\n');
+    }
+    // The turn's own span is the header, not a step: its children are the top
+    // of the tree, and any other root keeps its own line.
+    let mut top = Vec::new();
+    for node in trace.tree() {
+        if node.span.kind == SpanKind::Turn {
+            top.extend(node.children);
+        } else {
+            top.push(node);
+        }
+    }
+    push_digest_nodes(&top, 0, &mut out);
+    out
+}
+
+/// One line per span, indented by depth, with the text it carries beneath it.
+fn push_digest_nodes(nodes: &[TraceNode], depth: usize, out: &mut String) {
+    let indent = "  ".repeat(depth);
+    for node in nodes {
+        let span = &node.span;
+        out.push_str(&format!(
+            "{indent}- {} {} · {}{}{}\n",
+            span.kind.label(),
+            span.name,
+            ms_label(span.duration_ms()),
+            usage_label(span),
+            status_label(span),
+        ));
+        let field_indent = "  ".repeat(depth + 1);
+        for (key, value) in &span.attributes {
+            // The two text fields are printed as excerpts below, and the
+            // thinking metrics are the thinking line's own; everything else
+            // is short enough to show whole.
+            if matches!(
+                key.as_str(),
+                TOOL_ARGUMENTS_ATTR | TOOL_RESULT_ATTR | THINKING_CHARS_ATTR | THINKING_MS_ATTR
+            ) {
+                continue;
+            }
+            out.push_str(&format!(
+                "{field_indent}{key}: {}\n",
+                clip(&value.to_string(), DIGEST_TOOL_CHARS)
+            ));
+        }
+        if span.kind == SpanKind::Llm {
+            match &span.thinking {
+                Some(text) => {
+                    out.push_str(&format!(
+                        "{field_indent}thinking {} chars:\n",
+                        span.thinking_chars().unwrap_or(0)
+                    ));
+                    // Every line of the excerpt is marked, so a reasoning block
+                    // that is several paragraphs long cannot be mistaken for
+                    // the tree's own lines.
+                    for line in clip(text, DIGEST_THINKING_CHARS).lines() {
+                        out.push_str(&format!("{field_indent}| {line}\n"));
+                    }
+                }
+                None => {
+                    if let Some(chars) = span.thinking_chars() {
+                        out.push_str(&format!(
+                            "{field_indent}thinking {chars} chars (text not recorded)\n"
+                        ));
+                    }
+                }
+            }
+        }
+        for (key, label) in [
+            (TOOL_ARGUMENTS_ATTR, "args"),
+            (TOOL_RESULT_ATTR, "result"),
+        ] {
+            if let Some(value) = span.attributes.get(key) {
+                out.push_str(&format!(
+                    "{field_indent}{label}: {}\n",
+                    clip(&value.to_string(), DIGEST_TOOL_CHARS)
+                ));
+            }
+        }
+        push_digest_nodes(&node.children, depth + 1, out);
+    }
+}
+
+/// The turn's reasoning line: how much of it there was and how long the model
+/// spent before its answer began, with no claim about the text.
+fn thinking_line(trace: &TurnTrace) -> Option<String> {
+    if trace.thinking_calls() == 0 {
+        return None;
+    }
+    let mut line = format!(
+        "thinking · {} chars over {} call{}",
+        trace.thinking_chars(),
+        trace.thinking_calls(),
+        if trace.thinking_calls() == 1 { "" } else { "s" }
+    );
+    let reasoning = trace.reasoning_tokens();
+    if reasoning > 0 {
+        line.push_str(&format!(" · {reasoning} reasoning tokens"));
+    }
+    let ms = trace.thinking_ms();
+    if ms > 0 {
+        line.push_str(&format!(" · {} before the answer", ms_label(ms)));
+    }
+    Some(line)
+}
+
+/// A span's token counts, when it has any — one model call's share of the
+/// turn's total.
+fn usage_label(span: &Span) -> String {
+    if span.input_tokens == 0 && span.output_tokens == 0 {
+        return String::new();
+    }
+    let mut usage = format!(" · in {}", span.input_tokens);
+    if span.cached_tokens > 0 {
+        usage.push_str(&format!(" (cached {})", span.cached_tokens));
+    }
+    usage.push_str(&format!(" out {}", span.output_tokens));
+    if span.reasoning_tokens > 0 {
+        usage.push_str(&format!(" reasoning {}", span.reasoning_tokens));
+    }
+    if let Some(cost) = span.cost_micro_usd {
+        usage.push_str(&cost_label(Some(cost)));
+    }
+    usage
+}
+
+fn status_label(span: &Span) -> String {
+    match span.status {
+        SpanStatus::Ok => String::new(),
+        SpanStatus::Error => match &span.error {
+            Some(error) => format!(" · error: {}", clip(error, DIGEST_TOOL_CHARS)),
+            None => " · error".to_owned(),
+        },
+        SpanStatus::Cancelled => " · cancelled".to_owned(),
+    }
+}
+
+fn cached_label(cached: u64) -> String {
+    if cached == 0 {
+        String::new()
+    } else {
+        format!(" · cached {cached}")
+    }
+}
+
+fn cost_label(micro_usd: Option<u64>) -> String {
+    match micro_usd {
+        Some(micro) => format!(" · ${:.4}", micro as f64 / 1_000_000.0),
+        None => String::new(),
+    }
+}
+
+fn errors_label(errors: usize) -> String {
+    if errors == 0 {
+        String::new()
+    } else {
+        format!(" · {errors} error{}", if errors == 1 { "" } else { "s" })
+    }
+}
+
+/// A duration a model reads without a unit table: `190ms`, `3.2s`, `3m05s`.
+fn ms_label(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    if ms < 60_000 {
+        return format!("{:.1}s", ms as f64 / 1_000.0);
+    }
+    let secs = ms / 1_000;
+    format!("{}m{:02}s", secs / 60, secs % 60)
+}
+
+/// `text` cut to `max` characters, marked where it was cut. Only whole
+/// characters are taken, so a multi-byte script cannot be cut mid-scalar.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept} … [{} chars left out]", text.chars().count() - max)
+}
+
 /// Which part of a span a search matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchField {
@@ -933,7 +1247,7 @@ pub fn prune_at(
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
+            if !is_trace_file(&path) {
                 continue;
             }
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
@@ -958,6 +1272,20 @@ pub fn prune_at(
         }
     }
     Ok(doomed.len())
+}
+
+/// Whether a file in a session's trace directory is part of the trace: a
+/// turn's spans, or the analysis stored beside them.
+///
+/// An analysis is what the session recorded about a turn, and it is kept —
+/// and aged out — with the turn it belongs to rather than outliving it. Its
+/// name is matched whole: `3.analysis.md` has the extension `md`, which is
+/// not the trace's own.
+fn is_trace_file(path: &Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.ends_with(".jsonl") || name.ends_with(".analysis.md"),
+        None => false,
+    }
 }
 
 /// Which files a retention rule removes — the pure part of [`prune`].
@@ -1461,5 +1789,200 @@ mod tests {
         .unwrap_or_else(|e| panic!("prune: {e}"));
         assert_eq!(all, 2);
         assert_eq!(turns(dir.path(), "s1").unwrap_or_default().len(), 1);
+    }
+
+    /// One turn with every kind of span a digest has to carry: a turn frame, a
+    /// model call with thinking and a price, a tool call with arguments and a
+    /// result, a retry event, and a failed model call.
+    fn digest_trace() -> TurnTrace {
+        TurnTrace {
+            turn: 3,
+            spans: vec![
+                span("t", SpanKind::Turn, 0, 500),
+                span("l1", SpanKind::Llm, 10, 200)
+                    .with_parent("t")
+                    .with_tokens(1_200, 180, 1_000, 40)
+                    .with_cost_micro_usd(2_100)
+                    .with_thinking("first thought\nsecond thought")
+                    .with_attr("gen_ai.request.model", json!("gpt-4o")),
+                span("r1", SpanKind::Tool, 210, 240)
+                    .with_parent("l1")
+                    .with_attr(TOOL_ARGUMENTS_ATTR, json!({"path": "src/x.rs"}))
+                    .with_attr(TOOL_RESULT_ATTR, json!("fn main() {}")),
+                span("v1", SpanKind::Event, 245, 250)
+                    .with_parent("l1")
+                    .with_attr("error.type", json!("rate_limit"))
+                    .with_attr("titi.wait_ms", json!(500)),
+                span("l2", SpanKind::Llm, 250, 400)
+                    .with_parent("t")
+                    .with_tokens(300, 0, 0, 0)
+                    .with_error("timeout"),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_digest_is_the_tree_with_each_spans_facts() {
+        let digest = analysis_digest(&digest_trace()).unwrap_or_else(|e| panic!("digest: {e}"));
+        assert_eq!(
+            digest,
+            "\
+turn 3 · 500ms · in 1500 out 180 · cached 1000 · $0.0021 · 1 error
+thinking · 28 chars over 1 call · 40 reasoning tokens
+- llm chat gpt-4o · 190ms · in 1200 (cached 1000) out 180 reasoning 40 · $0.0021
+  gen_ai.request.model: \"gpt-4o\"
+  thinking 28 chars:
+  | first thought
+  | second thought
+  - tool r1-name · 30ms
+    args: {\"path\":\"src/x.rs\"}
+    result: \"fn main() {}\"
+    - event v1-name · 5ms
+      error.type: \"rate_limit\"
+      titi.wait_ms: 500
+- llm chat gpt-4o · 150ms · in 300 out 0 · error: timeout
+"
+        );
+    }
+
+    /// A span whose thinking was counted but not kept says so, and one that
+    /// never thought has no line at all.
+    #[test]
+    fn the_digest_names_thinking_only_when_there_was_some() {
+        let trace = TurnTrace {
+            turn: 1,
+            spans: vec![
+                span("a", SpanKind::Llm, 0, 10)
+                    .with_tokens(10, 5, 0, 0)
+                    .with_attr(THINKING_CHARS_ATTR, json!(842))
+                    .with_attr(THINKING_MS_ATTR, json!(1_200)),
+                span("b", SpanKind::Llm, 11, 20).with_tokens(10, 5, 0, 0),
+            ],
+        };
+        let digest = analysis_digest(&trace).unwrap_or_else(|e| panic!("digest: {e}"));
+        assert!(digest.contains("thinking 842 chars (text not recorded)"), "{digest}");
+        assert_eq!(digest.matches("thinking").count(), 2, "{digest}");
+    }
+
+    /// The cap is a refusal that names its size, not a trim: a digest that was
+    /// cut would describe a turn other than the one recorded.
+    #[test]
+    fn an_oversized_digest_is_refused_with_its_size() {
+        let trace = TurnTrace {
+            turn: 7,
+            spans: vec![
+                span("a", SpanKind::Tool, 0, 1).with_attr(
+                    TOOL_RESULT_ATTR,
+                    json!("x".repeat(ANALYSIS_CAP_CHARS + 100)),
+                ),
+            ],
+        };
+        match analysis_digest(&trace) {
+            Err(TraceError::DigestTooLarge { turn, chars }) => {
+                assert_eq!(turn, 7);
+                assert!(chars > ANALYSIS_CAP_CHARS, "{chars}");
+            }
+            other => panic!("expected DigestTooLarge, got {other:?}"),
+        }
+        let refused = analysis_digest(&trace)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(refused.contains("analysis cap"), "{refused}");
+        assert!(
+            refused.contains(&ANALYSIS_CAP_CHARS.to_string()),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn an_analysis_is_stored_private_and_read_back() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        assert_eq!(
+            read_analysis(dir.path(), "s1", 3).unwrap_or_else(|e| panic!("read: {e}")),
+            None
+        );
+        let path = write_analysis(dir.path(), "s1", 3, "where the time went")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        assert!(path.ends_with("traces/s1/3.analysis.md"));
+        assert_eq!(
+            read_analysis(dir.path(), "s1", 3).unwrap_or_else(|e| panic!("read: {e}")),
+            Some("where the time went".to_owned())
+        );
+
+        // A second analysis of the same turn replaces the first.
+        write_analysis(dir.path(), "s1", 3, "the second look")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            read_analysis(dir.path(), "s1", 3)
+                .unwrap_or_else(|e| panic!("read: {e}"))
+                .as_deref(),
+            Some("the second look")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("stat: {e}"))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// An analysis is aged out with the turn it describes: it is what the
+    /// session recorded about that turn, not a file of its own.
+    #[test]
+    fn prune_ages_out_an_analysis_with_its_turn() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let mut w = writer(dir.path(), 1);
+        w.append(&span("a", SpanKind::Turn, 1, 2))
+            .unwrap_or_else(|e| panic!("append: {e}"));
+        w.flush().unwrap_or_else(|e| panic!("{e}"));
+        drop(w);
+        write_analysis(dir.path(), "s1", 1, "an old look")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        let analysis = analysis_path(dir.path(), "s1", 1);
+        assert!(analysis.exists());
+
+        // One file past the age cutoff: it goes, and so does the one beside it.
+        let now = SystemTime::now();
+        let removed = prune_at(
+            dir.path(),
+            Retention {
+                max_files: 500,
+                max_age_days: 0,
+            },
+            now + Duration::from_secs(24 * 60 * 60),
+        )
+        .unwrap_or_else(|e| panic!("prune: {e}"));
+        assert_eq!(removed, 2, "the turn's spans and its analysis");
+        assert!(!analysis.exists());
+        assert!(turns(dir.path(), "s1").unwrap_or_default().is_empty());
+        // Both files gone leaves no empty session directory behind.
+        assert!(!session_dir(dir.path(), "s1").exists());
+    }
+
+    /// A file that is not a turn's spans or its analysis is left alone, however
+    /// old: the sweep knows two names, not one extension.
+    #[test]
+    fn prune_leaves_a_file_it_does_not_own() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let stray = session_dir(dir.path(), "s1");
+        fs::create_dir_all(&stray).unwrap_or_else(|e| panic!("{e}"));
+        let notes = stray.join("notes.md");
+        fs::write(&notes, "mine").unwrap_or_else(|e| panic!("{e}"));
+        prune_at(
+            dir.path(),
+            Retention {
+                max_files: 0,
+                max_age_days: 0,
+            },
+            SystemTime::now() + Duration::from_secs(24 * 60 * 60),
+        )
+        .unwrap_or_else(|e| panic!("prune: {e}"));
+        assert!(notes.exists());
     }
 }

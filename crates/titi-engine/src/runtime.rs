@@ -2681,11 +2681,12 @@ async fn run_turn(
                                     threshold_percent: 0.0,
                                     ..config.compaction.clone()
                                 };
-                                let _ = crate::compaction::compact(
+                                let folded = crate::compaction::compact(
                                     &mut messages,
                                     &forced,
                                     config.context_window.max(1),
-                                );
+                                )
+                                .is_some();
                                 OpenSpan::open(
                                     &spans,
                                     turn_span_id.clone(),
@@ -2693,13 +2694,27 @@ async fn run_turn(
                                     "fold",
                                 )
                                 .attr("titi.reason", serde_json::json!("context_too_long"))
+                                .attr("titi.folded", serde_json::json!(folded))
                                 .finish(spans::now_ms());
-                                last_error = None;
-                                continue;
+                                if folded {
+                                    last_error = None;
+                                    continue;
+                                }
+                                // Nothing was foldable: the history is already
+                                // as small as the policy will make it, so asking
+                                // again would send the same too-long request.
+                                meter.settle(&events, turn_id).await;
+                                emit_transport_failure(
+                                    &events,
+                                    turn_id,
+                                    error.naming_the_window(config.context_window, false),
+                                )
+                                .await;
+                                return None;
                             }
                             if visible_output || !error.is_retryable() {
                                 meter.settle(&events, turn_id).await;
-                                let message = error.naming_the_window(config.context_window);
+                                let message = error.naming_the_window(config.context_window, true);
                                 turn_error = Some(message.to_string());
                                 emit_transport_failure(&events, turn_id, message).await;
                                 return None;
