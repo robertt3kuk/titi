@@ -13,6 +13,9 @@ usage: titi [options]
   --prompt <text>             run one prompt headless and print the reply
   --goal <text>               run the coder/reviewer goal loop headless and exit
                               0 (pass), 1 (partial) or 3 (fail) for CI
+  --review                    review what changed (git diff HEAD) with a clean-context
+                              reviewer and exit: 0 pass, 3 fail, 4 partial, 5 nothing
+                              to review, 2 usage error; prints the verdict as JSON
   --approval <mode>           always-ask | write | yolo (default: write)
   --theme <name>              paint with a palette for this run; bare /theme
                               in the chat lists them and remembers a choice
@@ -95,6 +98,7 @@ fn main() -> io::Result<()> {
     let mut headless = false;
     let mut prompt: Option<String> = None;
     let mut goal: Option<String> = None;
+    let mut review = false;
     let mut set_key: Option<(String, String)> = None;
     let mut list_keys = false;
     let mut login: Option<Option<String>> = None;
@@ -141,6 +145,9 @@ fn main() -> io::Result<()> {
                 std::process::exit(2);
             };
             goal = Some(text);
+            headless = true;
+        } else if arg == "--review" {
+            review = true;
             headless = true;
         } else if arg == "--set-key" {
             match (args.next(), args.next()) {
@@ -239,6 +246,10 @@ fn main() -> io::Result<()> {
     }
     if goal.is_some() && prompt.is_some() {
         eprintln!("use --goal or a prompt, not both\n\n{USAGE}");
+        std::process::exit(2);
+    }
+    if review && (goal.is_some() || prompt.is_some()) {
+        eprintln!("use --review alone, without --goal or a prompt\n\n{USAGE}");
         std::process::exit(2);
     }
 
@@ -361,14 +372,17 @@ fn main() -> io::Result<()> {
         for note in [&pin_note, &continue_note].into_iter().flatten() {
             eprintln!("{note}");
         }
-        let code = match (goal, prompt) {
-            (Some(text), _) => {
+        let code = match (review, goal, prompt) {
+            (true, ..) => runtime.block_on(titi_cli::headless::run_review(engine, session_log))?,
+            (false, Some(text), _) => {
                 runtime.block_on(titi_cli::headless::run_goal(engine, session_log, &text))?
             }
-            (None, Some(text)) => {
+            (false, None, Some(text)) => {
                 runtime.block_on(titi_cli::headless::run_prompt(engine, session_log, &text))?
             }
-            (None, None) => runtime.block_on(titi_cli::headless::run(engine, session_log))?,
+            (false, None, None) => {
+                runtime.block_on(titi_cli::headless::run(engine, session_log))?
+            }
         };
         std::process::exit(code);
     }

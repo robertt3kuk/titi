@@ -648,13 +648,13 @@ fn a_recalled_slash_prompt_does_not_turn_up_into_the_command_list() {
     let agent = tempfile::tempdir().expect("agent");
     let (mut chat, log) = history_chat(ws.path(), agent.path());
     chat.skills.push(SkillRow {
-        name: "review".to_owned(),
+        name: "inspect".to_owned(),
         about: String::new(),
     });
     asked(&mut chat, &log, "first");
-    asked(&mut chat, &log, "/review this change");
+    asked(&mut chat, &log, "/inspect this change");
     press(&mut chat, Key::Up);
-    assert_eq!(chat.input, "/review this change");
+    assert_eq!(chat.input, "/inspect this change");
     press(&mut chat, Key::Up);
     assert_eq!(chat.input, "first", "↑ kept walking the history");
 }

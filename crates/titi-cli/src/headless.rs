@@ -19,8 +19,8 @@
 //!   call is already gone) and never emits an event.
 //!
 //! A command that answers is not a promise of a terminal frame: only a job
-//! command (`SubmitPrompt`, `FollowUp`, `RunGoal`, `RunCouncil`, `RunGraph`,
-//! `SpawnAgent`, `ReviveAgent`) runs until a terminal event. Everything else
+//! command (`SubmitPrompt`, `FollowUp`, `RunGoal`, `RunReview`, `RunCouncil`,
+//! `RunGraph`, `SpawnAgent`, `ReviveAgent`) runs until a terminal event. Everything else
 //! answers with its own event, or not at all, and the client reads on.
 
 use std::io::{self, BufRead, Write};
@@ -99,6 +99,7 @@ fn runs_a_turn(command: &EngineCommand) -> bool {
         EngineCommand::SubmitPrompt { .. }
             | EngineCommand::FollowUp { .. }
             | EngineCommand::RunGoal { .. }
+            | EngineCommand::RunReview { .. }
             | EngineCommand::RunCouncil { .. }
             | EngineCommand::RunGraph { .. }
             | EngineCommand::SpawnAgent { .. }
@@ -129,6 +130,7 @@ fn ends_a_turn(event: &EngineEvent) -> bool {
             | EngineEvent::Cancelled { .. }
             | EngineEvent::AgentFinished { .. }
             | EngineEvent::GoalFinished { .. }
+            | EngineEvent::ReviewFinished { .. }
             | EngineEvent::CouncilFinished { .. }
     )
 }
@@ -401,6 +403,47 @@ fn goal_exit_code(event: &EngineEvent) -> Option<i32> {
         EngineEvent::Failed { .. } => Some(GOAL_UNFINISHED),
         _ => None,
     }
+}
+
+/// One review, no JSONL client: judge what changed in the workspace
+/// (`git diff HEAD`; a fresh process has no edit set) and exit with the code
+/// CI reads (`0` pass, `3` fail, `4` partial, `5` nothing to review).
+///
+/// stdout carries the one verdict JSON line and nothing else; the banner and
+/// findings go to stderr for a person reading the job log.
+pub async fn run_review(
+    mut engine: Engine,
+    log: Option<crate::session_log::SessionLog>,
+) -> io::Result<i32> {
+    if engine
+        .send(EngineCommand::RunReview { edited: Vec::new() })
+        .await
+        .is_err()
+    {
+        eprintln!("review: the engine is gone");
+        return Ok(crate::review_cmd::UNFINISHED);
+    }
+    while let Some(event) = engine.recv().await {
+        match event {
+            EngineEvent::ReviewFinished { report } => {
+                let mut stdout = io::stdout();
+                writeln!(stdout, "{}", crate::review_cmd::json_line(&report))?;
+                stdout.flush()?;
+                eprintln!("{}", report.banner());
+                for finding in &report.findings {
+                    eprintln!("  {}", finding.render());
+                }
+                if let Some(log) = &log {
+                    let _ = log.assistant(&report.banner());
+                }
+                return Ok(crate::review_cmd::exit_code(&report));
+            }
+            EngineEvent::Failed { message, .. } => eprintln!("review: {message}"),
+            _ => {}
+        }
+    }
+    eprintln!("review: the engine stopped before the review finished");
+    Ok(crate::review_cmd::UNFINISHED)
 }
 
 #[cfg(test)]

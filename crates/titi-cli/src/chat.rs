@@ -808,7 +808,9 @@ pub struct Chat {
     session_cost_partial: bool,
     /// Files the agent created and edited this session, for the status line's
     /// `✎ +N ~M`.
-    agent_edits: titi_tui::status::AgentEdits,
+    pub(crate) agent_edits: titi_tui::status::AgentEdits,
+    /// This session's `/review` verdicts, and whether one is running.
+    pub(crate) reviews: crate::review_cmd::ReviewLog,
     /// The running turn ended in a failure the screen showed. It holds until
     /// the next turn starts, so the tab title says the turn broke rather than
     /// that it is your turn.
@@ -973,6 +975,7 @@ impl Chat {
             session_cost_micro: None,
             session_cost_partial: false,
             agent_edits: titi_tui::status::AgentEdits::default(),
+            reviews: crate::review_cmd::ReviewLog::default(),
             turn_failed: false,
             last_title: None,
             terminal: TerminalFeatures::default(),
@@ -1738,6 +1741,10 @@ impl Chat {
                 self.push(LineKind::Note, report.to_string());
                 Applied::none()
             }
+            EngineEvent::ReviewFinished { report } => {
+                self.review_finished(report);
+                Applied::none()
+            }
             EngineEvent::CouncilFinished { report } => {
                 // Without an arm of its own the report falls into the
                 // wildcard below and the council answers into the void.
@@ -2078,7 +2085,7 @@ impl Chat {
     /// A new turn for the rate estimate: no reading until this turn's own
     /// deltas arrive. Called where a turn opens, so a stale figure from the
     /// last one cannot be read as this one's.
-    fn begin_rate(&mut self) {
+    pub(crate) fn begin_rate(&mut self) {
         self.token_rate.begin();
     }
 
@@ -2112,7 +2119,7 @@ impl Chat {
     /// added to) or a resumed session whose answers are already on screen. The
     /// first request of a fresh session has no history to re-read, so a cold
     /// cache there is a provider's norm and not a miss worth naming.
-    fn begin_usage_ledger(&mut self) {
+    pub(crate) fn begin_usage_ledger(&mut self) {
         self.turn_usage = None;
         self.turn_cost_micro = None;
         self.turn_failed = false;
@@ -2330,6 +2337,7 @@ impl Chat {
             "plan" => self.plan(args),
             "done" => self.done(args),
             "goal" => self.goal(args),
+            "review" => self.review(args),
             "council" => self.council(args),
             "graph" => self.graph(args),
             "memory" => self.memory(args),

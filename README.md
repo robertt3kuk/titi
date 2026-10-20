@@ -97,6 +97,7 @@ titi --mode plan
 | `/duck` | Duck mode: repo-blind and toolless, for talking a problem through |
 | `/done` | Leaves plan or duck mode and acts again |
 | `/goal` | Runs the coder and the reviewer until the goal passes or the round cap stops it |
+| `/review` | A clean-context reviewer judges what changed (the files the agent edited, else `git diff HEAD`) and returns `VERDICT: PASS\|FAIL\|PARTIAL` with `file:line` findings. `/review apply` sends the findings to the coder, `/review list` shows the last 8 verdicts. `titi --review` does it headless: exit 0 pass, 3 fail, 4 partial, 5 nothing to review |
 | `/loop` | Repeats a prompt in the background: `/loop 5m <prompt>`, intervals `90s`, `5m`, `2h`. The engine owns the timer, so closing the screen does not kill it |
 | `/jobs` | Lists the background loops. `/jobs cancel <id>` stops one |
 | `/advisor` | A toolless second opinion on this conversation, `/advisor <question>` on something specific. It is not a turn: nothing it says is acted on |
@@ -355,6 +356,7 @@ titi --mode plan
 | `/hub` | Показывает или прячет ростер локального хаба |
 | `/join` | Подключает к локальному хабу, `/join <имя>` — под своим именем; по умолчанию это id сессии |
 | `/leave` | Выходит из хаба и снимает этого участника с ростера |
+| `/review` | Независимый рецензент с чистым контекстом оценивает изменения (файлы, которые правил агент, иначе `git diff HEAD`): `VERDICT: PASS\|FAIL\|PARTIAL` и находки `файл:строка`. `/review apply` отправляет находки кодеру, `/review list` — последние 8 вердиктов. `titi --review` — то же без экрана: код 0 — PASS, 3 — FAIL, 4 — PARTIAL, 5 — нечего проверять |
 | `/council` | Отдаёт вопрос совету независимых брифов, каждый на своей модели и со своим усилием; свёртка называет несогласных |
 | `/graph` | Гоняет оркестратор-граф: совет решает, цикл цели работает |
 | `/git` | Показывает git status или diff, только чтение |

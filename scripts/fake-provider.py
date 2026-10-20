@@ -6,6 +6,9 @@ by matching a word in the last message, so a smoke run can reach every
 phase of a turn — streaming, reasoning, each tool, each failure — through
 the real binary and the real HTTP stack:
 
+  "[titi-review]" (the marker every /review request carries; matched before the
+                  words below) a reviewer reply: `VERDICT: FAIL — missing test` and
+                  one finding, `README.md:1 — no test covers the new title`
   "sleepy shell"  a bash call that runs for 3 s (the live tool phase)
   "forever"       a bash call that never exits (Ctrl+C must stop it)
   "dev server"    a bash call on `npm run dev` (refused before it runs)
@@ -113,6 +116,9 @@ def script(last: dict) -> list[tuple[dict, float]]:
     if last.get("role") == "tool":
         first = content.strip().splitlines()[0] if content.strip() else "(empty)"
         return words(f"tool said: {first}", 0) + [(chunk({}, "stop"), 0)]
+    if "[titi-review]" in content:
+        answer = "VERDICT: FAIL — missing test\n- README.md:1 — no test covers the new title\n"
+        return words(answer, 0) + [(chunk({}, "stop"), 0)]
     if "sleepy shell" in content:
         return [(c, 0) for c in call("call_sleepy", "bash", {"command": "sleep 3; echo slept"})]
     if "forever" in content:

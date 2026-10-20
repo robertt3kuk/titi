@@ -139,6 +139,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "cut back to a rewind point",
     },
     Command {
+        name: "review",
+        about: "clean-context review of what changed (apply, list)",
+    },
+    Command {
         name: "fork",
         about: "fork current session into a new one",
     },
