@@ -130,10 +130,7 @@ impl Chat {
             return Applied::none();
         }
         self.reviews.running = true;
-        self.push(
-            LineKind::Note,
-            "review: asking a clean-context reviewer…".to_owned(),
-        );
+        self.push(LineKind::Note, "review: checking what changed…".to_owned());
         let edited = self
             .agent_edits
             .paths()
@@ -177,7 +174,10 @@ impl Chat {
         let count = report.findings.len();
         self.push(
             LineKind::Note,
-            format!("review: sending {count} findings to the coder"),
+            format!(
+                "review: sending {count} {} to the coder",
+                if count == 1 { "finding" } else { "findings" }
+            ),
         );
         let log = Some(LogWrite::text(Role::User, text.clone()));
         if self.turn_active {
@@ -412,6 +412,11 @@ mod tests {
         assert!(text.contains("returned FAIL (x)"), "{text}");
         assert!(text.contains("- a.rs:7 \u{2014} broken"), "{text}");
         assert!(chat.turn_active, "it opens a turn like any prompt");
+        assert!(
+            said(&chat).contains(&"review: sending 1 finding to the coder".to_owned()),
+            "{:?}",
+            said(&chat)
+        );
         assert_eq!(applied.log.map(|log| log.text), Some(text.to_string()));
     }
 
