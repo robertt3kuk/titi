@@ -6,6 +6,12 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- Every finished turn's footer row now ends with `copy · fork`, right-aligned and dim. A click on `copy` puts that turn's answer on the clipboard (every round of the turn's text, through the OS clipboard writer, or OSC 52 when there is none — the route a copy-by-selection takes); a click on `fork` starts a new session from the conversation as it stood at the end of that turn, and says so when the turn is the newest one (the whole session) or cannot be placed in the session file (the whole session too, with the reason). A footer too narrow to hold the actions beside its text, or one that wraps, draws without them. `/copy [n]` does the same copy from the keyboard — the newest answer, or the nth-last — and works with mouse reporting off.
+
+- `/errors` lists every error this session showed, newest first, with its time and where it came from (`provider`, `tool` or `titi`); Enter opens the whole message, which the transcript row cuts to a line, and Esc closes. The log keeps the newest 200. The status line shows `⚠ N` for the errors that arrived since you last opened the panel, and nothing while there are none. Alt+R stays with the keybinding table's `app.retry`, so the panel is the command only.
+
+- `/usage` also breaks the session down by model: prompt, cached, completion and cost per model, with the cache hit rate (cached share of the prompt) per model and in total once a second model has run. A turn that fell back to another model mid-way is counted to the model it ended on.
+
 - `/review` asks a clean-context reviewer — the one `/goal` uses, with read-only tools and no sight of the conversation — to judge what this session changed: first the files the agent edited, else the uncommitted `git diff HEAD`, at most 30 files listed with `+N/−M` each (a deleted file is checked through its callers). It answers `VERDICT: PASS|FAIL|PARTIAL — reason` with `file:line` findings, shown as a banner (`review · FAIL · 3 findings`) and the findings under it; a reply with no verdict is PARTIAL with its text shown, never a pass. `/review apply` sends the last findings to the coder as the next prompt, `/review list` shows this session's last 8 verdicts, and with nothing changed no model is called and it says `nothing to review`. `titi --review` does the same non-interactively (the git diff only), prints the verdict as one JSON line and exits 0 pass, 3 fail, 4 partial, 5 nothing to review, 2 usage error. A skill named `review` is now shadowed by the command.
 
 - `ctrl+k` on an empty draft opens a command palette: one fuzzy list of every slash command, the panels (models, themes, sessions, history, tree, status line preset, login) and every setting titi knows by name. Enter runs a command that needs nothing, leaves `/btw ` (and the like) in the composer for the text, opens the panel, or — for a setting — says its value and which config layer it came from and offers its words (`true`/`false`, the status line presets, …) to save to the agent config. A draft with text keeps the readline meaning: `ctrl+k` deletes from the caret to the end.
@@ -13,12 +19,6 @@ All notable user-facing changes to titi, newest first.
 - Commands that take one of a few words list them. `/theme `, `/details `, `/mouse `, `/genome ` and `/statusline ` (a space after the name) show the choices under the composer with the one in force marked `✓ current`; the list narrows as you type, Tab writes the highlighted word into the draft, the arrows plus Enter pick it, and a command typed out in full is still sent as typed. The palette reaches the same lists.
 
 - `shift+tab` cycles the session mode agent → plan → duck → agent through the same `SetMode` the `/plan`, `/duck` and `/done` commands send, and the composer's top border carries a `─ plan ─` or `─ duck ─` badge while the mode is not agent.
-
-- Every finished turn's footer row now ends with `copy · fork`, right-aligned and dim. A click on `copy` puts that turn's answer on the clipboard (every round of the turn's text, through the OS clipboard writer, or OSC 52 when there is none — the route a copy-by-selection takes); a click on `fork` starts a new session from the conversation as it stood at the end of that turn, and says so when the turn is the newest one (the whole session) or cannot be placed in the session file (the whole session too, with the reason). A footer too narrow to hold the actions beside its text, or one that wraps, draws without them. `/copy [n]` does the same copy from the keyboard — the newest answer, or the nth-last — and works with mouse reporting off.
-
-- `/errors` lists every error this session showed, newest first, with its time and where it came from (`provider`, `tool` or `titi`); Enter opens the whole message, which the transcript row cuts to a line, and Esc closes. The log keeps the newest 200. The status line shows `⚠ N` for the errors that arrived since you last opened the panel, and nothing while there are none. Alt+R stays with the keybinding table's `app.retry`, so the panel is the command only.
-
-- `/usage` also breaks the session down by model: prompt, cached, completion and cost per model, with the cache hit rate (cached share of the prompt) per model and in total once a second model has run. A turn that fell back to another model mid-way is counted to the model it ended on.
 
 - `titi` opens its first frame about three times sooner in a repo with a code map. The map's first index (a full parse of the tree, about a second of CPU on titi's own repo) used to run before anything was drawn; it now runs in the background, and the first prompt waits for it, so its map is still the whole tree.
 
@@ -51,43 +51,24 @@ All notable user-facing changes to titi, newest first.
 - A model you declare can declare what it costs: `price: { input: 3, output: 15, cachedInput: 0.3 }` under a model in `config.yml`, in dollars per million tokens. The digits are read as integers and scaled — never a float — so `0.15` is exactly 150,000 micro-dollars, and with a price on the model a money cap is enforceable: `/budget $0.000001` stops the next turn on the tokens this one spent, and the footer's `· $x` is the ledger's own. `cachedInput` is optional, as it is in the published tables. A model with no `price` is unpriced, exactly as every model was before this key: not free, and a cap over it is refused by name rather than guessed. A rate that cannot be read — a sign, a word, a seventh decimal place, a missing `input`/`output` — is refused, naming the key, and the model loads **unpriced** rather than at zero, with the rest of the config standing.
 
 - A mermaid `flowchart`/`graph` fence is drawn as a diagram: `TD`/`TB` and `LR`, nodes with or without a shape (`A`, `A[text]`, `A(text)`, `A{text}` — the rounded and diamond shapes degrade to the same box), the edge kinds `-->`, `---`, `-.->`, `==>` with an optional `|label|`, chains, and `subgraph` (its box is not drawn; its nodes and edges are). The layout is layered — longest path, one barycentric ordering pass, box-drawing glyphs with the theme’s ASCII forms where it has none. Anything else — another diagram type, a parse error, a drawing wider than the pane — renders the fence exactly as before, never a half diagram. `tui.renderMermaid` (unset = on, omp’s default) turns it off.
-
 - `modelRoles.default` names the model a session starts on: `modelRoles:` / `  default: openai/gpt-4.1`. Unset, the session starts on the first available model exactly as before; set and available, it starts on that one and `/model`’s list opens on it; set and not available — an id the registry cannot resolve, unknown or keyless — it starts on the default it would have used anyway and **says so by name once**, on the screen as a note and on stderr in a headless run, never a silent fallback. The key is omp’s own (`modelRoles.default`, the chat role), read from the map titi already owns for its named roles, so `/settings` lists it with the rest.
-
 - `display.smoothStreaming` reveals a streamed answer at a readable rate instead of in whatever bursts the provider sends: one line, `display.smoothStreaming: true`, turns it on. **omp defaults this key on; titi keeps it off**, because an unset key here never moves a pixel — with it unset every frame, and every golden, is exactly what it was. On, the pacing is omp's (`crates/titi-cli/src/reveal.rs`: a 30 fps frame revealing at least three characters, more when the backlog is longer, so a burst catches up within about a second), the revealed text is always a prefix of what arrived — cut at a character boundary, never half a character — and it settles in full at a tool call, at the turn's end, on a failure and on a cancel, so nothing is lost or held past the turn.
-
 - `/changelog` says what changed in the build you are running: the notes are the repository's `CHANGELOG.md` embedded at compile time (`include_str!`), so the command reads no file and a moved checkout changes nothing. Bare it shows the newest three releases, `full` all of them, `last n` n of them, and the file's `## Unreleased` section — which is what a working tree is building — is the newest block. After a run whose version differs from the last one this agent directory saw, one line says so (`titi 0.1.0: 49 changes across 1 release since 0.0.9 · /changelog`); the version is kept in `<agent>/last-changelog-version`, a first run writes it silently, and `startup.changelog` (unset = on) turns the line off. omp's third mode, the notes in full, is `/changelog` here.
-
 - The live agents are pinned above the composer: `display.pinnedAgents` (`off`, `collapsed` — the default, up to three rows and `… N more` — or `full`) draws one row per running agent with a moving glyph, and `display.subagentLivePreview` (unset = off) adds what it is doing — the engine's `tools: read, grep` activity, or the tail of its own answer. `alt+a` walks the jump list (an agent, the next, back to the main turn) and asks the engine for that agent's view; clicking a row does the same; Esc comes back from a focus first, after an open list. A focused agent's **pane** replaces the transcript while it has the view: its name, state and elapsed seconds, the activity line, and its own streamed answer wrapped and following the tail. Several agents at once are fine — a batch spawns up to four — and they leave the strip in whatever order they finish, out of order included.
-
 - `tui.tight` drops one cell of horizontal padding from the surfaces that carry it: the composer box (the draft starts a column further left and the row keeps one more character), the status row's left edge, and the panel boxes (the row inside moves a cell left and gains a cell of room). Unset is off, so every frame is exactly what it was; icons, list indents and the message gutters are not padding and stay. omp's `tui.tight` is the same key — it subtracts one from every component's `paddingX` (`pi-tui/src/utils.ts:764`).
-
 - `statusLine.separator` picks the glyph between the status line's segments — `powerline`, `powerline-thin` (the default), `slash`, `pipe`, `block`, `none` or `ascii`, omp's own set, each drawn from the theme's symbol table so a `nerd` symbol preset gets the Nerd Font forms and `unicode`/`ascii` the plain ones. `statusLine.sessionAccent` spends the theme's accent on the *idle* editor border and on the rest of the context gauge (a running turn and a needs-you prompt keep their own colours, because those say something the accent does not), and `statusLine.transparent` leaves the status line's background to the terminal — clearing the row rather than painting the theme's, since the screen paints `StatusLineBg` behind every cell. Unset, each key leaves the frame exactly as it was; omp defaults the accent *on* and this does not, because an unset key here never moves a pixel.
-
 - `/tree` shows what you ask it to: `alt+f` cycles the panel through every entry, everything but the tool traffic, and only what you said, and `treeFilterMode` (`default` / `no-tools` / `user-only`, unset = `default`) names the one it opens in. Hiding the tool rows does not break the tree: an entry whose parent the filter hides hangs from the nearest entry it keeps, so the answer that followed a tool call stays where it belongs instead of landing at the root. The title names the filter and counts what is left, and the cursor follows the entry it was on. omp's two other modes are not ported and the GAP says why.
-
 - `--continue` / `-c` reopens the newest session in the agent directory instead of starting blank; with nothing to resume, it starts fresh and says so. `session.autoResume`, set in a config layer, does the same at every launch and is off unless set.
-
 - A bare `exit`, `quit`, `q` (or `/exit`, `/quit`) in the composer leaves the chat instead of being sent to the model — straight away before the first turn, and on a second Enter once the session has one.
-
 - A second `Escape` on an empty composer opens the rewind cut, the same as `/rewind`.
-
 - A `bash` command that outlives its background threshold — `TITI_BASH_BACKGROUND_MS`, in milliseconds, 60 000 by default — is handed over as a background job instead of holding the turn; `/jobs cancel` stops it. The threshold is also a setting, `bash.autoBackground.thresholdMs` (1 to 3 600 000; 0 or anything larger is refused at startup), which the environment variable overrides when set.
-
 - A `todo` checklist tool: the agent writes a multi-step list, moves one item at a time through statuses, and a `todo N/M · name` chip tracks it in the transcript.
-
 - A splash screen at startup: a `TITI` wordmark, a tagline, facts, chords and one of twenty `Tip: …` hints, picked by the session id.
-
 - `read` takes `offset` and `limit`; `glob` matches real glob patterns (`**/`, `[a-z]`, `{rs,toml}`); `grep` takes a regular expression with `ignore_case` and a `glob` file filter, and a `path` may name one file.
-
 - `titi genome` manages the prompt map (`on`, `off`, `limit <n>`), `titi genome check` reports diagnostics per line, and `titi genome lsp` serves a stdio LSP; `/genome` repeats the same verbs in the chat.
-
 - Each turn carries a `<diff>` block: the working tree's changes next to the genome map, so the model sees its own edits.
-
 - `titi --login <provider>` signs in with OAuth in the browser and stores the subscription with its refresh token; a device-code flow is offered where the provider supports it, and bare `/login` opens a picker.
-
 - Screen switches read from the same settings layers: `statusLine.preset` and `statusLine.contextLine`, `notify.completion` / `notify.error` / `notify.ask` (desktop notifications, unset = on), `terminal.progress` (OSC 9;4, unset = on), `composer.tokenRate` (generation rate on the working row, unset = on), `genome.enabled` (unset = on) and `genome.limit` (1–64, default 24).
-
 - The model can hand one task to a subagent with the `agent` tool, or several at once with `tasks` — up to four run at a time, a shared `context` is prepended to every task, and the answer carries one section per child, the whole message capped at 30 000 characters with the cut stated in the text. Either way it spawns through the same supervisor a `/agents`-style command would, and the call returns when the subagents finish. A subagent cannot ask a question and cannot spawn a subagent of its own, and the tool is only offered to the model when the session has an agent model to run one on.
 
 - A response that asks for several files at once runs its read calls together, up to four at a time, instead of one after another — a turn that gathers five files pays for one round of I/O rather than five. Anything that writes, executes or needs an approval keeps the model's order and is a barrier between the reads around it, the answers still come back in the order the calls were made, and a cancelled turn settles at once, answering the calls it did not get to instead of leaving them dangling.
@@ -99,83 +80,46 @@ All notable user-facing changes to titi, newest first.
 - A walk of a repository with ignore rules is about three times faster (17.5 ms to 5.1 ms warm on this workspace's own tree, 229 source files, 20 rules), so a turn's index resync is less often reported as behind. The rules mean the same thing they did; they are just not re-decided against every path suffix with a fresh grid per call.
 
 - `bash` output reaches the model as the text a terminal would show: colour codes and window titles removed, `\r` progress bars reduced to their last state — on a pty and on a pipe alike, through timeouts and interrupts too.
-
 - A `bash` run is bounded on both paths: a deadline (`timeout_secs`, 300 by default), a whole-process-group stop on Ctrl+C, and a 64 KiB cap per stream kept (first and last on a pipe). Zero nowhere means "no deadline"; a foreground dev server, watcher or `tail -f` is refused before it runs.
-
 - `read` answers at most 30,000 characters and 2,000 lines without a `limit`; a longer file arrives paged as `[lines 1-N of M; read on from offset N+1]`, not cut in the middle. A directory read lists it; a binary is named as one.
-
 - `edit`, when `old_string` is not there as written, matches loosely by lines — ignoring surrounding whitespace and typographic quotes — and when it fits exactly one run, edits it with the file's own indentation and says the match was loose.
-
 - A `grep` path outside the workspace or non-existent is an error, not a silent search everywhere; a hit on a very long line shows about 300 characters around the match.
-
 - `/usage` counts what the provider reported for prompt, completion and cached tokens instead of an estimate; `/budget` no longer says "estimated".
-
 - Cancelled or failed turns still report their token usage, so `/usage` and the budget do not lose a paid round.
-
 - Model switches in headless JSONL now answer `ModelSwitched`, so a client can switch a model before a turn.
-
 - `/hotkeys` lists the keys the screen answers, grouped — composer, lists & pickers, transcript & mouse, turn control, session — one row per binding and what it does. The table sits beside the `on_key` that answers those keys, and a test walks every key `map_key` can produce through every state `on_key` branches on, so a binding missing from the listing fails the suite rather than going unadvertised.
-
 - `display.turnFooter.time`, `display.turnFooter.tokens` and `display.turnFooter.cacheMiss` mute one part of the dim row under a finished turn's answer — the seconds, the token counts with the money, the cache-miss marker. Unset means on; with all three off the row is not drawn at all, and `/usage` still totals the session.
-
 - `/tree` shows the session's stored entries as the tree they are — every branch, indented by depth, the path to the leaf marked and the leaf named — and Enter moves the leaf to the row under the cursor, replays that path to the engine and says how many entries it left behind. The branch stays in the store: this is a branch, not a rewind.
-
 - The composer has a caret: `←`/`→` move it a character, `alt+←`/`alt+→` (and `ctrl+←`/`ctrl+→`) a word, `home`/`end` (`ctrl+a`/`ctrl+e`) the two ends of the draft, `delete` takes what is after it and `ctrl+u` everything before it, while `backspace`, `alt+backspace` and `ctrl+w` take what is behind it. Typing, pasting and the `/` and emoji completions all act where the caret is, so a command completes mid-draft and an emoji expands where it is written; a `[Paste #N]` marker is one unit to the caret: it cannot be landed inside, and any cut that crosses it — backspace, delete, a word, `ctrl+u` — takes it whole, body and all, so a half marker is never left in the draft. The composer's row scrolls to keep the caret in view and draws it where it is, not at the end.
-
 - `editor.vim` edits the composer the vim way, off unless the setting asks for it: Esc leaves Insert for Normal and the caret steps back one, `i`/`a`/`I`/`A` come back at the caret, after it, at the first non-blank and at the end, and Normal has vim's motions (`h l w b e 0 ^ $`, a count in front of any of them), its edits (`x X s`, the operators `d`/`c` with a motion, `dd`, `D`, `cc`, `C`, `S`, and `cw` with vim's quirk) and the named keys a terminal has for them (`←`/`→` are `h`/`l`, home/end are `0`/`$`, delete is `x`, backspace is `h`). The mode is named in the composer's own border (`NORMAL`/`INSERT`), `/hotkeys` lists the vocabulary while it is on, and Enter sends the draft in either mode. A paste marker is one unit to every motion and every cut here too, so a vim edit cannot leave half of one behind. Off (the default) the composer answers keys exactly as it did before, which is what the whole existing suite runs against.
-
 - The `ask` tool: the model puts a question to the user and waits — with a list of choices (one or several) and, unless it says otherwise, room for an answer in the user's own words. The screen shows it as a panel titled with the question, `space` ticks the rows of a question that takes several, Enter answers, a printable character answers in the composer's own row instead, Esc cancels and Ctrl+C interrupts the turn; the question and the answer are kept in the transcript, so scrollback shows what was decided. A turn with no surface attached — a subagent, a headless one-shot — is told so rather than left waiting.
-
 - `/budget $2` caps a session in money as well as tokens: the figure is exact micro-dollars (`$0.50` is half a dollar, and anything finer than a millionth is refused rather than rounded), the cap is the engine's own cost ledger — each round billed at that round's model price — and `/budget off` lifts both bounds. A turn's money in the footer and `/usage` now comes from the engine's report (`TurnUsage.cost_micro_usd`) instead of being recomputed here, so a footer and a cap cannot disagree; a cap in money over a model with no price is named (`budget: <model> has no price, so a cap in money cannot be enforced over it`) rather than silently unenforced.
-
 - A paste of 100 lines or more — `paste.menuThreshold`, 0 to turn it off — offers how it should reach the model, the way omp's large-paste menu does: **attach as a block** sends it between fences, **attach as a file** writes it to `.titi/pastes/paste-<n>.txt` in the workspace and leaves that path in the draft for the model to `read` in ranges, and Esc keeps the plain `[Paste #1 · 150 lines]` marker every shorter paste gets. Nothing is written or wrapped unless a row is taken, and an attached file lands in the workspace's `.titi/pastes/`, which writes its own `.gitignore` (`*`) so a pasted log is never swept into a commit.
 
 ### Fixed
-
 - A provider that says how long to wait is waited for: a 429's `retry-after`, `retry-after-ms` or `x-ratelimit-reset-*` is honoured instead of the client's own 500 ms-doubling schedule, and a wait past a minute fails the attempt naming the number rather than holding the session.
-
 - A request the provider rejects for being longer than the model's window is folded once and asked again; a second rejection names the window.
-
 - A subagent that was stopped says so once: the status word is the whole message, so a cancelled batch no longer reads as `alpha — was stopped stopped`.
-
 - The Responses/Codex backend gets its encrypted reasoning back: a `reasoning` item's `encrypted_content`, id and summary are kept from the stream and replayed ahead of the turn's items. The path asks for them with `store: false` and requires them, so a multi-round turn without them could not continue.
-
 - An Anthropic turn that thought and then called a tool is replayed with its thinking blocks — text and `signature`, or a `redacted_thinking` payload — ahead of the text and the calls, so the API accepts the next request. Before, the signatures were dropped on the way in and a signed turn could not continue. A block is only replayed to the family that signed it.
-
 - A Gemini thinking model's `thoughtSignature` is echoed back with the function call it signed. It was dropped on the way in, and a thinking model rejects the next request when the signature is missing.
-
 - A replayed history now shows the model what it actually asked for: a tool call carries the arguments it was made with, and a tool result carries the id of the call it answers. Before, every replayed call had empty arguments and every result was paired by position, which a strict OpenAI-compatible server can reject and a resumed session got wrong the moment a result was reordered or dropped. Anthropic and Gemini histories also carry the calls at all now — they were written as plain text, so a resumed turn lost its tool blocks entirely. Session files written before this still load.
-
 - The second request of a tool round tells an OpenAI-compatible provider which calls the assistant made: the completions wire wrote every message as role and content, so a tool result arrived answering a call the provider had never been shown — which a strict endpoint rejects and a lenient one answers as if nothing had been called. Each result now carries the `tool_call_id` of the call it answers, paired in the order the calls were made.
-
 - A response with more than one tool call keeps all of them: the collector held a single "current" call, so a second call's deltas were appended to the first and one of the two was dropped before the loop ever saw it. A model that asked for two files ran one.
 
 - A dotted key written flat in a config file — `editor.vim: true` at the top level, which is exactly what `/settings` prints — is read as the setting its name spells, instead of being shown by `/settings` and silently doing nothing. Nothing is rewritten, so a name that really contains a dot (a provider named `openai.azure` under `providers`) is still one key; where a file writes both spellings, the nested one wins, because that is the shape this project writes; and `/settings reset` takes out whichever spelling the file has.
-
 - A `/sessions <query>` row is dated by the line that matched — when that entry was written, which is what the result is a result of — and named by the session's own title; it used to say when the session's *file* was last written, so a hit inside an old session read as brand new, and it looked the title up per hit instead of taking the one the search already carried.
 
 - `Escape` on an open command list closes the list and leaves the composer exactly as typed, the way the emoji picker's Esc works; the list comes back on the next keystroke. It used to take the whole draft with it — a mid-sentence skill's sentence included.
-
 - `Enter` in the composer runs the row the command list is highlighting, not the word under the caret: `/checkpoint` with `/checkpoints` picked used to record a checkpoint instead of listing them. A word that already is the highlighted row still runs as typed, so a complete command (and a sentence naming a skill exactly) keeps sending on one Enter.
-
 - The provider catalog can no longer be redeclared by a project `.titi/config.yml`, so a cloned repository cannot redirect `openai.base_url` and take the first request with its own key; the `settings` tool also no longer exposes `providers` or key-bearing leaves.
-
 - A turn before its first visible token that fails walks the rest of the model list in order and says so (`model fallback: a → b`); a `401` and an unknown model are not retried.
-
 - Network tools (`fetch`, `web_search`, `settings`) say in their approval prompt what they will do, and addresses named `localhost` or the metadata host are refused.
-
 - `titi genome check` reports an ambiguous name only when the files that export it are in the **same crate**: `Level` defined in one crate and `Level` in another are unrelated types that happen to share a name, and nothing in either can be confused by the other. The graph still draws no edge for such a name — that rule is unchanged — but the report no longer names it; two files of one crate exporting the same name is still a finding. On titi's own tree the report goes from 11 informational lines to 1, and the exit code on a clean tree is still 0.
-
 - A credential store (`auth.db`) or a memory index written by a **newer** titi is refused by name — `auth store schema 2 was written by a newer titi; this build understands 1` — instead of being opened and rewritten under the older schema, which would have lost the tokens in it. A store that never recorded a version (every file from an earlier release) is still opened, migrated and stamped current.
-
 - `fetch` refuses a metadata service by **address** as well as by name: every name is resolved through a guarded resolver that drops link-local (`169.254.0.0/16`, `fe80::/10`) and metadata addresses, so a name resolving to `169.254.169.254` is refused in the same words a literal one is, and a name with one public and one forbidden answer keeps the public one. Redirects are judged hop by hop for the same reason — a `302 Location: http://169.254.169.254/…` is refused rather than followed — and the chain is still bounded at five, with a hop to a scheme this tool does not speak refused like the first URL is.
-
 - Provider errors are quoted as the provider wrote them (`rejected (HTTP 401): …`) instead of `upstream status N`.
-
 - A file edited twice inside one filesystem timestamp tick is picked up by the next index walk. The walk trusted a file whose size and mtime matched its record, and two writes inside one tick leave both identical, so the second write never reached the map; a file whose mtime is within two seconds of the walk is now read whatever its metadata says, and the content hash decides. A tree nobody is writing to is unchanged and still read nothing.
-
 - A `edit` on a CRLF or BOM-carrying file matches from the LF text and keeps the file's line endings and byte-order mark.
-
 - Transient provider retries wait between rounds (500 ms doubling to 8 s) instead of hammering, always stoppable.
-
 - A turn can no longer replay its reasoning when it retries, and a panic leaves its message visible instead of taking the screen down with itself.
