@@ -15,6 +15,7 @@ use lang::support::first_known;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 pub mod ast_edit;
@@ -957,28 +958,44 @@ fn parse_batch(
             .map(|file| parse_one(file, known, previous.get(&file.path), overlay))
             .collect();
     }
-    let chunk = stale.len().div_ceil(workers);
+    // Files are claimed one at a time from a shared counter, in list order,
+    // rather than cut into one contiguous slice per thread: a slice that
+    // happens to hold the few large files finishes long after the rest, and
+    // the refresh waits for it. Claiming in order also keeps what `prioritize`
+    // promises — the urgent files are the first ones taken.
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = stale
-            .chunks(chunk)
-            .map(|slice| {
-                scope.spawn(move || {
-                    slice
-                        .iter()
-                        .map(|file| parse_one(file, known, previous.get(&file.path), overlay))
-                        .collect::<Vec<_>>()
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(file) = stale.get(at) else {
+                            return done;
+                        };
+                        done.push((
+                            at,
+                            parse_one(file, known, previous.get(&file.path), overlay),
+                        ));
+                    }
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| match handle.join() {
-                Ok(records) => records,
+        let mut slots: Vec<Option<(FileRecord, bool)>> = (0..stale.len()).map(|_| None).collect();
+        for handle in handles {
+            match handle.join() {
+                Ok(done) => {
+                    for (at, parsed) in done {
+                        slots[at] = Some(parsed);
+                    }
+                }
                 // A parser panic is a bug in this crate, not a file-level
                 // condition to swallow: carry it to the caller's thread.
                 Err(payload) => std::panic::resume_unwind(payload),
-            })
-            .collect()
+            }
+        }
+        slots.into_iter().flatten().collect()
     })
 }
 
@@ -1087,7 +1104,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
-    use super::{prioritize, scan};
+    use std::collections::{HashMap, HashSet};
+
+    use super::{parse_batch, prioritize, scan};
 
     fn listed(path: &str) -> scan::ListedFile {
         scan::ListedFile {
@@ -1133,5 +1152,51 @@ mod tests {
         let urgent = vec!["gone.rs".to_owned(), "b.rs".to_owned()];
         let ordered = prioritize(stale.iter().collect(), &urgent);
         assert_eq!(order(ordered), vec!["b.rs", "a.rs"]);
+    }
+
+    /// However the files are shared out over the threads, the records come back
+    /// in the order the files were given, one per file, each parsed from its own
+    /// bytes — a record answering for the wrong path would corrupt the index
+    /// silently. Sizes vary by two orders of magnitude so the threads finish in
+    /// a different order than they started.
+    #[test]
+    fn a_parallel_parse_returns_one_record_per_file_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for at in 0..64 {
+            let repeat = if at % 9 == 0 { 400 } else { 1 };
+            let body: String = (0..repeat)
+                .map(|n| format!("pub fn f_{at}_{n}() {{}}\n"))
+                .collect();
+            let path = format!("f{at}.rs");
+            std::fs::write(dir.path().join(&path), &body).unwrap();
+            files.push(scan::ListedFile {
+                abs: dir.path().join(&path),
+                path,
+                size: body.len() as u64,
+                mtime: SystemTime::UNIX_EPOCH,
+            });
+        }
+        files.reverse();
+        let stale: Vec<&scan::ListedFile> = files.iter().collect();
+        let known: HashSet<String> = files.iter().map(|file| file.path.clone()).collect();
+
+        let records = parse_batch(&stale, &known, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(records.len(), 64);
+        for ((record, parsed), file) in records.iter().zip(&files) {
+            assert_eq!(record.path, file.path);
+            assert!(parsed, "{} was read from disk, so it was parsed", file.path);
+            let at: &str = file.path.trim_start_matches('f').trim_end_matches(".rs");
+            assert!(
+                record
+                    .exports
+                    .iter()
+                    .any(|name| name == &format!("f_{at}_0")),
+                "{}: {:?}",
+                file.path,
+                record.exports
+            );
+        }
     }
 }
