@@ -24,7 +24,7 @@ pub(crate) fn arg_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
-fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn jail_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
     let candidate = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
@@ -1401,6 +1401,10 @@ pub fn workspace_tools_with_interrupt(
         Box::new(GrepTool {
             root: root.clone(),
             policy: policy.clone(),
+        }),
+        Box::new(crate::project::ProjectTool {
+            root: root.clone(),
+            interrupt: interrupt.clone(),
         }),
         Box::new(BashTool {
             root: root.clone(),

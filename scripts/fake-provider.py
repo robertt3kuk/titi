@@ -15,6 +15,8 @@ the real binary and the real HTTP stack:
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
+  "run project"   a `project` call: {action: list} (detects the workspace's
+                  ecosystem and prints the commands; runs nothing)
   "pin agents"    two `agent` calls in one round, each with a small task: the
                   tool loop runs them one after another, so the strip shows one
                   live agent at a time
@@ -139,6 +141,8 @@ def script(last: dict) -> list[tuple[dict, float]]:
         return [(c, 0) for c in call("call_ask", "ask", args)]
     if "slow" in content:
         return [(chunk({"content": f"tick{i} "}), 0.15) for i in range(60)] + [(chunk({}, "stop"), 0)]
+    if "run project" in content:
+        return [(c, 0) for c in call("call_project", "project", {"action": "list"})]
     if "run bash" in content:
         return [(chunk({"content": "Running it. "}), 0)] + [
             (c, 0) for c in call("call_bash", "bash", {"command": "echo titi-smoke"})

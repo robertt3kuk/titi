@@ -13,6 +13,7 @@ pub mod hashline;
 pub mod intercept;
 mod loose;
 pub mod pipe;
+pub mod project;
 pub mod pty;
 pub mod sensitive;
 pub mod web;
@@ -42,6 +43,7 @@ pub use pipe::{
     BACKGROUND_AFTER, BACKGROUND_ENV, Background, BackgroundCancel, BackgroundSink,
     background_after, background_after_with,
 };
+pub use project::{ProjectError, ProjectTool};
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;
