@@ -245,6 +245,25 @@ fn prompt_with_context(
     parts.join("\n\n").into()
 }
 
+/// Whether the newest copy of a context block in `history` is `block`, byte for
+/// byte.
+///
+/// `marker` is what opens a block of this kind (`<genome`, `<diff>`), so the
+/// newest user message carrying one is the copy the model is reading. A block
+/// that equals it adds nothing: the model has that text, a few messages up.
+/// Sending it again costs its full size on every turn — the map alone is about
+/// 2.5 KB — and the copies pile up, because each stays attached to the message
+/// it was built for. Comparing with the newest *copy* rather than the newest
+/// message is what keeps this stable: a turn that left a block out does not
+/// make the next one look like a change.
+fn previous_copy_matches(history: &[ChatMessage], marker: &str, block: &str) -> bool {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User && message.content.contains(marker))
+        .is_some_and(|message| message.content.contains(block))
+}
+
 /// `<diff>` after the genome block. Whitespace-only text is not a snapshot.
 fn render_diff(text: &str) -> Option<String> {
     if text.trim().is_empty() {
@@ -470,6 +489,35 @@ mod tests {
         assert_eq!(turn_two.len(), turn_one.len() + 1);
         assert!(turn_two[1].content.contains("<genome v1/>"));
         assert!(turn_one[1].content.contains("<genome v1/>"));
+    }
+
+    /// A block the model already has, as its newest copy, is not sent again;
+    /// one that differs from that copy is. A turn that sent no copy does not
+    /// hide the older one.
+    #[test]
+    fn a_block_the_newest_copy_already_holds_is_not_repeated() {
+        let first = prompt_with_context("first", None, Some("<genome v1/>"), None);
+        let history = vec![
+            message(Role::User, &first),
+            message(Role::Assistant, "an answer"),
+        ];
+        assert!(previous_copy_matches(&history, "<genome", "<genome v1/>"));
+        assert!(!previous_copy_matches(&history, "<genome", "<genome v2/>"));
+
+        let mut skipped = history.clone();
+        skipped.push(message(Role::User, "second, which sent no map"));
+        skipped.push(message(Role::Assistant, "another answer"));
+        assert!(previous_copy_matches(&skipped, "<genome", "<genome v1/>"));
+
+        let mut moved = skipped.clone();
+        moved.push(message(
+            Role::User,
+            &prompt_with_context("third", None, Some("<genome v2/>"), None),
+        ));
+        assert!(!previous_copy_matches(&moved, "<genome", "<genome v1/>"));
+        assert!(previous_copy_matches(&moved, "<genome", "<genome v2/>"));
+
+        assert!(!previous_copy_matches(&[], "<genome", "<genome v1/>"));
     }
 
     fn message(role: Role, text: &str) -> ChatMessage {
@@ -2428,11 +2476,22 @@ async fn run_turn(
         GENOME_QUIESCE,
     )
     .await;
+    let history = &config.restored_messages;
     let contextual_prompt = prompt_with_context(
         &prompt,
-        recalled.as_deref(),
-        genome_text.as_deref(),
-        snapshot.as_ref().map(|shot| shot.text.as_str()),
+        recalled
+            .as_deref()
+            .filter(|block| !previous_copy_matches(history, "# Recalled\n", block)),
+        genome_text
+            .as_deref()
+            .filter(|block| !previous_copy_matches(history, "<genome", block)),
+        snapshot
+            .as_ref()
+            .map(|shot| shot.text.as_str())
+            .filter(|text| {
+                render_diff(text)
+                    .is_none_or(|block| !previous_copy_matches(history, "<diff>", &block))
+            }),
     );
 
     // Per turn, not per model: rounds a fallback leaves behind were paid for.

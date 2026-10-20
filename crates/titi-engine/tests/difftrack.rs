@@ -324,3 +324,68 @@ async fn a_duck_turn_is_not_shown_the_working_tree() {
     );
     assert!(!prompt.content.contains("sk-test"), "{}", prompt.content);
 }
+
+/// The same diff, turn after turn, is sent once: the second turn's message
+/// carries no `<diff>` because the first turn's, still in the history, says
+/// the same thing. A new edit is a different diff and is sent.
+#[tokio::test]
+async fn an_unchanged_diff_is_not_sent_again_and_a_changed_one_is() {
+    let workspace = repo_with_an_outside_edit();
+    let done = || {
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }])
+    };
+    let transport = Arc::new(MockTransport::new(vec![done(), done(), done(), done()]));
+    let captured = Arc::clone(&transport);
+    let mut config = EngineConfig::new("primary");
+    config.workspace_root = Some(workspace.path().to_path_buf());
+    config.genome_root = Some(workspace.path().to_path_buf());
+    let mut engine = EngineRuntime::start(config, resolver(transport));
+    for text in ["what changed", "and now", "and again"] {
+        engine
+            .send(EngineCommand::SubmitPrompt { text: text.into() })
+            .await
+            .unwrap();
+        let _ = collect_until_terminal(&mut engine).await;
+    }
+
+    let requests = captured.requests();
+    let first = requests[0].messages.last().expect("a prompt");
+    assert!(first.content.contains("<diff>"), "{}", first.content);
+    let second = requests[1].messages.last().expect("a prompt");
+    assert!(second.content.ends_with("and now"), "{}", second.content);
+    assert!(!second.content.contains("<diff>"), "{}", second.content);
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("+pub fn added_for_the_turn() {}")),
+        "the first turn's copy is still in the history"
+    );
+
+    // A turn that left the diff out must not make the next one look changed.
+    let again = requests[2].messages.last().expect("a prompt");
+    assert!(again.content.ends_with("and again"), "{}", again.content);
+    assert!(!again.content.contains("<diff>"), "{}", again.content);
+
+    fs::write(
+        workspace.path().join("src/leaf.rs"),
+        "pub use crate::hub::hub;\npub fn leaf() {}\npub fn added_again() {}\n",
+    )
+    .expect("write");
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "once more".into(),
+        })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    let fourth = captured.requests();
+    let fourth = fourth[3].messages.last().expect("a prompt");
+    assert!(
+        fourth.content.contains("+pub fn added_again() {}"),
+        "{}",
+        fourth.content
+    );
+}

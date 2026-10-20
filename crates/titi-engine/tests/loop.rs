@@ -836,13 +836,21 @@ async fn queued_prompts_each_get_a_well_formed_frame() {
 
     let requests = transport.requests();
     assert_eq!(requests.len(), 2, "both turns reached the provider");
-    for request in &requests {
+    for (turn, request) in requests.iter().enumerate() {
         let prompt = &request.messages.last().expect("a prompt").content;
-        assert!(prompt.starts_with("<genome>\n"), "{prompt}");
-        assert!(
-            prompt.contains("</genome>\n\n"),
-            "the frame must be closed before the prompt: {prompt}"
-        );
+        if turn == 0 {
+            assert!(prompt.starts_with("<genome>\n"), "{prompt}");
+        }
+        // A map identical to the one the first turn sent is not sent again;
+        // whatever is sent must still be a whole frame in front of the prompt.
+        if prompt.starts_with("<genome") {
+            assert!(
+                prompt.contains("</genome>\n\n"),
+                "the frame must be closed before the prompt: {prompt}"
+            );
+        } else {
+            assert_eq!(prompt, "two", "a turn with no frame is the bare prompt");
+        }
     }
 }
 
