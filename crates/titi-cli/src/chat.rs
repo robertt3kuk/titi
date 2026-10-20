@@ -330,7 +330,7 @@ const GIT_OUTPUT_CAP: usize = 64 * 1024;
 /// run loop wakes on a 50ms poll, so a step of 50ms means the glyph changes
 /// on every frame it draws. A spinner that does not move reads as a frozen
 /// screen, which is worse than no spinner at all.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_PERIOD: Duration = Duration::from_millis(50);
 
 /// One key the state machine understands. The terminal loop translates.
@@ -1509,11 +1509,10 @@ impl Chat {
                 };
                 self.assistant_at = None;
                 self.shown_from = self.reply.len();
-                // The chip keeps what the call did (`bash cargo test`), not
-                // only which tool it was: once the row moves on, the
+                // The row keeps what the call does (`bash cargo test`), not
+                // only which tool it was: once the status row moves on, the
                 // transcript is the only place that says what ran.
-                let shown = detail.as_deref().unwrap_or(name.as_str());
-                self.push(LineKind::Tool, format!("tool {shown}"));
+                self.begin_action(&call_id, &name, detail.as_deref());
                 // The call goes to the session file now, not at the end of
                 // the turn: the result below it has to follow its own call,
                 // or a restore replays an orphan.
@@ -1558,6 +1557,7 @@ impl Chat {
                 // tool_loop.rs:145 then :271), so the running call keeps its
                 // own clock while the person decides, and answering hands
                 // the row back to that call without a second start time.
+                self.await_approval(&call_id);
                 self.hint.clear();
                 Applied::none()
             }
@@ -1621,27 +1621,32 @@ impl Chat {
                     // where it stood.
                     self.phase = WorkPhase::Streaming;
                 }
-                if let Some(detail) = detail {
-                    // A tool that has something to show besides its answer:
-                    // the diff of what it changed today. It is presentation
-                    // only — the model was told the answer alone — and the
-                    // renderer decides what to draw from it.
-                    self.push(LineKind::Diff, detail.to_string());
-                } else {
-                    let preview = one_line(&output, TOOL_PREVIEW);
-                    let text = if is_error {
-                        format!("tool error  {preview}")
-                    } else if preview.is_empty() {
-                        "tool done".to_owned()
+                let diff = detail.as_deref();
+                if !self.finish_action(&call_id, &output, is_error, diff) {
+                    // A result for a call this screen never saw start: it has
+                    // no row to settle, so it is shown as lines of its own.
+                    if let Some(detail) = detail {
+                        // A tool that has something to show besides its
+                        // answer: the diff of what it changed today. It is
+                        // presentation only — the model was told the answer
+                        // alone — and the renderer decides what to draw.
+                        self.push(LineKind::Diff, detail.to_string());
                     } else {
-                        format!("tool done  {preview}")
-                    };
-                    let kind = if is_error {
-                        LineKind::Error
-                    } else {
-                        LineKind::Tool
-                    };
-                    self.push(kind, text);
+                        let preview = one_line(&output, TOOL_PREVIEW);
+                        let text = if is_error {
+                            format!("tool error  {preview}")
+                        } else if preview.is_empty() {
+                            "tool done".to_owned()
+                        } else {
+                            format!("tool done  {preview}")
+                        };
+                        let kind = if is_error {
+                            LineKind::Error
+                        } else {
+                            LineKind::Tool
+                        };
+                        self.push(kind, text);
+                    }
                 }
                 // `output` is what the engine masked before it emitted the
                 // event, so no secret reaches the session file here.
@@ -2027,7 +2032,14 @@ impl Chat {
         let text = self.expand_pastes(&draft);
         self.clear_input();
         self.disarm();
-        self.push(LineKind::User, draft.clone());
+        // A message sent while a turn runs is steering, drawn under the turn
+        // rather than as a question of its own.
+        let kind = if self.turn_active {
+            LineKind::Steer
+        } else {
+            LineKind::User
+        };
+        self.push(kind, draft.clone());
         let log = Some(LogWrite::text(Role::User, text.clone()));
         if self.turn_active {
             Applied::send(EngineCommand::Steer { text: text.into() }, log)
@@ -4042,10 +4054,8 @@ impl Chat {
             line.text = text;
             return;
         }
-        self.lines.push(TranscriptLine {
-            kind: LineKind::Assistant,
-            text,
-        });
+        let line = TranscriptLine::new(LineKind::Assistant, text).stamped(&self.model);
+        self.lines.push(line);
         self.assistant_at = Some(self.lines.len() - 1);
     }
 
@@ -4057,10 +4067,8 @@ impl Chat {
             line.text = text;
             return;
         }
-        self.lines.push(TranscriptLine {
-            kind: LineKind::Thinking,
-            text,
-        });
+        self.lines
+            .push(TranscriptLine::new(LineKind::Thinking, text));
         self.thinking_at = Some(self.lines.len() - 1);
     }
 
@@ -4079,7 +4087,27 @@ impl Chat {
     }
 
     pub(crate) fn push(&mut self, kind: LineKind, text: String) {
-        self.lines.push(TranscriptLine { kind, text });
+        let line = TranscriptLine::new(kind, text).stamped(&self.model);
+        self.push_line(line);
+    }
+
+    pub(crate) fn push_line(&mut self, line: TranscriptLine) {
+        self.lines.push(line);
+        self.scroll_offset = 0;
+    }
+
+    /// Puts a line at `at`, below the lines before it. The reply and the
+    /// reasoning grow in place by index, so those that sit at or below `at`
+    /// move down with the rest.
+    pub(crate) fn insert_line(&mut self, at: usize, line: TranscriptLine) {
+        self.lines.insert(at, line);
+        for slot in [&mut self.assistant_at, &mut self.thinking_at] {
+            if let Some(index) = slot
+                && *index >= at
+            {
+                *index += 1;
+            }
+        }
         self.scroll_offset = 0;
     }
 
@@ -4088,7 +4116,12 @@ impl Chat {
     /// A surface that writes each line once — the cast replay — waits for a
     /// line to settle before writing it.
     pub fn settled_len(&self) -> usize {
-        [self.assistant_at, self.thinking_at]
+        // A call still running settles in place when it ends.
+        let running = self
+            .lines
+            .iter()
+            .position(|line| line.call.as_ref().is_some_and(|call| call.is_running()));
+        [self.assistant_at, self.thinking_at, running]
             .into_iter()
             .flatten()
             .min()
@@ -5275,7 +5308,7 @@ fn rgb(hex: &str) -> Color {
 }
 
 /// The spinner frame for an elapsed time: ten glyphs 80ms apart, wrapping.
-fn spinner_frame(elapsed: Duration) -> &'static str {
+pub(crate) fn spinner_frame(elapsed: Duration) -> &'static str {
     SPINNER[(elapsed.as_millis() / SPINNER_PERIOD.as_millis()) as usize % SPINNER.len()]
 }
 

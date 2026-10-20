@@ -1,20 +1,21 @@
 //! The transcript renderer: what turns a line into rows.
 //!
 //! One line arrives here as a [`TranscriptLine`] and leaves as the rows a frame
-//! draws — the block a message opens with, the markdown answer, the diff under
-//! a tool chip, the counted header a collapsed section folds into, the divider a
-//! compaction leaves. Nothing here owns a terminal: [`transcript`] clones the
-//! line list, renders it, and hands the rows back, so the screen keeps its own
-//! scroll state and this module keeps no state at all beyond what a block needs
-//! for its own width.
+//! draws — the header a speaker opens a message with, the markdown answer, the
+//! action block a round's tool calls make (`crate::actions`), the counted header
+//! a collapsed section folds into, the divider a compaction leaves. Nothing here
+//! owns a terminal: [`transcript`] clones the line list, renders it, and hands
+//! the rows back, so the screen keeps its own scroll state and this module keeps
+//! no state at all beyond what a block needs for its own width.
 //!
-//! The geometry of a block lives here too: [`MESSAGE_INDENT`], [`MARK_INDENT`]
-//! and [`body_width`] are the only places an indent and a body's room are
-//! spelled, and every block kind reads them.
+//! The geometry of a block lives here too: [`MESSAGE_INDENT`], [`ACTION_INDENT`],
+//! [`MARK_INDENT`] and [`body_width`] are the only places an indent and a body's
+//! room are spelled, and every block kind reads them.
 
 use std::collections::HashSet;
 use std::num::NonZeroU16;
 use std::path::Path;
+use std::time::Instant;
 
 use ratatui::buffer::CellDiffOption;
 use ratatui::style::{Color, Modifier, Style};
@@ -23,8 +24,10 @@ use ratatui::widgets::Paragraph;
 use titi_tui::markdown::{Section, SectionMode, SectionVisibility};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 
+use crate::actions::{self, ActionCall};
 use crate::chat::{Chat, TOOL_PREVIEW, bg, fg, page};
 use crate::composer::{one_line, wrap_plain};
+use crate::wallclock::Stamp;
 
 // ---------------------------------------------------------------------------
 // The transcript's geometry
@@ -32,32 +35,31 @@ use crate::composer::{one_line, wrap_plain};
 //
 // One place decides where a transcript block's rows sit and how much room its
 // body has. There are two kinds of block and so two indents — a message opens
-// with its label (`  you  │ `), a marked block with its mark (`   ▸ `) — and
-// every block kind, the markdown answer and the diff under a tool chip
-// included, reads its indent and its width from here. Nothing else spells an
-// indent of its own.
+// with a header row (`  ● titi · model · 14:02`) and its body sits under the
+// header's name; a marked block opens with its mark (`   ▸ `) — and every block
+// kind, the markdown answer and the diff under an action row included, reads
+// its indent and its width from here. Nothing else spells an indent of its own.
 //
 // The rows of a sign-in note's URL are the one deliberate exception: they are
 // flush left on purpose, so together they spell the URL (`link_note`).
 
-/// Cells a message block's body starts at, on its first row and on every
-/// wrapped one: `  you  │ ` and `       │ `.
-///
-/// The bar's cells, the label's four and the air before them make it up;
-/// `message_gutter` builds the pieces from this, and the tests measure that
-/// they add up to it.
-pub(crate) const MESSAGE_INDENT: usize = 9;
+/// Cells a message block's body starts at, on every row: the two cells of air
+/// and the two of the header's glyph and its space, so the body sits under the
+/// speaker's name.
+pub(crate) const MESSAGE_INDENT: usize = 4;
 
-/// The bar a message block carries after its label, and at the end of every
-/// wrapped row: one space, the bar, one space.
-const MESSAGE_BAR: &str = " │ ";
+/// Cells the header's own glyph is indented by.
+const HEADER_INDENT: usize = MESSAGE_INDENT - 2;
+
+/// Cells an action row starts at: under the block's summary, one level in.
+pub(crate) const ACTION_INDENT: usize = MESSAGE_INDENT + 2;
 
 /// Cells a marked block's body starts at: `   ▸ ` and the five cells a wrapped
 /// row hangs under.
 pub(crate) const MARK_INDENT: usize = 5;
 
 /// One cell kept clear of the layout's right edge, so a body never touches it.
-const BODY_MARGIN: usize = 1;
+pub(crate) const BODY_MARGIN: usize = 1;
 
 /// The columns a body has at `width`, sitting at `indent`: the layout less the
 /// indent, less the margin.
@@ -124,25 +126,6 @@ fn banded(
     spans
 }
 
-/// The pieces a message block opens with, and what a wrapped row hangs under:
-/// the air before the label, the label, the bar after it, and the hang.
-///
-/// The three openers add up to [`MESSAGE_INDENT`] cells, and so does the hang.
-pub(crate) fn message_gutter(name: &str) -> (String, String, String, String) {
-    // "you" and "titi" share a column so a short message stays one row.
-    let tag = format!("{name:<4}");
-    let air = " ".repeat(
-        MESSAGE_INDENT
-            .saturating_sub(tag.chars().count() + titi_tui::width::visible_width(MESSAGE_BAR)),
-    );
-    (
-        air,
-        tag,
-        MESSAGE_BAR.to_owned(),
-        format!("{:width$}│ ", "", width = MESSAGE_INDENT - 2),
-    )
-}
-
 /// The pieces a marked block opens with, and what a wrapped row hangs under:
 /// the cells before the mark, the mark, the space after it, and the hang.
 ///
@@ -192,6 +175,10 @@ pub enum LineKind {
     /// for the history above it, which is drawn only while the folded section
     /// is expanded.
     Fold,
+    /// A message the user sent while a turn was running. It is steering, not a
+    /// question: it is drawn attached under the running turn (`↯ text`), and
+    /// no switch hides it, since it is what was said.
+    Steer,
 }
 
 impl LineKind {
@@ -208,6 +195,7 @@ impl LineKind {
             LineKind::Thinking => "thinking",
             LineKind::Agent => "agent",
             LineKind::Fold => "fold",
+            LineKind::Steer => "steer",
         }
     }
 
@@ -220,7 +208,7 @@ impl LineKind {
     /// ([`Details::folded`]).
     fn section(self) -> Option<Section> {
         match self {
-            LineKind::User | LineKind::Assistant | LineKind::Fold => None,
+            LineKind::User | LineKind::Assistant | LineKind::Steer | LineKind::Fold => None,
             LineKind::Thinking => Some(Section::Thinking),
             LineKind::Tool | LineKind::Diff => Some(Section::Tools),
             LineKind::Agent => Some(Section::Subagents),
@@ -229,10 +217,44 @@ impl LineKind {
     }
 }
 
+/// One line of the transcript: what it says, and what the screen needs to draw
+/// it as more than text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+    /// The local time of day the line was created, for a speaker's header.
+    /// `None` for a line restored from a session file, which keeps no times,
+    /// and where the system will not say which zone it is in.
+    pub at: Option<Stamp>,
+    /// The model that wrote the line, for the assistant's header.
+    pub model: Option<String>,
+    /// Set on a tool call's line: what the call was and how it is going. The
+    /// line's text is then what a surface without rows reads.
+    pub call: Option<ActionCall>,
+}
+
+impl TranscriptLine {
+    pub fn new(kind: LineKind, text: String) -> Self {
+        Self {
+            kind,
+            text,
+            at: None,
+            model: None,
+            call: None,
+        }
+    }
+
+    /// The line as created now by `model`: the time on every line, and the
+    /// model on the kinds that wear a header (the assistant's own lines, and
+    /// the calls that open a turn before it has said anything).
+    pub(crate) fn stamped(mut self, model: &str) -> Self {
+        self.at = crate::wallclock::now();
+        if matches!(self.kind, LineKind::Assistant | LineKind::Tool) && !model.is_empty() {
+            self.model = Some(model.to_owned());
+        }
+        self
+    }
 }
 
 /// What `/details` reaches: the transcript's four named sections
@@ -500,7 +522,10 @@ pub(crate) fn transcript(
 ) -> (Paragraph<'static>, Vec<PhotoPaint>, Vec<LinkPaint>) {
     let inner = (width as usize).saturating_sub(2).max(8);
     let max_cols = width.saturating_sub(8).max(8);
+    let now = Instant::now();
+    chat.settle_approvals(now);
     let owned = chat.lines.clone();
+    let roles = line_roles(&owned);
     // The newest answer is the one still arriving: it is the reply whose rows
     // are worth keeping between frames (see `Chat::assistant_rows`).
     let newest_reply = owned
@@ -519,6 +544,9 @@ pub(crate) fn transcript(
     let fold_at = owned.iter().rposition(|line| line.kind == LineKind::Fold);
     let mut headers_drawn: HashSet<Section> = HashSet::new();
     let mut last_role: Option<BlockRole> = None;
+    // Whether the turn on screen has its speaker header yet: one header opens
+    // a turn, however many rounds of text and tool calls it holds.
+    let mut turn_headed = false;
     for (index, line) in owned.iter().enumerate() {
         if let Some(at) = fold_at {
             if index < at && folded != SectionMode::Expanded {
@@ -528,6 +556,10 @@ pub(crate) fn transcript(
                 continue;
             }
         }
+        // The rest of an action block is drawn by the call that opens it.
+        if roles[index] == LineRole::Member {
+            continue;
+        }
         // A section's own visibility, before anything is drawn: hidden lines
         // are not rows, and a collapsed section's lines become one counted
         // header where its first line would have been.
@@ -536,11 +568,19 @@ pub(crate) fn transcript(
             match mode {
                 SectionMode::Expanded => {}
                 SectionMode::Hidden => continue,
+                // An action block stands collapsed as its own summary row; a
+                // line that is not part of one folds into the section's
+                // counted header.
+                SectionMode::Collapsed if matches!(roles[index], LineRole::Start(_)) => {}
                 SectionMode::Collapsed => {
                     if headers_drawn.insert(section) {
                         let count = owned
                             .iter()
-                            .filter(|line| line.kind.section() == Some(section))
+                            .enumerate()
+                            .filter(|(at, line)| {
+                                roles[*at] == LineRole::Plain
+                                    && line.kind.section() == Some(section)
+                            })
                             .count();
                         if !rows.is_empty() {
                             rows.push(TranscriptRow::Text(Line::from("")));
@@ -563,7 +603,25 @@ pub(crate) fn transcript(
         }
         let base = rows.len();
         last_role = Some(line.kind.block_role());
-        let (texts, line_links) = if line.kind == LineKind::Assistant {
+        if line.kind == LineKind::User {
+            turn_headed = false;
+        }
+        let (texts, line_links) = if let LineRole::Start(end) = roles[index] {
+            let mut texts = Vec::new();
+            if !turn_headed {
+                texts.push(speaker_header(line, theme, inner));
+                turn_headed = true;
+            }
+            let mode = modes[section_index(Section::Tools)];
+            texts.extend(actions::group_rows(
+                &owned[index..end],
+                mode,
+                now,
+                theme,
+                inner,
+            ));
+            (texts, Vec::new())
+        } else if line.kind == LineKind::Assistant {
             {
                 // The newest answer is the one still arriving, so it is the one
                 // the reveal paces (`display.smoothStreaming`); every other
@@ -573,10 +631,13 @@ pub(crate) fn transcript(
                 } else {
                     &line.text
                 };
-                (
-                    chat.assistant_rows(newest_reply == Some(index), shown, inner, theme),
-                    Vec::new(),
-                )
+                let mut texts = Vec::new();
+                if !turn_headed {
+                    texts.push(speaker_header(line, theme, inner));
+                    turn_headed = true;
+                }
+                texts.extend(chat.assistant_rows(newest_reply == Some(index), shown, inner, theme));
+                (texts, Vec::new())
             }
         } else if line.kind == LineKind::Fold {
             // The divider carries the fold's own chevron, which the state
@@ -927,17 +988,27 @@ pub(crate) fn message_rows(
     let rows = match line.kind {
         // The user's own question is the one block with a surface of its own:
         // the theme's `userMessageBg` behind it, `userMessageText` on top, and
-        // the label's colour unchanged.
-        LineKind::User => speech(
-            "you",
-            ThemeColor::CustomMessageLabel,
-            ThemeColor::UserMessageText,
-            Surface::User,
-            &line.text,
-            width,
-            theme,
-        ),
-        LineKind::Assistant => reply_rows(&line.text, width, theme, mermaid, autograph),
+        // the header's label colour unchanged.
+        LineKind::User => {
+            let mut rows = vec![speaker_header(line, theme, width)];
+            rows.extend(speech(
+                ThemeColor::UserMessageText,
+                Surface::User,
+                &line.text,
+                width,
+                theme,
+            ));
+            rows
+        }
+        LineKind::Assistant => {
+            let mut rows = vec![speaker_header(line, theme, width)];
+            rows.extend(reply_rows(&line.text, width, theme, mermaid, autograph));
+            rows
+        }
+        LineKind::Steer => steer_rows(&line.text, width, theme),
+        LineKind::Tool if line.call.is_some() => {
+            actions::call_row(line, Instant::now(), theme, width)
+        }
         LineKind::Tool => chip(tool_chip(&line.text), theme, width),
         LineKind::Diff => diff_rows(&line.text, theme, width),
         LineKind::Error => chip(
@@ -1071,55 +1142,139 @@ pub(crate) fn wrap_url(url: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The rows a message body has besides its gutter: one rule for the plain
-/// block and for the markdown one, so an answer cannot re-wrap just because the
-/// markdown path took it.
+/// The rows a message body has: one rule for the plain block and for the
+/// markdown one, so an answer cannot re-wrap just because the markdown path
+/// took it.
 fn speech_width(width: usize) -> usize {
     body_width(width, MESSAGE_INDENT).max(8)
 }
 
-/// A message block: the name in its own colour, a bar, then the body rows under
-/// the same gutter.
+/// What a transcript line is, for the blocks that stand in a run: an action
+/// block is the call that opens it, then every line that belongs to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRole {
+    /// A line that is a block of its own.
+    Plain,
+    /// The first call of an action block; the block ends before `end`.
+    Start(usize),
+    /// A later line of an action block, drawn by the one that opened it.
+    Member,
+}
+
+/// Which lines make up action blocks: a run of tool calls and the diffs
+/// reported under them is one block, and anything else — the model's text, a
+/// note, the user — ends it. A `Diff` that no call precedes stays a line of its
+/// own.
+fn line_roles(lines: &[TranscriptLine]) -> Vec<LineRole> {
+    let mut roles = vec![LineRole::Plain; lines.len()];
+    let mut at = 0;
+    while at < lines.len() {
+        if lines[at].call.is_none() {
+            at += 1;
+            continue;
+        }
+        let mut end = at + 1;
+        while end < lines.len() && (lines[end].call.is_some() || lines[end].kind == LineKind::Diff)
+        {
+            end += 1;
+        }
+        roles[at] = LineRole::Start(end);
+        for role in &mut roles[at + 1..end] {
+            *role = LineRole::Member;
+        }
+        at = end;
+    }
+    roles
+}
+
+/// A speaker's header: who is talking, and when.
+///
+/// `◆ you · 14:02` for the user, `● titi · <model> · 14:02` for the assistant.
+/// A part the line does not have — a restored session keeps no times — is left
+/// out rather than guessed. On a narrow pane the model id is the part that is
+/// cut, since the name and the time are what tell one message from the next.
+pub(crate) fn speaker_header(line: &TranscriptLine, theme: &Theme, width: usize) -> Line<'static> {
+    let (glyph, name, label, surface) = match line.kind {
+        LineKind::User => ("◆", "you", ThemeColor::CustomMessageLabel, Surface::User),
+        _ => ("●", "titi", ThemeColor::Accent, Surface::Page),
+    };
+    let time = line.at.map(|at| at.to_string());
+    let separator = " · ";
+    let sep_width = titi_tui::width::visible_width(separator);
+    let fixed = HEADER_INDENT + 2 + name.len();
+    let time_width = time.as_ref().map_or(0, |time| sep_width + time.len());
+    let model = line
+        .model
+        .as_deref()
+        .filter(|_| line.kind != LineKind::User)
+        .and_then(|model| {
+            let room = width.saturating_sub(BODY_MARGIN + fixed + time_width + sep_width);
+            // A cut model id that is only an ellipsis says nothing.
+            (room >= 4).then(|| actions::fit(model, room))
+        });
+
+    let dim = on_surface(surface, theme, ThemeColor::Dim);
+    let mut row = vec![
+        Span::styled(" ".repeat(HEADER_INDENT), surface_style(surface, theme)),
+        Span::styled(glyph, on_surface(surface, theme, label)),
+        Span::styled(" ", surface_style(surface, theme)),
+        Span::styled(
+            name,
+            on_surface(surface, theme, label).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for part in [model, time].into_iter().flatten() {
+        row.push(Span::styled(separator, dim));
+        row.push(Span::styled(part, dim));
+    }
+    Line::from(banded(row, surface, theme, width))
+}
+
+/// A steering message: attached under the running turn as `↯ text`, in the
+/// dimmed accent, so it reads as something said to the turn and not as a
+/// question of its own.
+fn steer_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let style = actions::steer_style(theme);
+    let room = body_width(width, MESSAGE_INDENT + 2).max(8);
+    wrap_plain(text, room)
+        .into_iter()
+        .enumerate()
+        .map(|(index, piece)| {
+            let lead = if index == 0 { "↯ " } else { "  " };
+            Line::from(vec![
+                Span::styled(" ".repeat(MESSAGE_INDENT), page(theme)),
+                Span::styled(lead, style),
+                Span::styled(piece, style),
+            ])
+        })
+        .collect()
+}
+
+/// A message block's body rows: each under the header's name, on the block's
+/// surface.
 ///
 /// [`speech`] hands it one wrapped piece per row; the assistant's markdown path
 /// hands it rows that already carry their own styles, so neither caller can
-/// drift from the other's gutter.
+/// drift from the other's indent.
 fn message_block(
-    name: &str,
-    label: ThemeColor,
     surface: Surface,
     theme: &Theme,
     width: usize,
     bodies: Vec<Vec<Span<'static>>>,
 ) -> Vec<Line<'static>> {
-    let (air, tag, bar, hang) = message_gutter(name);
-    let mut rows = Vec::with_capacity(bodies.len());
-    for (index, body) in bodies.into_iter().enumerate() {
-        let mut row: Vec<Span<'static>> = Vec::with_capacity(body.len() + 3);
-        if index == 0 {
-            // The label carries the weight; the air before it and the bar after
-            // it do not, so the three are styled apart rather than as one run.
-            row.push(Span::styled(air.clone(), surface_style(surface, theme)));
-            row.push(Span::styled(
-                tag.clone(),
-                on_surface(surface, theme, label).add_modifier(Modifier::BOLD),
-            ));
-            row.push(Span::styled(bar.clone(), on_surface(surface, theme, label)));
-        } else {
-            row.push(Span::styled(
-                hang.clone(),
-                on_surface(surface, theme, label),
-            ));
-        }
-        row.extend(body);
-        rows.push(Line::from(banded(row, surface, theme, width)));
-    }
-    rows
+    let indent = " ".repeat(MESSAGE_INDENT);
+    bodies
+        .into_iter()
+        .map(|body| {
+            let mut row: Vec<Span<'static>> = Vec::with_capacity(body.len() + 1);
+            row.push(Span::styled(indent.clone(), surface_style(surface, theme)));
+            row.extend(body);
+            Line::from(banded(row, surface, theme, width))
+        })
+        .collect()
 }
 
 pub(crate) fn speech(
-    name: &str,
-    label: ThemeColor,
     body: ThemeColor,
     surface: Surface,
     text: &str,
@@ -1130,11 +1285,12 @@ pub(crate) fn speech(
         .into_iter()
         .map(|piece| vec![Span::styled(piece, on_surface(surface, theme, body))])
         .collect();
-    message_block(name, label, surface, theme, width, bodies)
+    message_block(surface, theme, width, bodies)
 }
 
-/// The assistant's answer as frame rows: markdown when the answer carries any,
-/// the plain block it has always been when it does not.
+/// The assistant's answer as body rows: markdown when the answer carries any,
+/// the plain block it has always been when it does not. The speaker's header is
+/// not among them — a turn has one, however many answers it holds.
 ///
 /// A table is markdown with no other marker in it, which is what an answer made
 /// of one looks like: without the table check it would take the plain path and
@@ -1155,25 +1311,10 @@ fn reply_rows(
     autograph: titi_tui::chart::AutoGraph,
 ) -> Vec<Line<'static>> {
     if !has_markdown(text) {
-        return speech(
-            "titi",
-            ThemeColor::Accent,
-            ThemeColor::Text,
-            Surface::Page,
-            text,
-            width,
-            theme,
-        );
+        return speech(ThemeColor::Text, Surface::Page, text, width, theme);
     }
     let bodies = markdown_bodies(text, speech_width(width), theme, mermaid, autograph);
-    message_block(
-        "titi",
-        ThemeColor::Accent,
-        Surface::Page,
-        theme,
-        width,
-        bodies,
-    )
+    message_block(Surface::Page, theme, width, bodies)
 }
 
 /// The renderer's rows as frame spans.
@@ -1626,6 +1767,172 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn line_at(
+        kind: LineKind,
+        text: &str,
+        model: Option<&str>,
+        at: Option<(u8, u8)>,
+    ) -> TranscriptLine {
+        let mut line = TranscriptLine::new(kind, text.to_owned());
+        line.model = model.map(str::to_owned);
+        line.at = at.map(|(hour, minute)| Stamp { hour, minute });
+        line
+    }
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Each speaker opens a message with a header row — who, and when — and the
+    /// body sits under the name.
+    #[test]
+    fn a_message_opens_with_its_speakers_header() {
+        let theme = theme();
+        let off = AutoGraph::Off;
+        let user = line_at(LineKind::User, "fix the parser", None, Some((14, 2)));
+        let rows = message_rows(&user, 80, &theme, false, off).0;
+        assert_eq!(text_of(&rows[0]).trim_end(), "  ◆ you · 14:02");
+        assert!(
+            text_of(&rows[1]).starts_with("    fix the parser"),
+            "{rows:?}"
+        );
+
+        let reply = line_at(
+            LineKind::Assistant,
+            "done",
+            Some("openai/gpt-4.1"),
+            Some((14, 2)),
+        );
+        let rows = message_rows(&reply, 80, &theme, false, off).0;
+        assert_eq!(text_of(&rows[0]), "  ● titi · openai/gpt-4.1 · 14:02");
+        assert_eq!(text_of(&rows[1]), "    done");
+
+        // A line that has no time or no model — a restored session — says only
+        // what it knows.
+        let restored = line_at(LineKind::Assistant, "done", None, None);
+        assert_eq!(text_of(&speaker_header(&restored, &theme, 80)), "  ● titi");
+        let timeless = line_at(LineKind::Assistant, "done", Some("m/x"), None);
+        assert_eq!(
+            text_of(&speaker_header(&timeless, &theme, 80)),
+            "  ● titi · m/x"
+        );
+    }
+
+    /// On a narrow pane it is the model id that gives way: the name and the
+    /// time are what tell one message from the next.
+    #[test]
+    fn a_narrow_header_cuts_the_model_and_keeps_the_time() {
+        let theme = theme();
+        let reply = line_at(
+            LineKind::Assistant,
+            "x",
+            Some("openrouter/anthropic/claude-sonnet-4.5-thinking"),
+            Some((9, 5)),
+        );
+        for width in [30usize, 40, 60] {
+            let header = text_of(&speaker_header(&reply, &theme, width));
+            assert!(visible_width(&header) < width, "{width}: {header:?}");
+            assert!(
+                header.starts_with("  ● titi · openr"),
+                "{width}: {header:?}"
+            );
+            assert!(header.contains('…'), "{width}: {header:?}");
+            assert!(header.ends_with(" · 09:05"), "{width}: {header:?}");
+        }
+        // Too narrow for any of the model: it is dropped whole.
+        let header = text_of(&speaker_header(&reply, &theme, 20));
+        assert_eq!(header, "  ● titi · 09:05");
+    }
+
+    /// The user's band covers the header row with the question's own rows, and
+    /// stops there.
+    #[test]
+    fn the_users_band_covers_the_header_and_the_body() {
+        let theme = theme();
+        let user = line_at(LineKind::User, "a question", None, Some((14, 2)));
+        let rows = message_rows(&user, 40, &theme, false, AutoGraph::Off).0;
+        assert_eq!(rows.len(), 2);
+        let band = bg(&theme, ThemeBg::UserMessageBg);
+        for row in &rows {
+            assert_eq!(visible_width(&text_of(row)), 40, "{row:?}");
+            assert!(
+                row.spans.iter().all(|span| span.style.bg == Some(band)),
+                "every cell of the row is on the band: {row:?}"
+            );
+        }
+    }
+
+    /// A message sent while a turn runs is drawn attached under the turn, dim,
+    /// with an arrow — and carries no header of its own.
+    #[test]
+    fn a_steering_message_is_an_arrow_row_under_the_turn() {
+        let theme = theme();
+        let steer = line_at(LineKind::Steer, "use the other crate", None, Some((14, 3)));
+        let rows = message_rows(&steer, 80, &theme, false, AutoGraph::Off).0;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(text_of(&rows[0]), "    ↯ use the other crate");
+        let arrow = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "↯ ")
+            .expect("arrow");
+        assert_eq!(arrow.style, actions::steer_style(&theme));
+        assert!(arrow.style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(arrow.style.fg, fg(&theme, ThemeColor::Accent).fg);
+
+        let long = line_at(LineKind::Steer, &"word ".repeat(30), None, None);
+        let rows = message_rows(&long, 40, &theme, false, AutoGraph::Off).0;
+        assert!(rows.len() >= 3, "{rows:?}");
+        for row in &rows[1..] {
+            assert!(
+                text_of(row).starts_with("      word"),
+                "hangs under the text: {row:?}"
+            );
+        }
+    }
+
+    /// One turn is one block of tool calls: a diff under a call belongs to its
+    /// block, and the model's text or anything else ends it.
+    #[test]
+    fn tool_calls_and_their_diffs_make_one_block() {
+        let call = |id: &str| {
+            let mut line = TranscriptLine::new(LineKind::Tool, String::new());
+            line.call = Some(ActionCall::start(
+                id,
+                "read",
+                Some("read a"),
+                Instant::now(),
+            ));
+            line
+        };
+        let lines = vec![
+            TranscriptLine::new(LineKind::Assistant, "look".to_owned()),
+            call("1"),
+            TranscriptLine::new(LineKind::Diff, "d".to_owned()),
+            call("2"),
+            TranscriptLine::new(LineKind::Assistant, "more".to_owned()),
+            call("3"),
+            TranscriptLine::new(LineKind::Note, "n".to_owned()),
+            TranscriptLine::new(LineKind::Diff, "loose".to_owned()),
+        ];
+        assert_eq!(
+            line_roles(&lines),
+            vec![
+                LineRole::Plain,
+                LineRole::Start(4),
+                LineRole::Member,
+                LineRole::Member,
+                LineRole::Plain,
+                LineRole::Start(6),
+                LineRole::Plain,
+                LineRole::Plain,
+            ]
+        );
     }
 
     /// An answer that is nothing but a table is markdown: without this the

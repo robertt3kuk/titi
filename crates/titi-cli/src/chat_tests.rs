@@ -4157,7 +4157,12 @@ fn an_approval_shows_what_the_call_will_do() {
         name: "bash".into(),
     });
     let frame = frame_rows(&mut chat, 80, 20).join("\n");
-    assert!(frame.contains("▸ bash rm -rf build"), "{frame}");
+    assert!(
+        frame.contains("Ran")
+            && frame.contains("rm -rf build")
+            && frame.contains("awaiting approval"),
+        "{frame}"
+    );
     let row = above_composer(&mut chat, 80, 20);
     assert!(row.contains("needs you · bash rm -rf build"), "{row:?}");
     let rows = frame_rows(&mut chat, 80, 20);
@@ -5167,17 +5172,6 @@ fn body_column(row: &str, first_word: &str) -> usize {
 /// the diff included.
 #[test]
 fn the_geometry_is_one_rule() {
-    let (air, tag, bar, hang) = message_gutter("you");
-    assert_eq!(
-        titi_tui::width::visible_width(&format!("{air}{tag}{bar}")),
-        MESSAGE_INDENT,
-        "the message gutter's pieces do not add up"
-    );
-    assert_eq!(
-        titi_tui::width::visible_width(&hang),
-        MESSAGE_INDENT,
-        "a wrapped message row does not hang under its body"
-    );
     let (air, mark, after, hang) = mark_gutter("\u{25b8}");
     assert_eq!(
         titi_tui::width::visible_width(&format!("{air}{mark}{after}")),
@@ -5195,7 +5189,7 @@ fn the_geometry_is_one_rule() {
     let wrapped = |kind: LineKind, text: String, indent: usize| {
         let rows = row_texts(
             &message_rows(
-                &TranscriptLine { kind, text },
+                &TranscriptLine::new(kind, text),
                 60,
                 &theme,
                 false,
@@ -5203,6 +5197,12 @@ fn the_geometry_is_one_rule() {
             )
             .0,
         );
+        // A message opens with its speaker's header, which holds no body.
+        let rows = if kind == LineKind::User {
+            &rows[1..]
+        } else {
+            &rows[..]
+        };
         assert!(rows.len() >= 2, "{kind:?} did not wrap: {rows:?}");
         for (at, row) in rows.iter().enumerate() {
             assert_eq!(
@@ -5233,26 +5233,16 @@ fn the_geometry_is_one_rule() {
     // The plain message block and the markdown one are the same block: an
     // answer cannot re-wrap because the renderer took it.
     for rows in [
-        speech(
-            "titi",
-            ThemeColor::Accent,
-            ThemeColor::Text,
-            Surface::Page,
-            &long,
-            60,
-            &theme,
-        ),
+        speech(ThemeColor::Text, Surface::Page, &long, 60, &theme),
         message_rows(
-            &TranscriptLine {
-                kind: LineKind::Assistant,
-                text: format!("## {long}"),
-            },
+            &TranscriptLine::new(LineKind::Assistant, format!("## {long}")),
             60,
             &theme,
             false,
             titi_tui::chart::AutoGraph::Off,
         )
-        .0,
+        .0[1..]
+            .to_vec(),
     ] {
         let rows = row_texts(&rows);
         assert!(rows.len() >= 2, "{rows:?}");
@@ -5269,10 +5259,7 @@ fn the_geometry_is_one_rule() {
     // column a chip's own mark has.
     let rows = row_texts(
         &message_rows(
-            &TranscriptLine {
-                kind: LineKind::Diff,
-                text: edit_result().to_owned(),
-            },
+            &TranscriptLine::new(LineKind::Diff, edit_result().to_owned()),
             60,
             &theme,
             false,
@@ -5361,19 +5348,19 @@ fn air_lands_on_a_role_change_and_nowhere_else() {
         .collect();
     assert_eq!(gaps.len(), 3, "air in the wrong places: {gaps:?}");
     assert!(
-        gaps.iter()
-            .any(|(above, below)| above.contains("what is in the repo?")
-                && below.contains("Files")),
+        gaps.iter().any(
+            |(above, below)| above.contains("what is in the repo?") && below.contains("● titi")
+        ),
         "no air between the question and the answer: {gaps:?}"
     );
     assert!(
         gaps.iter()
-            .any(|(above, below)| above.contains("a note") && below.contains("and the tests?")),
+            .any(|(above, below)| above.contains("a note") && below.contains("◆ you")),
         "no air between the turn and the next question: {gaps:?}"
     );
     assert!(
         gaps.iter()
-            .any(|(above, below)| above.contains("and the tests?") && below.contains("All green")),
+            .any(|(above, below)| above.contains("and the tests?") && below.contains("● titi")),
         "no air between the question and the answer: {gaps:?}"
     );
     // And none inside the turn: the reply, its chip, its diff and its note
@@ -7259,7 +7246,10 @@ fn a_pasted_block_keeps_its_lines() {
         .iter()
         .position(|row| row.contains("fn main() {"))
         .expect("the first line");
-    assert!(frame[first + 1].contains("│     println!"), "{frame:?}");
+    assert!(
+        frame[first + 1].starts_with("        println!"),
+        "{frame:?}"
+    );
     assert!(!frame[first].contains("println!"), "{frame:?}");
 }
 
@@ -8547,10 +8537,7 @@ fn btw_sends_without_log() {
 #[test]
 fn a_multi_line_note_is_one_row_per_line() {
     let theme = test_theme();
-    let line = TranscriptLine {
-        kind: LineKind::Note,
-        text: "alpha\nbeta\n\ngamma".to_owned(),
-    };
+    let line = TranscriptLine::new(LineKind::Note, "alpha\nbeta\n\ngamma".to_owned());
     let rows =
         row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
     assert_eq!(rows.len(), 4, "{rows:?}");
@@ -8568,10 +8555,7 @@ fn a_long_note_wraps_within_the_width() {
     let words = std::iter::repeat_n("token", 60)
         .collect::<Vec<_>>()
         .join(" ");
-    let line = TranscriptLine {
-        kind: LineKind::Note,
-        text: words.clone(),
-    };
+    let line = TranscriptLine::new(LineKind::Note, words.clone());
     let rows =
         row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
     assert!(rows.len() >= 8, "{rows:?}");
@@ -8597,10 +8581,7 @@ fn a_long_note_wraps_within_the_width() {
 fn errors_and_tool_chips_split_too() {
     let theme = test_theme();
     for kind in [LineKind::Error, LineKind::Tool] {
-        let line = TranscriptLine {
-            kind,
-            text: "first\nsecond".to_owned(),
-        };
+        let line = TranscriptLine::new(kind, "first\nsecond".to_owned());
         let rows =
             row_texts(&message_rows(&line, 40, &theme, false, titi_tui::chart::AutoGraph::Off).0);
         assert_eq!(rows.len(), 2, "{kind:?}: {rows:?}");
@@ -8609,10 +8590,7 @@ fn errors_and_tool_chips_split_too() {
 }
 
 fn assistant_line(text: &str) -> TranscriptLine {
-    TranscriptLine {
-        kind: LineKind::Assistant,
-        text: text.to_owned(),
-    }
+    TranscriptLine::new(LineKind::Assistant, text.to_owned())
 }
 
 /// A frame's buffer, for a test that has to read a cell's own style.
@@ -8645,6 +8623,7 @@ fn span_with<'a>(rows: &'a [Line<'static>], needle: &str) -> &'a Span<'static> {
 }
 
 fn reply_rows_of(text: &str, width: usize) -> Vec<Line<'static>> {
+    // The answer's body: the speaker's header above it is the transcript's.
     message_rows(
         &assistant_line(text),
         width,
@@ -8653,6 +8632,7 @@ fn reply_rows_of(text: &str, width: usize) -> Vec<Line<'static>> {
         titi_tui::chart::AutoGraph::Off,
     )
     .0
+    .split_off(1)
 }
 
 /// A heading is rendered as the theme's heading, and its `#` run is syntax:
@@ -8674,11 +8654,11 @@ fn a_heading_in_a_reply_is_styled_without_its_hashes() {
         "level 2 has no bold: {:?}",
         heading.style
     );
-    // The label and the gutter are the plain block's, unchanged.
-    assert!(texts[0].starts_with("  titi │ "), "{texts:?}");
-    assert_eq!(
-        span_with(&rows, "titi").style,
-        fg(&theme, ThemeColor::Accent).add_modifier(Modifier::BOLD)
+    // The body sits under the speaker's name, in the indent every message
+    // block shares; the header row above it is the transcript's.
+    assert!(
+        texts[0].starts_with(&format!("{:width$}What", "", width = MESSAGE_INDENT)),
+        "{texts:?}"
     );
 }
 
@@ -8731,12 +8711,7 @@ fn a_plain_reply_is_the_block_it_always_was() {
     assert_eq!(
         rows,
         vec![Line::from(vec![
-            Span::styled("  ", page(&theme)),
-            Span::styled(
-                "titi",
-                fg(&theme, ThemeColor::Accent).add_modifier(Modifier::BOLD)
-            ),
-            Span::styled(" │ ", fg(&theme, ThemeColor::Accent)),
+            Span::styled("    ", page(&theme)),
             Span::styled("done", fg(&theme, ThemeColor::Text)),
         ])]
     );
@@ -8744,29 +8719,13 @@ fn a_plain_reply_is_the_block_it_always_was() {
     let long = "word ".repeat(40);
     assert_eq!(
         reply_rows_of(&long, 60),
-        speech(
-            "titi",
-            ThemeColor::Accent,
-            ThemeColor::Text,
-            Surface::Page,
-            &long,
-            60,
-            &theme
-        )
+        speech(ThemeColor::Text, Surface::Page, &long, 60, &theme)
     );
     // Arithmetic and identifiers are not emphasis.
     for plain in ["2 * 3 * 4", "the snake_case_name field", "a_trailing_"] {
         assert_eq!(
             reply_rows_of(plain, 80),
-            speech(
-                "titi",
-                ThemeColor::Accent,
-                ThemeColor::Text,
-                Surface::Page,
-                plain,
-                80,
-                &theme
-            ),
+            speech(ThemeColor::Text, Surface::Page, plain, 80, &theme),
             "{plain:?}"
         );
     }
@@ -8777,7 +8736,7 @@ fn a_plain_reply_is_the_block_it_always_was() {
 #[test]
 fn a_bold_run_ends_where_its_marker_does() {
     let rows = reply_rows_of("**bold** and plain", 80);
-    assert_eq!(row_texts(&rows)[0], "  titi │ bold and plain");
+    assert_eq!(row_texts(&rows)[0], "    bold and plain");
     let bold = span_with(&rows, "bold");
     assert!(bold.style.has_modifier(Modifier::BOLD), "{:?}", bold.style);
     assert_eq!(bold.style.fg, None, "bold carries no colour of its own");
@@ -8805,11 +8764,11 @@ fn a_markdown_reply_stays_inside_the_pane() {
                 titi_tui::width::visible_width(row)
             );
         }
-        assert!(texts[0].starts_with("  titi │ Title"), "{width}: {texts:?}");
+        assert!(texts[0].starts_with("    Title"), "{width}: {texts:?}");
         for row in &texts[1..] {
             assert!(
-                row.starts_with("       │ ") || row.trim().is_empty(),
-                "{width}: a continuation row lost the gutter: {row:?}"
+                row.starts_with("    ") || row.trim().is_empty(),
+                "{width}: a continuation row lost the indent: {row:?}"
             );
         }
     }
@@ -8837,7 +8796,8 @@ fn a_frame_draws_the_reply_with_the_renderers_tokens() {
             "{syntax:?} reached the screen:\n{text}"
         );
     }
-    assert!(text.contains("  titi │ Title"), "{text}");
+    assert!(text.contains("  ● titi · openai/gpt-4.1"), "{text}");
+    assert!(text.contains("    Title"), "{text}");
     assert!(text.contains("let plan = 1;"), "{text}");
 
     // Where a cell of a named run sits, it carries that run's token.
@@ -9024,7 +8984,7 @@ fn only_a_result_with_a_detail_becomes_a_diff_line() {
             )
             .0;
             assert!(
-                row_texts(&rows)[0].starts_with("   ✓ "),
+                row_texts(&rows)[0].starts_with("      ✓ "),
                 "{tool}: {:?}",
                 row_texts(&rows)
             );
@@ -9038,10 +8998,7 @@ fn only_a_result_with_a_detail_becomes_a_diff_line() {
 fn a_result_without_a_diff_is_the_chip_it_always_was() {
     let theme = test_theme();
     let rows = message_rows(
-        &TranscriptLine {
-            kind: LineKind::Tool,
-            text: "tool done  read".to_owned(),
-        },
+        &TranscriptLine::new(LineKind::Tool, "tool done  read".to_owned()),
         80,
         &theme,
         false,
@@ -9065,10 +9022,7 @@ fn a_result_without_a_diff_is_the_chip_it_always_was() {
 #[test]
 fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
     let theme = test_theme();
-    let line = TranscriptLine {
-        kind: LineKind::Diff,
-        text: "not a diff at all\nsecond line".to_owned(),
-    };
+    let line = TranscriptLine::new(LineKind::Diff, "not a diff at all\nsecond line".to_owned());
     let rows = message_rows(&line, 80, &theme, false, titi_tui::chart::AutoGraph::Off).0;
     assert_eq!(
         row_texts(&rows)[..2],
@@ -9081,10 +9035,7 @@ fn a_diff_line_that_is_not_a_diff_is_the_plain_chip() {
 /// the renderer is handed the pane minus the block's inset.
 #[test]
 fn a_diff_block_stays_inside_the_pane() {
-    let line = TranscriptLine {
-        kind: LineKind::Diff,
-        text: edit_result().to_owned(),
-    };
+    let line = TranscriptLine::new(LineKind::Diff, edit_result().to_owned());
     for width in [60usize, 80, 120] {
         let rows = message_rows(
             &line,
@@ -9114,10 +9065,7 @@ fn a_very_long_diff_is_capped_and_says_so() {
     for line in 0..300 {
         text.push_str(&format!("+line {line}\n"));
     }
-    let line = TranscriptLine {
-        kind: LineKind::Diff,
-        text,
-    };
+    let line = TranscriptLine::new(LineKind::Diff, text);
     let rows = row_texts(
         &message_rows(
             &line,
@@ -9146,10 +9094,10 @@ fn a_long_login_url_is_one_slice_per_row() {
          &scope=openid%20profile%20email%20offline_access&state={}",
         "b".repeat(60)
     );
-    let line = TranscriptLine {
-        kind: LineKind::Note,
-        text: format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
-    };
+    let line = TranscriptLine::new(
+        LineKind::Note,
+        format!("login openai-codex: open this URL in your browser\n{url}\nEnter code: WXYZ"),
+    );
     let (rows, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
     let texts = row_texts(&rows);
     assert!(
@@ -9186,10 +9134,10 @@ fn a_long_login_url_is_one_slice_per_row() {
 fn a_short_login_url_is_one_row() {
     let theme = test_theme();
     let url = "https://auth.openai.com/codex/device";
-    let line = TranscriptLine {
-        kind: LineKind::Note,
-        text: format!("login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"),
-    };
+    let line = TranscriptLine::new(
+        LineKind::Note,
+        format!("login openai-codex: open this URL on any device\n{url}\nEnter code: WXYZ"),
+    );
     let (rows, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
     assert_eq!(links.len(), 1, "{:?}", row_texts(&rows));
     assert_eq!(row_texts(&rows)[links[0].row], url);
@@ -9220,10 +9168,7 @@ fn other_lines_get_no_link_rows() {
             "login x: open this URL\nhttps://example.invalid\nnow",
         ),
     ] {
-        let line = TranscriptLine {
-            kind,
-            text: text.to_owned(),
-        };
+        let line = TranscriptLine::new(kind, text.to_owned());
         let (_, links) = message_rows(&line, 78, &theme, false, titi_tui::chart::AutoGraph::Off);
         assert!(links.is_empty(), "{kind:?} {text:?} grew a link: {links:?}");
     }
@@ -9776,8 +9721,9 @@ fn a_drag_over_a_wrapped_reply_copies_the_text() {
     assert!(last > first, "the reply wrapped: {:?}", chat.last_rows);
     let top = chat.transcript_top;
 
-    // The body column: the nine cells of `  titi │ ` are the gutter.
-    chat.mouse_press(9, top + first as u16);
+    // The body column: the cells before it are the indent, which a copy
+    // leaves out.
+    chat.mouse_press(MESSAGE_INDENT as u16, top + first as u16);
     chat.mouse_drag(39, top + last as u16);
     let copied = chat.mouse_release().expect("a drag copies");
 
@@ -13044,4 +12990,320 @@ fn a_numeric_table_is_charted_and_the_setting_turns_it_off() {
     let off = plain.join("\n");
     assert!(!off.contains('█'), "off draws no bars: {off}");
     assert!(off.contains("Step"), "off is still the table: {off}");
+}
+
+/// One tool call as the engine reports it: started, then finished.
+fn run_call(chat: &mut Chat, id: &str, name: &str, detail: &str, output: &str, is_error: bool) {
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: id.into(),
+        name: name.into(),
+        detail: Some(detail.into()),
+    });
+    chat.on_event(EngineEvent::ToolFinished {
+        turn_id: TurnId(1),
+        call_id: id.into(),
+        output: output.into(),
+        is_error,
+        detail: None,
+    });
+}
+
+fn start_turn(chat: &mut Chat) {
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(1),
+        model: "openai/gpt-4.1".into(),
+    });
+}
+
+fn trimmed_frame(chat: &mut Chat, width: u16, height: u16) -> Vec<String> {
+    frame_rows(chat, width, height)
+        .iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect()
+}
+
+/// A round's tool calls are one block under the turn's header: a summary, then
+/// a row per call with its verb, target, result and duration.
+#[test]
+fn a_rounds_calls_draw_as_one_action_block() {
+    let mut chat = chat();
+    start_turn(&mut chat);
+    chat.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: "Let me look.".into(),
+    });
+    run_call(
+        &mut chat,
+        "c1",
+        "read",
+        "read README.md",
+        "# smoke\nline 2\n",
+        false,
+    );
+    run_call(
+        &mut chat,
+        "c2",
+        "bash",
+        "bash echo titi-smoke",
+        "titi-smoke",
+        false,
+    );
+    let rows = trimmed_frame(&mut chat, 100, 24);
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen: {rows:#?}"))
+    };
+    let header = at("● titi · openai/gpt-4.1");
+    assert_eq!(at("Let me look."), header + 1, "{rows:#?}");
+    assert_eq!(at("2 actions ▾"), header + 2, "{rows:#?}");
+    let read = &rows[at("README.md")];
+    assert!(read.starts_with("      ✓ Read "), "{read:?}");
+    assert!(
+        read.contains("2 lines") && read.ends_with("0.0s"),
+        "{read:?}"
+    );
+    let ran = &rows[at("echo titi-smoke")];
+    assert!(ran.starts_with("      ✓ Ran  "), "{ran:?}");
+    assert!(ran.contains("exit 0") && ran.ends_with("0.0s"), "{ran:?}");
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("● titi")).count(),
+        1,
+        "one turn, one header: {rows:#?}"
+    );
+}
+
+/// A turn that opens with a tool call, before any text, still gets its header.
+#[test]
+fn a_turn_that_starts_with_a_call_has_a_header() {
+    let mut chat = chat();
+    start_turn(&mut chat);
+    run_call(&mut chat, "c1", "read", "read a.rs", "x\n", false);
+    let rows = trimmed_frame(&mut chat, 80, 12);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("● titi · openai/gpt-4.1")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("1 action ▾")),
+        "{rows:#?}"
+    );
+}
+
+/// Three finished calls of one verb fold; a failure in the middle stands on its
+/// own and splits the run, so two and two do not fold.
+#[test]
+fn same_verb_calls_fold_at_three_and_a_failure_never_does() {
+    let mut chat = chat();
+    start_turn(&mut chat);
+    for (id, file) in [("1", "a.rs"), ("2", "b.rs"), ("3", "c.rs")] {
+        run_call(&mut chat, id, "read", &format!("read {file}"), "x\n", false);
+    }
+    let folded = trimmed_frame(&mut chat, 100, 24).join("\n");
+    assert!(folded.contains("3 actions ▾"), "{folded}");
+    assert!(folded.contains("Read ×3"), "{folded}");
+    assert!(
+        folded.find("c.rs") < folded.find("a.rs"),
+        "newest first: {folded}"
+    );
+
+    let mut chat = self::chat();
+    start_turn(&mut chat);
+    run_call(&mut chat, "1", "read", "read a.rs", "x\n", false);
+    run_call(&mut chat, "2", "read", "read b.rs", "x\n", false);
+    run_call(
+        &mut chat,
+        "3",
+        "read",
+        "read gone.rs",
+        "gone.rs is not there",
+        true,
+    );
+    run_call(&mut chat, "4", "read", "read c.rs", "x\n", false);
+    run_call(&mut chat, "5", "read", "read d.rs", "x\n", false);
+    let split = trimmed_frame(&mut chat, 100, 24).join("\n");
+    assert!(!split.contains('×'), "{split}");
+    assert!(split.contains("5 actions ▾"), "{split}");
+    let failed = split
+        .lines()
+        .find(|row| row.contains("gone.rs"))
+        .expect("the failed row");
+    assert!(
+        failed.contains('✕') && failed.contains("is not there"),
+        "{failed:?}"
+    );
+    // The failure is still a call, not an error line of its own.
+    assert!(!chat.lines.iter().any(|line| line.kind == LineKind::Error));
+}
+
+/// `/details tools` reaches the block: collapsed leaves the summary, hidden
+/// leaves nothing, expanded restores every row.
+#[test]
+fn details_tools_collapse_the_action_block_to_its_summary() {
+    let mut chat = chat();
+    start_turn(&mut chat);
+    run_call(&mut chat, "1", "read", "read README.md", "x\n", false);
+    run_call(&mut chat, "2", "grep", "grep needle src", "a:1:x\n", false);
+
+    command(&mut chat, "/details tools collapsed");
+    let frame = trimmed_frame(&mut chat, 100, 24).join("\n");
+    assert!(frame.contains("2 actions ▸"), "{frame}");
+    assert!(
+        !frame.contains("README.md") && !frame.contains("needle"),
+        "{frame}"
+    );
+
+    command(&mut chat, "/details tools hidden");
+    let frame = trimmed_frame(&mut chat, 100, 24).join("\n");
+    assert!(
+        !frame.contains("actions") && !frame.contains("README.md"),
+        "{frame}"
+    );
+
+    command(&mut chat, "/details tools expanded");
+    let frame = trimmed_frame(&mut chat, 100, 24).join("\n");
+    assert!(frame.contains("2 actions ▾"), "{frame}");
+    assert!(
+        frame.contains("README.md") && frame.contains("needle src"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("Searched") && frame.contains("1 match"),
+        "{frame}"
+    );
+}
+
+/// An edit's diff stays under its row, between that call and the next.
+#[test]
+fn an_edits_diff_stays_under_its_call_row() {
+    let mut chat = chat();
+    start_turn(&mut chat);
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: "e1".into(),
+        name: "edit".into(),
+        detail: Some("edit notes/kept.txt".into()),
+    });
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: "r1".into(),
+        name: "read".into(),
+        detail: Some("read other.txt".into()),
+    });
+    chat.on_event(EngineEvent::ToolFinished {
+        turn_id: TurnId(1),
+        call_id: "e1".into(),
+        output: "edited".into(),
+        is_error: false,
+        detail: Some(edit_result().into()),
+    });
+    let kinds: Vec<LineKind> = chat.lines.iter().map(|line| line.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![LineKind::Tool, LineKind::Diff, LineKind::Tool],
+        "the diff sits right under the call it belongs to, not at the end"
+    );
+    let rows = trimmed_frame(&mut chat, 100, 24);
+    let edited = rows
+        .iter()
+        .position(|row| row.contains("Edited"))
+        .expect("row");
+    assert!(rows[edited].contains("+1 \u{2212}1"), "{:?}", rows[edited]);
+    assert!(
+        rows[edited + 1..edited + 6]
+            .iter()
+            .any(|row| row.contains("added_line")),
+        "{rows:#?}"
+    );
+    let read = rows
+        .iter()
+        .position(|row| row.contains("other.txt"))
+        .expect("read row");
+    assert!(
+        read > edited + 3,
+        "the next call follows the diff: {rows:#?}"
+    );
+    assert!(
+        rows[read].contains('⠋')
+            || rows[read].contains('⠙')
+            || rows[read].contains('⠹')
+            || rows[read].contains('⠸')
+            || rows[read].contains('⠼')
+            || rows[read].contains('⠴')
+            || rows[read].contains('⠦')
+            || rows[read].contains('⠧')
+            || rows[read].contains('⠇')
+            || rows[read].contains('⠏'),
+        "a call still running shows a spinner: {:?}",
+        rows[read]
+    );
+}
+
+/// A result for a call this screen never saw start has no row to settle: it is
+/// shown the way it always was.
+#[test]
+fn a_result_without_a_start_is_still_shown() {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::ToolFinished {
+        turn_id: TurnId(1),
+        call_id: "ghost".into(),
+        output: "boom".into(),
+        is_error: true,
+        detail: None,
+    });
+    let last = chat.lines.last().expect("a line");
+    assert_eq!(
+        (last.kind, last.text.as_str()),
+        (LineKind::Error, "tool error  boom")
+    );
+}
+
+/// A message sent while a turn runs is steering: `↯ text` under the turn, not a
+/// second `you` block.
+#[test]
+fn a_message_sent_during_a_turn_is_a_steering_row() {
+    let mut chat = chat();
+    chat.push(LineKind::User, "run the slow thing".to_owned());
+    start_turn(&mut chat);
+    chat.on_event(EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: "working".into(),
+    });
+    type_text(&mut chat, "use the other crate");
+    let applied = chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(
+        applied.effect,
+        Some(ChatEffect::Send(EngineCommand::Steer {
+            text: "use the other crate".into()
+        })),
+        "the engine still gets the steer"
+    );
+    let last = chat.lines.last().expect("a line");
+    assert_eq!(last.kind, LineKind::Steer);
+
+    let rows = trimmed_frame(&mut chat, 80, 20);
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("◆ you")).count(),
+        1,
+        "no second you block: {rows:#?}"
+    );
+    let working = rows
+        .iter()
+        .position(|row| row == "    working")
+        .expect("answer");
+    assert_eq!(rows[working + 1], "    ↯ use the other crate", "{rows:#?}");
+
+    // Once the turn is over, a message is a question again.
+    chat.on_event(EngineEvent::TurnFinished {
+        turn_id: TurnId(1),
+        reason: StopReason::Stop,
+    });
+    type_text(&mut chat, "next question");
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(
+        chat.lines.last().map(|line| line.kind),
+        Some(LineKind::User)
+    );
 }
