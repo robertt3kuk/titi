@@ -22,6 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use titi_tui::markdown::{Section, SectionMode, SectionVisibility};
+use titi_tui::status::{FOOTER_ACTIONS_SEP, FOOTER_COPY_LABEL, FOOTER_FORK_LABEL, FooterActions};
 use titi_tui::theme::{Theme, ThemeBg, ThemeColor};
 
 use crate::actions::{self, ActionCall};
@@ -533,6 +534,8 @@ pub(crate) fn transcript(
         .rposition(|line| line.kind == LineKind::Assistant);
     let mut rows: Vec<TranscriptRow> = Vec::new();
     let mut links: Vec<(usize, LinkRow)> = Vec::new();
+    // Footer rows that drew their actions: `(first row, line, actions)`.
+    let mut footers: Vec<(usize, usize, FooterActions)> = Vec::new();
     // The section modes, read once: rendering wants `&mut chat` for the
     // newest answer's rows, so the state has to be out of the borrow before
     // the loop.
@@ -639,6 +642,12 @@ pub(crate) fn transcript(
                 texts.extend(chat.assistant_rows(newest_reply == Some(index), shown, inner, theme));
                 (texts, Vec::new())
             }
+        } else if line.kind == LineKind::Usage {
+            let (texts, actions) = usage_rows(&line.text, theme, inner);
+            if let Some(actions) = actions {
+                footers.push((base, index, actions));
+            }
+            (texts, Vec::new())
         } else if line.kind == LineKind::Fold {
             // The divider carries the fold's own chevron, which the state
             // above — not the line — decides.
@@ -675,6 +684,15 @@ pub(crate) fn transcript(
     let max_offset = total.saturating_sub(keep);
     chat.scroll_offset = chat.scroll_offset.clamp(0, max_offset);
     let start = total.saturating_sub(keep + chat.scroll_offset);
+    chat.footer_hits = footers
+        .into_iter()
+        .filter(|(row, _, _)| (start..start + keep).contains(row))
+        .map(|(row, line, actions)| FooterHit {
+            row: (row - start) as u16,
+            line,
+            actions,
+        })
+        .collect();
     let mut lines = Vec::new();
     let mut photos = Vec::new();
     let mut paints = Vec::new();
@@ -1021,7 +1039,7 @@ pub(crate) fn message_rows(
             theme,
             width,
         ),
-        LineKind::Usage => usage_row(&line.text, theme, width),
+        LineKind::Usage => usage_rows(&line.text, theme, width).0,
         // Reasoning reads exactly as a note does — the section it belongs to
         // is a `/details` axis, not a look.
         LineKind::Thinking => chip(
@@ -1051,18 +1069,59 @@ pub(crate) fn message_rows(
 /// The row is only ever pushed for a turn that reported usage, so a screen
 /// without one is a screen with nothing to report, and no zero is drawn as if
 /// it were a fact.
-fn usage_row(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+///
+/// `copy · fork` stands flush with the right edge of a row that fits on one
+/// line with them, dim like the rest of the row, and the second value says
+/// where, so a click can be mapped back to the turn. A row that would have to
+/// wrap to make room draws without them.
+fn usage_rows(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+) -> (Vec<Line<'static>>, Option<FooterActions>) {
     let room = body_width(width, MARK_INDENT).max(4);
     let gutter = " ".repeat(MARK_INDENT);
-    wrap_plain(text, room)
+    let pieces = wrap_plain(text, room);
+    let actions = match pieces.as_slice() {
+        [piece] => FooterActions::place(titi_tui::width::visible_width(piece), room),
+        _ => None,
+    };
+    let rows = pieces
         .into_iter()
         .map(|piece| {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(gutter.clone(), page(theme)),
-                Span::styled(piece, fg(theme, ThemeColor::Dim)),
-            ])
+                Span::styled(piece.clone(), fg(theme, ThemeColor::Dim)),
+            ];
+            if let Some(actions) = actions {
+                let used = titi_tui::width::visible_width(&piece);
+                spans.push(Span::styled(
+                    " ".repeat(actions.start() - used),
+                    page(theme),
+                ));
+                spans.push(Span::styled(
+                    format!(
+                        "{}{}{}",
+                        FOOTER_COPY_LABEL, FOOTER_ACTIONS_SEP, FOOTER_FORK_LABEL
+                    ),
+                    fg(theme, ThemeColor::Dim),
+                ));
+            }
+            Line::from(spans)
         })
-        .collect()
+        .collect();
+    (rows, actions.map(|actions| actions.shifted(MARK_INDENT)))
+}
+
+/// A footer row's actions where the last frame put them, for the click that
+/// lands on one. `row` is relative to the transcript pane, and `actions`
+/// counts columns in the pane's own cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FooterHit {
+    pub(crate) row: u16,
+    /// The usage line the row draws.
+    pub(crate) line: usize,
+    pub(crate) actions: FooterActions,
 }
 
 /// The sign-in note as its three parts: the head line, the authorize URL and

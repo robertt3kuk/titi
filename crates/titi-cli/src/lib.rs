@@ -11,6 +11,9 @@ pub(crate) mod errors_panel;
 #[cfg(test)]
 mod errors_tests;
 pub mod first_frame;
+pub(crate) mod footer_actions;
+#[cfg(test)]
+mod footer_tests;
 pub mod genome_cmd;
 pub mod git_checkpoint;
 pub mod headless;

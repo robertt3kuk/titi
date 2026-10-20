@@ -195,6 +195,78 @@ impl TurnFooter {
     }
 }
 
+/// What a click on a turn footer's right edge asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterAction {
+    /// Put the turn's answer on the clipboard.
+    Copy,
+    /// Fork the session at the turn.
+    Fork,
+}
+
+/// The label of [`FooterAction::Copy`].
+pub const FOOTER_COPY_LABEL: &str = "copy";
+/// The label of [`FooterAction::Fork`].
+pub const FOOTER_FORK_LABEL: &str = "fork";
+/// What stands between the two labels.
+pub const FOOTER_ACTIONS_SEP: &str = " · ";
+
+/// Cells the two labels and their separator take: `copy · fork`.
+pub const FOOTER_ACTIONS_WIDTH: usize = 4 + 3 + 4;
+
+/// The air that must stay between the row's text and its actions, so the two
+/// never read as one sentence.
+const FOOTER_ACTIONS_GAP: usize = 2;
+
+/// Where `copy · fork` stands on a footer row: flush with the row's right
+/// edge, or nowhere when the row has no room for them.
+///
+/// Columns are counted from the row's first cell. The actions are the first
+/// thing a narrow pane gives up — the text is the footer, the actions are a
+/// convenience on it — so a row that would need to wrap to hold them draws
+/// without.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterActions {
+    start: usize,
+}
+
+impl FooterActions {
+    /// The actions' place on a row whose text is `text_width` cells wide, in
+    /// `room` cells; `None` when they do not fit beside the text with a gap.
+    pub fn place(text_width: usize, room: usize) -> Option<Self> {
+        let start = room.checked_sub(FOOTER_ACTIONS_WIDTH)?;
+        (text_width + FOOTER_ACTIONS_GAP <= start).then_some(Self { start })
+    }
+
+    /// The column the first label starts at.
+    pub fn start(self) -> usize {
+        self.start
+    }
+
+    /// The same place, counted from `by` cells further left: a row that sits
+    /// behind a gutter reports its columns in the pane's own.
+    pub fn shifted(self, by: usize) -> Self {
+        Self {
+            start: self.start + by,
+        }
+    }
+
+    /// The action under `column`, if the column is on a label. The separator
+    /// belongs to neither, so a click between the two does nothing.
+    pub fn action_at(self, column: usize) -> Option<FooterAction> {
+        let copy = self.start..self.start + FOOTER_COPY_LABEL.len();
+        let fork_start = copy.end + FOOTER_ACTIONS_SEP.chars().count();
+        let fork = fork_start..fork_start + FOOTER_FORK_LABEL.len();
+        if copy.contains(&column) {
+            Some(FooterAction::Copy)
+        } else if fork.contains(&column) {
+            Some(FooterAction::Fork)
+        } else {
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Usage by model
 // ---------------------------------------------------------------------------
@@ -1256,6 +1328,42 @@ mod tests {
         assert_eq!(compact_tokens(128_000), "128k");
         assert_eq!(compact_tokens(1_200_000), "1.2M");
         assert_eq!(compact_tokens(128_000_000), "128M");
+    }
+
+    // ---- Footer actions ---------------------------------------------------
+
+    #[test]
+    fn footer_actions_stand_flush_right_when_the_row_has_room() {
+        let row = "1.4s · 3.4k prompt · 250 out";
+        let width = row.chars().count();
+        let wide = FooterActions::place(width, 80).expect("room at 80");
+        assert_eq!(wide.start(), 80 - FOOTER_ACTIONS_WIDTH);
+        assert_eq!(wide.action_at(wide.start()), Some(FooterAction::Copy));
+        assert_eq!(wide.action_at(wide.start() + 3), Some(FooterAction::Copy));
+        assert_eq!(wide.action_at(wide.start() + 4), None, "the separator");
+        assert_eq!(wide.action_at(wide.start() + 6), None, "the separator");
+        assert_eq!(wide.action_at(wide.start() + 7), Some(FooterAction::Fork));
+        assert_eq!(wide.action_at(wide.start() + 10), Some(FooterAction::Fork));
+        assert_eq!(wide.action_at(wide.start() + 11), None, "past the edge");
+        assert_eq!(wide.action_at(wide.start() - 1), None, "left of the label");
+    }
+
+    #[test]
+    fn footer_actions_are_the_first_thing_a_narrow_row_gives_up() {
+        // The row fits on its own at 40 cells; with the actions it does not.
+        assert!(FooterActions::place(28, 40).is_none());
+        // A gap of two is the least that keeps the text and the actions apart.
+        assert!(FooterActions::place(28, 28 + 2 + FOOTER_ACTIONS_WIDTH).is_some());
+        assert!(FooterActions::place(28, 28 + 1 + FOOTER_ACTIONS_WIDTH).is_none());
+        // A pane narrower than the labels themselves must not underflow.
+        assert!(FooterActions::place(0, 5).is_none());
+    }
+
+    #[test]
+    fn footer_actions_report_columns_behind_a_gutter() {
+        let placed = FooterActions::place(10, 60).expect("room").shifted(5);
+        assert_eq!(placed.start(), 60 - FOOTER_ACTIONS_WIDTH + 5);
+        assert_eq!(placed.action_at(placed.start()), Some(FooterAction::Copy));
     }
 
     // ---- Usage by model ---------------------------------------------------

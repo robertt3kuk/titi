@@ -211,6 +211,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "a diagnostics block to paste into a bug report",
     },
     Command {
+        name: "copy",
+        about: "copy an answer: /copy [n], the nth-last (default the newest)",
+    },
+    Command {
         name: "errors",
         about: "every error this session showed, newest first",
     },

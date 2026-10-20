@@ -452,6 +452,12 @@ impl Chat {
     /// nothing else — no selection starts there, because the strip is chrome,
     /// not transcript — which is why this returns what the screen should do.
     pub fn mouse_press(&mut self, x: u16, y: u16) -> Option<Applied> {
+        if let Some((line, action)) = self.footer_action_at(x, y) {
+            self.selection = None;
+            let path = std::env::var("PATH").unwrap_or_default();
+            self.run_footer_action(line, action, &path);
+            return None;
+        }
         if let Some(agent_id) = self.agent_at_row(y) {
             let agent_id = agent_id.to_owned();
             self.agent_focus = Some(agent_id.clone());

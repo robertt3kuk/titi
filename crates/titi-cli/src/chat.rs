@@ -869,6 +869,9 @@ pub struct Chat {
     probe_bytes: Option<Vec<u8>>,
     /// The Ctrl+R / ↑ browser over this session's own prompts; `None` = closed.
     pub(crate) history_picker: Option<HistoryPicker>,
+    /// The `copy · fork` actions the last frame drew on turn footers, for the
+    /// click that lands on one.
+    pub(crate) footer_hits: Vec<FooterHit>,
     /// Every error the transcript showed this session, and the `/errors`
     /// panel over them.
     pub(crate) errors: crate::errors_panel::ErrorsState,
@@ -998,6 +1001,7 @@ impl Chat {
             probe_sent: None,
             probe_bytes: None,
             history_picker: None,
+            footer_hits: Vec::new(),
             errors: crate::errors_panel::ErrorsState::default(),
             usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
@@ -2375,6 +2379,7 @@ impl Chat {
             "mouse" => self.mouse(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
+            "copy" => self.copy_command(args),
             "errors" => self.errors_command(args),
             _ => {
                 // A known skill is not a command: it goes to the model as a
@@ -5080,6 +5085,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, chat: &mut Chat) {
     if roster_h > 0 {
         frame.render_widget(roster(chat, &theme), cols[1]);
     }
+    // Only a frame that draws the transcript has footers to click.
+    chat.footer_hits.clear();
     // A focused agent's pane replaces the transcript body: its own text, which
     // the engine streamed as `AgentProgress` and which never entered the
     // parent's transcript.
