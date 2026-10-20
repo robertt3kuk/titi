@@ -869,6 +869,9 @@ pub struct Chat {
     probe_bytes: Option<Vec<u8>>,
     /// The Ctrl+R / ↑ browser over this session's own prompts; `None` = closed.
     pub(crate) history_picker: Option<HistoryPicker>,
+    /// Every error the transcript showed this session, and the `/errors`
+    /// panel over them.
+    pub(crate) errors: crate::errors_panel::ErrorsState,
     /// The session's usage by the model that ran each turn (`/usage`).
     pub(crate) usage_ledger: titi_tui::status::UsageLedger,
     /// Which transcript sections are drawn, and how: the `/details` state.
@@ -995,6 +998,7 @@ impl Chat {
             probe_sent: None,
             probe_bytes: None,
             history_picker: None,
+            errors: crate::errors_panel::ErrorsState::default(),
             usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
@@ -1661,12 +1665,11 @@ impl Chat {
                         } else {
                             format!("tool done  {preview}")
                         };
-                        let kind = if is_error {
-                            LineKind::Error
+                        if is_error {
+                            self.push_error(crate::errors_panel::ErrorSource::Tool, text, &output);
                         } else {
-                            LineKind::Tool
-                        };
-                        self.push(kind, text);
+                            self.push(LineKind::Tool, text);
+                        }
                     }
                 }
                 // `output` is what the engine masked before it emitted the
@@ -1718,7 +1721,11 @@ impl Chat {
             EngineEvent::Failed {
                 turn_id, message, ..
             } => {
-                self.push(LineKind::Error, one_line(&message, TOOL_PREVIEW));
+                self.push_error(
+                    crate::errors_panel::ErrorSource::Provider,
+                    one_line(&message, TOOL_PREVIEW),
+                    &message,
+                );
                 self.turn_failed = true;
                 if turn_id.is_some() && turn_id == self.active_turn_id {
                     // A failure that ends the turn the user is waiting on is
@@ -2368,6 +2375,7 @@ impl Chat {
             "mouse" => self.mouse(args),
             "git" => self.git(args),
             "diagnose" => self.diagnose(args),
+            "errors" => self.errors_command(args),
             _ => {
                 // A known skill is not a command: it goes to the model as a
                 // prompt, and the engine expands it there.
@@ -4148,6 +4156,10 @@ impl Chat {
     }
 
     pub(crate) fn push_line(&mut self, line: TranscriptLine) {
+        if line.kind == LineKind::Error {
+            let (source, text) = (crate::errors_panel::ErrorSource::Screen, line.text.clone());
+            self.errors.log.record(source, text, line.at);
+        }
         self.lines.push(line);
         self.scroll_offset = 0;
     }
@@ -5464,6 +5476,7 @@ pub(crate) fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
     snapshot.tokens = (chat.session_prompt_tokens > 0 || chat.session_completion_tokens > 0)
         .then_some((chat.session_prompt_tokens, chat.session_completion_tokens));
     snapshot.edits = chat.agent_edits.counts();
+    snapshot.errors = chat.errors.log.unseen();
     // The same floor rule `/usage` states: a session whose only priced total
     // is zero while some turn went unpriced has no figure worth showing.
     snapshot.cost_micro = chat

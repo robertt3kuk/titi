@@ -211,6 +211,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "a diagnostics block to paste into a bug report",
     },
     Command {
+        name: "errors",
+        about: "every error this session showed, newest first",
+    },
+    Command {
         name: "statusline",
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },
@@ -617,7 +621,7 @@ pub(crate) fn panel_body(total: u16) -> usize {
 
 /// Cells a row label may use: the panel has `room` and spends three of it on
 /// the cursor and the spaces around it.
-fn panel_label_room(width: u16) -> usize {
+pub(crate) fn panel_label_room(width: u16) -> usize {
     (width as usize).saturating_sub(2).max(8).saturating_sub(3)
 }
 
@@ -1697,6 +1701,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     if chat.compose.mention.is_visible() {
         return Some(mention_panel(chat, total, width));
     }
+    if chat.errors.picker.is_some() {
+        return Some(crate::errors_panel::errors_panel(chat, total, width));
+    }
     if chat.history_picker.is_some() {
         return Some(history_panel(chat, total));
     }
@@ -2500,6 +2507,7 @@ impl Chat {
             || self.pending_ask.is_some()
             || self.login_picker.is_some()
             || self.model_picker.is_some()
+            || self.errors.picker.is_some()
             || self.emoji_picker.is_visible()
             || self.arg_rows().is_some()
             || self.compose.mention.is_visible()

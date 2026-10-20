@@ -591,6 +591,9 @@ impl Chat {
         if self.history_picker.is_some() {
             return self.history_picker_key(key, now);
         }
+        if self.errors.picker.is_some() {
+            return self.errors_key(key, now);
+        }
         // The `@file` picker takes the keys that move or choose in it; every
         // other key is the draft's own, and the sync after an edit keeps the
         // picker in step with the word.

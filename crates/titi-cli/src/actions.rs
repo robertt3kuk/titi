@@ -642,7 +642,21 @@ impl Chat {
                 text.push_str(part);
             }
         }
+        let failure = (!outcome.ok).then(|| {
+            let head = if call.target.is_empty() {
+                call.tool.clone()
+            } else {
+                format!("{}  {}", call.tool, call.target)
+            };
+            format!("tool error  {head}\n{}", output.trim_end())
+        });
+        let at_time = line.at;
         line.text = text;
+        if let Some(failure) = failure {
+            self.errors
+                .log
+                .record(crate::errors_panel::ErrorSource::Tool, failure, at_time);
+        }
         if let Some(diff) = diff {
             let under = TranscriptLine::new(LineKind::Diff, diff.to_owned());
             self.insert_line(at + 1, under);

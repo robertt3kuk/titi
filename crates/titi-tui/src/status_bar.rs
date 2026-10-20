@@ -58,6 +58,9 @@ pub enum Segment {
     Edits,
     /// What the session's priced turns have cost, hidden until one is priced.
     Cost,
+    /// Errors the transcript showed since the error log was last opened,
+    /// hidden while there are none.
+    Errors,
 }
 
 /// The glyph between two segments, and whether the whole line stays ASCII.
@@ -251,6 +254,7 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Path,
                 Segment::Git,
                 Segment::Edits,
+                Segment::Errors,
             ],
             right: &[
                 Segment::Session,
@@ -294,6 +298,7 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Path,
                 Segment::Git,
                 Segment::Edits,
+                Segment::Errors,
             ],
             right: &[
                 Segment::Session,
@@ -327,6 +332,7 @@ const PRESETS: [(StatusLinePreset, PresetDef); 5] = [
                 Segment::Path,
                 Segment::Git,
                 Segment::Edits,
+                Segment::Errors,
             ],
             right: &[
                 Segment::Session,
@@ -471,6 +477,9 @@ pub struct StatusSnapshot {
     pub tokens: Option<(u32, u32)>,
     /// Files the agent created and edited this session, `(created, edited)`.
     pub edits: (usize, usize),
+    /// Errors shown since the error log was last opened; `0` hides the
+    /// segment.
+    pub errors: usize,
     /// What the session's priced turns have cost, in micro-dollars. `None`
     /// until a turn is priced: `$0.00` would be a figure nobody computed.
     pub cost_micro: Option<u64>,
@@ -498,6 +507,7 @@ impl Default for StatusSnapshot {
             context_window: None,
             tokens: None,
             edits: (0, 0),
+            errors: 0,
             cost_micro: None,
             cost_partial: false,
             session_name: String::new(),
@@ -834,8 +844,19 @@ fn segment_text(seg: Segment, theme: &Theme, ascii: bool, snap: &StatusSnapshot)
             }),
         Segment::Context => Some(context_part(theme, snap)),
         Segment::Edits => edits_part(theme, ascii, snap),
+        Segment::Errors => errors_part(theme, ascii, snap),
         Segment::Cost => cost_part(theme, snap),
     }
+}
+
+/// `⚠ 3`: the errors the transcript has shown since the log was last opened.
+/// Hidden at zero; the ASCII line says `err` where the sign would be.
+fn errors_part(theme: &Theme, ascii: bool, snap: &StatusSnapshot) -> Option<String> {
+    if snap.errors == 0 {
+        return None;
+    }
+    let mark = if ascii { "err" } else { "⚠" };
+    Some(theme.fg(ThemeColor::Error, &format!("{mark} {}", snap.errors)))
 }
 
 /// `✎ +1 ~2`: files the agent created and edited. Hidden while both are zero;
@@ -2019,6 +2040,33 @@ mod tests {
         // `minimal` and `compact` never carried it.
         assert!(!paint((1, 1), style(StatusLinePreset::Minimal)).contains('✎'));
         assert!(!paint((1, 1), style(StatusLinePreset::Compact)).contains('✎'));
+    }
+
+    #[test]
+    fn the_error_count_shows_only_while_there_is_one() {
+        let theme = theme();
+        let paint = |errors: usize, preset: StatusLinePreset| {
+            let mut s = snap();
+            s.errors = errors;
+            visible(&render_status_line(&theme, 140, style(preset), &s))
+        };
+        let zero = paint(0, StatusLinePreset::Default);
+        assert!(!zero.contains('⚠'), "{zero:?}");
+
+        let three = paint(3, StatusLinePreset::Default);
+        assert!(three.contains("⚠ 3"), "{three:?}");
+        assert!(
+            three
+                .find("⚠")
+                .zip(three.find("main"))
+                .is_some_and(|(errors, git)| errors > git),
+            "after the git state: {three:?}"
+        );
+        assert!(paint(2, StatusLinePreset::Full).contains("⚠ 2"));
+
+        let ascii = paint(4, StatusLinePreset::Ascii);
+        assert!(ascii.contains("err 4") && ascii.is_ascii(), "{ascii:?}");
+        assert!(!paint(1, StatusLinePreset::Minimal).contains('⚠'));
     }
 
     #[test]

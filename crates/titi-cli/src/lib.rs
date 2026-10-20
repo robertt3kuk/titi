@@ -7,6 +7,9 @@ pub mod composer;
 pub(crate) mod composer_state;
 pub(crate) mod draft_stash;
 pub mod engine;
+pub(crate) mod errors_panel;
+#[cfg(test)]
+mod errors_tests;
 pub mod first_frame;
 pub mod genome_cmd;
 pub mod git_checkpoint;
