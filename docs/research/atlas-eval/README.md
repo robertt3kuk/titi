@@ -1203,3 +1203,180 @@ two together give 0.75 / 0.80, and lens plus the map's files 0.77 / 0.83. Messag
 leakage. Against the previous run (find capped at 16): find r@24 0.52 -> 0.55, lens+find r@24 0.78 -> 0.80;
 the lens moved slightly (0.68 -> 0.69) with the atlas changes since. `find` is still weakest where messages
 are short or generic (express 0.17 / 0.30, requests 0.43).
+
+## Final v2 (atlas at 9ff851c plus the dump limit fix, run 2026-10-21)
+
+Verification of everything on master after the v2 rounds, one tree, one run.
+
+### 1. Tests
+`env -u TITI_AGENT_DIR -u TITI_NO_ATLAS cargo test --workspace --locked`: 3118 passed, 0 failed, 1 ignored, 126 suites.
+`cargo fmt --check` clean; `scripts/tui-smoke.py`: PASS.
+
+### 2. Corpus, original genome numbers vs now
+Baseline = the original run of this harness on `f78d934` (before any fix), scored with the same
+truth lists (its map tokens are bytes/4 of the 24-line map; it had no signatures, so signature coverage
+was 0). Now = this tree. The baseline run was itself nondeterministic, so a baseline cell can differ by one
+step from the "Final numbers" table above (mean 0.307 / 0.700 here, 0.300 / 0.701 there). The titi row is
+scored on a fresh clone of master (the old clone predates the rename).
+
+| repo | p@10 base→now | recall@24 base→now | LSP ok now | signature coverage now | map tokens base→now |
+|---|---|---|---|---|---|
+| Alamofire | 0.3→0.6 | 0.75→1.00 | 10/10 | 2057/2057 (100%) | 670→642 |
+| AutoMapper | 0.3→0.3 | 0.83→1.00 | 10/10 | 3363/3363 (100%) | 637→764 |
+| cobra | 0.6→0.6 | 1.00→1.00 | 10/10 | 502/502 (100%) | 432→432 |
+| express | 0.2→0.7 | 0.86→1.00 | 9/10 | 101/112 (90%) | 176→218 |
+| gson | 0.6→0.6 | 0.86→1.00 | 8/10 | 3056/3056 (100%) | 635→635 |
+| guzzle | 0.2→0.2 | 0.38→0.38 | 10/10 | 2690/2690 (100%) | 576→541 |
+| hiredis | 0.4→0.5 | 0.44→1.00 | 10/10 | 611/611 (100%) | 314→286 |
+| json | 0.0→0.2 | 0.29→0.43 | 10/10 | 2306/2306 (100%) | 735→464 |
+| kilo | 0.1→0.1 | 1.00→1.00 | 1/1 | 42/42 (100%) | 8→7 |
+| ky | 0.1→0.2 | 0.60→0.80 | 8/10 | 146/187 (78%) | 446→440 |
+| okio | 0.4→0.6 | 0.75→1.00 | 8/10 | 3944/3944 (100%) | 630→604 |
+| requests | 0.3→0.3 | 1.00→1.00 | 10/10 | 612/643 (95%) | 398→404 |
+| ripgrep | 0.4→0.3 | 0.50→0.75 | 10/10 | 918/918 (100%) | 562→444 |
+| sinatra | 0.5→0.5 | 1.00→1.00 | 9/10 | 1121/1121 (100%) | 407→439 |
+| titi | 0.2→0.4 | 0.25→0.75 | 10/10 | 2956/2956 (100%) | 720→568 |
+| **mean** | 0.307→0.407 | 0.700→0.874 | | | |
+
+Signature coverage below 100% is exports that are not a declaration node: `export { a as b }` names (ky),
+CommonJS object-literal keys (express), names a Python facade imports (requests).
+
+### 3. Determinism, 10 runs per repo (`--mode determinism`)
+
+| repo | files | runs | distinct dumps | distinct map texts | fields that differ |
+|---|---|---|---|---|---|
+| Alamofire | 111 | 10 | 1 | 1 | - |
+| AutoMapper | 514 | 10 | 1 | 1 | - |
+| cobra | 36 | 10 | 1 | 1 | - |
+| express | 141 | 10 | 1 | 1 | - |
+| gson | 264 | 10 | 1 | 1 | - |
+| guzzle | 145 | 10 | 1 | 1 | - |
+| hiredis | 53 | 10 | 1 | 1 | - |
+| json | 604 | 10 | 1 | 1 | - |
+| kilo | 1 | 10 | 1 | 1 | - |
+| ky | 98 | 10 | 1 | 1 | - |
+| okio | 357 | 10 | 1 | 1 | - |
+| requests | 37 | 10 | 1 | 1 | - |
+| ripgrep | 111 | 10 | 1 | 1 | - |
+| sinatra | 147 | 10 | 1 | 1 | - |
+| titi | 366 | 10 | 1 | 1 | - |
+
+One distinct dump and one distinct map text per repo, ranks included.
+
+### 4. Commit replay, 80 tasks (recall@10 / @24 over the first k paths)
+
+| repo | tasks | files | static r@10 | static r@24 | lens r@10 | lens r@24 | find r@10 | find r@24 | lens+find r@10 | lens+find r@24 | map+lens r@10 | map+lens r@24 | map tokens | leaky |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **ALL** | 80 | 147 | 0.29 | 0.52 | 0.69 | 0.71 | 0.41 | 0.55 | 0.75 | 0.80 | 0.77 | 0.83 | 451 | 23 |
+| **ALL, message names no truth file** | 57 | 137 | 0.31 | 0.57 | 0.65 | 0.67 | 0.38 | 0.55 | 0.74 | 0.78 | 0.76 | 0.81 | 447 | 0 |
+
+Same numbers as the c40d30c run: the later rounds (nested `.gitignore`, non-UTF-8, shallow-clone RECENT) do not
+move the replay. Static 0.29 / 0.52 is the pilot's baseline; the lens takes it to 0.69 / 0.71, `find --limit 24`
+alone 0.41 / 0.55, lens + find 0.75 / 0.80, lens + map 0.77 / 0.83.
+
+### 5. A real turn on a PTY (scripted provider, scratch copy of cobra)
+`titi --approval yolo`, prompt `where is MarkFlagsMutuallyExclusive handled? atlas probe MarkFlagsMutuallyExclusive`.
+The request body's last user message starts with the map and the lens:
+
+```
+<atlas>
+command.go (→35) [RECENT]
+  +Command (34)  type Command struct
+  +Name (25)  func (c *Command) Name() string
+  +Commands (11)  func (c *Command) Commands() []*Command
+  +AddCommand (10)  func (c *Command) AddCommand(cmds ...*Command)
+completions.go (→12) [RECENT]
+  +ShellCompDirectiveNoFileComp (8)  ShellCompDirectiveNoFileComp
+  +ShellCompNoDescRequestCmd (8)  ShellCompNoDescRequestCmd
+  +Completion (6)  type Completion
+  +ShellCompDirectiveFilterDirs (6)  ShellCompDirectiveFilterDirs
+cobra.go (→22) [RECENT]
+  +WriteStringAndCheck (7)  func WriteStringAndCheck(b io.StringWriter, s string)
+  +CheckErr (3)  func CheckErr(msg interface{})
+...
+bash_completions_test.go (→0) [test] [RECENT]
+cobra_test.go (→0) [test] [RECENT]
+</atlas>
+
+<atlas-lens>
+flag_groups.go (→3) defines MarkFlagsMutuallyExclusive +MarkFlagsMutuallyExclusive +MarkFlagsOneRequired +MarkFlagsRequiredTogether
+command.go (→35) uses completions.go +Command +Name +Commands
+completions.go (→12) uses command.go +ShellCompDirectiveNoFileComp +ShellCompNoDescRequestCmd +Completion
+cobra.go (→22) uses command.go +WriteStringAndCheck +CheckErr +EnableCaseInsensitive
+completions_test.go (→7) [test] uses command.go +Type +Set +GetSlice
+flag_groups_test.go (→0) [test] uses command.go
+shell_completions.go (→5) uses command.go +MarkFlagRequired +MarkFlagFilename +MarkPersistentFlagRequired
+bash_completions.go (→5) uses command.go +BashCompSubdirsInDir +BashCompFilenameExt +BashCompOneRequiredFlag
+args.go (→7) uses command.go +NoArgs +MinimumNArgs +ArbitraryArgs
+command_test.go (→0) [test] uses command.go
+</atlas-lens>
+```
+(`[RECENT]` is on because the scratch copy was committed seconds ago.) The `atlas` tool is in the request's
+tools; the scripted model calls `atlas {op: find, query: MarkFlagsMutuallyExclusive}`, the tool answers
+`flag_groups.go:65  func (c *Command) MarkFlagsMutuallyExclusive(flagNames ...string)  (→3)`, and the
+transcript renders it:
+
+```
+===== after-probe (110x24)
+00| titi  ready > 📁 ~/cobra > ⑂ main                                                      ⬢ fake/scripted >   
+01|  ◆ you · 21:04
+02|    where is MarkFlagsMutuallyExclusive handled? atlas probe MarkFlagsMutuallyExclusive
+03|
+04|  ● titi · fake/scripted · 21:04
+05|    1 action ▾
+06|      ✓ atlas  find MarkFlagsMutuallyExclusive  atlas gen=1                                            0.0s
+07|    tool said: atlas gen=1
+08|     0.1s · 200 prompt (120 cached) · 20 out                                                    copy · fork
+09|
+```
+
+### 6. The commands on titi
+```
+$ titi atlas
+atlas: on
+reason: default
+budget: auto
+config: /Users/homie/.titi/agent/config.yml
+
+$ titi atlas check
+crates/titi-config/src/hooks.rs:1: ambiguous-symbol: `Discovered` is defined in crates/titi-config/src/hooks.rs, crates/titi-config/src/mcp.rs
+crates/titi-config/src/hooks.rs:1: ambiguous-symbol: `PROJECT_FILES` is defined in crates/titi-config/src/hooks.rs, crates/titi-config/src/mcp.rs
+crates/titi-engine/src/agent_defs.rs:1: ambiguous-symbol: `Listing` is defined in crates/titi-engine/src/agent_defs.rs, crates/titi-engine/src/commands.rs, crates/titi-engine/src/skills.rs
+crates/titi-engine/src/agent_defs.rs:1: ambiguous-symbol: `Shadowed` is defined in crates/titi-engine/src/agent_defs.rs, crates/titi-engine/src/commands.rs, crates/titi-engine/src/skills.rs
+crates/titi-engine/src/hooks.rs:1: ambiguous-symbol: `DEFAULT_TIMEOUT` is defined in crates/titi-engine/src/hooks.rs, crates/titi-engine/src/judgment.rs
+docs/research/atlas-v2/pilot/commit_eval.py:1: ambiguous-symbol: `CORP` is defined in docs/research/atlas-v2/pilot/commit_eval.py, docs/research/atlas-v2/pilot/commit_ppr.py
+scripts/atlas_eval.py:1: ambiguous-symbol: `CONDITIONS` is defined in scripts/atlas_eval.py, scripts/eval.py
+scripts/atlas_eval.py:1: ambiguous-symbol: `ROOT` is defined in scripts/atlas_eval.py, scripts/bench.py
+(exit 0)
+
+$ titi atlas dump --limit 5
+1 crates/titi-providers/src/transport.rs source rank=0.052378 deps=95 exports=20 imports=3
+2 crates/titi-atlas/src/lib.rs entry rank=0.026081 deps=80 exports=40 imports=25
+3 crates/titi-providers/src/stream.rs source rank=0.023481 deps=72 exports=11 imports=1
+4 crates/titi-providers/src/compat.rs source rank=0.020739 deps=32 exports=17 imports=1
+5 crates/titi-tools/src/lib.rs entry rank=0.009803 deps=65 exports=32 imports=16
+
+$ titi atlas find AtlasHandle
+symbols (1–1 of 1):
+  crates/titi-atlas/src/live.rs:170  pub struct AtlasHandle  (→24)
+
+$ titi atlas impact crates/titi-atlas/src/graph.rs
+changing crates/titi-atlas/src/graph.rs touches:
+direct dependents (2):
+  crates/titi-atlas/src/lens.rs
+  crates/titi-atlas/src/lib.rs
+then, through those (79):
+  crates/titi-atlas/examples/bench_atlas.rs
+  crates/titi-atlas/examples/map.rs
+  crates/titi-atlas/examples/refresh.rs
+  crates/titi-atlas/src/ask.rs
+  crates/titi-atlas/src/cochange.rs
+  crates/titi-atlas/src/lang/c_family.rs
+  crates/titi-atlas/src/lang/csharp.rs
+  crates/titi-atlas/src/lang/go.rs
+  crates/titi-atlas/src/lang/java.rs
+  crates/titi-atlas/src/lang/kotlin.rs
+  crates/titi-atlas/src/lang/mod.rs
+```
+`check` exits 0: what it prints is `ambiguous-symbol` at info level. `dump --limit N` printed every file
+and panicked on a closed pipe before this change; it now honours the limit and ends quietly.

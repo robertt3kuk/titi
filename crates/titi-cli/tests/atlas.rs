@@ -452,6 +452,13 @@ fn dump_lists_the_index_in_map_order_and_refuses_bad_flags() {
     assert_eq!(code, 0);
     assert_eq!(plain.lines().count(), 3, "{plain}");
     assert!(plain.lines().next().unwrap().starts_with("1 "), "{plain}");
+    let (limited, _, code) = run(dir.path(), &ws, &["atlas", "dump", "--limit", "2"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        limited.lines().count(),
+        2,
+        "plain dump honours --limit: {limited}"
+    );
 
     let (_, stderr, code) = run(dir.path(), &ws, &["atlas", "dump", "--nope"]);
     assert_eq!(code, 2);

@@ -459,17 +459,21 @@ fn lens_cmd(workspace: &Path, args: &[String]) {
 /// One entry per file in the order the prompt map lists it, with the facts the
 /// ranking rests on: role, rank, the map's sort score, dependents, exports and
 /// the edges (imports, re-exports, resolved uses). Plain output is one line per
-/// file; `--json` is one object with the files and the map text for `--limit`
+/// file (the first `--limit` of them when one is given); `--json` is one object with the files and the map text for `--limit`
 /// (default 24, the prompt's), which is what an evaluation replays.
 fn dump_cmd(workspace: &Path, args: &[String]) {
     let mut json = false;
     let mut limit = 24usize;
+    let mut explicit_limit: Option<usize> = None;
     let mut words = args.iter();
     while let Some(word) = words.next() {
         match word.as_str() {
             "--json" => json = true,
             "--limit" => match words.next().and_then(|raw| raw.parse::<usize>().ok()) {
-                Some(n) if (1..=64).contains(&n) => limit = n,
+                Some(n) if (1..=64).contains(&n) => {
+                    limit = n;
+                    explicit_limit = Some(n);
+                }
                 _ => {
                     eprintln!("atlas dump: --limit expects an integer from 1 to 64");
                     std::process::exit(USAGE_EXIT);
@@ -492,11 +496,19 @@ fn dump_cmd(workspace: &Path, args: &[String]) {
     let ranked = titi_atlas::ranking(&atlas, &std::collections::HashSet::new());
     let dependents = |path: &str| atlas.dependents.get(path).copied().unwrap_or(0);
     if !json {
-        for (order, entry) in ranked.iter().enumerate() {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        for (order, entry) in ranked
+            .iter()
+            .enumerate()
+            .take(explicit_limit.unwrap_or(usize::MAX))
+        {
             let Some(file) = atlas.files.get(entry.path) else {
                 continue;
             };
-            println!(
+            // A closed pipe (`| head`) ends the listing; it is not a panic.
+            if writeln!(
+                stdout,
                 "{} {} {} rank={:.6} deps={} exports={} imports={}",
                 order + 1,
                 entry.path,
@@ -505,7 +517,11 @@ fn dump_cmd(workspace: &Path, args: &[String]) {
                 dependents(entry.path),
                 file.exports.len(),
                 file.imports.len()
-            );
+            )
+            .is_err()
+            {
+                return;
+            }
         }
         return;
     }
