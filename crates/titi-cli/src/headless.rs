@@ -347,7 +347,8 @@ pub async fn run_prompt(
                 let (row, _) = crate::verify_setup::finished_row(
                     command, *outcome, *exit_code, *ms, *retrying,
                 );
-                eprintln!("{row}");
+                // The reply streams to stderr without a newline of its own.
+                eprintln!("\n{row}");
             }
             _ => {}
         }
