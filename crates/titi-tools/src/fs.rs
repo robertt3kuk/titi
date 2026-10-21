@@ -75,7 +75,19 @@ pub(crate) fn readable_path(
 /// --separate-git-dir` both write — does not gate its own non-existent
 /// subtree, so edits beside it stay allowed. Hook files are refused too, by
 /// [`refuse_hook_config`].
-pub(crate) fn refuse_control_paths(root: &Path, resolved: &Path, raw: &str) -> Result<(), String> {
+pub(crate) fn refuse_control_paths(
+    root: &Path,
+    resolved: &Path,
+    raw: &str,
+    policy: &SensitivePolicy,
+) -> Result<(), String> {
+    if let Some(protected) = policy.write_protected(resolved) {
+        return Err(format!(
+            "{raw} is inside {} — titi refuses to write there: it holds the hooks that run \
+             on this machine and the consent to them, which the user changes themselves",
+            protected.display()
+        ));
+    }
     let base = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let relative = resolved.strip_prefix(&base).unwrap_or(resolved);
     let mut ancestor = PathBuf::new();
@@ -494,6 +506,8 @@ pub struct WriteFileTool {
     pub root: PathBuf,
     /// Invalidated on write, so the next read sees the new body.
     pub cache: ReadCache,
+    /// Which places are closed to writes.
+    pub policy: SensitivePolicy,
 }
 
 #[async_trait]
@@ -534,7 +548,7 @@ impl ToolHandler for WriteFileTool {
         };
         match jail_path(&self.root, &path)
             .and_then(|resolved| {
-                refuse_control_paths(&self.root, &resolved, &path).map(|_| resolved)
+                refuse_control_paths(&self.root, &resolved, &path, &self.policy).map(|_| resolved)
             })
             .and_then(|resolved| {
                 // What the write replaces is read here, for the diff: this is the
@@ -614,7 +628,7 @@ impl ToolHandler for EditFileTool {
         let replace_all = arg_bool(&args, "replace_all").unwrap_or(false);
         match readable_path(&self.root, &path, &self.policy)
             .and_then(|resolved| {
-                refuse_control_paths(&self.root, &resolved, &path).map(|_| resolved)
+                refuse_control_paths(&self.root, &resolved, &path, &self.policy).map(|_| resolved)
             })
             .and_then(|resolved| {
                 let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
@@ -1542,6 +1556,7 @@ pub fn workspace_tools_with_interrupt(
         Box::new(WriteFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: policy.clone(),
         }),
         Box::new(EditFileTool {
             root: root.clone(),
@@ -1756,6 +1771,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: cache.clone(),
+            policy: SensitivePolicy::default(),
         };
         let edit = EditFileTool {
             root: root.clone(),
@@ -1814,6 +1830,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         assert_eq!(
             write
@@ -2099,6 +2116,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let created = write
             .invoke(serde_json::json!({"path": "fresh.txt", "content": "one\ntwo\n"}))
@@ -2148,6 +2166,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let written = write
             .invoke(serde_json::json!({"path": "same.txt", "content": "alpha\n"}))
@@ -2725,6 +2744,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache,
+            policy: SensitivePolicy::default(),
         };
 
         let first = read.invoke(serde_json::json!({"path": "hello.txt"})).await;
@@ -3204,6 +3224,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let edit = EditFileTool {
             root: root.clone(),
@@ -3255,6 +3276,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         for path in [
             ".titi/hooks.json",
@@ -3279,6 +3301,70 @@ mod tests {
         assert!(!ordinary.is_error, "{}", ordinary.output);
     }
 
+    /// A user who starts titi in `$HOME` has `.titi/agent/` inside the jail.
+    /// `hooks.json` there runs with no trust hash at all and `config.yml` can
+    /// flip `hooks.foreignUserConfig`, so the whole directory is closed to the
+    /// write tools — under any spelling of its path.
+    #[tokio::test]
+    async fn the_agent_directory_cannot_be_written_from_inside_the_workspace() {
+        let root = temp_root();
+        let agent = root.join(".titi/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(agent.join("config.yml"), "theme: dark\n").unwrap();
+        fs::write(root.join(".claude/settings.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let policy = SensitivePolicy::default()
+            .protecting_writes([agent.clone(), root.join(".claude/settings.json")]);
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: policy.clone(),
+        };
+        let edit = EditFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: policy.clone(),
+        };
+        for path in [
+            ".titi/agent/hooks.json",
+            ".titi/agent/trust.json",
+            ".titi/agent/config.yml",
+            ".titi/agent/config.yaml",
+            ".titi/agent/skills/x/SKILL.md",
+            ".titi/./agent/hooks.json",
+            "src/../.titi/agent/hooks.json",
+            ".TITI/Agent/Hooks.json",
+            ".claude/settings.json",
+        ] {
+            let result = write
+                .invoke(serde_json::json!({ "path": path, "content": "{}" }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(
+                !root.join(".titi/agent/hooks.json").exists(),
+                "{path} wrote"
+            );
+        }
+        let result = edit
+            .invoke(serde_json::json!({
+                "path": ".titi/agent/config.yml",
+                "old_string": "dark",
+                "new_string": "hooks: {foreignUserConfig: true}"
+            }))
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(agent.join("config.yml")).unwrap(),
+            "theme: dark\n"
+        );
+        // Beside it is still the workspace.
+        let ordinary = write
+            .invoke(serde_json::json!({ "path": ".titi/notes.md", "content": "x" }))
+            .await;
+        assert!(!ordinary.is_error, "{}", ordinary.output);
+    }
+
     #[tokio::test]
     async fn a_real_git_directory_gates_but_a_git_named_file_does_not() {
         // The workspace jail must keep working beside a real checkout: the
@@ -3295,6 +3381,7 @@ mod tests {
         let write = WriteFileTool {
             root: root.clone(),
             cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
         };
         let inside = write
             .invoke(serde_json::json!({

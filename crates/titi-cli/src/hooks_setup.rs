@@ -135,6 +135,22 @@ impl HookStartup {
     }
 }
 
+/// What the write tools must refuse whatever the user approves: titi's own
+/// agent directory (`hooks.json` and `trust.json` live there, `config.yml`
+/// holds the opt-in) and, when the opt-in is on, the `~/.claude` settings file
+/// whose hooks then run without a trust hash.
+pub fn protected_write_paths(
+    agent_dir: &Path,
+    settings: Option<&Settings>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![agent_dir.to_owned()];
+    if let (true, Some(home)) = (settings.is_some_and(foreign_user_config_on), home) {
+        paths.push(home.join(hooks::FOREIGN_USER_FILE));
+    }
+    paths
+}
+
 /// `hooks.foreignUserConfig`, from the user's own layers only: a repository's
 /// config cannot opt the user into running `~/.claude` hooks.
 fn foreign_user_config_on(settings: &Settings) -> bool {
@@ -313,6 +329,32 @@ mod tests {
         .unwrap();
         let settings = Settings::load(agent.path(), repo.path(), &[]).unwrap();
         assert!(foreign_user_config_on(&settings));
+    }
+
+    #[test]
+    fn the_agent_dir_is_always_write_protected_and_claude_settings_with_the_opt_in() {
+        let agent = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let home = Path::new("/home/someone");
+        let off = Settings::load(agent.path(), repo.path(), &[]).unwrap();
+        assert_eq!(
+            protected_write_paths(agent.path(), Some(&off), Some(home)),
+            vec![agent.path().to_owned()]
+        );
+        assert_eq!(
+            protected_write_paths(agent.path(), None, Some(home)),
+            vec![agent.path().to_owned()]
+        );
+        std::fs::write(
+            agent.path().join("config.yml"),
+            "hooks:\n  foreignUserConfig: true\n",
+        )
+        .unwrap();
+        let on = Settings::load(agent.path(), repo.path(), &[]).unwrap();
+        assert_eq!(
+            protected_write_paths(agent.path(), Some(&on), Some(home)),
+            vec![agent.path().to_owned(), home.join(".claude/settings.json")]
+        );
     }
 
     #[test]

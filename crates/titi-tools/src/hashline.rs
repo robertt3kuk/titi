@@ -126,7 +126,8 @@ impl HashlineEditTool {
 
         let path = readable_path(&self.root, &raw_path, &self.policy)
             .and_then(|resolved| {
-                crate::fs::refuse_control_paths(&self.root, &resolved, &raw_path).map(|_| resolved)
+                crate::fs::refuse_control_paths(&self.root, &resolved, &raw_path, &self.policy)
+                    .map(|_| resolved)
             })
             .map_err(|reason| HashlineError::Path { reason })?;
         let content = fs::read_to_string(&path).map_err(|error| HashlineError::Io {

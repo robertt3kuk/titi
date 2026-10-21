@@ -5,7 +5,7 @@
 //! handed to a third party, so these paths are refused outright rather than
 //! gated behind an approval the user might wave through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Directories whose every file is a credential or points at one.
 const SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws"];
@@ -63,11 +63,41 @@ const ENV_TEMPLATES: &[&str] = &[".example", ".sample", ".template", ".dist"];
 pub struct SensitivePolicy {
     extra: Vec<String>,
     allow: Vec<String>,
+    /// Places the write tools refuse whatever the user approves: titi's own
+    /// agent directory and, with the opt-in on, `~/.claude/settings.json`.
+    /// They hold what runs on the user's machine (hooks) and what consents to
+    /// it (the trust store), which a prompt-injected model must not be able to
+    /// plant through a write the user took for an ordinary dotfile.
+    write_protected: Vec<PathBuf>,
 }
 
 impl SensitivePolicy {
     pub fn new(extra: Vec<String>, allow: Vec<String>) -> Self {
-        Self { extra, allow }
+        Self {
+            extra,
+            allow,
+            write_protected: Vec::new(),
+        }
+    }
+
+    /// The same policy with `paths` (files or whole directories) closed to
+    /// the write tools. Each is resolved as far as it exists, so a symlinked
+    /// agent directory is protected under its real name.
+    pub fn protecting_writes(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.write_protected
+            .extend(paths.into_iter().map(|path| canonical_lossy(&path)));
+        self
+    }
+
+    /// The protected path `resolved` lies on or under, if any. Compared
+    /// without regard to case: the default macOS volume does not tell
+    /// `.titi` from `.TITI`.
+    pub fn write_protected(&self, resolved: &Path) -> Option<&Path> {
+        let lowered = lowercase(resolved);
+        self.write_protected
+            .iter()
+            .find(|path| lowered.starts_with(lowercase(path)))
+            .map(PathBuf::as_path)
     }
 
     pub fn blocks(&self, path: &Path) -> bool {
@@ -75,6 +105,22 @@ impl SensitivePolicy {
             return false;
         }
         is_sensitive(path) || self.extra.iter().any(|pattern| matches(pattern, path))
+    }
+}
+
+fn lowercase(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// `path` with its longest existing prefix canonicalised, so a path that does
+/// not exist yet still compares equal to one that does.
+fn canonical_lossy(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if parent != path => canonical_lossy(parent).join(name),
+        _ => path.to_path_buf(),
     }
 }
 

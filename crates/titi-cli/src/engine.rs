@@ -1016,6 +1016,15 @@ pub fn start_engine_with(
         .as_ref()
         .map(privacy_policy)
         .unwrap_or_else(|| (SensitivePolicy::default(), true));
+    // The agent directory holds the hooks that run on this machine and the
+    // consent to them; a model that could write there could plant its own.
+    let sensitive = sensitive.protecting_writes(crate::hooks_setup::protected_write_paths(
+        &agent_dir,
+        settings.as_ref(),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    ));
     engine_config.sensitive = sensitive.clone();
     engine_config.mask_ips = mask_ips;
     // A round's reasoning text is the most sensitive thing a trace holds, so it
