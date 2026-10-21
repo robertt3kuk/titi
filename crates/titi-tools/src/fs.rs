@@ -502,7 +502,11 @@ impl ToolHandler for WriteFileTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "write".into(),
-                description: "Write a UTF-8 file in the workspace".into(),
+                description: "Create a file, or replace one: this replaces the whole file with \
+                              `content` and creates parent directories. To change part of an \
+                              existing file use `edit`, which sends only the changed text. \
+                              Paths stay in the workspace; .git/ is refused."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1167,7 +1171,16 @@ impl ToolHandler for BashTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "bash".into(),
-                description: "Run a shell command in the workspace".into(),
+                description: "Run a shell command in the workspace. No TTY unless `pty` is \
+                              true, and no input (stdin is closed): editors, pagers and \
+                              prompts cannot work. Prefer read, grep, glob, edit and project \
+                              over cat, grep, find, sed and test/lint commands. Output is cut \
+                              to 40,000 characters, head and tail kept: narrow it with flags, \
+                              grep or head. After 60 s a running command moves to the \
+                              background and its output arrives when it ends; at 300 s unless \
+                              `timeout_secs` is set it is killed. Foreground servers and \
+                              watchers are refused."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

@@ -80,7 +80,11 @@ impl ToolHandler for GitTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "git".into(),
-                description: "Show git status or diff for the workspace".into(),
+                description: "Show git status (short, with branch) or diff of the workspace; \
+                              credential files are cut from a diff. A read-only tool: it never \
+                              pushes, resets, cleans, rebases or checks out. Commit with \
+                              git_commit; use bash for log, show, blame."
+                    .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

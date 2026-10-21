@@ -165,13 +165,57 @@ fn every_tool_keeps_every_parameter_and_its_description() {
     }
 }
 
+/// The three tools whose one-line descriptions used to leave the model to
+/// find out by failing: what `bash` cannot do and how far it goes, that
+/// `write` replaces a whole file, and what `git` will and will not run.
+#[test]
+fn bash_write_and_git_say_what_the_model_needs_to_know() {
+    let specs = registry().specs();
+    let description = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("{name} is not registered"))
+            .description
+            .to_string()
+    };
+    let bash = description("bash");
+    for needle in [
+        "300 s",
+        "60 s",
+        "background",
+        "No TTY unless `pty`",
+        "no input",
+        "Prefer read, grep, glob, edit and project",
+        "40,000 characters",
+        "head and tail",
+    ] {
+        assert!(
+            bash.contains(needle),
+            "bash does not say {needle:?}: {bash}"
+        );
+    }
+    let write = description("write");
+    for needle in ["replaces", "whole file", "`edit`", "parent directories"] {
+        assert!(
+            write.contains(needle),
+            "write does not say {needle:?}: {write}"
+        );
+    }
+    let git = description("git");
+    for needle in ["read-only", "git_commit", "never pushes", "bash"] {
+        assert!(git.contains(needle), "git does not say {needle:?}: {git}");
+    }
+}
+
 /// Bytes of name, description and parameter schema, summed over the tools
 /// above. `tool_schemas` ride in every request and fill the context window
 /// from the first turn, so growth here is a decision, not a drift: raise the
 /// ceiling in the commit that adds the words, and say why.
 #[test]
 fn the_schemas_stay_within_their_byte_budget() {
-    const CEILING: usize = 7_600;
+    // 7_600 + 862: the bash, write and git descriptions (7_526 -> 8_388 bytes).
+    const CEILING: usize = 8_462;
     let total: usize = registry()
         .specs()
         .iter()
