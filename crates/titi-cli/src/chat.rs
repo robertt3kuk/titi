@@ -482,6 +482,9 @@ pub(crate) struct PendingAsk {
     /// Whether the composer is the answer field, because the user started
     /// typing into it.
     pub(crate) typing: bool,
+    /// Whether a running `ask` call's action row already says the question
+    /// and the answer, so no notes repeat them.
+    pub(crate) has_action_row: bool,
 }
 
 impl PendingAsk {
@@ -1615,12 +1618,22 @@ impl Chat {
             } => {
                 let options: Vec<String> =
                     options.iter().map(|option| option.to_string()).collect();
+                // A question raised by a running `ask` call is already said
+                // by that call's action row (target, result and detail); the
+                // notes are the record only when there is no such row.
+                let has_action_row = self.lines.iter().any(|line| {
+                    line.call
+                        .as_ref()
+                        .is_some_and(|call| call.tool == "ask" && call.is_running())
+                });
                 // The transcript keeps what was asked, whole, so scrollback
                 // shows the question and the choice that answered it once the
                 // panel is gone: the tool's own chip carries only the head of
                 // a question (`titi_tools::ask`'s `CHIP_CHARS`).
-                self.push(LineKind::Note, format!("ask · {question}"));
-                if !options.is_empty() {
+                if !has_action_row {
+                    self.push(LineKind::Note, format!("ask · {question}"));
+                }
+                if !has_action_row && !options.is_empty() {
                     self.push(
                         LineKind::Note,
                         format!(
@@ -1643,6 +1656,7 @@ impl Chat {
                     free_text,
                     selected: 0,
                     typing: false,
+                    has_action_row,
                 });
                 Applied::none()
             }

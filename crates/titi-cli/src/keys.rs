@@ -989,7 +989,9 @@ impl Chat {
             titi_tools::AskAnswer::Text(text) => format!("ask · answered {text}"),
             titi_tools::AskAnswer::Cancelled => "ask · cancelled".to_owned(),
         };
-        self.push(LineKind::Note, said);
+        if !ask.has_action_row {
+            self.push(LineKind::Note, said);
+        }
         Applied::send(
             EngineCommand::AnswerAsk {
                 request_id: ask.request_id.into(),

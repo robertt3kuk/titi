@@ -399,6 +399,75 @@ fn a_single_choice_is_taken_with_enter() {
     );
 }
 
+/// The same question as `asked`, raised by a running `ask` call: the call's
+/// action row already says what was asked and what was chosen.
+fn asked_by_a_call(question_options: &[&str]) -> Chat {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: "call-ask".into(),
+        name: "ask".into(),
+        detail: Some("ask Which database should I use?".into()),
+    });
+    chat.on_event(EngineEvent::AskRequested {
+        request_id: "ask-1".into(),
+        question: "Which database should I use?".into(),
+        options: question_options
+            .iter()
+            .map(|option| (*option).into())
+            .collect(),
+        multi: false,
+        free_text: true,
+    });
+    chat
+}
+
+fn ask_notes(chat: &Chat) -> Vec<&str> {
+    chat.lines
+        .iter()
+        .filter(|line| line.kind == LineKind::Note && line.text.starts_with("ask · "))
+        .map(|line| line.text.as_str())
+        .collect()
+}
+
+/// A question that belongs to an action row is said there — `✓ Asked …` and
+/// its detail — so the three notes would say it a second, third and fourth
+/// time. Only an ask with no row of its own keeps them.
+#[test]
+fn a_question_with_an_action_row_adds_no_notes() {
+    let mut chat = asked_by_a_call(&["postgres", "sqlite"]);
+    assert_eq!(ask_notes(&chat), Vec::<&str>::new());
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(ask_notes(&chat), Vec::<&str>::new());
+
+    let mut chat = asked_by_a_call(&["postgres", "sqlite"]);
+    for ch in "mongo".chars() {
+        chat.on_key(Key::Char(ch), Instant::now());
+    }
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(ask_notes(&chat), Vec::<&str>::new());
+
+    let mut chat = asked_by_a_call(&["postgres", "sqlite"]);
+    chat.on_key(Key::Esc, Instant::now());
+    assert_eq!(ask_notes(&chat), Vec::<&str>::new());
+}
+
+/// With no action row — a surface that never saw the call start — the notes
+/// are the only record, so they stay.
+#[test]
+fn a_question_without_an_action_row_keeps_its_notes() {
+    let mut chat = asked(&["postgres", "sqlite"], false, true);
+    assert_eq!(
+        ask_notes(&chat),
+        [
+            "ask · Which database should I use?",
+            "ask · options: postgres · sqlite"
+        ]
+    );
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(ask_notes(&chat).last(), Some(&"ask · chose postgres"));
+}
+
 /// A question that takes several ticks rows with Space and sends the set
 /// in the order it was offered; an empty set is not an answer.
 #[test]
