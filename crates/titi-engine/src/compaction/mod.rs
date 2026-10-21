@@ -7,6 +7,7 @@
 //!
 //! Spec: `docs/research/compaction-context`.
 
+mod digest;
 mod mask;
 mod reported;
 
@@ -15,6 +16,7 @@ use titi_core::compaction::{CompactionPolicy, StructuredSummarizer, Summarizer, 
 use titi_core::session::{Entry, Role as EntryRole};
 use titi_providers::{ChatMessage, Role};
 
+use digest::{digest_message, digest_summary, is_digest};
 use mask::mask_tool_results;
 pub use reported::{PromptMemory, Reported, context_used};
 
@@ -70,27 +72,17 @@ fn leading_system(messages: &[ChatMessage]) -> usize {
         .count()
 }
 
-/// The digest as a message.
-///
-/// A `user` message right behind the system prompt, not a `system` one in the
-/// middle of the history: some providers drop a system message that is not
-/// first and Anthropic's wire has no such role at all, so only a user message
-/// reaches every family. Behind the system prompt is also the most stable
-/// place for it — everything above is rebuilt identically each turn and
-/// everything below only grows, so the provider's prompt cache keeps the
-/// whole prefix up to the digest until the next fold rewrites it.
-fn digest_message(summary: &str, folded: usize) -> ChatMessage {
-    ChatMessage {
-        role: Role::User,
-        content: format!(
-            "<conversation-summary folded=\"{folded}\">\n\
-             Earlier messages were folded to keep the context short; this is what they held.\n\
-             {summary}\n\
-             </conversation-summary>"
-        )
-        .into(),
-        ..Default::default()
+/// How much of an earlier digest a model-free fold carries forward.
+const CARRIED_CHARS: usize = 3_000;
+
+/// `text` cut to `max` characters, with a mark where it was cut.
+fn clamp_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
     }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// Shrinks the request when it crosses the policy threshold, and returns
@@ -147,13 +139,21 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
             break;
         }
     }
-    let Some((strategy, summary)) = chosen else {
+    let Some((strategy, mut summary)) = chosen else {
         // No strategy could write a digest; what masking already did stands.
         return (masked.count > 0).then_some(masked_only);
     };
 
+    // The structural digest names prompts and counts; what an earlier fold
+    // already knew would otherwise be lost to a second one.
+    let folded_messages = &messages[lead..first_kept];
+    if let Some(earlier) = folded_messages.iter().find(|m| is_digest(m)) {
+        summary.push_str("\n\nCarried from an earlier fold:\n");
+        summary.push_str(&clamp_chars(digest_summary(earlier), CARRIED_CHARS));
+    }
     let folded = first_kept - lead;
-    messages.splice(lead..first_kept, [digest_message(&summary, folded)]);
+    let digest = digest_message(&summary, folded, folded_messages);
+    messages.splice(lead..first_kept, [digest]);
     Some(Compacted {
         folded,
         masked: masked.count,
@@ -164,6 +164,9 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
 
 fn to_entry(message: &ChatMessage) -> Entry {
     let role = match message.role {
+        // An earlier digest is context the user did not type, and listing it
+        // among the prompts would name the wrapper instead of the work.
+        Role::User if is_digest(message) => EntryRole::System,
         Role::User => EntryRole::User,
         Role::Assistant => EntryRole::Assistant,
         // Tool output is context the model reads, not something it said.
@@ -499,5 +502,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_second_fold_carries_the_first_digest_and_its_file_list() {
+        let policy = CompactionPolicy {
+            threshold_percent: 0.0,
+            keep_recent_tokens: 6,
+            method_order: vec![titi_core::compaction::Strategy::SnapCompact],
+        };
+        let mut messages = vec![
+            user("fix the lexer"),
+            call("c1", "read", r#"{"path":"src/lexer.rs"}"#),
+            result("c1", "tokens"),
+            assistant("the lexer drops a quote"),
+            user("now the parser"),
+            assistant("on it"),
+            user("newest"),
+        ];
+        compact(&mut messages, &policy, 100).expect("the first fold");
+        let first_digest = messages[0].content.clone();
+        assert!(first_digest.contains("- src/lexer.rs"), "{first_digest}");
+
+        messages.extend([
+            call("c2", "edit", r#"{"path":"src/parser.rs"}"#),
+            result("c2", "edited"),
+            assistant("the parser is fixed"),
+            user("and now the docs, please, when you can"),
+        ]);
+        compact(&mut messages, &policy, 100).expect("the second fold");
+
+        let digests: Vec<&ChatMessage> = messages.iter().filter(|m| is_digest(m)).collect();
+        assert_eq!(digests.len(), 1, "one digest, not a stack: {messages:#?}");
+        let second = &digests[0].content;
+        assert!(second.contains("Carried from an earlier fold"), "{second}");
+        assert!(second.contains("fix the lexer"), "{second}");
+        assert!(second.contains("- src/parser.rs"), "{second}");
+        assert!(second.contains("- src/lexer.rs"), "{second}");
     }
 }

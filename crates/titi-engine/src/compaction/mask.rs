@@ -112,16 +112,7 @@ pub(super) fn target_of(call: &ToolCallRef) -> Option<String> {
             .to_owned(),
     };
     let one_line = target.split_whitespace().collect::<Vec<_>>().join(" ");
-    Some(clamp(&one_line, TARGET_CHARS))
-}
-
-fn clamp(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
+    Some(super::clamp_chars(&one_line, TARGET_CHARS))
 }
 
 #[cfg(test)]
