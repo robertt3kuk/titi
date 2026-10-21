@@ -52,7 +52,7 @@ the state at `238e911`, before the 2026-10-21 waves.
 | # | Idea | Why it matters | titi today | Status |
 |---|---|---|---|---|
 | 23 | Measured prompt budget | bytes per turn by part (system, tools, map, diff, history) | `/context` estimates | have (`scripts/bench.py`, [`../perf/README.md`](../perf/README.md)) |
-| 24 | Size-budgeted tool results | every result capped so a single grep is not re-billed for the rest of the session | 40k-char cap per result | partial (map/diff resent only on change `07ec079`; schemas −11% `52011bd`; old results elided to stubs when compaction fires) |
+| 24 | Size-budgeted tool results | every result capped so a single grep is not re-billed for the rest of the session | 40k-char cap per result | partial (map/diff resent only on change `07ec079`; schemas −11% `52011bd`; old results elided to stubs when compaction fires `2ea13de`; still no budget per result below the 40k cap) |
 | 25 | Cache-break diagnostics | a notice naming what changed in the prefix and what it cost | none | open |
 | 26 | On-demand tool loading | rare tools behind a search tool, decided per session so the cache holds | every tool every turn | open (measured proposal in the perf README) |
 | 27 | Co-change ranking | the map ranks files that change together | import graph + touched set | open |
@@ -63,3 +63,20 @@ the state at `238e911`, before the 2026-10-21 waves.
   agent's core; titi's CUA theme is PLAN M3 and separate from this list.
 - `/orchestrate` workflow graphs and routines beyond `/loop`: titi has `/graph`
   and `/council`; a general graph runtime waits for M7.
+
+## Landed since the inventory (not rows above)
+
+Empryo's public docs also describe these; titi has them from other work, as of
+2026-10-21:
+
+- Subagent definitions from Markdown files (`.titi/agents`, `.agents/agents`,
+  `.claude/agents`) with `model` and `effort` per specialist, and `/agents`:
+  `166000c`, `0528d4f`, `0f3e8fa`; a subagent wraps up at its tool budget
+  (`98a9b1b`).
+- Role-based model routing over `modelRoles`, with a `/router` view: `27d59cb`
+  … `622c413`.
+- MCP servers over stdio (`2dc8e69`) and Streamable HTTP (`331a3cb`), with
+  consent for a repository's servers; no OAuth yet.
+- Rows 11, 18 and 20 are unchanged: Shift+Tab has no architect or challenge
+  postures, diagnostics are syntax-only, and the verify gate is per turn, not
+  per `git commit`.

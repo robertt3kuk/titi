@@ -14,15 +14,25 @@ Method and limits:
 ## Summary: the ten changes worth most
 
 1. The default system prompt has almost no operating guidance (#1).
+   - Status 2026-10-21: have — versioned operating manual ahead of SOUL.md (`8002c57`, pointed at the project rules in `a89c020`).
 2. A turn dies after 8 tool rounds, and a subagent after 6 (#2).
+   - Status 2026-10-21: have — `agent.maxToolRounds` default 100 and `agent.subagentMaxToolRounds` default 40 (`adb9d27`), wrap-up at the cap and a repeat nudge (`95140d2`), subagent wrap-up (`98a9b1b`). No token or dollar budget yet.
 3. Compaction never uses a model and keeps only the first line of ≤8 user prompts (#3).
+   - Status 2026-10-21: partial — the session's model writes the summary (`71aea04`), compaction triggers on the provider's prompt-token count (`db0d792`), the digest lists files to re-read (`5fc6c11`) and sits behind the system prompt (`d42f9f7`). The summary prompt is not tuned on real traces.
 4. Nothing checks an edit automatically (#4).
+   - Status 2026-10-21: have — `verify.command` at the end of a turn that edited files (`851c2d1`, `26e5e05`, `/verify`), a syntax line on every edit (`57a22a6`), a trust hash for a repository's command (`db2a803`). No type or LSP diagnostics.
 5. Reasoning effort is never sent on the wire (#5).
+   - Status 2026-10-21: have — effort goes out on every wire family (`7ade005`), is a per-session setting (`5ed6389`) with `/effort` (`6179a75`).
 6. Memory recall ignores the prompt (#6).
+   - Status 2026-10-21: have — recalled notes are ranked by the prompt, not by use alone (`28dab1d`).
 7. The bash/write/git tool descriptions are one-liners (#7).
+   - Status 2026-10-21: have for the three named — `bash`, `write` and `git` say what they do and refuse (`20b6c7b`); the other tools keep their short descriptions.
 8. No context editing for stale tool results (#8).
+   - Status 2026-10-21: partial — old tool results are elided to one-line stubs before a fold (`2ea13de`); nothing clears them between compactions.
 9. Every subagent and helper runs on the main model (#9).
+   - Status 2026-10-21: have — a role router over `modelRoles` (`27d59cb`), subagents, `/review` and the `/goal` reviewer on their roles (`b59a5ac`), advisor, session namer and compaction summary routed (`f67c76a`), `/router` view (`622c413`), map entries with model and effort (`1a298ce`).
 10. No eval harness: titi has no SWE-bench, Terminal-Bench or Aider run, so none of the above can be measured (#10).
+   - Status 2026-10-21: partial — `scripts/eval.py` with five starter tasks and hidden grading tests (`4d42a61`, `934baf2`, `7670dad`, [evals README](../evals/README.md)). Not yet run against a real model, so there is no baseline.
 
 ---
 
@@ -242,6 +252,7 @@ Method and limits:
 ---
 
 ## C. Tool design and edit formats
+- **Status, 2026-10-21:** partial — skills v2 reads `.titi`, `.agents` and `.claude` roots with real YAML, and the model loads a body with the `skill` tool (`c48e704`, `cd41bff`).
 
 ### 23. Fewer, better tools
 - **Evidence:**
@@ -345,9 +356,11 @@ Method and limits:
 - **Evidence:** Deterministic gates versus advisory prompts; PreToolUse/Stop; Empryo reads Claude Code hooks too ([docs](https://empryo.com/docs/tools/hooks.md)).
 - **titi:** missing, gated by PLAN M6.
 - **Do:** when M6 opens, ship three events first: PreToolUse (block), PostToolUse (add context), Stop (block until check passes). That gives #4's Stop-hook for free.
+- **Status, 2026-10-21:** have — Claude-compatible command hooks around a turn (`509d9e5`), consent panel for a repository's hooks (`1484908`), allow-listed hook environment (`7b7ca44`).
 
 ### 40. MCP
 - **titi:** missing, gated by PLAN M6. Design with #27 deferral and `readOnlyHint`-style annotations mapped to approval tiers.
+- **Status, 2026-10-21:** have for tools — stdio client and manager (`2dc8e69`, `e61952a`), `/mcp` and the consent panel (`bc5a197`), Streamable HTTP (`331a3cb`), one-read status and registry (`3a557aa`). No OAuth, no resources or prompts, no sampling.
 
 ### 41. Prompt-injection hygiene
 - **titi:** have. The soul scan, the genome path sanitiser (paths containing `<`/`>` dropped) and secret redaction cover memory, genome and tool output. Project rules and skills pass an injection scanner (STATE.md:164).
