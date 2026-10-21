@@ -44,6 +44,7 @@ mod shared;
 mod symbol;
 mod symbols;
 pub mod syntax_check;
+mod watch;
 
 pub use ask::{
     AskError, DEFAULT_LIMIT, FileHit, FindKind, Found, Impact, MAX_LIMIT, Outline, SymbolHit, User,

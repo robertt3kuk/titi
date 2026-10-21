@@ -70,6 +70,52 @@ pub struct Options {
     /// would prove nothing; held open here it is exact. A hook inside a window
     /// would not do, because the state under test is the gap after one.
     pub hold: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Watch the tree between requests with `stat` ticks; `None` for none. See
+    /// [`Poll`].
+    pub poll: Option<Poll>,
+}
+
+/// How the worker notices a change nobody told it about.
+///
+/// Each tick asks three cheap questions (see the `watch` module) and, when one
+/// says the tree moved, walks it. The cadence follows the session: quick while
+/// requests are arriving (a turn is running or has just run), slow while it is
+/// idle, and off once it has been idle long enough that nobody is reading the
+/// index. A request switches it back on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Poll {
+    /// The tick while a request arrived within [`Self::active_for`].
+    pub active: Duration,
+    /// The tick after that.
+    pub idle: Duration,
+    /// How long after a request the quick tick lasts.
+    pub active_for: Duration,
+    /// How long after a request before ticking stops altogether.
+    pub off_after: Duration,
+}
+
+impl Default for Poll {
+    fn default() -> Self {
+        Self {
+            active: Duration::from_millis(250),
+            idle: Duration::from_secs(2),
+            active_for: Duration::from_secs(30),
+            off_after: Duration::from_secs(300),
+        }
+    }
+}
+
+impl Poll {
+    /// The wait before the next tick, `None` once ticking has stopped.
+    fn interval(&self, since_request: Duration) -> Option<Duration> {
+        if since_request >= self.off_after {
+            None
+        } else if since_request < self.active_for {
+            Some(self.active)
+        } else {
+            Some(self.idle)
+        }
+    }
 }
 
 impl std::fmt::Debug for Options {
@@ -78,6 +124,7 @@ impl std::fmt::Debug for Options {
             .field("debounce", &self.debounce)
             .field("batch_cap", &self.batch_cap)
             .field("hold", &self.hold.is_some())
+            .field("poll", &self.poll)
             .finish()
     }
 }
@@ -88,6 +135,7 @@ impl Default for Options {
             debounce: Duration::from_millis(120),
             batch_cap: 1024,
             hold: None,
+            poll: None,
         }
     }
 }
@@ -474,6 +522,42 @@ fn accumulate(
     progress.items.store(queue.items(), Ordering::Release);
 }
 
+enum Next {
+    Request(Request),
+    /// A tick found the tree moved.
+    Moved,
+    Closed,
+}
+
+/// Wait for the next request, ticking the watcher while nothing arrives.
+fn next_request(
+    rx: &Receiver<Request>,
+    options: &Options,
+    atlas: &SharedAtlas,
+    root: &Path,
+    watcher: &mut crate::watch::Watcher,
+    last_request: std::time::Instant,
+) -> Next {
+    loop {
+        let wait = options
+            .poll
+            .and_then(|poll| poll.interval(last_request.elapsed()));
+        let received = match wait {
+            Some(wait) => rx.recv_timeout(wait),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(request) => return Next::Request(request),
+            Err(RecvTimeoutError::Disconnected) => return Next::Closed,
+            Err(RecvTimeoutError::Timeout) => {
+                if watcher.changed(root, &atlas.snapshot()) {
+                    return Next::Moved;
+                }
+            }
+        }
+    }
+}
+
 /// The worker loop: window, apply, answer, repeat.
 fn run(
     rx: Receiver<Request>,
@@ -492,11 +576,23 @@ fn run(
     // own count, so it is exact at the moment it is read: nothing else bumps
     // it, and the worker is single-threaded.
     let mut received: u64 = 0;
+    let mut watcher = crate::watch::Watcher::default();
+    let mut last_request = std::time::Instant::now();
     loop {
-        let Ok(first) = rx.recv() else {
-            return;
+        let first = match next_request(&rx, &options, &atlas, &root, &mut watcher, last_request) {
+            Next::Request(request) => {
+                received += 1;
+                last_request = std::time::Instant::now();
+                if let Request::Changed(paths) | Request::Priority(paths) = &request {
+                    watcher.note(paths);
+                }
+                request
+            }
+            // A tick that saw the tree move is a resync nobody sent: it is not
+            // a request, so the handle's count of what it sent is untouched.
+            Next::Moved => Request::Resync,
+            Next::Closed => return,
         };
-        received += 1;
         let mut waiters = Vec::new();
         let mut stop = false;
         accumulate(
@@ -1096,6 +1192,7 @@ mod tests {
                 debounce: Duration::from_secs(600),
                 batch_cap: 4,
                 hold: None,
+                poll: None,
             },
         )
         .unwrap();

@@ -1490,7 +1490,17 @@ impl EngineRuntime {
         // exists before the subagent runner below so that runner can fold its
         // own writes in the same way the main turn does.
         let atlas = config.atlas_root.as_ref().and_then(|root| {
-            AtlasHandle::spawn_deferred(root, titi_atlas::live::Options::default()).ok()
+            // Ticks as well as requests: a file edited in another window or a
+            // `git checkout` in another terminal reaches the index in about a
+            // second instead of at the next prompt.
+            AtlasHandle::spawn_deferred(
+                root,
+                titi_atlas::live::Options {
+                    poll: Some(titi_atlas::live::Poll::default()),
+                    ..titi_atlas::live::Options::default()
+                },
+            )
+            .ok()
         });
         // The model's questions reach the surface through this door, and the
         // answers come back as commands. Installed here because it is the only

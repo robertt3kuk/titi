@@ -117,6 +117,17 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   instead of an edge to nothing. A move is a deletion and an arrival; a record
   is not carried across paths, because what a file's relative imports resolve
   to depends on where it is.
+- **The index watches with `stat`, not a watcher.** Between requests the worker
+  ticks (`live::Poll`: 250 ms for 30 s after a request, 2 s after that, off
+  after 5 minutes without one; a request starts it again) and asks three
+  cheap questions (`watch.rs`): did a directory holding indexed files change
+  its mtime (create, delete and rename move it), did a file the session named
+  (the last 64) change size or mtime (an edit does not move its directory),
+  did `.git/HEAD` or `.git/index` move (a checkout). Any yes is a walk, and
+  every tenth tick is one regardless, for what the three cannot see. A tick
+  that finds nothing publishes nothing and is not a request: the handle's
+  `pending` count is untouched. No dependency, no `unsafe`; the engine turns
+  it on, library users opt in with `Options::poll`.
 - **A command's effects are in the index before the next read.** After any
   Exec-tier tool call (`bash`, `project`, an MCP tool) the tool loop runs one
   `SharedAtlas::resync` — a walk on the calling thread, nothing published when
