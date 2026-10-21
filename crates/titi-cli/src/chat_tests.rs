@@ -8349,6 +8349,20 @@ fn details_cycles_and_refuses_what_it_cannot_read() {
     assert_eq!(chat.details.mode("tools"), Some(SectionMode::Expanded));
 }
 
+/// Asking for the mode a section is already on is a valid directive that
+/// changes nothing, not an unknown one.
+#[test]
+fn details_restating_the_current_mode_confirms_it() {
+    let mut chat = chat();
+    command(&mut chat, "/details thinking expanded");
+    let frame = frame_text(&mut chat);
+    assert!(!frame.contains("no such section or mode"), "{frame}");
+    assert!(frame.contains("details: thinking expanded"), "{frame}");
+    command(&mut chat, "/details folded collapsed");
+    let frame = frame_text(&mut chat);
+    assert!(!frame.contains("no such section or mode"), "{frame}");
+}
+
 /// Subagent chatter is the section the default folds, and the header says
 /// how much is behind it.
 #[test]

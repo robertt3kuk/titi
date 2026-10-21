@@ -371,9 +371,8 @@ impl Details {
         if !apply_mode(&mut current, mode) {
             return false;
         }
-        let changed = self.sections.get(section) != current;
         self.sections.set(section, current);
-        changed
+        true
     }
 
     /// The mode a named section or the fold is on, or `None` for a name
@@ -415,7 +414,8 @@ fn is_mode_word(word: &str) -> bool {
 
 /// One section's or the fold's mode moved by a `/details` word: one of the
 /// three names, or `cycle` (hidden → collapsed → expanded → hidden, the order
-/// the old `SectionVisibility::apply` walked). `false` for anything else.
+/// the old `SectionVisibility::apply` walked). `false` only for a word that is
+/// not a mode; naming the mode it is already on is valid and changes nothing.
 fn apply_mode(current: &mut SectionMode, word: &str) -> bool {
     let next = if word.eq_ignore_ascii_case("cycle") {
         match current {
@@ -429,9 +429,8 @@ fn apply_mode(current: &mut SectionMode, word: &str) -> bool {
             None => return false,
         }
     };
-    let changed = *current != next;
     *current = next;
-    changed
+    true
 }
 
 /// The writer a transcript block belongs to, for the air between blocks.
