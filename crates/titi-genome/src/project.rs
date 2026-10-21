@@ -1,11 +1,6 @@
 use std::collections::HashSet;
-use std::time::Duration;
 
 use crate::Genome;
-
-/// Files modified within this window are marked `[RECENT]`. That means
-/// recently modified, not newly created.
-const NEW_WINDOW: Duration = Duration::from_secs(48 * 3600);
 
 /// Symbol lines shown under one file in the prompt map. File ranking is
 /// untouched. An export nobody uses is omitted: a zero is not a blast radius.
@@ -54,11 +49,7 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>, pending:
     for (path, _) in ranked {
         let file = &genome.files[path];
         let dependents = genome.dependents.get(&file.path).copied().unwrap_or(0);
-        let recent = file
-            .mtime
-            .elapsed()
-            .ok()
-            .is_some_and(|elapsed| elapsed <= NEW_WINDOW);
+        let recent = genome.is_recent(&file.path, file.mtime);
         out.push_str(&file.path);
         out.push_str(" (→");
         out.push_str(&dependents.to_string());

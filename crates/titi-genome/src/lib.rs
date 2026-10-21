@@ -28,6 +28,7 @@ mod lsp;
 mod patterns;
 mod project;
 mod query;
+mod recency;
 mod refs;
 mod scan;
 mod shared;
@@ -289,6 +290,8 @@ pub struct Genome {
     overlay: HashMap<String, String>,
     /// Root of the last refresh, so definition can read the identifier.
     root: std::path::PathBuf,
+    /// What `[RECENT]` means for `root`; see [`recency`].
+    recency: Option<recency::Recency>,
 }
 
 /// One refresh's file-level outcome, before the graph decision is folded in.
@@ -363,6 +366,12 @@ impl Genome {
         max_workers: usize,
     ) -> RefreshStats {
         self.root = root.to_path_buf();
+        // The git questions run while the files parse, once per root.
+        let probe = (!self
+            .recency
+            .as_ref()
+            .is_some_and(|known| known.is_for(root)))
+        .then(|| recency::Probe::start(root));
         // A path with an open buffer is part of the workspace even when it is
         // not on disk yet, so it is kept rather than swept as a removal.
         let known: HashSet<String> = listed
@@ -372,6 +381,10 @@ impl Genome {
             .collect();
 
         let absorbed = self.absorb(listed, &known, urgent, max_workers);
+        match probe {
+            Some(probe) => self.recency = Some(probe.finish()),
+            None => self.note_changed(&absorbed.dirty),
+        }
         let gone: Vec<String> = self
             .files
             .keys()
@@ -461,6 +474,7 @@ impl Genome {
             .collect();
 
         let absorbed = self.absorb(&listed, &known, paths, usize::MAX);
+        self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
@@ -507,6 +521,7 @@ impl Genome {
             .collect();
         self.overlay.insert(path.to_owned(), source.to_owned());
         let absorbed = self.absorb(&[listed], &known, &[path.to_owned()], usize::MAX);
+        self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
         Ok(RefreshStats {
@@ -542,6 +557,21 @@ impl Genome {
             return Some(source.clone());
         }
         fs::read_to_string(self.root.join(path)).ok()
+    }
+
+    /// Whether the prompt map marks `path`, last written at `mtime`, recent.
+    pub(crate) fn is_recent(&self, path: &str, mtime: SystemTime) -> bool {
+        match &self.recency {
+            Some(recency) => recency.is_recent(path, mtime),
+            None => recency::by_clock(mtime),
+        }
+    }
+
+    /// Files re-parsed after the recency set was read were changed since.
+    fn note_changed(&mut self, dirty: &[String]) {
+        if let Some(recency) = &mut self.recency {
+            recency.note_changed(dirty);
+        }
     }
 
     /// Whether `file`, as the walk lists it, has to be read again.
