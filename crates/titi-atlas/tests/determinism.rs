@@ -47,6 +47,43 @@ fn fixture(root: &Path) {
     }
 }
 
+/// Two files a suffix import cannot tell apart: `import okio.ByteString` names
+/// both `m1/src/okio/ByteString.kt` and `m2/src/okio/ByteString.kt`. Which one
+/// the edge lands on must be a function of the paths, not of the hasher.
+fn suffix_twins(root: &Path) {
+    write(
+        root,
+        "m1/src/okio/ByteString.kt",
+        "package okio\nclass ByteString\n",
+    );
+    write(
+        root,
+        "m2/src/okio/ByteString.kt",
+        "package okio\nclass ByteString\n",
+    );
+    write(
+        root,
+        "app/Main.kt",
+        "import okio.ByteString\nfun main() { ByteString() }\n",
+    );
+}
+
+#[test]
+fn a_suffix_import_with_two_candidates_lands_on_the_same_one_every_time() {
+    let dir = tempfile::tempdir().unwrap();
+    suffix_twins(dir.path());
+    let landed = |atlas: &Atlas| atlas.files["app/Main.kt"].imports.clone();
+    let first = landed(&Atlas::index(dir.path()).unwrap());
+    assert_eq!(first.len(), 1, "{first:?}");
+    for run in 1..20 {
+        assert_eq!(
+            first,
+            landed(&Atlas::index(dir.path()).unwrap()),
+            "run {run}"
+        );
+    }
+}
+
 struct Bytes {
     map: String,
     skeleton: String,
