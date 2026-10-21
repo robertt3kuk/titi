@@ -171,3 +171,46 @@ async fn switched_off_or_without_an_index_there_is_no_tool() {
             .any(|s| s.name == "atlas")
     );
 }
+
+/// `atlas.lens: false` keeps the map and drops the per-prompt lens: the
+/// condition an A/B needs to tell the two apart.
+#[tokio::test]
+async fn the_lens_can_be_switched_off_while_the_map_stays() {
+    async fn first_prompt(lens: bool) -> String {
+        let dir = workspace();
+        let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ])]));
+        let mut config = EngineConfig::new("primary");
+        config.atlas_root = Some(dir.path().to_path_buf());
+        config.atlas_lens = lens;
+        let mut engine = EngineRuntime::start_with_tools(
+            config,
+            resolver(Arc::clone(&transport) as _),
+            ToolRegistry::new(),
+        );
+        engine
+            .send(EngineCommand::SubmitPrompt {
+                text: "why does SessionStore lose entries?".into(),
+            })
+            .await
+            .unwrap();
+        until_terminal(&mut engine).await;
+        transport.requests()[0]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .to_string()
+    }
+    let with = first_prompt(true).await;
+    assert!(
+        with.contains("<atlas>") && with.contains("<atlas-lens>"),
+        "{with}"
+    );
+    let without = first_prompt(false).await;
+    assert!(without.contains("<atlas>"), "{without}");
+    assert!(!without.contains("<atlas-lens>"), "{without}");
+}

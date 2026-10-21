@@ -90,6 +90,8 @@ pub const ATLAS_BUDGET_KEY: &str = "atlas.budget";
 /// related, answered from the index. Unset means on; `false`, `off` or `no`
 /// takes the tool out of the request. This crate owns the name only.
 pub const ATLAS_TOOL_KEY: &str = "atlas.tool";
+/// `atlas.lens`: whether each prompt gets its lens; on unless set off.
+pub const ATLAS_LENS_KEY: &str = "atlas.lens";
 
 /// Smallest `atlas.budget`: below it the map is a few lines and the lens none.
 pub const MIN_ATLAS_BUDGET: i64 = 200;

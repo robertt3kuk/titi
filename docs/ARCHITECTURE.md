@@ -268,6 +268,12 @@ src/runtime.rs (→3) [RECENT]
   tokens), the LSP's `references` (one location per mention instead of one
   per file) and `titi atlas`. An unknown name is an error that names the
   closest ones.
+- **Switches**: `atlas.enabled` is the whole atlas; inside it `atlas.tool: false`
+  removes the tool and `atlas.lens: false` drops the per-prompt lens, each on
+  its own, so the map alone, the map and the lens, and the map and the tool
+  can be compared. `find` and `related` take a `limit` (at most 40; `titi
+  atlas find <text> --limit N`), and a `find` that matches no name answers
+  with the lens's reading of the same words.
 - **Test pairing** (`pairing.rs`): a test is linked to its source by naming
   (`tests/foo.rs`, `test_foo.py`, `foo_test.go`, `FooTest.java`, `foo.test.ts`,
   `foo_spec.rb` are all about `foo`; `mod.rs`/`index.ts`/`__init__.py` answer to

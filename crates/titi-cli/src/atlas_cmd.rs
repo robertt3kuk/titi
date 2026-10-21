@@ -227,19 +227,33 @@ fn save_setting(
     }
 }
 
-/// `titi atlas find|outline|uses|impact|related <text…> [--json]`: the questions
+/// `titi atlas find|outline|uses|impact|related <text…> [--limit N] [--json]`: the questions
 /// the model's `atlas` tool answers, asked from a terminal — the same query
 /// layer, the same text. `--json` prints the matched paths in order, which is
 /// what an evaluation scores.
 fn ask_cmd(workspace: &Path, op: &str, args: &[String]) {
     let json = args.iter().any(|arg| arg == "--json");
-    let words: Vec<&str> = args
-        .iter()
-        .filter(|arg| arg.as_str() != "--json")
-        .map(String::as_str)
-        .collect();
+    let mut limit = titi_atlas::DEFAULT_LIMIT;
+    let mut words: Vec<&str> = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => {}
+            "--limit" => match rest.next().and_then(|value| value.parse::<usize>().ok()) {
+                Some(value) => limit = value,
+                None => {
+                    eprintln!(
+                        "atlas {op}: --limit takes a number (at most {})",
+                        titi_atlas::MAX_LIMIT
+                    );
+                    std::process::exit(USAGE_EXIT);
+                }
+            },
+            word => words.push(word),
+        }
+    }
     if words.is_empty() {
-        eprintln!("usage: titi atlas {op} <text…> [--json]");
+        eprintln!("usage: titi atlas {op} <text…> [--limit N] [--json]");
         std::process::exit(USAGE_EXIT);
     }
     let text = words.join(" ");
@@ -255,7 +269,7 @@ fn ask_cmd(workspace: &Path, op: &str, args: &[String]) {
     }
     let outcome: Result<(String, Vec<String>), titi_atlas::AskError> = match op {
         "find" => {
-            let found = atlas.find(&text, titi_atlas::FindKind::Any, titi_atlas::MAX_LIMIT, 0);
+            let found = atlas.find(&text, titi_atlas::FindKind::Any, limit, 0);
             let mut paths: Vec<String> = Vec::new();
             for hit in &found.symbols {
                 if !paths.contains(&hit.path) {
@@ -265,6 +279,11 @@ fn ask_cmd(workspace: &Path, op: &str, args: &[String]) {
             for hit in &found.files {
                 if !paths.contains(&hit.path) {
                     paths.push(hit.path.clone());
+                }
+            }
+            for entry in &found.related.entries {
+                if !paths.contains(&entry.path) {
+                    paths.push(entry.path.clone());
                 }
             }
             Ok((found.render(0), paths))
@@ -283,7 +302,7 @@ fn ask_cmd(workspace: &Path, op: &str, args: &[String]) {
             (impact.render(), paths)
         }),
         _ => {
-            let lens = atlas.related(&text, titi_atlas::MAX_LIMIT);
+            let lens = atlas.related(&text, limit);
             let paths = lens
                 .entries
                 .iter()

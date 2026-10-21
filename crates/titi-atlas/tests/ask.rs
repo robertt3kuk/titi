@@ -234,3 +234,30 @@ fn lsp_references_are_the_mentions_not_the_top_of_the_file() {
         "{refs:?}"
     );
 }
+
+/// A question that matches no name is answered with the lens's reading of it,
+/// not with nothing.
+#[test]
+fn find_falls_back_to_the_lens_when_nothing_is_named_like_the_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/store.rs", "pub struct SessionStore;\n");
+    write(
+        root,
+        "src/service.rs",
+        "use crate::store::SessionStore;\npub fn run() { let _ = SessionStore; }\n",
+    );
+    let atlas = Atlas::index(root).unwrap();
+    // Snake case against a camel-case name: no substring matches, but the
+    // lens splits identifiers into words.
+    let found = atlas.find("session_store", FindKind::Any, 20, 0);
+    assert!(
+        found.symbols.is_empty() && found.files.is_empty(),
+        "{found:?}"
+    );
+    let rendered = found.render(0);
+    assert!(rendered.contains("src/store.rs"), "{rendered}");
+
+    let found = atlas.find("zzzz qqqq", FindKind::Any, 20, 0);
+    assert!(found.render(0).contains("nothing in the index matches"));
+}

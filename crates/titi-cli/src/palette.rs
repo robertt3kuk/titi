@@ -105,6 +105,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Bool,
     ),
     setting(
+        cfg::ATLAS_LENS_KEY,
+        "give each prompt its lens of related files",
+        Values::Bool,
+    ),
+    setting(
         cfg::ATLAS_TOOL_KEY,
         "give the model the atlas query tool",
         Values::Bool,

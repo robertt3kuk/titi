@@ -70,6 +70,9 @@ pub struct Found {
     pub files: Vec<FileHit>,
     pub total_symbols: usize,
     pub total_files: usize,
+    /// What the words of the query are related to, when no symbol and no file
+    /// is named like any of them: the lens's answer for the same text.
+    pub related: Lens,
 }
 
 /// A file's shape.
@@ -268,6 +271,13 @@ impl Atlas {
                 .take(limit)
                 .map(|(_, hit)| hit)
                 .collect();
+        }
+        // A short, generic question ("fix flaky retries") names no identifier,
+        // and an empty answer sends the model to grep for what the lens could
+        // have listed. The lens reads the same text with the walk and the
+        // history behind it.
+        if kind == FindKind::Any && offset == 0 && found.total_symbols + found.total_files == 0 {
+            found.related = self.related(query, limit);
         }
         found
     }
@@ -691,7 +701,13 @@ fn list(title: &str, items: &[String], total: usize) -> String {
 impl Found {
     pub fn render(&self, offset: usize) -> String {
         if self.symbols.is_empty() && self.files.is_empty() {
-            return "nothing in the index matches\n".to_owned();
+            if self.related.is_empty() {
+                return "nothing in the index matches\n".to_owned();
+            }
+            return format!(
+                "no symbol or file is named like that; related by the words of the query:\n{}",
+                self.related.render_lines()
+            );
         }
         let mut out = String::new();
         if !self.symbols.is_empty() {

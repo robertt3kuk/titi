@@ -892,6 +892,9 @@ pub struct EngineConfig {
     /// Whether the model gets the `atlas` tool (`atlas.tool`, on unless set
     /// off). Only meaningful with an `atlas_root`: no index, no tool.
     pub atlas_tool: bool,
+    /// Whether each prompt gets its lens (`atlas.lens`, on unless set off).
+    /// The map is sent either way; the budget split does not move.
+    pub atlas_lens: bool,
     /// Tokens the atlas may add to one turn, the prompt map and the lens
     /// together (`atlas.budget`). `None` sizes it from the repository.
     pub atlas_budget: Option<usize>,
@@ -987,6 +990,7 @@ impl EngineConfig {
             atlas_root: None,
             atlas_budget: None,
             atlas_tool: true,
+            atlas_lens: true,
             workspace_root: None,
             agent_model: None,
             agent_writes: false,
@@ -3235,18 +3239,22 @@ async fn run_turn(
     .await;
     // Duck mode is repo-blind, so its root is already gone and there is no
     // lens either.
-    let lens_text = atlas_lens(
-        config.atlas_root.clone(),
-        config.atlas_budget,
-        atlas.as_ref(),
-        &prompt,
-        &touched,
-        snapshot
-            .as_ref()
-            .map(|shot| shot.files.clone())
-            .unwrap_or_default(),
-    )
-    .await;
+    let lens_text = if config.atlas_lens {
+        atlas_lens(
+            config.atlas_root.clone(),
+            config.atlas_budget,
+            atlas.as_ref(),
+            &prompt,
+            &touched,
+            snapshot
+                .as_ref()
+                .map(|shot| shot.files.clone())
+                .unwrap_or_default(),
+        )
+        .await
+    } else {
+        None
+    };
     let history = &config.restored_messages;
     // The map and the lens ride together on the newest user message, each only
     // when it differs from the copy the model already has.

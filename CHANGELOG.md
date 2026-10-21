@@ -12,6 +12,7 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `atlas.lens: false` turns the per-prompt lens off while the map and the `atlas` tool stay (and `atlas.tool: false` the reverse), so the three can be compared; `titi atlas find|related <text> --limit N` takes a count up to 40, and `find` on words that match no symbol or file answers with the lens's reading of them instead of `nothing in the index matches`.
 - A test is tied to the source it is named for even when it imports nothing from it: `tests/foo.rs`, `test_foo.py`, `foo_test.go`, `FooTest.java`, `foo.test.ts` and `foo_spec.rb` pair with `foo` (same language, the nearest directory when several share a name, nothing on a tie). The lens lists the source of a failing test as `tested by tests/foo.rs`, and the `atlas` tool's `outline` and `impact` list the paired tests with the ones that import the file.
 - A name a file imports counts as used by it even when the file only passes it around (`import { formatDate } from "./format"`, `from .util import slugify`, `use crate::util::helper;`), so `+Name (n)` in the map and the `uses` and `impact` answers no longer miss callers that hold a function as a value.
 
