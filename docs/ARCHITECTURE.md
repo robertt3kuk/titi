@@ -104,9 +104,11 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   ubiquitous std names are filtered; `MAX_REFS = 512` per file.
 - **The walk is cheap and honours ignore files.** `scan.rs` reads
   `.gitignore`, `.reference-productignore` and `.atlasignore` (`!`, `dir/`,
-  `/anchor`, `*`, `**`, `?`); `.atlasignore` is the atlas's own file and, unlike
-  the other two, is also read in nested directories (rules relative to the
-  file's directory). titi's own `.atlasignore` hides `evals/tasks/`. It skips dot-directories, `node_modules`, `dist`, `build`,
+  `/anchor`, `*`, `**`, `?`). `.gitignore` and `.atlasignore` are also read in
+  nested directories, as git reads the former: rules relative to the file's
+  directory, reaching its own subtree only, `.atlasignore` after `.gitignore`
+  so it has the last word. A directory's listing says whether either file is
+  there, so a directory without one costs no extra open. titi's own `.atlasignore` hides `evals/tasks/`. It skips dot-directories, `node_modules`, `dist`, `build`,
   `target`, `coverage`, `vendor`, `__pycache__`, `.git`, files over
   `MAX_FILE_BYTES = 1_000_000`, non-source files, and names with control
   characters (they would break the line-based projection).

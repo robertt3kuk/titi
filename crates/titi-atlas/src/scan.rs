@@ -80,7 +80,7 @@ pub fn stat(root: &Path, path: &str) -> Option<ListedFile> {
 }
 
 /// The atlas's own ignore file: gitignore syntax, read at the root and in any
-/// directory below it, on top of `.gitignore`. It says what is not part of the
+/// directory below it, after the `.gitignore` of the same directory. It says what is not part of the
 /// project's code as far as the map is concerned (eval fixtures, vendored
 /// samples) without hiding it from git.
 const ATLASIGNORE: &str = ".atlasignore";
@@ -145,12 +145,19 @@ fn walk(
         Err(_) if !root => return Ok(()),
         Err(why) => return Err(why),
     };
-    // A nested `.atlasignore` applies to its own directory's subtree only.
+    let entries: Vec<fs::DirEntry> = entries.flatten().collect();
+    // A nested ignore file applies to its own directory's subtree only, and
+    // `.atlasignore` comes after `.gitignore` so it has the last word. The
+    // listing says whether either exists, so a directory without one costs no
+    // open: a tree has thousands of directories and a few such files.
+    let has = |name: &str| entries.iter().any(|entry| entry.file_name() == name);
     let nested: Vec<Rule> = if root || rel.is_empty() {
         Vec::new()
     } else {
-        load_rules(dir, ATLASIGNORE)
+        [".gitignore", ATLASIGNORE]
             .into_iter()
+            .filter(|name| has(name))
+            .flat_map(|name| load_rules(dir, name))
             .map(|rule| Rule {
                 base: rel.to_owned(),
                 ..rule
@@ -164,7 +171,7 @@ fn walk(
         combined = rules.iter().cloned().chain(nested).collect();
         &combined
     };
-    for entry in entries.flatten() {
+    for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Control characters would break the line-oriented prompt projection.
@@ -365,6 +372,47 @@ mod tests {
             found,
             ["other/samples/o.rs", "pkg/real.rs", "src/keep.rs"],
             "the root file hides evals/tasks, the nested one only pkg/samples"
+        );
+    }
+
+    /// git reads a `.gitignore` in every directory, relative to that
+    /// directory, and a rule there reaches only its own subtree. A monorepo's
+    /// package that ignores its `generated/` must not have it in the map.
+    #[test]
+    fn a_nested_gitignore_applies_to_its_own_subtree_like_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "pkg/real.rs", "pub fn real() {}\n");
+        write(root, "pkg/generated/g.rs", "pub fn g() {}\n");
+        write(root, "pkg/api.gen.rs", "pub fn api() {}\n");
+        write(root, "pkg/keep.gen.rs", "pub fn keep() {}\n");
+        write(
+            root,
+            "pkg/.gitignore",
+            "generated/\n*.gen.rs\n!keep.gen.rs\n/local.rs\n",
+        );
+        write(root, "pkg/local.rs", "pub fn local() {}\n");
+        write(root, "pkg/deep/local.rs", "pub fn deep_local() {}\n");
+        write(root, "other/generated/o.rs", "pub fn o() {}\n");
+        write(root, "other/api.gen.rs", "pub fn other_api() {}\n");
+
+        let mut found: Vec<String> = list_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "other/api.gen.rs",
+                "other/generated/o.rs",
+                "pkg/deep/local.rs",
+                "pkg/keep.gen.rs",
+                "pkg/real.rs",
+            ],
+            "pkg's rules hide pkg/generated, *.gen.rs (but not the negated one) and \
+             pkg/local.rs (anchored to pkg), and touch nothing outside pkg"
         );
     }
 
