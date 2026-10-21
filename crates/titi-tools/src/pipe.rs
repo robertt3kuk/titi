@@ -265,12 +265,12 @@ pub struct HookRun {
 }
 
 /// Runs a hook command: `input` on its standard input, its own process group,
-/// the caller's environment minus anything that names a secret
-/// ([`is_secret_env`]), and the same output bounds and deadline as [`run`].
+/// an allow-listed environment ([`hook_environment`]), and the same output
+/// bounds and deadline as [`run`].
 ///
 /// A hook is project- or user-supplied code the engine runs on the user's
 /// behalf; it has no business with the API keys titi holds in its own
-/// environment, so they are not handed to it.
+/// environment, so only what a script needs to find its tools is handed to it.
 pub fn run_hook(
     command: &str,
     cwd: &Path,
@@ -280,7 +280,7 @@ pub fn run_hook(
 ) -> Result<HookRun, PipeError> {
     let spec = Spec {
         input: Some(input),
-        scrub_env: true,
+        hook_env: true,
     };
     match run_core(command, cwd, timeout, None, interrupt, &spec)? {
         Finished::Done { streams, status } => {
@@ -303,46 +303,53 @@ pub fn run_hook(
     }
 }
 
-/// Whether an environment variable's name says it holds a credential: a
-/// `_`-separated word that is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`
-/// or `CREDENTIALS`, or a name ending in `APIKEY`. Names are matched, not
-/// values, so `OPENAI_API_KEY`, `GITHUB_TOKEN` and `AWS_SECRET_ACCESS_KEY`
-/// go while `PATH` and `HOME` stay.
-pub fn is_secret_env(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.ends_with("APIKEY")
-        || upper.split('_').any(|word| {
-            matches!(
-                word,
-                "KEY"
-                    | "KEYS"
-                    | "TOKEN"
-                    | "TOKENS"
-                    | "SECRET"
-                    | "SECRETS"
-                    | "PASSWORD"
-                    | "PASSWD"
-                    | "CREDENTIAL"
-                    | "CREDENTIALS"
-            )
-        })
-}
+/// Variables a hook inherits, by name. Everything else — every API key,
+/// token, session cookie and `DATABASE_URL` titi's own environment happens to
+/// hold — is left out: a list of what is *allowed* cannot miss a secret
+/// because of how it is spelled (`PGPASSWORD`, `MYSQL_PWD`, `SSH_AUTH_SOCK`).
+const HOOK_ENV: [&str; 12] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+    // titi's own: where its state lives, which profile it runs as.
+    "TITI_AGENT_DIR",
+    "TITI_PROFILE",
+];
 
-/// Takes every variable in `names` that [`is_secret_env`] out of what the
-/// command inherits.
-fn scrub_secrets(shell: &mut Command, names: impl IntoIterator<Item = std::ffi::OsString>) {
-    for name in names {
-        if name.to_str().is_some_and(is_secret_env) {
-            shell.env_remove(name);
-        }
-    }
+/// The environment a hook runs with: the allowed variables of `vars`, every
+/// `LC_*`, and `CLAUDE_PROJECT_DIR` (the name a Claude Code script expects)
+/// set to the directory the hook runs in.
+pub fn hook_environment(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    project_dir: &Path,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut kept: Vec<_> = vars
+        .into_iter()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| HOOK_ENV.contains(&name) || name.starts_with("LC_"))
+        })
+        .collect();
+    kept.push((
+        "CLAUDE_PROJECT_DIR".into(),
+        project_dir.as_os_str().to_owned(),
+    ));
+    kept
 }
 
 #[derive(Default)]
 struct Spec<'a> {
     /// Bytes written to the command's standard input; closed when `None`.
     input: Option<&'a [u8]>,
-    scrub_env: bool,
+    /// Run with [`hook_environment`] instead of the caller's own.
+    hook_env: bool,
 }
 
 enum Finished {
@@ -384,8 +391,9 @@ fn run_core(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if spec.scrub_env {
-        scrub_secrets(&mut shell, std::env::vars_os().map(|(name, _)| name));
+    if spec.hook_env {
+        shell.env_clear();
+        shell.envs(hook_environment(std::env::vars_os(), cwd));
     }
     // Its own process group, so a stop reaches every process the command
     // started, not just the shell.
@@ -893,34 +901,60 @@ mod tests {
     }
 
     #[test]
-    fn names_that_say_secret_are_scrubbed_and_the_rest_stay() {
-        for secret in [
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "GITHUB_TOKEN",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "DB_PASSWORD",
-            "MYAPIKEY",
-            "gh_token",
-        ] {
-            assert!(is_secret_env(secret), "{secret}");
-        }
-        for plain in ["PATH", "HOME", "TITI_AGENT_DIR", "KEYBOARD_LAYOUT", "SHELL"] {
-            assert!(!is_secret_env(plain), "{plain}");
-        }
-
-        let mut shell = Command::new("sh");
-        shell
-            .arg("-c")
-            .arg("echo ${OPENAI_API_KEY:-gone} ${KEEP:-lost}")
-            .env("OPENAI_API_KEY", "sk-test")
-            .env("KEEP", "kept");
-        scrub_secrets(
-            &mut shell,
-            ["OPENAI_API_KEY", "KEEP"].map(std::ffi::OsString::from),
+    fn a_hook_gets_an_allow_list_not_the_callers_environment() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("LC_ALL", "C"),
+            ("TITI_AGENT_DIR", "/a"),
+            ("OPENAI_API_KEY", "sk-test"),
+            ("PGPASSWORD", "x"),
+            ("MYSQL_PWD", "x"),
+            ("GITHUB_PAT", "x"),
+            ("DATABASE_URL", "postgres://u:p@h/db"),
+            ("SENTRY_DSN", "x"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("AWS_ACCESS_KEY_ID", "x"),
+            ("KEYBOARD_LAYOUT", "us"),
+        ]
+        .map(|(name, value)| {
+            (
+                std::ffi::OsString::from(name),
+                std::ffi::OsString::from(value),
+            )
+        });
+        let kept = hook_environment(vars, Path::new("/work/repo"));
+        let names: Vec<&str> = kept.iter().filter_map(|(name, _)| name.to_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "PATH",
+                "HOME",
+                "LC_ALL",
+                "TITI_AGENT_DIR",
+                "CLAUDE_PROJECT_DIR"
+            ]
         );
-        let output = shell.output().unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "gone kept");
+        assert_eq!(
+            kept.last().map(|(_, value)| value.to_str()),
+            Some(Some("/work/repo"))
+        );
+    }
+
+    #[test]
+    fn a_running_hook_sees_only_the_allow_list() {
+        // Whatever the test runner's environment holds, the hook's own is the
+        // allow-list plus what `sh` adds for itself.
+        let run = hook("env", "", 20).unwrap_or_else(|error| panic!("{error}"));
+        for line in run.stdout.lines() {
+            let name = line.split('=').next().unwrap_or("");
+            assert!(
+                HOOK_ENV.contains(&name)
+                    || name.starts_with("LC_")
+                    || ["CLAUDE_PROJECT_DIR", "PWD", "OLDPWD", "SHLVL", "_"].contains(&name),
+                "{name} reached the hook"
+            );
+        }
+        assert!(run.stdout.contains("CLAUDE_PROJECT_DIR="), "{}", run.stdout);
     }
 }

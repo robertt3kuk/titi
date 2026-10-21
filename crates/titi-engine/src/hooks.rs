@@ -1090,22 +1090,30 @@ mod tests {
 
     #[tokio::test]
     async fn the_hook_environment_has_no_keys() {
-        // The process environment is the test runner's; what it holds that
-        // names a secret must not reach the hook.
-        let Some((name, _)) = std::env::vars().find(|(name, _)| titi_tools::is_secret_env(name))
-        else {
-            return;
-        };
+        // Whatever the runner's environment holds, a hook sees only the
+        // allow-list: no variable but the ones a script needs.
         let f = fixture(vec![def(
             HookEvent::UserPromptSubmit,
             None,
-            &format!("cat >/dev/null; printf '%s' \"${{{name}:-scrubbed}}\""),
+            "cat >/dev/null; env | cut -d= -f1 | tr '\\n' ' '",
         )]);
         let PromptVerdict::Pass { context } =
             f.hooks.user_prompt_submit("hi", TurnId(1), &f.events).await
         else {
             panic!("passes");
         };
-        assert!(context.unwrap().contains("scrubbed"));
+        let context = context.unwrap();
+        assert!(context.contains("CLAUDE_PROJECT_DIR"), "{context}");
+        for name in context.split_whitespace().skip(2) {
+            let name = name.trim_end_matches(&['\n'][..]);
+            assert!(
+                !name.contains("KEY") && !name.contains("TOKEN") && !name.contains("SECRET"),
+                "{name}"
+            );
+        }
+        assert!(
+            !context.contains("CARGO"),
+            "cargo's variables reached the hook: {context}"
+        );
     }
 }
