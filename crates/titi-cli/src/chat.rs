@@ -679,6 +679,9 @@ pub struct Chat {
     pub(crate) login_picker: Option<usize>,
     /// Ctrl+X: the session the screen is on, in the list of stored sessions.
     pub(crate) session_picker: Option<usize>,
+    /// What has been typed to narrow the Ctrl+X list; `session_picker` is then
+    /// a row of the narrowed list.
+    pub(crate) session_query: String,
     /// The workspace this screen's session belongs to: where a paste attached
     /// as a file lands, and the root the tools read it back from. Resolved once
     /// (`session_fs::current_workspace`), so a caller that is not the live run —
@@ -950,6 +953,7 @@ impl Chat {
             picker_hidden: false,
             login_picker: None,
             session_picker: None,
+            session_query: String::new(),
             tree_picker: None,
             tree_filter: TreeFilter::default(),
             trace_picker: None,

@@ -1564,11 +1564,11 @@ fn ctrl_x_switches_sessions() {
         "both sessions are listed: {frame}"
     );
     assert!(
-        frame.contains(&older),
+        frame.contains("older question"),
         "the older session is a row: {frame}"
     );
     assert!(
-        frame.contains(&newer),
+        frame.contains("newer question"),
         "the newer session is a row: {frame}"
     );
 
@@ -1581,7 +1581,7 @@ fn ctrl_x_switches_sessions() {
     // Walk the cursor onto the older session and take it.
     chat.on_key(Key::CtrlX, Instant::now());
     for _ in 0..3 {
-        if frame_text(&mut chat).contains(&format!("▶ {older}")) {
+        if frame_text(&mut chat).contains("▶ older question") {
             break;
         }
         chat.on_key(Key::Down, Instant::now());
@@ -1613,6 +1613,116 @@ fn ctrl_x_switches_sessions() {
         !frame.contains("newer question"),
         "and not the other one: {frame}"
     );
+}
+
+/// The Ctrl+X panel as the user reads it: its title and its rows, without the
+/// welcome drawn behind it.
+fn session_panel_text(chat: &Chat) -> (String, Vec<String>) {
+    let view = panel_view_for(chat, 30, 100).expect("the session list is up");
+    let rows = view
+        .lines
+        .into_iter()
+        .map(|line| match line {
+            PanelLine::Heading(text) => text,
+            PanelLine::Row { text, .. } => text,
+        })
+        .collect();
+    (view.title.unwrap_or_default(), rows)
+}
+
+/// A session reads by what it was asked, how long ago, and how many turns —
+/// the welcome's own brief — not by its id. The one on screen is marked.
+#[test]
+fn the_session_list_reads_by_title_age_and_turns() {
+    let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+    let older = seed_session(dir.path(), "older", "older question");
+    seed_session(dir.path(), "newer", "newer question");
+    chat.session_id = older.clone();
+
+    chat.on_key(Key::CtrlX, Instant::now());
+    let (title, rows) = session_panel_text(&chat);
+    assert_eq!(title, "sessions · 2");
+    assert_eq!(
+        rows,
+        [
+            "newer question  now · 1 turn",
+            "older question  now · 1 turn  ✓ current"
+        ]
+    );
+    assert!(rows.iter().all(|row| !row.contains(&older)), "{rows:?}");
+}
+
+/// Two sessions with the same title are told apart by the first eight
+/// characters of their ids, and only those two.
+#[test]
+fn the_session_list_tells_identical_titles_apart_by_id() {
+    let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+    let one = seed_session(dir.path(), "one", "same words");
+    let two = seed_session(dir.path(), "two", "same words");
+    seed_session(dir.path(), "other", "different words");
+
+    chat.on_key(Key::CtrlX, Instant::now());
+    let (_, rows) = session_panel_text(&chat);
+    for id in [&one, &two] {
+        let short: String = id.chars().take(8).collect();
+        let row = rows
+            .iter()
+            .find(|row| row.ends_with(&short))
+            .unwrap_or_else(|| panic!("{short}: {rows:?}"));
+        assert!(row.starts_with("same words  now · 1 turn  "), "{row}");
+    }
+    let other = rows
+        .iter()
+        .find(|row| row.starts_with("different words"))
+        .expect("the other row");
+    assert_eq!(other, "different words  now · 1 turn");
+}
+
+/// A session nothing was asked in reads `untitled`.
+#[test]
+fn an_empty_session_reads_untitled() {
+    let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+    let store = titi_core::session::SessionStore::new(dir.path()).expect("session store");
+    store
+        .create(titi_core::session::SessionMeta::default())
+        .expect("create");
+    chat.on_key(Key::CtrlX, Instant::now());
+    let (_, rows) = session_panel_text(&chat);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].starts_with("untitled  "), "{rows:?}");
+}
+
+/// Typing narrows the list, matching the title as well as the id, and
+/// Enter takes the row the narrowed list leaves under the cursor.
+#[test]
+fn typing_narrows_the_session_list_by_title_and_id() {
+    let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
+    seed_session(dir.path(), "older", "fix the parser");
+    let newer = seed_session(dir.path(), "newer", "write the docs");
+
+    chat.on_key(Key::CtrlX, Instant::now());
+    for ch in "pars".chars() {
+        chat.on_key(Key::Char(ch), Instant::now());
+    }
+    let (title, rows) = session_panel_text(&chat);
+    assert_eq!(title, "sessions · 1 of 2 · pars");
+    assert_eq!(rows, ["fix the parser  now · 1 turn"]);
+
+    for _ in 0..4 {
+        chat.on_key(Key::Backspace, Instant::now());
+    }
+    let (title, _) = session_panel_text(&chat);
+    assert_eq!(title, "sessions · 2");
+
+    // The id matches too: none of its characters are in either title.
+    for ch in newer.chars() {
+        chat.on_key(Key::Char(ch), Instant::now());
+    }
+    let (_, rows) = session_panel_text(&chat);
+    assert_eq!(rows, ["write the docs  now · 1 turn"]);
+
+    chat.on_key(Key::Enter, Instant::now());
+    assert_eq!(chat.session_id, newer, "the narrowed row was taken");
 }
 
 /// The crate's theme is a process-wide global, so the tests that change it
@@ -12989,14 +13099,17 @@ fn branched_session() -> (tempfile::TempDir, String, titi_core::session::Session
 #[test]
 fn sessions_bare_opens_the_ctrl_x_list() {
     let (dir, mut chat) = picker_chat("openai/gpt-4.1", "session-123");
-    let older = seed_session(dir.path(), "older", "older question");
-    let newer = seed_session(dir.path(), "newer", "newer question");
+    seed_session(dir.path(), "older", "older question");
+    seed_session(dir.path(), "newer", "newer question");
 
     command(&mut chat, "/sessions");
     assert!(chat.session_picker.is_some(), "the list is up, as Ctrl+X");
     let frame = frame_text(&mut chat);
     assert!(frame.contains("sessions · 2"), "{frame}");
-    assert!(frame.contains(&older) && frame.contains(&newer), "{frame}");
+    assert!(
+        frame.contains("older question") && frame.contains("newer question"),
+        "{frame}"
+    );
     assert!(chat.session_search.is_none(), "the list is not the search");
 
     // And Enter takes the row the cursor is on through the same switch.

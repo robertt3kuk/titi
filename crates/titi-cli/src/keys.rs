@@ -393,7 +393,7 @@ pub(crate) const HOTKEYS: &[Hotkey] = &[
     Hotkey {
         group: HotkeyGroup::Session,
         keys: "ctrl+x",
-        what: "switch sessions",
+        what: "switch sessions; type to narrow the list by title or id",
     },
     Hotkey {
         group: HotkeyGroup::Session,

@@ -1717,14 +1717,32 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     Some(command_panel(chat, total))
 }
 
-/// A session's row, named the same way wherever a session is offered: its id,
-/// and the mark that says the screen is already on it.
-pub(crate) fn session_row_text(id: &str, current: bool) -> String {
-    if current {
-        format!("{id}  ✓ current")
-    } else {
-        id.to_owned()
+/// A session's row in the Ctrl+X list, as the welcome names it: what it was
+/// first asked (`untitled` while nothing was), how long ago it was written and
+/// how many turns it holds, then the mark that says the screen is already on
+/// it. `short_id` is the first eight characters of its id, given only when
+/// another session has the same title and the title alone cannot tell them
+/// apart.
+fn session_row_text(
+    brief: &crate::session_fs::SessionBrief,
+    now: std::time::SystemTime,
+    short_id: Option<&str>,
+    current: bool,
+) -> String {
+    let title = brief.title.as_deref().unwrap_or("untitled");
+    let when = match brief.age(now) {
+        Some(age) => format!("{age} · {}", brief.turns_label()),
+        None => brief.turns_label(),
+    };
+    let mut row = format!("{title}  {when}");
+    if let Some(short) = short_id {
+        row.push_str("  ");
+        row.push_str(short);
     }
+    if current {
+        row.push_str("  ✓ current");
+    }
+    row
 }
 
 /// The `/theme` picker: the palettes this build carries, `auto` first, the one
@@ -2056,16 +2074,54 @@ fn session_search_panel(chat: &Chat, total: u16) -> PanelView {
 /// The Ctrl+X switcher: one row per stored session, newest first, the session
 /// on screen marked where the model browser marks the model in use.
 fn session_panel(chat: &Chat, total: u16) -> PanelView {
-    let lines: Vec<PanelLine> = chat
-        .session_choices()
+    let now = std::time::SystemTime::now();
+    let briefs: Vec<(String, crate::session_fs::SessionBrief)> = chat
+        .session_visible()
         .into_iter()
-        .map(|id| PanelLine::Row {
-            text: session_row_text(&id, id == chat.session_id),
-            accent: false,
+        .map(|id| {
+            let brief = crate::session_fs::session_brief(&chat.agent_dir, &id);
+            (id, brief)
         })
         .collect();
-    let title = format!("sessions · {}", lines.len());
-    panel_view(Some(title), lines, chat.session_picker, panel_body(total))
+    let lines: Vec<PanelLine> = briefs
+        .iter()
+        .map(|(id, brief)| {
+            // Two rows with one title: the ids are what tell them apart.
+            let twin = briefs
+                .iter()
+                .any(|(other, rival)| other != id && rival.title == brief.title);
+            let short: String = id.chars().take(8).collect();
+            PanelLine::Row {
+                text: session_row_text(
+                    brief,
+                    now,
+                    twin.then_some(short.as_str()),
+                    *id == chat.session_id,
+                ),
+                accent: false,
+            }
+        })
+        .collect();
+    let total_sessions = chat.session_choices().len();
+    let title = if chat.session_query.is_empty() {
+        format!("sessions · {}", lines.len())
+    } else {
+        format!(
+            "sessions · {} of {total_sessions} · {}",
+            lines.len(),
+            chat.session_query
+        )
+    };
+    if lines.is_empty() {
+        return panel_view(
+            Some(title),
+            vec![PanelLine::Heading("nothing matches".to_owned())],
+            None,
+            panel_body(total),
+        );
+    }
+    let selected = chat.session_picker.map(|at| at % lines.len());
+    panel_view(Some(title), lines, selected, panel_body(total))
 }
 
 /// The row that stands for the probe's own pick rather than a palette: it is
@@ -2865,6 +2921,7 @@ impl Chat {
             self.push(LineKind::Note, "no sessions to switch to".to_owned());
             return Applied::none();
         }
+        self.session_query.clear();
         self.session_picker = Some(
             sessions
                 .iter()
@@ -2872,6 +2929,32 @@ impl Chat {
                 .unwrap_or(0),
         );
         Applied::none()
+    }
+
+    /// The sessions the Ctrl+X list shows now: all of them, newest first, or
+    /// those the typed query narrows them to, best match first. A query is
+    /// matched against the title the row reads by and against the id.
+    pub(crate) fn session_visible(&self) -> Vec<String> {
+        let ids = self.session_choices();
+        let query = self.session_query.trim();
+        if query.is_empty() {
+            return ids;
+        }
+        let mut kept: Vec<(i32, usize, String)> = ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(at, id)| {
+                let brief = crate::session_fs::session_brief(&self.agent_dir, &id);
+                let title = brief.title.as_deref().unwrap_or("untitled");
+                let score = fuzzy_score(query, title)
+                    .into_iter()
+                    .chain(fuzzy_score(query, &id))
+                    .max()?;
+                Some((score, at, id))
+            })
+            .collect();
+        kept.sort_by_key(|(score, at, _)| (std::cmp::Reverse(*score), *at));
+        kept.into_iter().map(|(_, _, id)| id).collect()
     }
 
     pub(crate) fn session_choices(&self) -> Vec<String> {
@@ -2894,17 +2977,29 @@ impl Chat {
             Key::Enter => self.accept_session_picker(),
             Key::Esc => {
                 self.session_picker = None;
+                self.session_query.clear();
+                Applied::none()
+            }
+            Key::Backspace => {
+                self.session_query.pop();
+                self.session_picker = Some(0);
+                Applied::none()
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                self.session_query.push(ch);
+                self.session_picker = Some(0);
                 Applied::none()
             }
             other => {
                 self.session_picker = None;
+                self.session_query.clear();
                 self.on_key(other, now)
             }
         }
     }
 
     fn move_session_picker(&mut self, delta: isize) {
-        let len = self.session_choices().len();
+        let len = self.session_visible().len();
         if len == 0 {
             return;
         }
@@ -2917,10 +3012,12 @@ impl Chat {
     /// history would leave the model on a conversation the screen is not
     /// showing.
     fn accept_session_picker(&mut self) -> Applied {
+        let visible = self.session_visible();
         let choice = self
             .session_picker
-            .and_then(|at| self.session_choices().get(at).cloned());
+            .and_then(|at| visible.get(at % visible.len().max(1)).cloned());
         self.session_picker = None;
+        self.session_query.clear();
         let Some(id) = choice else {
             return Applied::none();
         };
