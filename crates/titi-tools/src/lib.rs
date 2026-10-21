@@ -179,6 +179,9 @@ pub struct ToolRegistry {
     /// The tiers the last [`ToolRegistry::retain_tiers`] kept, to say what is
     /// on offer instead.
     offered: Vec<ApprovalTier>,
+    /// Names [`ToolRegistry::retain_names`] or [`ToolRegistry::remove_names`]
+    /// took out, for the same reason as `withheld`.
+    excluded: std::collections::BTreeSet<SmolStr>,
 }
 
 impl ToolRegistry {
@@ -247,12 +250,39 @@ impl ToolRegistry {
         });
     }
 
+    /// Keeps only the tools named in `allow`. A name the registry never had
+    /// adds nothing: the list narrows, it cannot widen. Used for a subagent
+    /// definition's `tools`.
+    pub fn retain_names(&mut self, allow: &[SmolStr]) {
+        let excluded = &mut self.excluded;
+        self.tools.retain(|name, _| {
+            let keep = allow.contains(name);
+            if !keep {
+                excluded.insert(name.clone());
+            }
+            keep
+        });
+    }
+
+    /// Takes out the tools named in `deny`.
+    pub fn remove_names(&mut self, deny: &[SmolStr]) {
+        for name in deny {
+            if self.tools.remove(name).is_some() {
+                self.excluded.insert(name.clone());
+            }
+        }
+    }
+
     /// Why a call to `name` cannot run, when the tool exists but
-    /// [`ToolRegistry::retain_tiers`] withheld it: `write is withheld here;
-    /// only read tools are offered`. `None` for a name never registered.
+    /// [`ToolRegistry::retain_tiers`] withheld it (`write is withheld here;
+    /// only read tools are offered`) or a name filter took it out. `None` for
+    /// a name never registered.
     pub fn withheld_reason(&self, name: &str) -> Option<String> {
         if !self.withheld.contains(name) {
-            return None;
+            return self
+                .excluded
+                .contains(name)
+                .then(|| format!("{name} is not available to this agent"));
         }
         let offered: Vec<&str> = self.offered.iter().map(|tier| tier.as_str()).collect();
         Some(if offered.is_empty() {
@@ -479,5 +509,36 @@ mod tests {
                 "bash", "edit", "glob", "grep", "hub", "read", "task", "write"
             ]
         );
+    }
+
+    #[test]
+    fn names_can_be_kept_or_dropped_and_a_dropped_one_says_why() {
+        let mut registry = ToolRegistry::new();
+        for name in ["read", "grep", "bash", "write"] {
+            registry.register(Arc::new(NamedTool(name)));
+        }
+        registry.retain_names(&["read".into(), "grep".into(), "bash".into(), "nope".into()]);
+        registry.remove_names(&["bash".into()]);
+        assert_eq!(registry.names(), ["grep", "read"]);
+        assert!(registry.get("bash").is_none());
+        assert_eq!(
+            registry.withheld_reason("bash").as_deref(),
+            Some("bash is not available to this agent")
+        );
+        assert_eq!(
+            registry.withheld_reason("write").as_deref(),
+            Some("write is not available to this agent")
+        );
+        assert_eq!(registry.withheld_reason("never-registered"), None);
+    }
+
+    /// An allow-list can only shrink what is there: naming a tool the
+    /// registry never had does not conjure it.
+    #[test]
+    fn an_allow_list_cannot_add_a_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(NamedTool("read")));
+        registry.retain_names(&["read".into(), "bash".into()]);
+        assert_eq!(registry.names(), ["read"]);
     }
 }
