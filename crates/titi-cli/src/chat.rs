@@ -593,6 +593,10 @@ pub struct Chat {
     /// the composer answers keys exactly as it did before the mode existed.
     pub(crate) vim: Option<crate::vim::VimState>,
     pub(crate) turn_active: bool,
+    /// The user asked the running turn to stop. A call that ends because of
+    /// it is the user's act, not a failure, so the error log leaves it out.
+    /// Cleared when the next turn starts.
+    pub(crate) stopping: bool,
     /// When the running turn was asked for. `Some` exactly while
     /// `turn_active`: the status row above the composer reads it for the
     /// spinner and the elapsed seconds, so a request in flight is visible
@@ -897,6 +901,7 @@ impl Chat {
             next_paste: 0,
             vim: None,
             turn_active: false,
+            stopping: false,
             turn_started: None,
             phase: WorkPhase::Waiting,
             active_turn_id: None,
@@ -1483,6 +1488,7 @@ impl Chat {
         match event {
             EngineEvent::TurnStarted { turn_id, model, .. } => {
                 self.turn_active = true;
+                self.stopping = false;
                 // A prompt sent from the composer already stamped the start;
                 // one the engine began on its own (a goal, a loop) is stamped
                 // here, so the status row has a time either way.
@@ -2846,7 +2852,7 @@ impl Chat {
         if self.paused {
             self.push(LineKind::Note, "paused · /pause resumes".to_owned());
             if self.turn_active {
-                return Applied::effect(ChatEffect::Send(EngineCommand::Cancel));
+                return self.stop_turn();
             }
         } else {
             self.push(LineKind::Note, "resumed".to_owned());

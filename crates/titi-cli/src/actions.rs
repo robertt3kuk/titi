@@ -652,7 +652,7 @@ impl Chat {
         });
         let at_time = line.at;
         line.text = text;
-        if let Some(failure) = failure {
+        if let Some(failure) = failure.filter(|_| !self.stopping) {
             self.errors
                 .log
                 .record(crate::errors_panel::ErrorSource::Tool, failure, at_time);

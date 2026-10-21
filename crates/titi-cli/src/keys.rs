@@ -622,7 +622,7 @@ impl Chat {
         match key {
             Key::CtrlC if self.turn_active => {
                 self.disarm();
-                Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
+                self.stop_turn()
             }
             Key::CtrlC => {
                 let applied = self.arm_quit(now, CTRL_C_HINT);
@@ -966,6 +966,13 @@ impl Chat {
     fn cancel_ask(&mut self) -> Applied {
         self.pending_ask = None;
         self.disarm();
+        self.stop_turn()
+    }
+
+    /// Asks the engine to stop the running turn and remembers that the user
+    /// did, so the call it interrupts is not logged as a failure.
+    pub(crate) fn stop_turn(&mut self) -> Applied {
+        self.stopping = true;
         Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
     }
 
@@ -1166,7 +1173,7 @@ impl Chat {
             Key::CtrlC => {
                 self.approval = None;
                 self.disarm();
-                Applied::effect(ChatEffect::Send(EngineCommand::Cancel))
+                self.stop_turn()
             }
             _ => Applied::none(),
         }

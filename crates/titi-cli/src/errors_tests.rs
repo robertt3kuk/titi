@@ -123,6 +123,53 @@ fn a_note_is_not_an_error() {
     assert_eq!(masthead_snapshot(&chat).errors, 0);
 }
 
+/// Stopping a turn is the user's own act: the call it interrupts ends red
+/// on its row, but it is not an error the status line should count.
+#[test]
+fn a_call_the_user_stopped_is_not_counted_as_an_error() {
+    let (_dir, mut chat) = chat();
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(1),
+        model: "openai/gpt-4.1".into(),
+    });
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(1),
+        call_id: "c1".into(),
+        name: "bash".into(),
+        detail: Some("bash sleep 600".into()),
+    });
+    chat.on_key(Key::CtrlC, Instant::now());
+    chat.on_event(EngineEvent::ToolFinished {
+        turn_id: TurnId(1),
+        call_id: "c1".into(),
+        output: "command interrupted\n".into(),
+        is_error: true,
+        detail: None,
+    });
+    assert!(chat.errors.log.is_empty(), "{:?}", chat.errors.log.len());
+    assert_eq!(masthead_snapshot(&chat).errors, 0);
+
+    // The next turn's failures count again.
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(2),
+        model: "openai/gpt-4.1".into(),
+    });
+    chat.on_event(EngineEvent::ToolStarted {
+        turn_id: TurnId(2),
+        call_id: "c2".into(),
+        name: "read".into(),
+        detail: Some("read nope.txt".into()),
+    });
+    chat.on_event(EngineEvent::ToolFinished {
+        turn_id: TurnId(2),
+        call_id: "c2".into(),
+        output: "ENOENT: nope.txt".into(),
+        is_error: true,
+        detail: None,
+    });
+    assert_eq!(masthead_snapshot(&chat).errors, 1);
+}
+
 #[test]
 fn the_status_count_resets_when_the_panel_opens_and_counts_again() {
     let (_dir, mut chat) = chat();

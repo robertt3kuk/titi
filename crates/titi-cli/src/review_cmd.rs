@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use titi_engine::{EngineCommand, ReviewReport, Verdict};
 
 use crate::chat::{Applied, Chat, LogWrite};
-use crate::transcript::LineKind;
+use crate::transcript::{LineKind, TranscriptLine};
 use titi_core::session::Role;
 
 /// Verdicts `/review list` remembers.
@@ -207,7 +207,11 @@ impl Chat {
         } else {
             LineKind::Error
         };
-        self.push(kind, report.banner());
+        // Red, because a FAIL needs reading; not logged, because it is the
+        // reviewer's answer rather than something that went wrong.
+        let banner = TranscriptLine::new(kind, report.banner()).stamped(&self.model);
+        self.lines.push(banner);
+        self.scroll_offset = 0;
         if !report.reason.is_empty() {
             self.push(LineKind::Note, report.reason.to_string());
         }
@@ -367,6 +371,10 @@ mod tests {
         assert_eq!(shown[at + 4], "  c.rs:3 \u{2014} three");
         assert!(shown[at + 5].contains("/review apply"), "{shown:?}");
         assert_eq!(chat.lines[at].kind, LineKind::Error, "a FAIL is red");
+        assert!(
+            chat.errors.log.is_empty(),
+            "a verdict is the reviewer's answer, not a failure of titi's"
+        );
     }
 
     #[test]
