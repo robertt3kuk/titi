@@ -18,7 +18,12 @@ For each task × run it
 3. runs `titi --prompt "<task.md>" --approval yolo` there with
    `TITI_AGENT_DIR` pointed at the copy, and kills the whole process group at
    the timeout;
-4. runs the task's `check.sh` in the working copy. Exit 0 is *solved*. It is
+4. copies the task's `hidden/` (the grading tests) over the working copy,
+   overwriting same-named files, then runs `check.sh` there. A model that edits
+   or deletes a test cannot pass that way; the report row says whether it tried
+   (`tests_touched`, from `git status` against the start commit, taken before
+   `hidden/` goes back).
+   `check.sh` Exit 0 is *solved*. It is
    graded even after a timeout, because the work may already be done.
 
 The environment is inherited except `TITI_AGENT_DIR`, so `PATH` finds `cargo`
@@ -47,8 +52,9 @@ A task whose `meta.json` `requires` tool is not on `PATH` is listed as
 ## Adding a task
 
 `evals/tasks/<name>/` holds `task.md` (the prompt, word for word),
-`repo/` (a tiny self-contained project), `check.sh` (runs the project's own
-test, offline; it runs from outside the repo, so the agent cannot edit it) and
+`repo/` (a tiny self-contained project; it may hold a copy of the tests so the
+model can run them), `hidden/` (the tests that grade, same paths as in `repo/`),
+`check.sh` (runs only the hidden tests, offline; it runs from outside the repo, so the agent cannot edit it) and
 optional `meta.json` `{"timeout_s": 300, "tags": [...], "requires": [...]}`.
 The check must fail on the untouched `repo/`; verify that before committing.
 
@@ -70,6 +76,7 @@ From titi's stdout JSONL (`EngineEvent`, `crates/titi-engine/src/protocol.rs`):
 | tools | count of `ToolStarted` |
 | tool errors | `ToolFinished` with `is_error` |
 | tool-error rate | tool errors / tool calls over the group |
+| tests touched | the run added, changed or deleted a test file (or a `hidden/` path) |
 | timeouts | runs killed at the time limit |
 
 The JSON report also has `turns`, `failed` (the `Failed` event's message),

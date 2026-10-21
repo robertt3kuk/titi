@@ -12,7 +12,10 @@ fresh copy of an agent dir, then runs the task's `check.sh` in that dir. Exit
 
 Task layout (`evals/tasks/<name>/`): `task.md` (the prompt), `repo/` (the
 starting project), `check.sh` (offline; runs the project's own test),
-optional `meta.json` {"timeout_s": int, "tags": [..], "requires": [tool..]}.
+optional `hidden/` (the grading tests: copied over the working copy after the
+run, overwriting same-named files, so editing or deleting a test cannot pass a
+task; the report row says whether the run touched a test file as
+`tests_touched`), optional `meta.json` {"timeout_s": int, "tags": [..], "requires": [tool..]}.
 A task whose `requires` tool is not on PATH is reported as skipped, not as
 unsolved. Names starting with `_` (pipeline probes) run only with `--smoke`.
 
@@ -138,6 +141,53 @@ def parse_events(stdout):
     return stats
 
 
+def is_test_path(path):
+    parts = path.split("/")
+    if "__pycache__" in parts or path.endswith(".pyc"):
+        return False
+    name = parts[-1].lower()
+    return (
+        "tests" in parts[:-1] or "test" in parts[:-1]
+        or name.startswith("test") or "_test." in name or ".test." in name
+        or name.endswith("_test.go")
+    )
+
+
+def tests_touched(workdir, hidden_files):
+    """Whether the run added, changed or deleted a test file since `start`."""
+    done = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all", "-z"],
+        cwd=workdir, stdout=subprocess.PIPE, text=True, errors="replace", check=True,
+    )
+    paths = []
+    fields = done.stdout.split("\0")
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if entry[0] in "RC":  # a rename lists its source as the next field
+            paths.append(fields[index])
+            index += 1
+    return any(is_test_path(path) or path in hidden_files for path in paths)
+
+
+def hidden_paths(task):
+    hidden = os.path.join(task["dir"], "hidden")
+    return {
+        os.path.relpath(os.path.join(root, name), hidden)
+        for root, _, names in os.walk(hidden) for name in names
+    }
+
+
+def restore_hidden(task, workdir):
+    hidden = os.path.join(task["dir"], "hidden")
+    if os.path.isdir(hidden):
+        shutil.copytree(hidden, workdir, dirs_exist_ok=True)
+
+
 def run_check(task, workdir):
     try:
         done = subprocess.run(
@@ -165,10 +215,14 @@ def run_one(args, task, index, agent_src):
     started = time.monotonic()
     code, out, err, timed_out = run_titi(args.bin, task["prompt"], workdir, agent_dir, timeout_s)
     wall = time.monotonic() - started
+    # Judged before the grading files go back, so what the model did to them shows.
+    touched = tests_touched(workdir, hidden_paths(task))
+    restore_hidden(task, workdir)
     solved, check_tail = run_check(task, workdir)
     row = {
         "task": task["name"], "run": index, "solved": solved,
         "wall_s": round(wall, 2), "timed_out": timed_out, "exit_code": code,
+        "tests_touched": touched,
         **parse_events(out),
     }
     if not solved:
@@ -202,6 +256,7 @@ def summarize(rows):
         "runs": len(rows),
         "solved": sum(1 for r in rows if r["solved"]),
         "timeouts": sum(1 for r in rows if r["timed_out"]),
+        "tests_touched": sum(1 for r in rows if r["tests_touched"]),
         "pass_rate": (sum(1 for r in rows if r["solved"]) / len(rows)) if rows else None,
         "mean_wall_s": mean([r["wall_s"] for r in rows]),
         "mean_tokens": mean(tokens),
@@ -223,19 +278,19 @@ def print_report(tasks, rows, skipped):
         if not task_rows:
             continue
         print(f"### {task['name']}\n")
-        print("| run | solved | wall s | timeout | prompt | completion | cached | cost $ | tools | tool errors |")
-        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        print("| run | solved | wall s | timeout | tests touched | prompt | completion | cached | cost $ | tools | tool errors |")
+        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for r in task_rows:
             print(
                 f"| {r['run']} | {'yes' if r['solved'] else 'no'} | {r['wall_s']:.1f} "
-                f"| {'yes' if r['timed_out'] else 'no'} | {r['prompt_tokens']} "
+                f"| {'yes' if r['timed_out'] else 'no'} | {'yes' if r['tests_touched'] else 'no'} | {r['prompt_tokens']} "
                 f"| {r['completion_tokens']} | {r['cached_tokens']} "
                 f"| {fmt(r['cost_usd'], 4)} | {r['tool_calls']} | {r['tool_errors']} |"
             )
         print()
     print("## Totals\n")
-    print("| task | solved | pass rate | mean wall s | mean tokens | mean cost $ | tool-error rate | timeouts |")
-    print("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    print("| task | solved | pass rate | mean wall s | mean tokens | mean cost $ | tool-error rate | timeouts | tests touched |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     groups = [(task["name"], [r for r in rows if r["task"] == task["name"]]) for task in tasks]
     groups = [(name, group) for name, group in groups if group]
     for name, group in groups + [("**all**", rows)]:
@@ -246,10 +301,10 @@ def print_report(tasks, rows, skipped):
         print(
             f"| {name} | {s['solved']}/{s['runs']} | {s['pass_rate'] * 100:.0f}% "
             f"| {s['mean_wall_s']:.1f} | {fmt(s['mean_tokens'])} | {fmt(s['mean_cost_usd'], 4)} "
-            f"| {rate}{'' if rate == '-' else '%'} | {s['timeouts']} |"
+            f"| {rate}{'' if rate == '-' else '%'} | {s['timeouts']} | {s['tests_touched']} |"
         )
     for name, why in skipped:
-        print(f"| {name} | skipped: {why} | - | - | - | - | - | - |")
+        print(f"| {name} | skipped: {why} | - | - | - | - | - | - | - |")
     print()
 
 
