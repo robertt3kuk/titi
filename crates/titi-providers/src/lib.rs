@@ -23,8 +23,9 @@ pub mod wire;
 
 pub use anthropic::AnthropicStreamState;
 pub use compat::{
-    CompatPolicy, EFFORT_LADDER, Effort, MaxTokensField, ModelCompat, RequestOpts,
-    StreamDecodePolicy, StrictMode, ThinkingFormat, clamp_effort, resolve_compat,
+    CompatPolicy, EFFORT_LADDER, Effort, MaxTokensField, ModelCompat, Reasoning, ReasoningValue,
+    RequestOpts, StreamDecodePolicy, StrictMode, ThinkingFormat, clamp_effort, resolve_compat,
+    resolve_reasoning,
 };
 pub use creds::{CredKind, Credential, LadderCtx, LadderLevel, parse_env_file, resolve_credential};
 pub use discovery::{DiscoveryError, MAX_DISCOVERY_BODY, list_models};

@@ -92,6 +92,10 @@ pub struct WireRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub system: Option<SmolStr>,
+    /// The reasoning effort to ask for, already resolved against the model
+    /// (`resolve_reasoning`). `None` sends nothing and leaves the provider on
+    /// its own default.
+    pub reasoning: Option<crate::compat::Reasoning>,
     pub extra: serde_json::Value,
 }
 
@@ -104,6 +108,7 @@ impl WireRequest {
             max_tokens: None,
             temperature: None,
             system: None,
+            reasoning: None,
             extra: serde_json::Value::Null,
         }
     }

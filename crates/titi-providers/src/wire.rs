@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::compat::StreamDecodePolicy;
+use crate::compat::{ReasoningValue, StreamDecodePolicy, ThinkingFormat};
 use crate::creds::{CredKind, Credential};
 use crate::http::{BodyChunk, HttpFetch, HttpRequest, ReqwestFetch};
 use crate::sse::{SseDecoder, SseFrame};
@@ -782,6 +782,15 @@ fn account_id_from_jwt(access: &str) -> Option<SmolStr> {
         .map(SmolStr::new)
 }
 
+/// The wire token of the request's reasoning effort when it speaks `format`.
+fn reasoning_token(req: &WireRequest, format: ThinkingFormat) -> Option<&str> {
+    let reasoning = req.reasoning.as_ref().filter(|r| r.format == format)?;
+    match &reasoning.value {
+        ReasoningValue::Token(token) => Some(token.as_str()),
+        ReasoningValue::Budget(_) => None,
+    }
+}
+
 /// Serialize a normalized request into a family-specific HTTP request.
 ///
 /// The auth scheme follows the credential's kind, not the family alone: the
@@ -817,7 +826,7 @@ pub fn build_http_request(
                 ("accept".into(), "text/event-stream".into()),
             ];
             auth_headers(&mut headers, "bearer");
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": req.model.as_str(),
                 "messages": openai_messages_wire(req),
                 "stream": true,
@@ -827,6 +836,11 @@ pub fn build_http_request(
                 "max_tokens": req.max_tokens,
                 "temperature": req.temperature,
             });
+            // Chat Completions' `reasoning_effort`:
+            // https://developers.openai.com/api/docs/guides/reasoning
+            if let Some(token) = reasoning_token(req, ThinkingFormat::OpenAi) {
+                body["reasoning_effort"] = Value::String(token.to_owned());
+            }
             HttpRequest {
                 method: "POST".into(),
                 url: format!("{}/chat/completions", base_url.trim_end_matches('/')).into(),
@@ -856,6 +870,11 @@ pub fn build_http_request(
             });
             if let Some(sys) = &req.system {
                 body["instructions"] = Value::String(sys.to_string());
+            }
+            // Responses' `reasoning.effort`:
+            // https://developers.openai.com/api/docs/guides/reasoning
+            if let Some(token) = reasoning_token(req, ThinkingFormat::OpenAiResponses) {
+                body["reasoning"] = serde_json::json!({"effort": token});
             }
             if let Some(cred) = codex_cred {
                 headers.push((
@@ -931,6 +950,23 @@ pub fn build_http_request(
                     "cache_control": ephemeral(),
                 }]);
             }
+            // Effort is `output_config.effort`, not a field of `thinking`;
+            // where the model supports adaptive thinking the request names it
+            // too, because Opus 4.6 to 4.8 and Sonnet 4.6 do not think until
+            // asked and the models that always do accept it as a no-op:
+            // https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost
+            if let Some(reasoning) = &req.reasoning
+                && let ReasoningValue::Token(token) = &reasoning.value
+                && matches!(
+                    reasoning.format,
+                    ThinkingFormat::AnthropicAdaptive | ThinkingFormat::AnthropicEffort
+                )
+            {
+                body["output_config"] = serde_json::json!({"effort": token.as_str()});
+                if reasoning.format == ThinkingFormat::AnthropicAdaptive {
+                    body["thinking"] = serde_json::json!({"type": "adaptive"});
+                }
+            }
             HttpRequest {
                 method: "POST".into(),
                 url: format!(
@@ -964,6 +1000,23 @@ pub fn build_http_request(
             }
             if let Some(max) = req.max_tokens {
                 body["generationConfig"] = serde_json::json!({"maxOutputTokens": max});
+            }
+            // `generationConfig.thinkingConfig`: a level for Gemini 3, a
+            // thought-token budget for 2.5 —
+            // https://ai.google.dev/api/generate-content#ThinkingConfig
+            if let Some(reasoning) = &req.reasoning {
+                let thinking = match (&reasoning.format, &reasoning.value) {
+                    (ThinkingFormat::GoogleLevel, ReasoningValue::Token(level)) => {
+                        Some(serde_json::json!({"thinkingLevel": level.as_str()}))
+                    }
+                    (ThinkingFormat::GoogleBudget, ReasoningValue::Budget(tokens)) => {
+                        Some(serde_json::json!({"thinkingBudget": tokens}))
+                    }
+                    _ => None,
+                };
+                if let Some(thinking) = thinking {
+                    body["generationConfig"]["thinkingConfig"] = thinking;
+                }
             }
             HttpRequest {
                 method: "POST".into(),
@@ -1481,6 +1534,7 @@ pub type OpenAiCompatTransport = FamilyTransport;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::{Effort, ModelCompat, RequestOpts};
     use crate::creds::LadderLevel;
     use crate::mock::{MockFetch, MockFetchResponse};
     use crate::transport::ChatMessage;
@@ -3029,5 +3083,193 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "cancel took {elapsed:?}"
         );
+    }
+
+    // ---- reasoning effort on the wire -----------------------------------
+
+    fn with_effort(api: ApiKind, model: &ModelCompat, effort: Option<Effort>) -> Value {
+        let mut r = req();
+        r.reasoning = crate::compat::resolve_reasoning(api, Some(model), &RequestOpts { effort });
+        body_of(api, &r)
+    }
+
+    /// The thinking fields a body carries, by name.
+    fn thinking_fields(body: &Value) -> Vec<&'static str> {
+        let mut found: Vec<&'static str> =
+            ["reasoning_effort", "reasoning", "thinking", "output_config"]
+                .into_iter()
+                .filter(|key| body.get(*key).is_some())
+                .collect();
+        if body["generationConfig"].get("thinkingConfig").is_some() {
+            found.push("thinkingConfig");
+        }
+        found
+    }
+
+    #[test]
+    fn no_family_sends_a_thinking_field_without_an_effort() {
+        let model = ModelCompat::default();
+        for api in [
+            ApiKind::OpenAiCompletions,
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+            ApiKind::GeminiGenerateContent,
+        ] {
+            let body = with_effort(api, &model, None);
+            assert_eq!(thinking_fields(&body), Vec::<&str>::new(), "{api}: {body}");
+        }
+    }
+
+    #[test]
+    fn chat_completions_carries_reasoning_effort() {
+        let body = with_effort(
+            ApiKind::OpenAiCompletions,
+            &ModelCompat::default(),
+            Some(Effort::High),
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    #[test]
+    fn responses_carries_reasoning_effort_object() {
+        let body = with_effort(
+            ApiKind::OpenAiResponses,
+            &ModelCompat::default(),
+            Some(Effort::Medium),
+        );
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "medium"}));
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn codex_backend_carries_reasoning_effort_too() {
+        let mut r = req();
+        r.reasoning = crate::compat::resolve_reasoning(
+            ApiKind::OpenAiResponses,
+            Some(&ModelCompat::default()),
+            &RequestOpts {
+                effort: Some(Effort::Low),
+            },
+        );
+        let hr = build_http_request(
+            ApiKind::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex",
+            &r,
+            Some(&bearer("tok")),
+        );
+        let body: Value = serde_json::from_slice(hr.body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn anthropic_adaptive_model_gets_thinking_and_output_config() {
+        let body = with_effort(
+            ApiKind::AnthropicMessages,
+            &ModelCompat::default(),
+            Some(Effort::Xhigh),
+        );
+        assert_eq!(
+            body["output_config"],
+            serde_json::json!({"effort": "xhigh"})
+        );
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn anthropic_effort_only_model_gets_no_thinking_object() {
+        let model = ModelCompat {
+            thinking_format: Some(ThinkingFormat::AnthropicEffort),
+            efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+            ..ModelCompat::default()
+        };
+        let body = with_effort(ApiKind::AnthropicMessages, &model, Some(Effort::Max));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    #[test]
+    fn gemini_level_model_gets_a_thinking_level_beside_the_output_cap() {
+        let model = ModelCompat {
+            efforts: vec![Effort::Low, Effort::High],
+            ..ModelCompat::default()
+        };
+        let mut r = req();
+        r.reasoning = crate::compat::resolve_reasoning(
+            ApiKind::GeminiGenerateContent,
+            Some(&model),
+            &RequestOpts {
+                effort: Some(Effort::Medium),
+            },
+        );
+        let body = body_of(ApiKind::GeminiGenerateContent, &r);
+        assert_eq!(
+            body["generationConfig"],
+            serde_json::json!({"maxOutputTokens": 128, "thinkingConfig": {"thinkingLevel": "low"}})
+        );
+    }
+
+    #[test]
+    fn gemini_budget_model_gets_a_thought_token_budget_without_an_output_cap() {
+        let model = ModelCompat {
+            efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+            thinking_format: Some(ThinkingFormat::GoogleBudget),
+            ..ModelCompat::default()
+        };
+        let mut r = WireRequest::new("m");
+        r.reasoning = crate::compat::resolve_reasoning(
+            ApiKind::GeminiGenerateContent,
+            Some(&model),
+            &RequestOpts {
+                effort: Some(Effort::High),
+            },
+        );
+        let body = body_of(ApiKind::GeminiGenerateContent, &r);
+        assert_eq!(
+            body["generationConfig"],
+            serde_json::json!({"thinkingConfig": {"thinkingBudget": 24576}})
+        );
+    }
+
+    #[test]
+    fn a_model_that_declares_no_effort_is_sent_none_whatever_was_asked() {
+        for api in [
+            ApiKind::OpenAiCompletions,
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+            ApiKind::GeminiGenerateContent,
+        ] {
+            let mut r = req();
+            r.reasoning = crate::compat::resolve_reasoning(
+                api,
+                None,
+                &RequestOpts {
+                    effort: Some(Effort::High),
+                },
+            );
+            let body = body_of(api, &r);
+            assert_eq!(thinking_fields(&body), Vec::<&str>::new(), "{api}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_reasoning_request_of_another_dialect_is_ignored_by_the_builder() {
+        // Hand-built, past `resolve_reasoning`: the builder still writes only
+        // the field of its own family.
+        let mut r = req();
+        r.reasoning = Some(crate::compat::Reasoning {
+            format: ThinkingFormat::GoogleLevel,
+            effort: Effort::High,
+            value: ReasoningValue::Token("high".into()),
+        });
+        for api in [
+            ApiKind::OpenAiCompletions,
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+        ] {
+            let body = body_of(api, &r);
+            assert_eq!(thinking_fields(&body), Vec::<&str>::new(), "{api}: {body}");
+        }
     }
 }
