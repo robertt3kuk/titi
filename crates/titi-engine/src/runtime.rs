@@ -2648,6 +2648,22 @@ async fn run_turn(
         // What the last model to give up said, for the failure that ends the
         // turn when every model has: "unavailable" alone does not say why.
         let mut last_failure: Option<String> = None;
+        // `SessionStart` output joins the system prompt, computed once, so the
+        // prompt stays byte-stable from turn to turn. A duck is repo-blind.
+        let session_context = if config.mode == crate::protocol::SessionMode::Duck {
+            None
+        } else {
+            hooks.session_context(&events).await
+        };
+        let system: Option<SmolStr> = match (system.as_ref(), session_context) {
+            (Some(base), Some(context)) => Some(
+                format!("{base}\n\n<session-start-hook>\n{context}\n</session-start-hook>").into(),
+            ),
+            (None, Some(context)) => {
+                Some(format!("<session-start-hook>\n{context}\n</session-start-hook>").into())
+            }
+            (base, None) => base.cloned(),
+        };
         // The prompt hooks run once, before any model is asked. A blocked
         // prompt never becomes a turn: the user gets the reason and their
         // text back, and the history is untouched.
@@ -2673,22 +2689,6 @@ async fn run_turn(
             )
             .into(),
             None => contextual_prompt.clone(),
-        };
-        // `SessionStart` output joins the system prompt, computed once, so the
-        // prompt stays byte-stable from turn to turn. A duck is repo-blind.
-        let session_context = if config.mode == crate::protocol::SessionMode::Duck {
-            None
-        } else {
-            hooks.session_context(&events).await
-        };
-        let system: Option<SmolStr> = match (system.as_ref(), session_context) {
-            (Some(base), Some(context)) => Some(
-                format!("{base}\n\n<session-start-hook>\n{context}\n</session-start-hook>").into(),
-            ),
-            (None, Some(context)) => {
-                Some(format!("<session-start-hook>\n{context}\n</session-start-hook>").into())
-            }
-            (base, None) => base.cloned(),
         };
         for model in models {
             if aborted.load(Ordering::SeqCst) {

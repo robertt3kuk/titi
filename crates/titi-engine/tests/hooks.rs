@@ -481,3 +481,34 @@ async fn a_hook_that_crashes_does_not_stop_the_turn() {
             .any(|(_, outcome, _)| *outcome == HookOutcome::Warning)
     );
 }
+
+#[tokio::test]
+async fn the_session_starts_before_the_first_prompt_is_judged() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("order.log");
+    let log = log.display();
+    let transport = Arc::new(MockTransport::new(vec![say("ok")]));
+    let mut engine = start(
+        &transport,
+        ApprovalMode::Write,
+        vec![
+            hook(
+                HookEvent::UserPromptSubmit,
+                None,
+                &format!("cat >/dev/null; echo prompt >> {log}"),
+            ),
+            hook(
+                HookEvent::SessionStart,
+                None,
+                &format!("cat >/dev/null; echo start >> {log}"),
+            ),
+        ],
+    )
+    .await;
+    submit(&engine, "hi").await;
+    until(&mut engine, turn_end).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("order.log")).unwrap(),
+        "start\nprompt\n"
+    );
+}
