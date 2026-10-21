@@ -1,0 +1,1 @@
+`cargo test` fails in this project. `sum_to(n)` should return the sum of the integers from 1 to n inclusive, but it is off by one. Fix the bug in the library code (do not change the tests) so that `cargo test --offline` passes.

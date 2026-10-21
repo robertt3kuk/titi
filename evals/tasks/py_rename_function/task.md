@@ -1,0 +1,1 @@
+Rename the function `calc_total` to `compute_total` everywhere in this project (its definition and every caller, across all files). The tests already use the new name. Afterwards `python3 -m unittest` must pass and `calc_total` must not appear in any `.py` file.

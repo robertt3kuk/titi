@@ -1,0 +1,1 @@
+`python3 -m unittest` fails because `slugify` is missing from `textutil.py`. Implement `slugify(text)`: lowercase the text, replace every run of non-alphanumeric characters with a single `-`, and strip leading and trailing `-`. Do not change the tests.

@@ -1,0 +1,1 @@
+`wc.py` is a tiny word-count CLI. Add a `--verbose` flag: with it, print an extra first line `reading <path>` to stdout before the count; without it, the output is unchanged (just the count). Make the existing `test_wc.py` pass by implementing the flag in `wc.py` (do not weaken the tests).
