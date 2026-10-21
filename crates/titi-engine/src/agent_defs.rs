@@ -357,7 +357,7 @@ fn discover(root: &Root) -> (Vec<AgentDef>, Vec<Invalid>) {
     for file in files {
         match load(root, &file) {
             Ok(agent) => found.push(agent),
-            Err(refused) => invalid.push(refused),
+            Err(refused) => invalid.push(*refused),
         }
     }
     (found, invalid)
@@ -382,19 +382,21 @@ fn walk(dir: &Path, depth: usize, nested: bool, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn load(root: &Root, file: &Path) -> Result<AgentDef, Invalid> {
+fn load(root: &Root, file: &Path) -> Result<AgentDef, Box<Invalid>> {
     let relative = file
         .strip_prefix(&root.origin.dir)
         .map_or_else(|_| String::new(), |rest| rest.display().to_string());
     let stem = file
         .file_stem()
         .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-    let refuse = |reason: &str| Invalid {
-        name: stem.clone(),
-        origin: root.origin.clone(),
-        reason: reason.to_owned(),
-        path: file.to_path_buf(),
-        bound: root.bound.clone(),
+    let refuse = |reason: &str| {
+        Box::new(Invalid {
+            name: stem.clone(),
+            origin: root.origin.clone(),
+            reason: reason.to_owned(),
+            path: file.to_path_buf(),
+            bound: root.bound.clone(),
+        })
     };
     if !stays_inside(file, &root.bound) {
         return Err(refuse("the file resolves outside its directory"));
