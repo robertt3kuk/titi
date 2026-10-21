@@ -36,6 +36,7 @@ mod scan;
 mod scope;
 mod shared;
 mod symbols;
+pub mod syntax_check;
 
 pub use lang::{Capability, Language, Level};
 pub use live::GenomeHandle;
