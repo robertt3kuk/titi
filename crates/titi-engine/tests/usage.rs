@@ -283,18 +283,25 @@ async fn reported_rounds_on_both_sides_of_a_fallback_are_summed() {
     assert_eq!(spent(&events), 2215);
 }
 
-/// Rounds a turn paid for stay paid for when it ends without finishing: a
-/// turn stopped by the tool-round cap reports what its rounds cost before
-/// the failure that ends it.
+/// Rounds a turn paid for stay paid for when the tool-round cap ends it: the
+/// wrap-up request is a round like any other, and both are reported.
 #[tokio::test]
-async fn a_turn_that_fails_still_reports_the_rounds_it_paid_for() {
+async fn a_turn_stopped_by_the_cap_still_reports_the_rounds_it_paid_for() {
     let round = |prompt, completion| {
         let mut events = echo_call();
         events.push(reported(prompt, completion));
         events.push(done(StopReason::ToolUse));
         MockBody::Events(events)
     };
-    let transport = Arc::new(MockTransport::new(vec![round(100, 10), round(200, 20)]));
+    let wrap_up = MockBody::Events(vec![
+        StreamEvent::TextDelta {
+            id: BlockId::new("text"),
+            text: "summary".into(),
+        },
+        reported(200, 20),
+        done(StopReason::Stop),
+    ]);
+    let transport = Arc::new(MockTransport::new(vec![round(100, 10), wrap_up]));
     let mut config = EngineConfig::new("primary");
     config.max_tool_rounds = 1;
     let mut engine = EngineRuntime::start_with_tools(
@@ -304,7 +311,12 @@ async fn a_turn_that_fails_still_reports_the_rounds_it_paid_for() {
     );
     let events = run_turn(&mut engine).await;
     assert!(
-        matches!(events.last(), Some(EngineEvent::Failed { message, .. }) if message.contains("cap")),
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TurnFinished { .. }))
+            && !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Failed { .. })),
         "{events:?}"
     );
     assert_eq!(turn_usage(&events), [(300, 30)], "{events:?}");

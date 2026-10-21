@@ -667,6 +667,9 @@ pub struct EngineConfig {
     pub retry_backoff: std::time::Duration,
     pub command_capacity: usize,
     pub event_capacity: usize,
+    /// Tool rounds the turn may spend. At the limit the model is not cut off:
+    /// it gets one last request with tool calls forbidden and is asked to
+    /// summarise what is done and what is left.
     pub max_tool_rounds: u32,
     pub approval_mode: ApprovalMode,
     /// Workspace root kept indexed turn-by-turn. `None` disables the Genome.
@@ -757,7 +760,7 @@ impl EngineConfig {
             retry_backoff: std::time::Duration::from_millis(500),
             command_capacity: 64,
             event_capacity: 256,
-            max_tool_rounds: 8,
+            max_tool_rounds: crate::tool_budget::DEFAULT_TOOL_ROUNDS,
             approval_mode: ApprovalMode::Write,
             genome_root: None,
             genome_limit: 24,
@@ -2816,6 +2819,7 @@ async fn run_turn(
             });
             let mut tool_rounds = 0;
             let mut stop_continued = false;
+            let mut watch = crate::tool_budget::LoopWatch::default();
             loop {
                 // `execute_tools` returns as soon as the abort lands, and the loop
                 // used to walk straight back into another stream. Nothing below
@@ -2857,6 +2861,19 @@ async fn run_turn(
                         .attr("titi.folded", serde_json::json!(folded.folded as u64))
                         .attr("titi.strategy", serde_json::json!(folded.strategy.as_str()))
                         .finish(spans::now_ms());
+                }
+                // The budget is spent: this request is the model's last word
+                // for the turn. It still declares its tools (see
+                // `WireRequest::forbid_tool_calls`) but may not call one, and
+                // the note says what to do with the round it has been given.
+                let wrap_up = tool_rounds >= config.max_tool_rounds;
+                if wrap_up {
+                    messages.push(crate::tool_budget::wrap_up_message());
+                    let _ = events
+                        .send(EngineEvent::Notice {
+                            message: crate::tool_budget::wrap_up_notice(tool_rounds),
+                        })
+                        .await;
                 }
                 let _ = events
                     .send(EngineEvent::ContextUsage {
@@ -2925,6 +2942,7 @@ async fn run_turn(
                         events.clone(),
                         Arc::clone(&aborted),
                         &tools,
+                        wrap_up,
                         &mut meter,
                         hold_finish,
                     )
@@ -2946,20 +2964,9 @@ async fn run_turn(
                         }
                         Ok((text, calls, thinking, report)) => {
                             round_report = Some(report);
-                            if tool_rounds >= config.max_tool_rounds {
-                                meter.settle(&events, turn_id).await;
-                                turn_error = Some("tool round cap reached".to_owned());
-                                let _ = events
-                                    .send(EngineEvent::Failed {
-                                        turn_id: Some(turn_id),
-                                        reason: ErrorReason::Rejected,
-                                        message: "tool round cap reached".into(),
-                                    })
-                                    .await;
-                                return None;
-                            }
+                            let issued = crate::tool_budget::IssuedCall::of(&calls);
                             tool_rounds += 1;
-                            let extra = execute_tools(
+                            let mut extra = execute_tools(
                                 turn_id,
                                 calls,
                                 text,
@@ -2989,6 +2996,7 @@ async fn run_turn(
                                 &hooks,
                             )
                             .await;
+                            watch.observe(&issued, &mut extra);
                             messages.extend(extra);
                             last_error = None;
                             break;
@@ -3057,6 +3065,9 @@ async fn run_turn(
                     }
                 }
                 round_span = round_span.attr("titi.attempts", serde_json::json!(attempts));
+                if wrap_up {
+                    round_span = round_span.attr("titi.wrap_up", serde_json::json!(true));
+                }
                 // A round that paused and then succeeded is a success: the
                 // failure that asked for the retry belongs to the attempts
                 // inside the span, not to the span's own outcome.
@@ -3115,6 +3126,9 @@ async fn run_turn(
                     // tool call without its result is a request no provider accepts.
                     if aborted.load(Ordering::SeqCst) {
                         return None;
+                    }
+                    if wrap_up {
+                        crate::tool_budget::strip_wrap_up(&mut messages);
                     }
                     return Some(visible_history(messages, system.as_ref()));
                 }
@@ -3400,6 +3414,9 @@ async fn stream_attempt(
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
+    // The turn's tool budget is spent: the request keeps the declared tools
+    // and forbids calling one.
+    forbid_tools: bool,
     // The turn's meter, which adds this request to the session's as well.
     meter: &mut TurnMeter<'_>,
     // A `Stop` hook has yet to say whether the turn may end, so the surface
@@ -3432,6 +3449,7 @@ async fn stream_attempt(
     request.messages = messages.to_vec();
     request.tools = tools.specs();
     request.reasoning = reasoning;
+    request.forbid_tool_calls = forbid_tools;
     let context = RequestCtx {
         credential,
         aborted: Arc::clone(&aborted),
@@ -3479,7 +3497,14 @@ async fn stream_attempt(
             }
             StreamEvent::Usage(usage) => reported = Some(usage),
             StreamEvent::Done { reason } => {
-                let calls = collector.take();
+                let mut calls = collector.take();
+                // A model that calls a tool on a request that forbade it is
+                // answered by its text alone: there is no round left to run
+                // the call in, and a call with no result is a history no
+                // provider accepts.
+                if forbid_tools {
+                    calls.clear();
+                }
                 // Every round is paid for, tool rounds included, so the
                 // meter is bumped here rather than once per turn. The
                 // provider's own count wins; a provider that reports none

@@ -30,6 +30,7 @@ pub mod sources;
 pub mod spans;
 pub mod steering;
 pub mod tool_agent;
+pub mod tool_budget;
 pub mod tool_loop;
 
 pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
@@ -71,6 +72,7 @@ pub use runtime::{Engine, EngineConfig, EngineError, EngineRuntime, TransportRes
 pub use spans::{SpanRecorder, SpanSink};
 pub use steering::{STEERING_CAPACITY, Steering};
 pub use tool_agent::{DEFAULT_AGENT_ROUNDS, ToolAgentRunner};
+pub use tool_budget::DEFAULT_TOOL_ROUNDS;
 pub use tool_loop::{
     MAX_TOOL_OUTPUT, TOUCHED_CAPACITY, TOUCHING_TOOLS, TouchedSet, TouchedSink, TrajectorySink,
 };

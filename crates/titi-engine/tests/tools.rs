@@ -639,26 +639,6 @@ async fn the_next_turn_starts_from_the_digest_not_the_folded_prefix() {
 }
 
 #[tokio::test]
-async fn tool_round_cap_stops_the_turn() {
-    let transport = Arc::new(MockTransport::new(vec![
-        MockBody::Events(tool_call_events("echo", r#"{"text":"one"}"#)),
-        MockBody::Events(tool_call_events("echo", r#"{"text":"two"}"#)),
-    ]));
-    let mut config = EngineConfig::new("primary");
-    config.max_tool_rounds = 1;
-    let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), echo_registry());
-    engine
-        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
-        .await
-        .unwrap();
-    let events = collect_until_terminal(&mut engine).await;
-    assert!(matches!(
-        events.last(),
-        Some(EngineEvent::Failed { message, .. }) if message == "tool round cap reached"
-    ));
-}
-
-#[tokio::test]
 async fn session_trajectory_records_user_tools_and_turn_end() {
     use titi_core::trajectory::{EventKind, TrajectoryRecorder};
     use titi_engine::TrajectorySink;

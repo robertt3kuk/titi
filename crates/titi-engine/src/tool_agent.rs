@@ -31,13 +31,14 @@ use crate::hooks::Hooks;
 use crate::protocol::TurnId;
 use crate::runtime::TransportResolver;
 use crate::spans::{self, OpenSpan, SpanSink};
+use crate::tool_budget::{IssuedCall, LoopWatch};
 use crate::tool_loop::{
     ApprovalWaiters, ToolCallCollector, TouchedSink, TrajectorySink, execute_tools, mask,
 };
 use titi_core::trace::SpanKind;
 
 /// Rounds a subagent may spend calling tools before it is stopped.
-pub const DEFAULT_AGENT_ROUNDS: u32 = 6;
+pub const DEFAULT_AGENT_ROUNDS: u32 = 40;
 
 /// Runs a subagent as a tool-calling turn.
 pub struct ToolAgentRunner {
@@ -217,6 +218,7 @@ impl ToolAgentRunner {
         let trajectory = TrajectorySink::default();
 
         let mut rounds = 0;
+        let mut watch = LoopWatch::default();
         loop {
             if context.is_aborted() {
                 aborted.store(true, Ordering::SeqCst);
@@ -335,6 +337,7 @@ impl ToolAgentRunner {
                 );
             }
             rounds += 1;
+            let issued = IssuedCall::of(&calls);
 
             let names: Vec<String> = calls.iter().map(|call| call.name.to_string()).collect();
             // Activity, not progress: this is the engine saying what the agent
@@ -345,7 +348,7 @@ impl ToolAgentRunner {
                 .activity(format!("tools: {}", names.join(", ")))
                 .await;
 
-            let results = execute_tools(
+            let mut results = execute_tools(
                 TurnId(0),
                 calls,
                 text.into(),
@@ -371,6 +374,7 @@ impl ToolAgentRunner {
                 &self.hooks,
             )
             .await;
+            watch.observe(&issued, &mut results);
             messages.extend(results);
         }
 
