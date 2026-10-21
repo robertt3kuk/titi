@@ -659,6 +659,7 @@ fn every_engine_event_round_trips_through_its_fixture() {
                         description: "Read a file".into(),
                     }],
                     command: "npx -y srv".into(),
+                    host: String::new(),
                     source: "mcp.json".into(),
                 },
                 ServerStatus {
@@ -666,12 +667,13 @@ fn every_engine_event_round_trips_through_its_fixture() {
                     state: ServerState::Failed,
                     reason: "the server exited (exit status: 1)".into(),
                     tools: vec![],
-                    command: "srv".into(),
+                    command: "http https://mcp.example.invalid/mcp?…".into(),
+                    host: "mcp.example.invalid".into(),
                     source: ".mcp.json".into(),
                 },
             ],
         },
-        r#"{"McpStatus":{"servers":[{"name":"files","state":"ready","reason":"","tools":[{"name":"mcp__files__read","description":"Read a file"}],"command":"npx -y srv","source":"mcp.json"},{"name":"web","state":"failed","reason":"the server exited (exit status: 1)","tools":[],"command":"srv","source":".mcp.json"}]}}"#,
+        r#"{"McpStatus":{"servers":[{"name":"files","state":"ready","reason":"","tools":[{"name":"mcp__files__read","description":"Read a file"}],"command":"npx -y srv","source":"mcp.json"},{"name":"web","state":"failed","reason":"the server exited (exit status: 1)","tools":[],"command":"http https://mcp.example.invalid/mcp?…","host":"mcp.example.invalid","source":".mcp.json"}]}}"#,
     );
     // An older engine's status has only names and states.
     let old: EngineEvent =
@@ -686,6 +688,7 @@ fn every_engine_event_round_trips_through_its_fixture() {
                 reason: String::new(),
                 tools: vec![],
                 command: String::new(),
+                host: String::new(),
                 source: String::new(),
             }]
         }

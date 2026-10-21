@@ -1,4 +1,4 @@
-//! The session's servers: start them in the background, keep them up, say
+//! The session's servers (programs or HTTP endpoints): start them in the background, keep them up, say
 //! what state each is in, and hand the engine the tools of the ones that are
 //! ready.
 //!
@@ -30,6 +30,7 @@ use titi_tools::{ApprovalTier, ToolHandler};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::client::{Client, ClientEvent, Launch, McpError, ToolInfo};
+use crate::http::HttpLaunch;
 use crate::tool::{McpTool, tool_name};
 
 /// Servers that die are started again this many times.
@@ -82,9 +83,13 @@ pub struct ServerStatus {
     pub reason: String,
     #[serde(default)]
     pub tools: Vec<ToolSummary>,
-    /// The command line, for a person.
+    /// The command line, for a person; for an HTTP server its URL without the
+    /// query.
     #[serde(default)]
     pub command: String,
+    /// `host[:port]` of an HTTP server; empty for a program.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
     /// The file the definition came from.
     #[serde(default)]
     pub source: String,
@@ -98,6 +103,34 @@ pub struct ManagerConfig {
     /// The variables a server inherits, already filtered: nothing else of
     /// titi's own environment reaches it.
     pub inherit: Vec<(OsString, OsString)>,
+    /// Where `${VAR}` in a user's HTTP server definition is read from.
+    pub vars: EnvLookup,
+}
+
+/// Reads an environment variable by name. Its own type so that a
+/// [`ManagerConfig`] can be printed without printing the environment.
+#[derive(Clone)]
+pub struct EnvLookup(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+
+impl EnvLookup {
+    pub fn new(lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    /// The process's own environment.
+    pub fn process() -> Self {
+        Self::new(|name| std::env::var(name).ok())
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        (self.0)(name)
+    }
+}
+
+impl std::fmt::Debug for EnvLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvLookup(..)")
+    }
 }
 
 impl ManagerConfig {
@@ -107,6 +140,7 @@ impl ManagerConfig {
             agent_dir: agent_dir.to_owned(),
             workspace: workspace.to_owned(),
             inherit: titi_tools::hook_environment(std::env::vars_os(), workspace),
+            vars: EnvLookup::process(),
         }
     }
 }
@@ -207,7 +241,12 @@ impl Slot {
                     description: tool.description.clone(),
                 })
                 .collect(),
-            command: self.def.command_line(),
+            command: self
+                .def
+                .display_url()
+                .map(|url| format!("http {url}"))
+                .unwrap_or_else(|| self.def.command_line()),
+            host: self.def.http_host().unwrap_or_default(),
             source: self.def.source.clone(),
         }
     }
@@ -388,6 +427,52 @@ impl Drop for McpManager {
     }
 }
 
+enum Connect {
+    Stdio(Launch),
+    Http(HttpLaunch),
+}
+
+/// How a definition is reached, or why it may not be. An HTTP server of the
+/// user's own file has `${VAR}` expanded from the environment; a repository's
+/// is sent exactly as the approved text says, and held to the URL rule again
+/// here so no path to a connection skips it.
+fn connect_kind(def: &McpServerDef, config: &ManagerConfig) -> Result<Connect, String> {
+    let Some(url) = &def.url else {
+        return Ok(Connect::Stdio(launch_for(def, config)));
+    };
+    let timeout = Duration::from_secs(def.timeout());
+    if def.project {
+        if let Some(problem) = def.project_url_problem() {
+            return Err(problem);
+        }
+        return Ok(Connect::Http(HttpLaunch {
+            url: url.clone(),
+            headers: def
+                .headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            timeout,
+        }));
+    }
+    let lookup = |name: &str| config.vars.get(name);
+    let expand = |what: &str, text: &str| {
+        titi_config::mcp::expand_env(text, &lookup).map_err(|why| format!("{what}: {why}"))
+    };
+    let url = expand("url", url)?;
+    // The expanded URL is the one that is connected to: it must still be one.
+    titi_config::mcp::parse_http_url(&url).map_err(|why| format!("url: {why}"))?;
+    let mut headers = Vec::with_capacity(def.headers.len());
+    for (name, value) in &def.headers {
+        headers.push((name.clone(), expand(&format!("header {name}"), value)?));
+    }
+    Ok(Connect::Http(HttpLaunch {
+        url,
+        headers,
+        timeout,
+    }))
+}
+
 fn launch_for(def: &McpServerDef, config: &ManagerConfig) -> Launch {
     let mut env = config.inherit.clone();
     for (key, value) in &def.env {
@@ -463,9 +548,23 @@ async fn supervise(slot: Arc<Slot>, config: ManagerConfig, events: UnboundedSend
             return;
         }
         let (client_events, mut from_client) = unbounded_channel();
-        let launch = launch_for(&slot.def, &config);
+        let connect = match connect_kind(&slot.def, &config) {
+            Ok(connect) => connect,
+            Err(reason) => {
+                slot.set(ServerState::Failed, &reason);
+                let _ = events.send(McpEvent::Notice(format!(
+                    "mcp: {} not started: {reason}",
+                    slot.name
+                )));
+                let _ = events.send(McpEvent::Changed);
+                return;
+            }
+        };
         let started = async {
-            let client = Arc::new(Client::connect(&launch, client_events).await?);
+            let client = Arc::new(match &connect {
+                Connect::Stdio(launch) => Client::connect(launch, client_events).await?,
+                Connect::Http(launch) => Client::connect_http(launch, client_events).await?,
+            });
             let tools = if client.has_tools {
                 client.list_tools().await?
             } else {

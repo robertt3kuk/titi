@@ -15,6 +15,9 @@
 //! same. The stateless 2026-07-28 revision, which has no handshake, is not
 //! implemented.
 //!
+//! A server of `"type": "http"` is reached by [`crate::http`] instead: the same
+//! JSON-RPC messages over the Streamable HTTP transport of the same revision.
+//!
 //! The server is a child process in its own process group. Its standard input
 //! belongs to a writer thread and its standard output to a reader thread, so
 //! no async task ever blocks on a pipe, and a server that stops reading cannot
@@ -74,6 +77,9 @@ pub enum McpError {
     Rpc { code: i64, message: String },
     #[error("bad answer from the server: {0}")]
     Protocol(String),
+    /// The server answered HTTP 401. Signing in (OAuth) is not supported yet.
+    #[error("needs auth (not supported yet)")]
+    NeedsAuth,
     #[error(
         "the server speaks protocol {server}, which this client does not (it supports {PROTOCOL_VERSION} and older)"
     )]
@@ -158,10 +164,58 @@ struct Inner {
     tools_pending: Arc<AtomicBool>,
 }
 
+/// How a request reaches the server.
+enum Conn {
+    Stdio(Arc<Inner>),
+    Http(Arc<crate::http::HttpConn>),
+}
+
+impl Conn {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        cancellable: bool,
+    ) -> Result<Value, McpError> {
+        match self {
+            Conn::Stdio(inner) => inner.request(method, params, cancellable).await,
+            Conn::Http(http) => http.request(method, params, cancellable).await,
+        }
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
+        match self {
+            Conn::Stdio(inner) => inner.notify(method, params),
+            Conn::Http(http) => http.notify(method, params).await,
+        }
+    }
+
+    fn clear_tools_pending(&self) {
+        match self {
+            Conn::Stdio(inner) => inner.tools_pending.store(false, Ordering::SeqCst),
+            Conn::Http(http) => http.clear_tools_pending(),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        match self {
+            Conn::Stdio(inner) => locked(&inner.state).closed.is_none(),
+            Conn::Http(http) => http.is_alive(),
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            Conn::Stdio(inner) => inner.stop(),
+            Conn::Http(http) => http.stop(),
+        }
+    }
+}
+
 /// A live connection. Dropping the last handle stops the server and the
-/// process group it leads.
+/// process group it leads (stdio), or ends the HTTP session.
 pub struct Client {
-    inner: Arc<Inner>,
+    conn: Conn,
     /// What the server said about itself, for a panel.
     pub server_name: String,
     /// The revision the server answered with.
@@ -186,10 +240,23 @@ impl Client {
         launch: &Launch,
         events: UnboundedSender<ClientEvent>,
     ) -> Result<Self, McpError> {
-        let inner = Arc::new(spawn(launch, events)?);
-        let init = Handshake::run(&inner).await?;
+        let conn = Conn::Stdio(Arc::new(spawn(launch, events)?));
+        Self::handshake(conn).await
+    }
+
+    /// Connects to a Streamable HTTP server and runs the handshake.
+    pub async fn connect_http(
+        launch: &crate::http::HttpLaunch,
+        events: UnboundedSender<ClientEvent>,
+    ) -> Result<Self, McpError> {
+        let conn = Conn::Http(Arc::new(crate::http::HttpConn::new(launch, events)?));
+        Self::handshake(conn).await
+    }
+
+    async fn handshake(conn: Conn) -> Result<Self, McpError> {
+        let init = Handshake::run(&conn).await?;
         Ok(Self {
-            inner,
+            conn,
             server_name: init.server_name,
             version: init.version,
             has_tools: init.has_tools,
@@ -200,7 +267,7 @@ impl Client {
     pub async fn list_tools(&self) -> Result<Vec<ToolInfo>, McpError> {
         // Cleared first: a change announced while the pages are read is a new
         // event, not one this list already covers.
-        self.inner.tools_pending.store(false, Ordering::SeqCst);
+        self.conn.clear_tools_pending();
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -208,7 +275,7 @@ impl Client {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
             };
-            let page = self.inner.request("tools/list", params, true).await?;
+            let page = self.conn.request("tools/list", params, true).await?;
             let listed = page
                 .get("tools")
                 .and_then(Value::as_array)
@@ -251,7 +318,7 @@ impl Client {
     /// request the server refused, or never answered, is `Err`.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallOutput, McpError> {
         let params = json!({ "name": name, "arguments": arguments });
-        let result = self.inner.request("tools/call", params, true).await?;
+        let result = self.conn.request("tools/call", params, true).await?;
         Ok(CallOutput {
             text: render_content(&result),
             is_error: result
@@ -263,22 +330,19 @@ impl Client {
 
     /// `ping`: whether the server still answers.
     pub async fn ping(&self) -> Result<(), McpError> {
-        self.inner
-            .request("ping", json!({}), true)
-            .await
-            .map(|_| ())
+        self.conn.request("ping", json!({}), true).await.map(|_| ())
     }
 
     /// Whether the server's output is still open.
     pub fn is_alive(&self) -> bool {
-        locked(&self.inner.state).closed.is_none()
+        self.conn.is_alive()
     }
 
     /// Stops the server now: closes its input, gives it a moment, then
     /// `SIGTERM` and `SIGKILL` to its whole process group. Blocks for at most
     /// a few hundred milliseconds; dropping the client does the same.
     pub fn shutdown(&self) {
-        self.inner.stop();
+        self.conn.stop();
     }
 }
 
@@ -289,14 +353,14 @@ struct Handshake {
 }
 
 impl Handshake {
-    async fn run(inner: &Inner) -> Result<Self, McpError> {
+    async fn run(conn: &Conn) -> Result<Self, McpError> {
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "titi", "version": env!("CARGO_PKG_VERSION") },
         });
         // `initialize` is the one request the protocol forbids cancelling.
-        let result = inner.request("initialize", params, false).await?;
+        let result = conn.request("initialize", params, false).await?;
         let version = result
             .get("protocolVersion")
             .and_then(Value::as_str)
@@ -306,7 +370,11 @@ impl Handshake {
                 server: plain(version),
             });
         }
-        inner.notify("notifications/initialized", json!({}))?;
+        if let Conn::Http(http) = conn {
+            // From here every request names the revision that was agreed.
+            http.negotiated(version);
+        }
+        conn.notify("notifications/initialized", json!({})).await?;
         Ok(Self {
             server_name: plain(
                 result

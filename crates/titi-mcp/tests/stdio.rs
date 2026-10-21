@@ -66,6 +66,7 @@ fn rig() -> Rig {
             agent_dir: agent.path().to_owned(),
             workspace: work.path().to_owned(),
             inherit,
+            vars: titi_mcp::EnvLookup::new(|_| None),
         },
         tx,
     );

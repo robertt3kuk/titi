@@ -388,6 +388,7 @@ mod tests {
                 })
                 .collect(),
             command: "npx -y srv".to_owned(),
+            host: String::new(),
             source: "mcp.json".to_owned(),
         }
     }

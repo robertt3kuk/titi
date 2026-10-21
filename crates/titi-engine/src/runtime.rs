@@ -2219,6 +2219,7 @@ impl EngineRuntime {
         let mut servers = self.mcp.status();
         for server in &mut servers {
             server.command = mask(&server.command, self.config.mask_ips);
+            server.host = mask(&server.host, self.config.mask_ips);
             server.reason = mask(&server.reason, self.config.mask_ips);
         }
         let _ = self.events.send(EngineEvent::McpStatus { servers }).await;
