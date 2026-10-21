@@ -556,11 +556,20 @@ async fn a_long_turn_folds_its_oldest_messages() {
     // The request that followed carries the digest, not the folded prefix.
     let requests = transport.requests();
     let second = requests.last().expect("a second request");
-    assert_eq!(second.messages[0].role, Role::System);
+    let digest = second
+        .messages
+        .iter()
+        .find(|message| message.content.contains("<conversation-summary"))
+        .expect("the request carries the digest");
+    assert_eq!(
+        digest.role,
+        Role::User,
+        "a user message reaches every provider; a system one mid-history may not"
+    );
     assert!(
-        second.messages[0].content.contains("folded"),
+        digest.content.contains("folded"),
         "the digest explains what was dropped: {}",
-        second.messages[0].content
+        digest.content
     );
     // And the turn still completed.
     assert!(events.iter().any(|event| matches!(
@@ -621,8 +630,10 @@ async fn the_next_turn_starts_from_the_digest_not_the_folded_prefix() {
         .map(|message| (message.role, message.content.to_string()))
         .collect();
     assert!(
-        shape.iter().any(|(role, content)| *role == Role::System
-            && content.contains("earlier message(s) folded")),
+        shape
+            .iter()
+            .any(|(role, content)| *role == Role::User
+                && content.contains("earlier message(s) folded")),
         "the digest leads the replayed history: {shape:#?}"
     );
     assert!(

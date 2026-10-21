@@ -346,9 +346,9 @@ fn responses_input_wire(req: &WireRequest) -> Vec<Value> {
 
 /// Anthropic and Gemini carry the system prompt in a top-level field, not in
 /// the message list. The engine hands it over as a leading `Role::System`
-/// message (`runtime.rs` builds it, compaction inserts its digest the same
-/// way), so without folding those here they are dropped on the floor and the
-/// model runs with no identity, no project rules and no repository map.
+/// message (`runtime.rs` builds it), so without folding those here they are
+/// dropped on the floor and the model runs with no identity, no project rules
+/// and no repository map.
 fn leading_system(req: &WireRequest) -> (Option<String>, usize) {
     let mut folded = req
         .messages
@@ -408,9 +408,10 @@ fn anthropic_messages_wire(req: &WireRequest, folded: usize) -> Vec<Value> {
         .enumerate()
         .skip(folded)
         .map(|(index, m)| {
-            // A system message further down is a compaction digest, and it
-            // belongs where it sits in the history. The role does not exist
-            // in this API, so it travels as user text rather than vanishing.
+            // A system message further down is one a session saved before the
+            // compaction digest became a user message, and it belongs where it
+            // sits in the history. The role does not exist in this API, so it
+            // travels as user text rather than vanishing.
             let role = m.role.anthropic_role().unwrap_or("user");
             let mut blocks: Vec<Value> = Vec::new();
             match m.role {

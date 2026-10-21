@@ -35,6 +35,38 @@ pub fn estimate_request(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(|m| estimate_tokens(&m.content)).sum()
 }
 
+/// The system prompt: the leading `System` messages. They are the request's
+/// identity, rebuilt per turn, and never part of what a fold takes away.
+fn leading_system(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count()
+}
+
+/// The digest as a message.
+///
+/// A `user` message right behind the system prompt, not a `system` one in the
+/// middle of the history: some providers drop a system message that is not
+/// first and Anthropic's wire has no such role at all, so only a user message
+/// reaches every family. Behind the system prompt is also the most stable
+/// place for it — everything above is rebuilt identically each turn and
+/// everything below only grows, so the provider's prompt cache keeps the
+/// whole prefix up to the digest until the next fold rewrites it.
+fn digest_message(summary: &str, folded: usize) -> ChatMessage {
+    ChatMessage {
+        role: Role::User,
+        content: format!(
+            "<conversation-summary folded=\"{folded}\">\n\
+             Earlier messages were folded to keep the context short; this is what they held.\n\
+             {summary}\n\
+             </conversation-summary>"
+        )
+        .into(),
+        ..Default::default()
+    }
+}
+
 /// Shrinks the request when it crosses the policy threshold, and returns
 /// what happened. Tool results older than the kept tail are masked first; if
 /// that brings the request under the threshold it stops there, otherwise the
@@ -50,12 +82,13 @@ pub fn compact(
         return None;
     }
 
-    let entries: Vec<Entry> = messages.iter().map(to_entry).collect();
+    let lead = leading_system(messages);
+    let entries: Vec<Entry> = messages[lead..].iter().map(to_entry).collect();
     let target = policy.compute_target(&entries, policy.keep_recent_tokens);
-    let mut first_kept = target.first_kept;
-    if first_kept == 0 {
+    if target.first_kept == 0 {
         return None;
     }
+    let mut first_kept = lead + target.first_kept;
     // A tool result without the assistant call that produced it is an invalid
     // request, so the kept tail may not begin with one.
     while first_kept < messages.len() && messages[first_kept].role == Role::Tool {
@@ -66,18 +99,19 @@ pub fn compact(
     }
 
     let masked = mask_tool_results(messages, first_kept);
+    let masked_only = Compacted {
+        folded: 0,
+        masked: masked.count,
+        tokens_before: used,
+        strategy: "mask".into(),
+    };
     if masked.count > 0
         && !policy.should_compact(used.saturating_sub(masked.saved_tokens), context_window)
     {
-        return Some(Compacted {
-            folded: 0,
-            masked: masked.count,
-            tokens_before: used,
-            strategy: "mask".into(),
-        });
+        return Some(masked_only);
     }
 
-    let prefix = &entries[..first_kept];
+    let prefix = &entries[..first_kept - lead];
     let mut summarizer = StructuredSummarizer;
     let mut chosen = None;
     for strategy in &policy.method_order {
@@ -86,20 +120,15 @@ pub fn compact(
             break;
         }
     }
-    let (strategy, summary) = chosen?;
+    let Some((strategy, summary)) = chosen else {
+        // No strategy could write a digest; what masking already did stands.
+        return (masked.count > 0).then_some(masked_only);
+    };
 
-    messages.drain(..first_kept);
-    messages.insert(
-        0,
-        ChatMessage {
-            role: Role::System,
-            content: summary.into(),
-            tool_calls: Vec::new(),
-            ..Default::default()
-        },
-    );
+    let folded = first_kept - lead;
+    messages.splice(lead..first_kept, [digest_message(&summary, folded)]);
     Some(Compacted {
-        folded: first_kept,
+        folded,
         masked: masked.count,
         tokens_before: used,
         strategy: strategy.as_str().into(),
@@ -181,7 +210,12 @@ mod tests {
         // The provider-backed strategy failed and the chain fell through.
         assert_eq!(folded.strategy, "snapcompact");
         assert!(folded.folded >= 1);
-        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].role, Role::User);
+        assert!(
+            messages[0].content.contains("<conversation-summary"),
+            "{}",
+            messages[0].content
+        );
         assert!(
             messages[0].content.contains("first question"),
             "the digest names what was dropped: {}",
@@ -327,5 +361,44 @@ mod tests {
             "line\n".repeat(900),
             "the newest result is read whole"
         );
+    }
+
+    fn system(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::System,
+            content: text.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_fold_keeps_the_system_prompt_and_puts_the_digest_right_behind_it() {
+        let mut messages = vec![
+            system("you are titi"),
+            user("first question"),
+            assistant("first answer"),
+            user("second question"),
+            assistant("second answer"),
+            user("the newest question"),
+        ];
+        let done = compact(&mut messages, &eager(), 100).expect("a compaction");
+
+        assert!(done.folded >= 1);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].content, "you are titi");
+        assert_eq!(messages[1].role, Role::User);
+        assert!(messages[1].content.contains("<conversation-summary"));
+        assert_eq!(
+            messages.iter().filter(|m| m.role == Role::System).count(),
+            1,
+            "no system message mid-history: {messages:#?}"
+        );
+    }
+
+    #[test]
+    fn a_history_that_is_only_the_system_prompt_is_left_alone() {
+        let mut messages = vec![system("you are titi"), user("hi")];
+        assert_eq!(compact(&mut messages, &eager(), 100), None);
+        assert_eq!(messages.len(), 2);
     }
 }

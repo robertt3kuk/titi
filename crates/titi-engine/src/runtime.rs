@@ -572,7 +572,7 @@ mod tests {
             other => panic!("expected a compaction, got {other:?}"),
         }
         assert_eq!(config.restored_messages.len(), 2);
-        assert_eq!(config.restored_messages[0].role, Role::System);
+        assert_eq!(config.restored_messages[0].role, Role::User);
         assert_eq!(config.restored_messages[1].content, "now");
     }
 
