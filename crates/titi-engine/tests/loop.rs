@@ -665,8 +665,15 @@ async fn no_genome_means_prompt_only() {
     let _ = collect_until_terminal(&mut engine).await;
 
     let requests = transport.requests();
-    assert_eq!(requests[0].messages.len(), 1);
-    assert_eq!(requests[0].messages[0].role, Role::User);
+    // Past the leading system message (the operating manual) the request is
+    // the prompt alone: no map, no recall, no history.
+    let after_system: Vec<&ChatMessage> = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .collect();
+    assert_eq!(after_system.len(), 1);
+    assert_eq!(after_system[0].role, Role::User);
 }
 
 #[tokio::test]
@@ -784,7 +791,11 @@ async fn restored_history_is_replayed_before_the_prompt() {
     let _ = collect_until_terminal(&mut engine).await;
 
     let requests = transport.requests();
-    let messages = &requests[0].messages;
+    let messages: Vec<&ChatMessage> = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .collect();
     assert_eq!(messages.len(), 3, "restored history plus the new prompt");
     assert_eq!(messages[0].role, Role::User);
     assert_eq!(messages[0].content, "earlier question");

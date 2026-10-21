@@ -6,6 +6,8 @@
 //!   soul (slot #1), personality, appendix, plus the aggregate scan verdict.
 //! - [`soul`] loads/seeds `<agent_dir>/SOUL.md` (auto-seed, never overwrite,
 //!   fallback to the built-in default identity).
+//! - [`OPERATING_MANUAL`] is the built-in, versioned workflow text that leads the
+//!   prompt ahead of the soul; it is static so it stays cache-safe.
 //! - [`personality`] resolves the personality slot: built-in presets,
 //!   `PERSONALITY.md` override, session-level [`Overlay`].
 //! - [`scan`] detects prompt-injection patterns before content is injected.
@@ -13,11 +15,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod builder;
+mod manual;
 mod personality;
 mod scan;
 mod soul;
 
 pub use builder::{SystemPrompt, SystemPromptBuilder};
+pub use manual::{OPERATING_MANUAL, OPERATING_MANUAL_VERSION};
 pub use personality::{Overlay, PersonalityPreset};
 pub use scan::{Pattern, ScanVerdict, scan};
 pub use soul::{DEFAULT_IDENTITY, MAX_SOUL_BYTES, Soul, SoulSource};

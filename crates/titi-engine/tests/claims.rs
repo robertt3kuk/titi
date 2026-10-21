@@ -220,7 +220,13 @@ async fn queued_steering_is_injected_before_the_prompt_answer() {
 
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);
-    let messages: Vec<&ChatMessage> = requests[0].messages.iter().collect();
+    // The operating manual is always the leading system message; the test is
+    // about the order of what follows it.
+    let messages: Vec<&ChatMessage> = requests[0]
+        .messages
+        .iter()
+        .filter(|message| message.role != Role::System)
+        .collect();
     assert_eq!(messages.len(), 2, "prompt plus the steering message");
     assert_eq!(messages[0].content, "fix the bug");
     assert_eq!(messages[1].role, Role::User);

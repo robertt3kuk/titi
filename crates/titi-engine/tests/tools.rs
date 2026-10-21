@@ -493,6 +493,7 @@ async fn a_cancelled_turn_leaves_no_orphan_tool_call_in_the_history() {
     let shape: Vec<(Role, String)> = last
         .messages
         .iter()
+        .filter(|message| message.role != Role::System)
         .map(|message| (message.role, message.content.to_string()))
         .collect();
     assert_eq!(shape, vec![(Role::User, "two".to_owned())]);

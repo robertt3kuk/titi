@@ -2005,7 +2005,17 @@ impl EngineRuntime {
         expanded.text.map(SmolStr::from).unwrap_or(text)
     }
 
-    /// Identity and personality, then project rules and skill names.
+    /// The built-in workflow text, ahead of everything the user can edit.
+    ///
+    /// Duck mode is repo-blind and has no tools: a manual that says to read
+    /// the repository and run its checks would be an instruction it cannot
+    /// follow, so the partner gets identity alone.
+    fn operating_manual(&self) -> Option<&'static str> {
+        (self.mode != crate::protocol::SessionMode::Duck).then_some(titi_soul::OPERATING_MANUAL)
+    }
+
+    /// The operating manual, then identity and personality, then project
+    /// rules and skill names.
     ///
     /// Everything here is static for the life of the session, and that is
     /// the point: this text sits in front of the whole conversation, so a
@@ -2019,6 +2029,9 @@ impl EngineRuntime {
     /// they are not folded into `SOUL.md`. Skill bodies are not injected.
     async fn system_prompt(&self) -> Option<SmolStr> {
         let mut parts = Vec::new();
+        if let Some(manual) = self.operating_manual() {
+            parts.push(manual.to_owned());
+        }
         if let Some(identity) = self.identity_prompt() {
             parts.push(identity.to_string());
         }
@@ -2140,8 +2153,13 @@ impl EngineRuntime {
                     + titi_core::compaction::estimate_tokens(&spec.parameters.to_string())
             })
             .sum();
+        let system_prompt = [self.operating_manual(), self.identity_prompt().as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
         vec![
-            context_part("system prompt", self.identity_prompt().as_deref()),
+            context_part("system prompt", Some(system_prompt.as_str())),
             context_part("project rules", self.project_context().as_deref()),
             context_part("skills", self.skill_list().as_deref()),
             context_part("recalled memory", self.recalled_memory().await.as_deref()),
