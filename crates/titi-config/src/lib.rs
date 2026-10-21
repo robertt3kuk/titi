@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod roles;
 pub mod settings;
 pub mod trust;
+pub mod verify;
 
 use std::path::PathBuf;
 

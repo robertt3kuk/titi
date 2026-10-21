@@ -31,6 +31,10 @@ pub const TRUST_FILE: &str = "trust.json";
 /// `kind` of a command hook, the one code-bearing definition there is today.
 pub const KIND_HOOK: &str = "hook";
 
+/// `kind` of a repository's `verify.command`: a shell command the engine runs
+/// when a turn that edited files ends.
+pub const KIND_VERIFY: &str = "verify";
+
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
     #[error("could not read {path}: {reason}")]
