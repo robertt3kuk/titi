@@ -10,7 +10,11 @@
 //! stripped, long lines wrapped), where it was defined and a short hash, and
 //! `trust` / `once` are refused until the cursor has gone down past the last
 //! hook. `no` is always available. Only a key press here enables a
-//! repository's hook.
+//! repository's hook, and the keys that could are ignored for a moment after
+//! the panel first appears, so what a person was typing when it came up (the
+//! start of a prompt, a held Enter) is never an answer. There is no letter
+//! that answers `trust` or `once`, and the cursor stops at the ends instead of
+//! wrapping from `no` to `trust`.
 
 use std::cell::Cell;
 use std::time::Instant;
@@ -24,16 +28,18 @@ use crate::pickers::{PanelLine, PanelView, panel_body, panel_label_room, panel_v
 use crate::transcript::LineKind;
 
 /// The three answers, in the order the panel lists them, after the hooks.
-const ROWS: [(Choice, char, &str, &str); 3] = [
+const ROWS: [(Choice, &str, &str); 3] = [
     (
         Choice::Trust,
-        't',
         "trust",
         "run them, and remember until their text changes",
     ),
-    (Choice::Once, 'o', "once", "run them this session only"),
-    (Choice::No, 'n', "no", "skip them"),
+    (Choice::Once, "once", "run them this session only"),
+    (Choice::No, "no", "skip them"),
 ];
+
+/// How long the panel ignores keys after its first frame.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// What the panel drew last: the cursor's lines are indices into this layout,
 /// so the keys need its size, and the gate needs to know how much of the list
@@ -53,6 +59,9 @@ pub(crate) struct TrustPanel {
     /// The line the cursor is on: the hooks' lines first, then the answers.
     cursor: usize,
     drawn: Drawn,
+    /// When the panel was first drawn. Keys before that, and for [`SETTLE`]
+    /// after it, are dropped: they were typed for something else.
+    opened: Cell<Option<Instant>>,
 }
 
 impl TrustPanel {
@@ -61,12 +70,19 @@ impl TrustPanel {
             start,
             cursor: 0,
             drawn: Drawn::default(),
+            opened: Cell::new(None),
         }
     }
 
     /// Whether every hook has been scrolled past.
     fn all_shown(&self) -> bool {
         self.drawn.shown.get() >= self.start.pending.len()
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.opened
+            .get()
+            .is_some_and(|opened| now.saturating_duration_since(opened) >= SETTLE)
     }
 
     /// The answer the cursor is on, when it is on one.
@@ -83,10 +99,23 @@ impl TrustPanel {
 impl Chat {
     /// A key while the panel is up. Up and down scroll through the hooks and
     /// on to the answers, Enter takes the answer under the cursor (`trust`
-    /// and `once` only once every hook has been shown), `t` `o` `n` take one
-    /// outright under the same rule, Esc is `no`; ctrl+c and ctrl+d decline
-    /// and then do what they always do. Every other key is ignored.
+    /// and `once` only once every hook has been shown), `n` and Esc are `no`;
+    /// ctrl+c and ctrl+d decline and then do what they always do. Every other
+    /// key is ignored, and so is everything but a decline until the panel has
+    /// been on screen for a moment.
     pub(crate) fn hook_trust_key(&mut self, key: Key, now: Instant) -> Applied {
+        let declines = matches!(
+            key,
+            Key::Esc | Key::CtrlC | Key::CtrlD | Key::Char('n' | 'N')
+        );
+        if !declines
+            && !self
+                .hook_trust
+                .as_ref()
+                .is_some_and(|panel| panel.settled(now))
+        {
+            return Applied::none();
+        }
         match key {
             Key::Up => self.move_hook_trust(-1),
             Key::Down | Key::Tab => self.move_hook_trust(1),
@@ -99,14 +128,7 @@ impl Chat {
                     return self.answer_hook_trust(choice);
                 }
             }
-            Key::Char(letter) => {
-                if let Some((choice, ..)) = ROWS
-                    .iter()
-                    .find(|(_, hotkey, ..)| hotkey.eq_ignore_ascii_case(&letter))
-                {
-                    return self.answer_hook_trust(*choice);
-                }
-            }
+            Key::Char('n' | 'N') => return self.answer_hook_trust(Choice::No),
             Key::Esc => return self.answer_hook_trust(Choice::No),
             Key::CtrlC | Key::CtrlD => {
                 self.answer_hook_trust(Choice::No);
@@ -246,11 +268,14 @@ pub(crate) fn trust_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
             accent: false,
         })
         .collect();
-    rows.extend(ROWS.iter().map(|(_, _, name, about)| PanelLine::Row {
+    rows.extend(ROWS.iter().map(|(_, name, about)| PanelLine::Row {
         text: format!("{name}   {about}"),
         accent: false,
     }));
     panel.drawn.lines.set(rows.len());
+    if panel.opened.get().is_none() {
+        panel.opened.set(Some(Instant::now()));
+    }
     let cursor = panel.cursor.min(rows.len() - 1);
     let title = format!(
         "this repo defines {} {} · trust · once · no",
@@ -371,7 +396,10 @@ mod tests {
     }
 
     fn press(screen: &mut Screen, key: Key) -> Applied {
-        let applied = screen.chat.on_key(key, Instant::now());
+        // A moment after the last frame, which is past the settling time.
+        let applied = screen
+            .chat
+            .on_key(key, Instant::now() + std::time::Duration::from_secs(1));
         if screen.chat.hook_trust.is_some() {
             draw(screen);
         }
@@ -448,6 +476,52 @@ mod tests {
             Some(ChatEffect::Send(EngineCommand::SetHooks { ref hooks })) if hooks.len() == 8
         ));
         assert_eq!(pending_after(&screen), 0);
+    }
+
+    #[test]
+    fn letters_never_answer_trust_or_once_even_after_everything_was_shown() {
+        let mut screen = screen();
+        scroll_to_the_end(&mut screen);
+        for letter in ['t', 'o', 'T', 'O'] {
+            assert!(press(&mut screen, Key::Char(letter)).effect.is_none());
+            assert!(screen.chat.hook_trust.is_some(), "{letter} consented");
+        }
+        assert_eq!(pending_after(&screen), 2);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_no_instead_of_wrapping_to_trust() {
+        let mut screen = screen();
+        scroll_to_the_end(&mut screen);
+        // Down, Tab and Enter past the end: still on `no`, which declines.
+        press(&mut screen, Key::Down);
+        press(&mut screen, Key::Tab);
+        let applied = press(&mut screen, Key::Enter);
+        assert!(applied.effect.is_none());
+        assert!(screen.chat.hook_trust.is_none());
+        assert_eq!(pending_after(&screen), 2, "nothing was trusted");
+    }
+
+    #[test]
+    fn keys_in_the_first_moments_are_dropped_and_before_any_frame_too() {
+        let mut screen = screen();
+        let now = Instant::now();
+        // Before the first frame: nothing counts, not even a scroll.
+        screen
+            .chat
+            .on_key(Key::Down, now + std::time::Duration::from_secs(5));
+        assert_eq!(screen.chat.hook_trust.as_ref().unwrap().cursor, 0);
+        draw(&screen);
+        // Typed ahead, a moment after the frame: ignored, and the panel stays.
+        let soon = Instant::now() + std::time::Duration::from_millis(50);
+        for key in [Key::Down, Key::Enter, Key::Char('t'), Key::Tab] {
+            assert!(screen.chat.on_key(key, soon).effect.is_none());
+        }
+        let panel = screen.chat.hook_trust.as_ref().expect("still asking");
+        assert_eq!(panel.cursor, 0, "the early keys did not scroll either");
+        // A decline is never held back.
+        screen.chat.on_key(Key::Esc, soon);
+        assert!(screen.chat.hook_trust.is_none());
     }
 
     #[test]
