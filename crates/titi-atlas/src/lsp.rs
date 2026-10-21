@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -44,7 +44,7 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
         // an editor's buffer invisible. An error folding the text is the
         // client's message being wrong, so it is reported as a protocol error
         // rather than answered with a stale graph.
-        if let Some(change) = buffer_change(root, &message) {
+        if let Some(change) = buffer_change(&atlas, &message) {
             change.apply(&mut atlas).map_err(invalid)?;
             continue;
         }
@@ -59,7 +59,7 @@ pub fn serve_lsp(root: &Path, reader: impl BufRead, writer: impl Write) -> io::R
             "textDocument/documentSymbol" => document_symbols(&atlas, root, &message),
             "textDocument/definition" => definition(&atlas, root, &message),
             "textDocument/references" => references(&atlas, root, &message),
-            "textDocument/diagnostic" => diagnostic(&atlas, root, &message),
+            "textDocument/diagnostic" => diagnostic(&atlas, &message),
             _ => {
                 write_frame(
                     &mut writer,
@@ -109,8 +109,8 @@ impl BufferChange {
 /// so guessing at the offsets of a client that ignored that would corrupt the
 /// identifier lookup behind every later query. The document keeps the text of
 /// the last full change until the next one.
-fn buffer_change(root: &Path, message: &Value) -> Option<BufferChange> {
-    let path = rel_of(root, message)?;
+fn buffer_change(atlas: &Atlas, message: &Value) -> Option<BufferChange> {
+    let path = rel_of(atlas, message)?;
     match message.get("method").and_then(Value::as_str)? {
         "textDocument/didOpen" => {
             let text = message
@@ -170,7 +170,7 @@ fn initialize_result() -> Value {
 }
 
 fn document_symbols(atlas: &Atlas, root: &Path, message: &Value) -> Value {
-    let Some(rel) = rel_of(root, message) else {
+    let Some(rel) = rel_of(atlas, message) else {
         return json!([]);
     };
     let symbols = atlas.document_symbols(&rel);
@@ -189,7 +189,7 @@ fn document_symbols(atlas: &Atlas, root: &Path, message: &Value) -> Value {
 }
 
 fn definition(atlas: &Atlas, root: &Path, message: &Value) -> Value {
-    let Some((rel, line, character)) = position_of(root, message) else {
+    let Some((rel, line, character)) = position_of(atlas, message) else {
         return Value::Null;
     };
     atlas
@@ -199,7 +199,7 @@ fn definition(atlas: &Atlas, root: &Path, message: &Value) -> Value {
 }
 
 fn references(atlas: &Atlas, root: &Path, message: &Value) -> Value {
-    let Some((rel, line, character)) = position_of(root, message) else {
+    let Some((rel, line, character)) = position_of(atlas, message) else {
         return json!([]);
     };
     Value::Array(
@@ -211,8 +211,8 @@ fn references(atlas: &Atlas, root: &Path, message: &Value) -> Value {
     )
 }
 
-fn diagnostic(atlas: &Atlas, root: &Path, message: &Value) -> Value {
-    let Some(rel) = rel_of(root, message) else {
+fn diagnostic(atlas: &Atlas, message: &Value) -> Value {
+    let Some(rel) = rel_of(atlas, message) else {
         return json!({ "kind": "full", "items": [] });
     };
     let items: Vec<Value> = atlas
@@ -261,8 +261,8 @@ fn file_uri(root: &Path, rel: &str) -> String {
     format!("file://{}", root.join(rel).display())
 }
 
-fn position_of(root: &Path, message: &Value) -> Option<(String, u32, u32)> {
-    let rel = rel_of(root, message)?;
+fn position_of(atlas: &Atlas, message: &Value) -> Option<(String, u32, u32)> {
+    let rel = rel_of(atlas, message)?;
     let position = message.pointer("/params/position")?;
     let line = position.get("line")?.as_u64()?;
     let character = position.get("character")?.as_u64()?;
@@ -271,27 +271,14 @@ fn position_of(root: &Path, message: &Value) -> Option<(String, u32, u32)> {
     Some((rel, line, character))
 }
 
-fn rel_of(root: &Path, message: &Value) -> Option<String> {
+fn rel_of(atlas: &Atlas, message: &Value) -> Option<String> {
     let uri = message.pointer("/params/textDocument/uri")?.as_str()?;
-    uri_to_rel(root, uri)
+    uri_to_rel(atlas, uri)
 }
 
-fn uri_to_rel(root: &Path, uri: &str) -> Option<String> {
+fn uri_to_rel(atlas: &Atlas, uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
-    let decoded = percent_decode(rest);
-    let abs = PathBuf::from(&decoded);
-    let rel = abs.strip_prefix(root).ok()?;
-    if rel.as_os_str().is_empty() {
-        return None;
-    }
-    if rel
-        .components()
-        .any(|part| matches!(part, Component::ParentDir))
-    {
-        return None;
-    }
-    let text = rel.to_str()?;
-    Some(text.replace('\\', "/"))
+    atlas.key(&percent_decode(rest))
 }
 
 fn percent_decode(input: &str) -> String {

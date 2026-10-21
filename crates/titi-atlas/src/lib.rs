@@ -351,6 +351,9 @@ pub struct Atlas {
     overlay: HashMap<String, String>,
     /// Root of the last refresh, so definition can read the identifier.
     root: std::path::PathBuf,
+    /// `root` with symlinks resolved, so a path spelled through `/tmp` finds a
+    /// root the process knows as `/private/tmp`. See [`Self::key`].
+    canonical_root: std::path::PathBuf,
     /// What `[RECENT]` means for `root`; see [`recency`].
     recency: Option<recency::Recency>,
     /// What the set of paths says about scope; see [`scope`].
@@ -433,6 +436,7 @@ impl Atlas {
         max_workers: usize,
     ) -> RefreshStats {
         self.root = root.to_path_buf();
+        self.canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         // The git questions run while the files parse, once per root.
         let probe = (!self
             .recency
@@ -523,6 +527,8 @@ impl Atlas {
         }
         let mut listed = Vec::new();
         let mut removed = 0;
+        let keys: Vec<String> = paths.iter().filter_map(|path| self.key(path)).collect();
+        let paths = keys.as_slice();
         let mut seen: HashSet<&str> = HashSet::new();
         for path in paths {
             // A watcher may report one path twice in a burst; it is one change.
@@ -632,6 +638,50 @@ impl Atlas {
             return Some(source.clone());
         }
         fs::read_to_string(self.root.join(path)).ok()
+    }
+
+    /// The index key of `path`: relative to the root, `/`-separated, without
+    /// `.`/`..` segments — however the caller spelled it.
+    ///
+    /// A tool argument (`/abs/src/a.rs`, `./src/a.rs`), a diff path and an
+    /// editor URI name one file three ways, and the index keys by exactly one.
+    /// Everything that comes from outside goes through here before it is
+    /// compared with a key or used as one, so a second spelling can neither
+    /// create a duplicate record nor miss the file it means. `None` for a path
+    /// that is empty or outside the root.
+    pub fn key(&self, path: &str) -> Option<String> {
+        if path.is_empty() {
+            return None;
+        }
+        let relative = if path.starts_with('/') {
+            let spelled = Path::new(path);
+            let rest = spelled
+                .strip_prefix(&self.root)
+                .or_else(|_| spelled.strip_prefix(&self.canonical_root))
+                .map(Path::to_path_buf)
+                .or_else(|_| {
+                    // A symlinked spelling of a root the process knows by its
+                    // real name: resolve what exists of the path and retry.
+                    let real = resolve_existing(spelled);
+                    real.strip_prefix(&self.canonical_root)
+                        .map(Path::to_path_buf)
+                })
+                .ok()?;
+            rest.to_str()?.to_owned()
+        } else {
+            path.to_owned()
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for segment in relative.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                other => parts.push(other),
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("/"))
     }
 
     /// Whether the prompt map marks `path`, last written at `mtime`, recent.
@@ -1058,8 +1108,26 @@ impl Atlas {
     /// [`Self::project_with`], with the background indexer's backlog named in
     /// the header. See [`render`].
     pub fn project_with_pending(&self, limit: usize, touched: &[String], pending: usize) -> String {
-        let touched: HashSet<String> = touched.iter().cloned().collect();
+        let touched: HashSet<String> = touched.iter().filter_map(|path| self.key(path)).collect();
         render(self, limit, &touched, pending)
+    }
+}
+
+/// `path` with the symlinks of its longest existing prefix resolved.
+fn resolve_existing(path: &Path) -> std::path::PathBuf {
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(at) {
+            return missing.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
