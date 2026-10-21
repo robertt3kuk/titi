@@ -14,7 +14,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use titi_config::hooks::{HookDef, HookEvent};
-use titi_engine::protocol::{HookOutcome, JobInfo, SessionMode};
+use titi_engine::protocol::{HookOutcome, JobInfo, SessionMode, VerifyOutcome};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 use titi_providers::{ChatMessage, Effort, ErrorReason, Role, StopReason, ToolCallRef};
 use titi_tools::AskAnswer;
@@ -249,6 +249,22 @@ fn every_engine_command_round_trips_through_its_fixture() {
             }],
         },
         r#"{"SetHooks":{"hooks":[{"event":"PreToolUse","matcher":"Bash","command":"lint.sh","timeout_secs":30,"source":".titi/hooks.json"}]}}"#,
+    );
+    command(
+        EngineCommand::SetVerify {
+            command: Some("cargo test".into()),
+            on_edit: false,
+        },
+        r#"{"SetVerify":{"command":"cargo test","on_edit":false}}"#,
+    );
+    // A bare `SetVerify` clears the command, and `on_edit` defaults on.
+    let bare: EngineCommand = serde_json::from_str(r#"{"SetVerify":{}}"#).expect("deserialize");
+    assert_eq!(
+        bare,
+        EngineCommand::SetVerify {
+            command: None,
+            on_edit: true
+        }
     );
     // A client that sends nothing clears the hooks; one that sends a bare
     // definition gets the defaults.
@@ -520,6 +536,40 @@ fn every_engine_event_round_trips_through_its_fixture() {
             ms: 60000,
         },
         r#"{"HookRan":{"event":"SessionStart","hook":"ctx.sh","outcome":"timed_out","detail":"","ms":60000}}"#,
+    );
+    event(
+        EngineEvent::VerifyStarted {
+            turn_id: TurnId(1),
+            command: "cargo test".into(),
+        },
+        r#"{"VerifyStarted":{"turn_id":1,"command":"cargo test"}}"#,
+    );
+    event(
+        EngineEvent::VerifyFinished {
+            turn_id: TurnId(1),
+            command: "cargo test".into(),
+            outcome: VerifyOutcome::Failed,
+            exit_code: Some(101),
+            ms: 3200,
+            retrying: true,
+        },
+        r#"{"VerifyFinished":{"turn_id":1,"command":"cargo test","outcome":"failed","exit_code":101,"ms":3200,"retrying":true}}"#,
+    );
+    // Absent `exit_code` and `retrying` read as "no code" and "not retrying".
+    let finished: EngineEvent = serde_json::from_str(
+        r#"{"VerifyFinished":{"turn_id":2,"command":"make","outcome":"timed_out","ms":300000}}"#,
+    )
+    .expect("deserialize");
+    assert_eq!(
+        finished,
+        EngineEvent::VerifyFinished {
+            turn_id: TurnId(2),
+            command: "make".into(),
+            outcome: VerifyOutcome::TimedOut,
+            exit_code: None,
+            ms: 300_000,
+            retrying: false,
+        }
     );
     event(
         EngineEvent::ContextBreakdown {

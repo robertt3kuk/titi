@@ -214,6 +214,19 @@ pub enum EngineCommand {
         #[serde(default)]
         hooks: Vec<titi_config::hooks::HookDef>,
     },
+    /// Set the command the engine runs when a turn that edited files ends.
+    /// `None` clears it. As with hooks, the surface sends only a command it
+    /// resolved and the user approved: a repository's own `verify.command`
+    /// reaches the engine only through a surface that asked.
+    ///
+    /// `on_edit` (default true) limits the run to turns that changed a file;
+    /// false runs it at the end of every turn.
+    SetVerify {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default = "default_on_edit")]
+        on_edit: bool,
+    },
     Shutdown,
 }
 
@@ -417,6 +430,25 @@ pub enum EngineEvent {
         detail: SmolStr,
         ms: u64,
     },
+    /// The turn-end verifier started: the turn is still open until it ends.
+    VerifyStarted {
+        turn_id: TurnId,
+        command: SmolStr,
+    },
+    /// The turn-end verifier ended. `retrying` says the failure went back to
+    /// the model, which continues; a failure with `retrying` false is the
+    /// turn's last word on it.
+    VerifyFinished {
+        turn_id: TurnId,
+        command: SmolStr,
+        outcome: VerifyOutcome,
+        /// `None` when a signal ended the command or it never started.
+        #[serde(default)]
+        exit_code: Option<i32>,
+        ms: u64,
+        #[serde(default)]
+        retrying: bool,
+    },
     /// What fills the context window right now, part by part.
     ///
     /// The answer to [`EngineCommand::DescribeContext`]. There is no total
@@ -542,6 +574,21 @@ pub enum EngineEvent {
         #[serde(default)]
         cache_miss: bool,
     },
+}
+
+fn default_on_edit() -> bool {
+    true
+}
+
+/// How the turn-end verifier ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyOutcome {
+    Passed,
+    /// A non-zero exit, a signal, or a command that would not start.
+    Failed,
+    /// The command outlived its deadline and was killed.
+    TimedOut,
 }
 
 /// What one hook command decided.

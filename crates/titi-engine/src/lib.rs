@@ -32,6 +32,7 @@ pub mod steering;
 pub mod tool_agent;
 pub mod tool_budget;
 pub mod tool_loop;
+pub mod verify;
 
 pub use advisor::{ADVISOR_BRIEF, Advisor, ConsultError};
 pub use agent_tool::{AgentTool, BATCH_CONCURRENCY, MAX_ANSWER_CHARS, MAX_BATCH_TASKS};

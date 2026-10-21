@@ -1137,6 +1137,9 @@ pub struct EngineRuntime {
     /// The session's hooks. Only `SetHooks` fills it: the engine reads no hook
     /// file and no trust store.
     hooks: Hooks,
+    /// The turn-end verify command. Only `SetVerify` fills it, for the same
+    /// reason.
+    verifier: crate::verify::Verifier,
 }
 
 impl EngineRuntime {
@@ -1276,6 +1279,16 @@ impl EngineRuntime {
             config.interrupt.clone(),
             config.mask_ips,
         );
+        let verifier = crate::verify::Verifier::new(
+            config
+                .workspace_root
+                .clone()
+                .or_else(|| config.genome_root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from(".")),
+            config.interrupt.clone(),
+            config.mask_ips,
+        );
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
@@ -1348,6 +1361,7 @@ impl EngineRuntime {
         let runtime = Self {
             mode: config.mode,
             hooks,
+            verifier,
             config,
             resolver,
             commands: command_rx,
@@ -1674,6 +1688,9 @@ impl EngineRuntime {
                             for notice in self.hooks.set(hooks) {
                                 let _ = self.events.send(EngineEvent::Notice { message: notice.into() }).await;
                             }
+                        }
+                        EngineCommand::SetVerify { command, on_edit } => {
+                            self.verifier.set(command, on_edit);
                         }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
@@ -2240,6 +2257,7 @@ impl EngineRuntime {
         // arrived late.
         let money_bounded = self.money_budget.is_some();
         let hooks = self.hooks.clone();
+        let verifier = self.verifier.clone();
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -2262,6 +2280,7 @@ impl EngineRuntime {
                 money,
                 money_bounded,
                 hooks,
+                verifier,
             )
             .await;
             let _ = done
@@ -2610,6 +2629,7 @@ async fn run_turn(
     money: MoneyLedger,
     money_bounded: bool,
     hooks: Hooks,
+    verifier: crate::verify::Verifier,
 ) -> Option<Vec<ChatMessage>> {
     // The turn's own span opens here and closes at the tail — the one place
     // every path below reaches, because the early returns all belong to the
@@ -2821,6 +2841,7 @@ async fn run_turn(
             });
             let mut tool_rounds = 0;
             let mut stop_continued = false;
+            let mut verify = verifier.for_turn(touched.lock().await.edits());
             let mut watch = crate::tool_budget::LoopWatch::default();
             loop {
                 // `execute_tools` returns as soon as the abort lands, and the loop
@@ -2905,7 +2926,8 @@ async fn run_turn(
                 let mut attempts = 0u32;
                 let mut last_error = None;
                 let mut completed = false;
-                let hold_finish = hooks.has_stop() && !stop_continued;
+                let verify_due = verify.due(touched.lock().await.edits());
+                let hold_finish = (hooks.has_stop() && !stop_continued) || verify_due;
                 // One fold per turn for a request the provider rejected as too
                 // long: the window does not change, so a second rejection is
                 // the answer.
@@ -3092,6 +3114,18 @@ async fn run_turn(
                 }
                 round_span.finish(spans::now_ms());
                 if completed {
+                    // The verifier runs first: a model that has just been
+                    // told its work fails a check has no use for a hook's
+                    // opinion of the same work. A failure goes back once.
+                    if verify_due
+                        && !aborted.load(Ordering::SeqCst)
+                        && let Some(failure) = verify
+                            .finish(turn_id, touched.lock().await.edits(), !wrap_up, &events)
+                            .await
+                    {
+                        messages.push(failure);
+                        continue;
+                    }
                     // A `Stop` hook may refuse to let the turn end: its reason
                     // goes to the model, which continues. Once per turn, so a
                     // hook that always refuses cannot loop the turn forever.

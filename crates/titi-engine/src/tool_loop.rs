@@ -91,6 +91,10 @@ pub const TOUCHED_CAPACITY: usize = 64;
 #[derive(Debug, Default)]
 pub struct TouchedSet {
     order: Vec<String>,
+    /// File changes that succeeded, over the whole session. The turn-end
+    /// verifier compares it with its value at the turn's start to learn
+    /// whether the turn edited anything.
+    edits: u64,
 }
 
 impl TouchedSet {
@@ -104,6 +108,16 @@ impl TouchedSet {
         if self.order.len() > TOUCHED_CAPACITY {
             self.order.remove(0);
         }
+    }
+
+    /// Counts one successful file change.
+    pub fn mark_edit(&mut self) {
+        self.edits += 1;
+    }
+
+    /// How many file changes have succeeded in this session.
+    pub fn edits(&self) -> u64 {
+        self.edits
     }
 
     /// The tracked paths, least recently touched first.
@@ -127,7 +141,7 @@ pub type TouchedSink = Arc<Mutex<TouchedSet>>;
 pub const TOUCHING_TOOLS: &[&str] = &["read", "write", "edit"];
 
 /// Tools that mutate a file, so they take an exclusive claim for the call.
-const WRITING_TOOLS: &[&str] = &["write", "edit"];
+const WRITING_TOOLS: &[&str] = &["write", "edit", "hashline_edit"];
 
 /// How many read calls of one response run at the same time.
 ///
@@ -588,6 +602,9 @@ pub(crate) async fn execute_tools(
         // is current by the time anything reads it; the cost is a `stat`, a
         // read and a parse of the one file, and a read never pays it. A call
         // that failed or was refused changed nothing on disk, so it is skipped.
+        if !result.is_error && prepared.write_path.is_some() {
+            touched.lock().await.mark_edit();
+        }
         if !result.is_error
             && let (Some(genome), Some(path)) = (genome.cloned(), prepared.write_path.clone())
         {
