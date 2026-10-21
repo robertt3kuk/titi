@@ -40,8 +40,8 @@ pub use fs::{
 };
 pub use git::{DiagnoseTool, GIT_TIMEOUT, GitCommitTool, GitError, GitTool, git_tools};
 pub use pipe::{
-    BACKGROUND_AFTER, BACKGROUND_ENV, Background, BackgroundCancel, BackgroundSink,
-    background_after, background_after_with,
+    BACKGROUND_AFTER, BACKGROUND_ENV, Background, BackgroundCancel, BackgroundSink, HookRun,
+    background_after, background_after_with, is_secret_env, run_hook,
 };
 pub use project::{ProjectError, ProjectTool};
 pub use pty::{Interrupt, PtyError};

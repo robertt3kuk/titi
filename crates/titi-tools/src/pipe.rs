@@ -236,6 +236,134 @@ pub fn run_with_background(
     background_after: Option<Duration>,
     interrupt: &Interrupt,
 ) -> Result<Outcome, PipeError> {
+    match run_core(
+        command,
+        cwd,
+        timeout,
+        background_after,
+        interrupt,
+        &Spec::default(),
+    )? {
+        Finished::Done { streams, status } => Ok(Outcome::Done(Run {
+            output: streams.render(),
+            exit_code: status.code(),
+            success: status.success(),
+        })),
+        Finished::Backgrounded(background) => Ok(Outcome::Backgrounded(background)),
+    }
+}
+
+/// What a hook command printed, kept apart: a hook's exit code and its two
+/// streams each mean something different, so the merged text [`run`] returns
+/// is not enough.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookRun {
+    pub stdout: String,
+    pub stderr: String,
+    /// `None` when a signal ended the shell.
+    pub exit_code: Option<i32>,
+}
+
+/// Runs a hook command: `input` on its standard input, its own process group,
+/// the caller's environment minus anything that names a secret
+/// ([`is_secret_env`]), and the same output bounds and deadline as [`run`].
+///
+/// A hook is project- or user-supplied code the engine runs on the user's
+/// behalf; it has no business with the API keys titi holds in its own
+/// environment, so they are not handed to it.
+pub fn run_hook(
+    command: &str,
+    cwd: &Path,
+    input: &[u8],
+    timeout: Duration,
+    interrupt: &Interrupt,
+) -> Result<HookRun, PipeError> {
+    let spec = Spec {
+        input: Some(input),
+        scrub_env: true,
+    };
+    match run_core(command, cwd, timeout, None, interrupt, &spec)? {
+        Finished::Done { streams, status } => {
+            let (stdout, stderr) = streams.split();
+            Ok(HookRun {
+                stdout,
+                stderr,
+                exit_code: status.code(),
+            })
+        }
+        // No threshold was passed, so nothing is ever handed over.
+        Finished::Backgrounded(background) => {
+            let run = background.wait();
+            Ok(HookRun {
+                stdout: run.output,
+                stderr: String::new(),
+                exit_code: run.exit_code,
+            })
+        }
+    }
+}
+
+/// Whether an environment variable's name says it holds a credential: a
+/// `_`-separated word that is `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`
+/// or `CREDENTIALS`, or a name ending in `APIKEY`. Names are matched, not
+/// values, so `OPENAI_API_KEY`, `GITHUB_TOKEN` and `AWS_SECRET_ACCESS_KEY`
+/// go while `PATH` and `HOME` stay.
+pub fn is_secret_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("APIKEY")
+        || upper.split('_').any(|word| {
+            matches!(
+                word,
+                "KEY"
+                    | "KEYS"
+                    | "TOKEN"
+                    | "TOKENS"
+                    | "SECRET"
+                    | "SECRETS"
+                    | "PASSWORD"
+                    | "PASSWD"
+                    | "CREDENTIAL"
+                    | "CREDENTIALS"
+            )
+        })
+}
+
+/// Takes every variable in `names` that [`is_secret_env`] out of what the
+/// command inherits.
+fn scrub_secrets(shell: &mut Command, names: impl IntoIterator<Item = std::ffi::OsString>) {
+    for name in names {
+        if name.to_str().is_some_and(is_secret_env) {
+            shell.env_remove(name);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Spec<'a> {
+    /// Bytes written to the command's standard input; closed when `None`.
+    input: Option<&'a [u8]>,
+    scrub_env: bool,
+}
+
+enum Finished {
+    Done {
+        streams: Streams,
+        status: std::process::ExitStatus,
+    },
+    Backgrounded(Background),
+}
+
+/// The one spawn-and-wait loop: [`run_with_background`] and [`run_hook`] are
+/// two views of it, so a deadline, a cancel and a process-group kill behave
+/// the same for a `bash` call and a hook.
+fn run_core(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    background_after: Option<Duration>,
+    interrupt: &Interrupt,
+    spec: &Spec<'_>,
+) -> Result<Finished, PipeError> {
     let mark = interrupt.mark();
     // A cancel that landed while this call was queued still means stop: the
     // command must not start at all.
@@ -249,9 +377,16 @@ pub fn run_with_background(
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if spec.input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if spec.scrub_env {
+        scrub_secrets(&mut shell, std::env::vars_os().map(|(name, _)| name));
+    }
     // Its own process group, so a stop reaches every process the command
     // started, not just the shell.
     #[cfg(unix)]
@@ -259,6 +394,17 @@ pub fn run_with_background(
     let mut child = shell.spawn().map_err(|error| PipeError::Spawn {
         reason: error.to_string(),
     })?;
+    if let (Some(input), Some(mut stdin)) = (spec.input, child.stdin.take()) {
+        let input = input.to_vec();
+        // On its own thread: a command that never reads would otherwise hold
+        // the writer, and with it the deadline, once the pipe is full. A
+        // command that exits without reading closes the pipe on this write,
+        // which is not an error worth reporting.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
     let streams = Streams {
         stdout: Reader::spawn(child.stdout.take()),
         stderr: Reader::spawn(child.stderr.take()),
@@ -274,13 +420,7 @@ pub fn run_with_background(
                     reason: error.to_string(),
                 });
             }
-            Ok(Some(status)) => {
-                return Ok(Outcome::Done(Run {
-                    output: streams.render(),
-                    exit_code: status.code(),
-                    success: status.success(),
-                }));
-            }
+            Ok(Some(status)) => return Ok(Finished::Done { streams, status }),
             Ok(None) => {}
         }
         if interrupt.raised_since(mark) {
@@ -292,7 +432,7 @@ pub fn run_with_background(
         if background_at.is_some_and(|at| Instant::now() >= at) {
             // Hand the live command over instead of stopping it: it keeps its
             // group and its output still goes somewhere.
-            return Ok(Outcome::Backgrounded(Background {
+            return Ok(Finished::Backgrounded(Background {
                 child,
                 streams,
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -394,13 +534,18 @@ struct Streams {
 }
 
 impl Streams {
-    fn render(&self) -> String {
+    /// Standard output and standard error, each as captured, once the readers
+    /// have had their grace to drain.
+    fn split(&self) -> (String, String) {
         let deadline = Instant::now() + DRAIN_GRACE;
         while !(self.stdout.drained() && self.stderr.drained()) && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }
-        let mut text = self.stdout.render();
-        let errors = self.stderr.render();
+        (self.stdout.render(), self.stderr.render())
+    }
+
+    fn render(&self) -> String {
+        let (mut text, errors) = self.split();
         if !text.is_empty() && !errors.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
@@ -710,5 +855,72 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(marker.exists(), "the group never got SIGTERM");
         assert!(!dir.path().join("survived").exists());
+    }
+
+    fn hook(command: &str, input: &str, secs: u64) -> Result<HookRun, PipeError> {
+        run_hook(
+            command,
+            Path::new("."),
+            input.as_bytes(),
+            Duration::from_secs(secs),
+            &Interrupt::new(),
+        )
+    }
+
+    #[test]
+    fn a_hook_reads_its_input_and_its_streams_stay_apart() {
+        let run = hook("cat; echo reason >&2; exit 2", "{\"a\":1}", 20)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(run.stdout, "{\"a\":1}");
+        assert_eq!(run.stderr, "reason\n");
+        assert_eq!(run.exit_code, Some(2));
+    }
+
+    #[test]
+    fn a_hook_that_never_reads_its_input_is_not_held_by_it() {
+        // More than a pipe holds, to a command that ignores stdin.
+        let big = "x".repeat(1 << 20);
+        let run = hook("echo done", &big, 20).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(run.stdout, "done\n");
+    }
+
+    #[test]
+    fn a_slow_hook_is_killed_at_its_deadline() {
+        let started = Instant::now();
+        let error = hook("sleep 30", "", 1).expect_err("must time out");
+        assert!(matches!(error, PipeError::TimedOut { .. }), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn names_that_say_secret_are_scrubbed_and_the_rest_stay() {
+        for secret in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "DB_PASSWORD",
+            "MYAPIKEY",
+            "gh_token",
+        ] {
+            assert!(is_secret_env(secret), "{secret}");
+        }
+        for plain in ["PATH", "HOME", "TITI_AGENT_DIR", "KEYBOARD_LAYOUT", "SHELL"] {
+            assert!(!is_secret_env(plain), "{plain}");
+        }
+
+        let mut shell = Command::new("sh");
+        shell
+            .arg("-c")
+            .arg("echo ${OPENAI_API_KEY:-gone} ${KEEP:-lost}")
+            .env("OPENAI_API_KEY", "sk-test")
+            .env("KEEP", "kept");
+        scrub_secrets(
+            &mut shell,
+            ["OPENAI_API_KEY", "KEEP"].map(std::ffi::OsString::from),
+        );
+        let output = shell.output().unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "gone kept");
     }
 }
