@@ -300,7 +300,7 @@ async fn an_unknown_model_falls_back_with_a_notice() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            EngineEvent::Notice { message } if message.contains("agent a: model sonnet")
+            EngineEvent::Notice { message } if message.contains("agent a: model `sonnet` cannot be used")
         )),
         "{events:?}"
     );
@@ -422,5 +422,40 @@ async fn a_batch_entry_can_name_a_definition_and_a_bare_name_beside_tasks_is_ref
     assert!(
         refusal.contains("inside each entry of `tasks`"),
         "{refusal}"
+    );
+}
+
+/// The transcript says what the call is about to do: with a definition named
+/// and no label given, that is the definition's name.
+#[tokio::test]
+async fn the_call_is_labelled_with_the_definitions_name() {
+    let workspace = tempfile::tempdir().unwrap();
+    write(&workspace.path().join(".titi/agents/reviewer.md"), REVIEWER);
+    let parent = Arc::new(MockTransport::new(vec![
+        tool_call("agent", r#"{"agent":"reviewer","task":"look at it"}"#),
+        text("ok"),
+    ]));
+    let child = Arc::new(MockTransport::new(vec![text("fine")]));
+    let mut engine = EngineRuntime::start_with_tools(
+        config(workspace.path()),
+        resolver(vec![("primary", &parent), ("worker", &child)]),
+        ToolRegistry::new(),
+    );
+    let events = turn(&mut engine, "go").await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::ToolStarted { name, detail: Some(detail), .. }
+                if name == "agent" && detail.starts_with("reviewer: look at it")
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::AgentStarted { name, .. } if name == "reviewer"
+        )),
+        "{events:?}"
     );
 }

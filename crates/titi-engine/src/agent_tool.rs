@@ -239,6 +239,7 @@ impl ToolHandler for AgentTool {
         let task = args.get("task")?.as_str()?.trim();
         let name = args
             .get("name")
+            .or_else(|| args.get("agent"))
             .and_then(Value::as_str)
             .unwrap_or("Subagent");
         Some(format!("{name}: {}", head(task, 60)))
@@ -415,9 +416,11 @@ impl AgentTool {
                 Choice::Inherit => None,
                 Choice::Use(model) => Some(model),
                 Choice::Fallback(why) => {
+                    let asked = definition.model.as_deref().unwrap_or_default();
                     self.agents
                         .notice(format!(
-                            "agent {name}: model {why}; running on the subagents' own model"
+                            "agent {name}: model `{asked}` cannot be used ({why}); running on \
+                             the subagents' own model"
                         ))
                         .await;
                     None

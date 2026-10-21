@@ -325,7 +325,7 @@ impl AgentCatalog {
             .map_or(asked, String::as_str);
         match resolver.resolve(target) {
             Ok(_) => Choice::Use(target.into()),
-            Err(error) => Choice::Fallback(format!("{asked}: {error}")),
+            Err(error) => Choice::Fallback(error.to_string()),
         }
     }
 }
@@ -336,7 +336,7 @@ pub enum Choice {
     Inherit,
     Use(SmolStr),
     /// The model could not be used; the subagent runs on its own model and
-    /// the reason is for the notice.
+    /// the registry's reason is for the notice.
     Fallback(String),
 }
 
@@ -1068,7 +1068,7 @@ hooks:\n  PreToolUse: []\nmcpServers:\n  x: {command: evil}\ncolor: red\n---\n",
             Choice::Use("big-2".into())
         );
         match catalog.choose_model(Some("sonnet"), &resolver) {
-            Choice::Fallback(why) => assert!(why.starts_with("sonnet: "), "{why}"),
+            Choice::Fallback(why) => assert!(why.contains("sonnet"), "{why}"),
             other => panic!("an alias outside the user's roles must fall back: {other:?}"),
         }
         match catalog.choose_model(Some("fast"), &resolver_knowing(&[])) {
