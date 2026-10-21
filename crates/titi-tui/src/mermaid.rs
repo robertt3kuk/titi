@@ -48,11 +48,18 @@
 //!
 //! # Cycles
 //!
-//! A depth-first pass finds the back edges; they are dropped from the layering
-//! DAG, and each one is instead laid out as a run from its source down to a
-//! *copy* of its target placed one layer below the source. The drawing is
-//! therefore always a DAG whose runs point down (or right), and `A --> B --> A`
-//! draws A, then B, then A again — one unroll, not a loop, and never `None`.
+//! A depth-first pass finds the back edges — an edge into a node that is
+//! already on the path, which includes a self-loop. They are dropped from the
+//! layering DAG and drawn as edges, never as a second copy of their target:
+//!
+//! - Routed: the run leaves the source's right edge (top-down) or bottom edge
+//!   (left-right), follows a lane past the far side of the drawing, and enters
+//!   the target with `◀` (top-down) or `▲` (left-right). The label sits beside
+//!   the lane (top-down) or under it (left-right).
+//! - Stubbed: when no lane fits — another box stands beyond the source or the
+//!   target on the lane's side, or the lane would push the drawing past the
+//!   pane — the run ends one layer below its source in a dim, box-less
+//!   reference such as `↺ Start`, which cannot be taken for a node.
 //!
 //! Not ported: every other diagram type, node styling and colours, curves and
 //! self-crossing runs, `&`-joins and `;`-separated statements, link ids, and
@@ -378,23 +385,27 @@ fn intern(
 // Layering
 // ---------------------------------------------------------------------------
 
-/// One laid-out node: a box with text, or a one-cell pass-through inserted so
-/// a run that skips a layer becomes a chain of layer-to-layer runs.
+/// One laid-out node: a box with text, a box-less reference stub standing in
+/// for a back edge's target, or a one-cell pass-through inserted so a run that
+/// skips a layer becomes a chain of layer-to-layer runs.
+#[derive(Clone)]
 enum LNode {
     Box(String),
+    Ref(String),
     Ghost,
 }
 
 impl LNode {
     fn text(&self) -> &str {
         match self {
-            LNode::Box(text) => text,
+            LNode::Box(text) | LNode::Ref(text) => text,
             LNode::Ghost => "",
         }
     }
 }
 
 /// A run between two adjacent layers, as the layout sees it.
+#[derive(Clone)]
 struct Hop {
     from: usize,
     to: usize,
@@ -535,11 +546,23 @@ const GAP: usize = 3;
 // Geometry
 // ---------------------------------------------------------------------------
 
+/// A back edge drawn as a run in a lane beside the drawing.
+struct Lane {
+    from: usize,
+    to: usize,
+    label: Option<String>,
+    head: bool,
+    /// Top-down: the lane's column. Left-right: its row.
+    at: usize,
+}
+
 /// The laid-out drawing: what goes where, before any glyph or colour.
 struct Plan {
     direction: Direction,
     nodes: Vec<LNode>,
     hops: Vec<Hop>,
+    /// Back edges drawn in a lane, in the order they were written.
+    lanes: Vec<Lane>,
     /// Nodes per layer, in drawing order.
     layers: Vec<Vec<usize>>,
     /// The layer each node sits in.
@@ -561,11 +584,17 @@ fn box_width(text: &str) -> usize {
     text.chars().count() + 4
 }
 
+/// A stub is its marker, a space, then the target's text.
+fn ref_width(text: &str) -> usize {
+    text.chars().count() + 2
+}
+
 /// A node's extent across the run axis (columns for top-down, rows for
 /// left-right).
 fn extent(node: &LNode) -> usize {
     match node {
         LNode::Box(text) => box_width(text),
+        LNode::Ref(text) => ref_width(text),
         LNode::Ghost => 1,
     }
 }
@@ -573,7 +602,7 @@ fn extent(node: &LNode) -> usize {
 fn slot_height(node: &LNode) -> usize {
     match node {
         LNode::Box(_) => 3,
-        LNode::Ghost => 1,
+        LNode::Ref(_) | LNode::Ghost => 1,
     }
 }
 
@@ -592,7 +621,7 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
     if n == 0 {
         return None;
     }
-    let mut nodes: Vec<LNode> = graph
+    let nodes: Vec<LNode> = graph
         .nodes
         .iter()
         .map(|nd| {
@@ -614,7 +643,7 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
         return None;
     }
 
-    let mut hops: Vec<Hop> = graph
+    let hops: Vec<Hop> = graph
         .edges
         .iter()
         .map(|e| Hop {
@@ -625,27 +654,68 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
         })
         .collect();
 
-    // Layering, then one copy of the target per back edge, one layer below its
-    // source: the cycle is unrolled once and every run points down.
+    // Layering. A back edge is not a layering edge: `route` draws it in a lane
+    // beside the drawing, and only an edge no lane fits is drawn into a
+    // reference stub one layer below its source. Either way every layered run
+    // points down.
     let back = back_edges(n, &hops);
-    let mut layer = longest_path(n, &hops, &back);
-    let mut unrolled: Vec<Hop> = Vec::with_capacity(hops.len());
-    for h in hops.drain(..) {
-        if !back.contains(&(h.from, h.to)) {
-            unrolled.push(h);
-            continue;
+    let layer = longest_path(n, &hops, &back);
+    let mut stubbed: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        match place(
+            graph.direction,
+            &nodes,
+            &hops,
+            &back,
+            &layer,
+            &stubbed,
+            width,
+        )? {
+            Placement::Done(plan) => return Some(*plan),
+            Placement::Stub(failed) => stubbed.extend(failed),
         }
-        let text = nodes[h.to].text().to_owned();
-        let copy = nodes.len();
-        nodes.push(LNode::Box(text));
-        let below = layer[h.from] + 1;
-        layer.push(below);
-        unrolled.push(Hop {
-            from: h.from,
-            to: copy,
-            label: h.label,
-            head: h.head,
-        });
+    }
+}
+
+/// What one placement pass came to: the plan, or the indices of the back
+/// edges whose lane did not fit and must be drawn as stubs instead.
+enum Placement {
+    Done(Box<Plan>),
+    Stub(Vec<usize>),
+}
+
+/// Lay the graph out once, with the back edges in `stubbed` unrolled into
+/// reference stubs and every other back edge left for `route`.
+fn place(
+    direction: Direction,
+    nodes: &[LNode],
+    edges: &[Hop],
+    back: &BTreeSet<(usize, usize)>,
+    layer: &[usize],
+    stubbed: &BTreeSet<usize>,
+    width: usize,
+) -> Option<Placement> {
+    let mut nodes = nodes.to_vec();
+    let mut layer = layer.to_vec();
+    let mut unrolled: Vec<Hop> = Vec::with_capacity(edges.len());
+    let mut pending: Vec<(usize, Hop)> = Vec::new();
+    for (idx, h) in edges.iter().enumerate() {
+        if !back.contains(&(h.from, h.to)) {
+            unrolled.push(h.clone());
+        } else if !stubbed.contains(&idx) {
+            pending.push((idx, h.clone()));
+        } else {
+            let text = nodes[h.to].text().to_owned();
+            let stub = nodes.len();
+            nodes.push(LNode::Ref(text));
+            layer.push(layer[h.from] + 1);
+            unrolled.push(Hop {
+                from: h.from,
+                to: stub,
+                label: h.label.clone(),
+                head: h.head,
+            });
+        }
     }
 
     // A run that skips a layer gets a ghost per layer it crosses, so every run
@@ -690,7 +760,7 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
     }
     order(&mut layers, &hops, &layer, count);
 
-    if graph.direction == Direction::TopDown {
+    if direction == Direction::TopDown {
         let mut pos = vec![0usize; count];
         let mut total = 0usize;
         for (li, band) in layers.iter().enumerate() {
@@ -724,20 +794,33 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
             return None;
         }
         let band: Vec<usize> = (0..layers.len()).map(|li| li * 5).collect();
-        let height = (layers.len() - 1) * 5 + 3;
-        return Some(Plan {
-            direction: Direction::TopDown,
-            nodes,
-            hops,
-            layers,
-            layer,
-            pos,
-            band,
-            band_width: Vec::new(),
-            label_width: Vec::new(),
-            width: total,
-            height,
-        });
+        let tail = if layers.last().is_some_and(|band| {
+            band.iter()
+                .all(|&node| matches!(nodes[node], LNode::Ref(_)))
+        }) {
+            1
+        } else {
+            3
+        };
+        let height = (layers.len() - 1) * 5 + tail;
+        return Some(finish(
+            Plan {
+                direction: Direction::TopDown,
+                nodes,
+                hops,
+                lanes: Vec::new(),
+                layers,
+                layer,
+                pos,
+                band,
+                band_width: Vec::new(),
+                label_width: Vec::new(),
+                width: total,
+                height,
+            },
+            pending,
+            width,
+        ));
     }
 
     let mut pos = vec![0usize; count];
@@ -794,6 +877,7 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
             .iter()
             .map(|&node| match &nodes[node] {
                 LNode::Box(text) => box_width(text),
+                LNode::Ref(text) => ref_width(text),
                 LNode::Ghost => GAP,
             })
             .max()
@@ -809,19 +893,143 @@ fn layout(graph: &Graph, width: usize) -> Option<Plan> {
     if total > width {
         return None;
     }
-    Some(Plan {
-        direction: Direction::LeftRight,
-        nodes,
-        hops,
-        layers,
-        layer,
-        pos,
-        band,
-        band_width,
-        label_width,
-        width: total,
-        height,
+    Some(finish(
+        Plan {
+            direction: Direction::LeftRight,
+            nodes,
+            hops,
+            lanes: Vec::new(),
+            layers,
+            layer,
+            pos,
+            band,
+            band_width,
+            label_width,
+            width: total,
+            height,
+        },
+        pending,
+        width,
+    ))
+}
+
+/// Route what `place` left pending; a lane that does not fit sends its edge
+/// back to be drawn as a stub.
+fn finish(mut plan: Plan, pending: Vec<(usize, Hop)>, width: usize) -> Placement {
+    let failed = route(&mut plan, pending, width);
+    if failed.is_empty() {
+        Placement::Done(Box::new(plan))
+    } else {
+        Placement::Stub(failed)
+    }
+}
+
+/// A lane runs past the far side of the drawing, so a box standing beyond the
+/// node on that side would be crossed by the run that reaches the lane. A
+/// pass-through is only crossed, which the glyphs can say.
+fn walled_in(plan: &Plan, node: usize) -> bool {
+    plan.layers[plan.layer[node]].iter().any(|&other| {
+        other != node
+            && !matches!(plan.nodes[other], LNode::Ghost)
+            && plan.pos[other] > plan.pos[node]
     })
+}
+
+/// Left-right: the columns a lane leaves its source at and enters its target
+/// at, both on the boxes' bottom edges. A self-loop uses the two ends of the
+/// one box.
+fn lane_columns(plan: &Plan, from: usize, to: usize) -> (usize, usize) {
+    let left = |node: usize| plan.band[plan.layer[node]];
+    let wide = |node: usize| plan.band_width[plan.layer[node]];
+    if from == to {
+        (left(from) + 1, left(from) + wide(from) - 2)
+    } else {
+        (left(from) + wide(from) / 2, left(to) + wide(to) / 2)
+    }
+}
+
+/// Give each pending back edge a lane past the far side of the drawing: the
+/// columns right of everything top-down, the rows below everything
+/// left-right. Returns the indices of the edges that could not be routed —
+/// walled in by a neighbour, or past `width`.
+fn route(plan: &mut Plan, pending: Vec<(usize, Hop)>, width: usize) -> Vec<usize> {
+    let mut failed = Vec::new();
+    let mut cursor = match plan.direction {
+        Direction::TopDown => {
+            // The lanes start past the forward labels, which sit beside heads.
+            let labels = plan
+                .hops
+                .iter()
+                .filter_map(|h| {
+                    h.label
+                        .as_deref()
+                        .map(|l| centre_x(&plan.nodes, &plan.pos, h.to) + 2 + l.chars().count())
+                })
+                .max()
+                .unwrap_or(0);
+            plan.width.max(labels) + 1
+        }
+        Direction::LeftRight => plan.height + 1,
+    };
+    // A node's lane exit and a lane's entry into it share one cell, so a node
+    // that is both gets only the lane that came first; the other is a stub.
+    let mut exits: BTreeSet<usize> = BTreeSet::new();
+    let mut entries: BTreeSet<usize> = BTreeSet::new();
+    let across = plan.direction == Direction::LeftRight;
+    for (idx, h) in pending {
+        let clash = if h.from != h.to {
+            entries.contains(&h.from) || exits.contains(&h.to)
+        } else if across {
+            // A self-loop leaves and enters at two cells of the box's bottom
+            // edge, one beside the centre cell any other lane uses.
+            entries.contains(&h.from) || exits.contains(&h.from)
+        } else {
+            exits.contains(&h.from)
+        };
+        if clash || walled_in(plan, h.from) || walled_in(plan, h.to) {
+            failed.push(idx);
+            continue;
+        }
+        let label = h.label.as_deref().map(|l| l.chars().count());
+        let at = cursor;
+        match plan.direction {
+            Direction::TopDown => {
+                let end = at + label.map_or(1, |len| len + 2);
+                if end > width {
+                    failed.push(idx);
+                    continue;
+                }
+                plan.width = plan.width.max(end);
+                cursor = end + 1;
+            }
+            Direction::LeftRight => {
+                let (out, back_in) = lane_columns(plan, h.from, h.to);
+                let reach = out.min(back_in) + label.map_or(0, |len| len + 2);
+                if reach > width {
+                    failed.push(idx);
+                    continue;
+                }
+                let end = at + 1 + usize::from(label.is_some());
+                plan.width = plan.width.max(reach);
+                plan.height = plan.height.max(end);
+                cursor = end + 1;
+            }
+        }
+        if h.from != h.to || across {
+            exits.insert(h.from);
+            entries.insert(h.to);
+        } else {
+            entries.insert(h.to);
+        }
+        plan.lanes.push(Lane {
+            from: h.from,
+            to: h.to,
+            label: h.label,
+            head: h.head,
+            at,
+        });
+    }
+    failed
 }
 
 /// Columns between two left-right bands: the trunk, the head, and room for the
@@ -846,6 +1054,8 @@ const DOWN: u8 = 8;
 /// A terminating arrowhead.
 const HEAD_DOWN: u8 = 16;
 const HEAD_RIGHT: u8 = 32;
+const HEAD_UP: u8 = 64;
+const HEAD_LEFT: u8 = 128;
 
 /// The box set, as the theme has it (ASCII `+ - |` when it has no glyph).
 struct Glyphs {
@@ -862,6 +1072,10 @@ struct Glyphs {
     cross: String,
     head_down: String,
     head_right: String,
+    head_left: String,
+    head_up: String,
+    /// The marker of a reference stub.
+    back: char,
 }
 
 impl Glyphs {
@@ -898,6 +1112,17 @@ impl Glyphs {
             } else {
                 "▶".to_owned()
             },
+            head_left: if ascii {
+                "<".to_owned()
+            } else {
+                "◀".to_owned()
+            },
+            head_up: if ascii {
+                "^".to_owned()
+            } else {
+                "▲".to_owned()
+            },
+            back: if ascii { '~' } else { '↺' },
         }
     }
 
@@ -908,6 +1133,12 @@ impl Glyphs {
         }
         if flags & HEAD_RIGHT != 0 {
             return &self.head_right;
+        }
+        if flags & HEAD_LEFT != 0 {
+            return &self.head_left;
+        }
+        if flags & HEAD_UP != 0 {
+            return &self.head_up;
         }
         let l = flags & LEFT != 0;
         let r = flags & RIGHT != 0;
@@ -936,6 +1167,7 @@ impl Glyphs {
 enum Cell {
     Empty,
     Ink(char),
+    Dim(char),
     Line(u8),
 }
 
@@ -964,7 +1196,7 @@ impl Canvas {
         match self.cells[i] {
             Cell::Empty => self.cells[i] = Cell::Line(flags),
             Cell::Line(held) => self.cells[i] = Cell::Line(held | flags),
-            Cell::Ink(_) => {}
+            Cell::Ink(_) | Cell::Dim(_) => {}
         }
     }
 
@@ -980,6 +1212,20 @@ impl Canvas {
             return true;
         }
         false
+    }
+
+    /// Whether `n` cells from `x` are all on the canvas and still free.
+    fn free(&self, x: usize, y: usize, n: usize) -> bool {
+        y < self.h
+            && x + n <= self.w
+            && (x..x + n).all(|x| self.cells[y * self.w + x] == Cell::Empty)
+    }
+
+    /// Write a dim character if the cell is still free.
+    fn dim(&mut self, x: usize, y: usize, c: char) {
+        if x < self.w && y < self.h && self.cells[y * self.w + x] == Cell::Empty {
+            self.cells[y * self.w + x] = Cell::Dim(c);
+        }
     }
 
     fn render(&self, theme: &Theme, glyphs: &Glyphs) -> Vec<String> {
@@ -1015,6 +1261,19 @@ impl Canvas {
                             })
                             .collect();
                         out.push_str(&theme.fg(ThemeColor::MdCodeBlock, &text));
+                    }
+                    Cell::Dim(_) => {
+                        let from = x;
+                        while x < last && matches!(self.cells[y * self.w + x], Cell::Dim(_)) {
+                            x += 1;
+                        }
+                        let text: String = (from..x)
+                            .map(|x| match self.cells[y * self.w + x] {
+                                Cell::Dim(c) => c,
+                                _ => ' ',
+                            })
+                            .collect();
+                        out.push_str(&theme.fg(ThemeColor::Dim, &text));
                     }
                     Cell::Line(_) => {
                         let from = x;
@@ -1054,19 +1313,21 @@ fn paint(plan: &Plan, width: usize, theme: &Theme) -> Option<Vec<String>> {
     let mut canvas = Canvas::new(canvas_width, plan.height);
     match plan.direction {
         Direction::TopDown => {
-            boxes_down(plan, &mut canvas);
+            boxes_down(plan, &glyphs, &mut canvas);
             runs_down(plan, &mut canvas);
+            lanes_down(plan, &mut canvas);
         }
         Direction::LeftRight => {
-            boxes_across(plan, &mut canvas);
+            boxes_across(plan, &glyphs, &mut canvas);
             runs_across(plan, &mut canvas);
+            lanes_across(plan, &mut canvas);
         }
     }
     Some(canvas.render(theme, &glyphs))
 }
 
 /// The boxes and ghost pass-throughs of a top-down drawing.
-fn boxes_down(plan: &Plan, canvas: &mut Canvas) {
+fn boxes_down(plan: &Plan, glyphs: &Glyphs, canvas: &mut Canvas) {
     for (li, band) in plan.layers.iter().enumerate() {
         let top = plan.band[li];
         for &node in band {
@@ -1090,6 +1351,7 @@ fn boxes_down(plan: &Plan, canvas: &mut Canvas) {
                     }
                     canvas.line(x + w - 1, top + 2, LEFT | UP);
                 }
+                LNode::Ref(text) => stub(canvas, glyphs, x, top, text),
                 LNode::Ghost => {
                     for row in top..(top + 3) {
                         canvas.line(x, row, UP | DOWN);
@@ -1148,7 +1410,7 @@ fn runs_down(plan: &Plan, canvas: &mut Canvas) {
 }
 
 /// The boxes and ghost pass-throughs of a left-right drawing.
-fn boxes_across(plan: &Plan, canvas: &mut Canvas) {
+fn boxes_across(plan: &Plan, glyphs: &Glyphs, canvas: &mut Canvas) {
     for (li, band) in plan.layers.iter().enumerate() {
         let left = plan.band[li];
         let w = plan.band_width[li];
@@ -1172,6 +1434,7 @@ fn boxes_across(plan: &Plan, canvas: &mut Canvas) {
                     }
                     canvas.line(left + w - 1, y + 2, LEFT | UP);
                 }
+                LNode::Ref(text) => stub(canvas, glyphs, left, y, text),
                 LNode::Ghost => {
                     for x in left..(left + w) {
                         canvas.line(x, y, LEFT | RIGHT);
@@ -1245,6 +1508,113 @@ fn write_label(canvas: &mut Canvas, x: usize, y: usize, label: &str, room: usize
     Some(())
 }
 
+/// A reference stub: the back marker, a space, the target's text — all dim,
+/// none of it boxed, so it reads as a pointer and not as a second node.
+fn stub(canvas: &mut Canvas, glyphs: &Glyphs, x: usize, y: usize, text: &str) {
+    canvas.dim(x, y, glyphs.back);
+    canvas.dim(x + 1, y, ' ');
+    for (i, c) in text.chars().enumerate() {
+        canvas.dim(x + 2 + i, y, c);
+    }
+}
+
+/// The back edges of a top-down drawing: out of the source's right edge, up a
+/// lane beyond the drawing, and back in along the target's middle row. A
+/// self-loop leaves from its bottom-right corner, since the one middle row is
+/// the way back in.
+fn lanes_down(plan: &Plan, canvas: &mut Canvas) {
+    for lane in &plan.lanes {
+        let top = |node: usize| plan.band[plan.layer[node]];
+        let right = |node: usize| plan.pos[node] + extent(&plan.nodes[node]) - 1;
+        let out_row = top(lane.from) + if lane.from == lane.to { 2 } else { 1 };
+        let in_row = top(lane.to) + 1;
+        let (out_right, in_right) = (right(lane.from), right(lane.to));
+        canvas.line(out_right, out_row, RIGHT);
+        for x in (out_right + 1)..lane.at {
+            canvas.line(x, out_row, LEFT | RIGHT);
+        }
+        canvas.line(lane.at, out_row, LEFT | UP);
+        for y in (in_row + 1)..out_row {
+            canvas.line(lane.at, y, UP | DOWN);
+        }
+        canvas.line(lane.at, in_row, LEFT | DOWN);
+        for x in (in_right + 2)..lane.at {
+            canvas.line(x, in_row, LEFT | RIGHT);
+        }
+        if lane.head {
+            canvas.line(in_right + 1, in_row, HEAD_LEFT);
+        } else {
+            canvas.line(in_right + 1, in_row, LEFT | RIGHT);
+            canvas.line(in_right, in_row, RIGHT);
+        }
+    }
+    for lane in &plan.lanes {
+        let Some(label) = lane.label.as_deref() else {
+            continue;
+        };
+        let out_row = plan.band[plan.layer[lane.from]] + if lane.from == lane.to { 2 } else { 1 };
+        let in_row = plan.band[plan.layer[lane.to]] + 1;
+        // Beside the source, else beside the target, else down the lane: a
+        // second lane out of one node, or into one, has the first rows taken.
+        let len = label.chars().count();
+        let rows = [out_row, in_row].into_iter().chain((in_row + 1)..out_row);
+        if let Some(row) = rows
+            .into_iter()
+            .find(|&row| canvas.free(lane.at + 1, row, len + 1))
+        {
+            write_label(canvas, lane.at + 2, row, label, usize::MAX);
+        }
+    }
+}
+
+/// The back edges of a left-right drawing: down out of the source's bottom
+/// edge, along a lane under the drawing, and up into the target's bottom edge.
+fn lanes_across(plan: &Plan, canvas: &mut Canvas) {
+    for lane in &plan.lanes {
+        let (out, back_in) = lane_columns(plan, lane.from, lane.to);
+        let out_border = plan.pos[lane.from] + 2;
+        let in_border = plan.pos[lane.to] + 2;
+        canvas.line(out, out_border, DOWN);
+        for y in (out_border + 1)..lane.at {
+            canvas.line(out, y, UP | DOWN);
+        }
+        let (lo, hi) = (out.min(back_in), out.max(back_in));
+        for x in lo..=hi {
+            let mut flags = 0;
+            if x > lo {
+                flags |= LEFT;
+            }
+            if x < hi {
+                flags |= RIGHT;
+            }
+            if x == out || x == back_in {
+                flags |= UP;
+            }
+            canvas.line(x, lane.at, flags);
+        }
+        for y in (in_border + 2)..lane.at {
+            canvas.line(back_in, y, UP | DOWN);
+        }
+        if lane.head {
+            canvas.line(back_in, in_border + 1, HEAD_UP);
+        } else {
+            canvas.line(back_in, in_border + 1, UP | DOWN);
+            canvas.line(back_in, in_border, DOWN);
+        }
+    }
+    for lane in &plan.lanes {
+        let Some(label) = lane.label.as_deref() else {
+            continue;
+        };
+        let (out, back_in) = lane_columns(plan, lane.from, lane.to);
+        for (offset, c) in label.chars().enumerate() {
+            if !canvas.ink(out.min(back_in) + 2 + offset, lane.at + 1, c) {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod hostile {
     use super::*;
@@ -1272,6 +1642,10 @@ mod hostile {
             "flowchart TD\nA --> B\n".to_owned(),
             "flowchart TD\nA[x] --> A[y]\n".to_owned(),
             "flowchart TD\nA --> B\nB --> A\nA --> B\n".to_owned(),
+            "flowchart TD\nA -->|a long label| A\nA --> B\nB -->|another long one| A\nB --> B\n"
+                .to_owned(),
+            "flowchart LR\nA --> B\nA --> C\nB -->|x| A\nC -->|y| A\nC --> C\nB --- A\n".to_owned(),
+            "flowchart TD\nA --> B\nB --> C\nC --> A\nC --> B\nB --> B\nA --> A\n".to_owned(),
             "flowchart LR\nA --> B --> C --> D\n".to_owned(),
             "flowchart TD\n".to_owned(),
             "flowchart TD\nsubgraph s\nA --> B\nend\n".to_owned(),
@@ -1666,12 +2040,222 @@ mod tests {
         );
     }
 
-    /// `A --> B --> A` is a cycle. The depth-first pass calls `B --> A` a back
-    /// edge; it is dropped from the layering (A source, B one below) and drawn
-    /// as a run from B into a *copy* of A placed one layer below B. So the
-    /// drawing is the unrolled cycle: A, then B, then A again.
+    fn loop_fence() -> &'static str {
+        "flowchart TD\n  A[Start] --> B{Go?}\n  B -->|yes| C[Done]\n  B -->|no| A\n"
+    }
+
+    /// The reported bug: `B -->|no| A` drew a second box labelled `Start`
+    /// beside `Done`, so there were two Start nodes and no loop. The back edge
+    /// is now a lane up the right side into `Start`, with its label — and the
+    /// text `Start` is drawn once.
     #[test]
-    fn a_cycle_is_unrolled_once() {
+    fn a_back_edge_is_a_lane_into_its_target_not_a_second_node() {
+        let expected = vec![
+            "┌───────┐",
+            "│ Start │◀┐",
+            "└───┬───┘ │",
+            "    │     │",
+            "    ▼     │",
+            " ┌─────┐  │",
+            " │ Go? ├──┘ no",
+            " └──┬──┘",
+            "    │",
+            "    ▼ yes",
+            "┌──────┐",
+            "│ Done │",
+            "└──────┘",
+        ];
+        let drawn = rows(loop_fence(), 80);
+        assert_eq!(drawn, expected);
+        assert_eq!(drawn.join("\n").matches("Start").count(), 1);
+    }
+
+    /// `A --> B --> A`: B's back edge is a lane into the one A, not an A below B.
+    #[test]
+    fn a_two_node_cycle_draws_each_node_once() {
+        let expected = vec![
+            "┌───┐",
+            "│ A │◀┐",
+            "└─┬─┘ │",
+            "  │   │",
+            "  ▼   │",
+            "┌───┐ │",
+            "│ B ├─┘",
+            "└───┘",
+        ];
+        assert_eq!(rows("flowchart TD\n A --> B --> A\n", 80), expected);
+    }
+
+    #[test]
+    fn a_self_loop_leaves_the_corner_and_enters_the_middle() {
+        let expected = vec!["┌───┐", "│ A │◀┐", "└───┴─┘"];
+        assert_eq!(rows("flowchart TD\n A --> A\n", 80), expected);
+        let labelled = vec!["┌───────┐", "│ Start │◀┐", "└───────┴─┘ again"];
+        assert_eq!(rows("flowchart TD\n A[Start] -->|again| A\n", 80), labelled);
+    }
+
+    #[test]
+    fn a_back_edge_spanning_two_layers_runs_the_whole_lane() {
+        let expected = vec![
+            "┌───┐",
+            "│ A │◀┐",
+            "└─┬─┘ │",
+            "  │   │",
+            "  ▼   │",
+            "┌───┐ │",
+            "│ B │ │",
+            "└─┬─┘ │",
+            "  │   │",
+            "  ▼   │",
+            "┌───┐ │",
+            "│ C ├─┘",
+            "└───┘",
+        ];
+        assert_eq!(rows("flowchart TD\n A --> B --> C --> A\n", 80), expected);
+    }
+
+    #[test]
+    fn a_headless_back_edge_has_no_head() {
+        let expected = vec![
+            "┌───┐",
+            "│ A ├─┐",
+            "└─┬─┘ │",
+            "  │   │",
+            "  │   │",
+            "┌─┴─┐ │",
+            "│ B ├─┘",
+            "└───┘",
+        ];
+        assert_eq!(rows("flowchart TD\n A --- B\n B --- A\n", 80), expected);
+    }
+
+    /// Two lanes: the second sits beyond the first, crosses it on the way in,
+    /// and the label that has no free row beside its source goes beside its
+    /// target.
+    #[test]
+    fn two_back_edges_take_two_lanes() {
+        let expected = vec![
+            "┌───┐",
+            "│ A │◀┐ a",
+            "└─┬─┘ │",
+            "  │   │",
+            "  ▼   │",
+            "┌───┐ │",
+            "│ B │◀┼───┐",
+            "└─┬─┘ │   │",
+            "  │   │   │",
+            "  ▼   │   │",
+            "┌───┐ │   │",
+            "│ C ├─┴───┘ bb",
+            "└───┘",
+        ];
+        assert_eq!(
+            rows(
+                "flowchart TD\n A --> B\n B --> C\n C -->|a| A\n C -->|bb| B\n",
+                80
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_left_right_back_edge_runs_under_the_drawing() {
+        let expected = vec![
+            "┌───┐   ┌───┐",
+            "│ A ├─▶ │ B │",
+            "└───┘   └─┬─┘",
+            "  ▲       │",
+            "  └───────┘",
+        ];
+        assert_eq!(rows("flowchart LR\n A --> B --> A\n", 80), expected);
+        let labelled = vec![
+            "┌───┐   ┌───┐",
+            "│ A ├─▶ │ B │",
+            "└───┘   └─┬─┘",
+            "  ▲       │",
+            "  └───────┘",
+            "    retry",
+        ];
+        assert_eq!(
+            rows("flowchart LR\n A --> B\n B -->|retry| A\n", 80),
+            labelled
+        );
+        let long = vec![
+            "┌───┐   ┌───┐   ┌───┐",
+            "│ A ├─▶ │ B ├─▶ │ C │",
+            "└───┘   └───┘   └─┬─┘",
+            "  ▲               │",
+            "  └───────────────┘",
+        ];
+        assert_eq!(rows("flowchart LR\n A --> B --> C --> A\n", 80), long);
+    }
+
+    #[test]
+    fn a_left_right_self_loop_uses_both_ends_of_the_bottom_edge() {
+        let expected = vec!["┌───┐", "│ A │", "└┬──┘", " │ ▲", " └─┘"];
+        assert_eq!(rows("flowchart LR\n A --> A\n", 80), expected);
+    }
+
+    /// A DAG has no back edge, so nothing about lanes or stubs touches it: the
+    /// layout carries neither, and the goldens above stay as they were.
+    #[test]
+    fn a_dag_has_no_lanes_and_no_stubs() {
+        for source in [
+            "flowchart TD\n A[Start] --> B[End]\n",
+            "flowchart LR\n A[Start] --> B[End]\n",
+            "flowchart TD\n A --> B\n A --> C\n A --> D\n",
+            "flowchart TD\n A --> B\n A --> C\n B --> D\n C --> D\n",
+            "flowchart TD\n A --> B\n B --> C\n A --> C\n",
+            "flowchart LR\n A --> B\n A --> C\n A --> D\n",
+        ] {
+            let plan = layout(&parse(source).expect("parses"), 80).expect("lays out");
+            assert!(plan.lanes.is_empty(), "{source:?}");
+            assert!(
+                plan.nodes.iter().all(|n| !matches!(n, LNode::Ref(_))),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A back edge into a node that is not the rightmost of its layer cannot
+    /// reach the side lane without crossing a box, so it is a stub: dim, no
+    /// frame, `↺` and the target's text — and the target stays one box.
+    #[test]
+    fn a_walled_in_back_edge_is_a_dim_reference_stub() {
+        let expected = vec![
+            "┌───┐",
+            "│ A │",
+            "└─┬─┘",
+            "  ├───────┐",
+            "  ▼       ▼",
+            "┌───┐   ┌───┐",
+            "│ B │   │ C │",
+            "└─┬─┘   └───┘",
+            "  │",
+            "  ▼",
+            " ↺ A",
+        ];
+        let source = "flowchart TD\n A --> B\n A --> C\n B --> A\n";
+        assert_eq!(rows(source, 80), expected);
+        let drawn = draw(source, 80, &theme()).expect("draws");
+        let last = drawn.last().expect("rows");
+        assert!(
+            last.contains(&theme().fg(ThemeColor::Dim, "↺ A")),
+            "the stub is dim: {last:?}"
+        );
+    }
+
+    /// A pane too narrow for the lane gets the stub rather than nothing.
+    #[test]
+    fn a_lane_that_does_not_fit_the_pane_is_a_stub() {
+        let source = "flowchart TD\n A --> B --> A\n";
+        let routed = rows(source, 80);
+        let needed = routed
+            .iter()
+            .map(|r| r.chars().count())
+            .max()
+            .expect("rows");
+        assert_eq!(rows(source, needed), routed);
         let expected = vec![
             "┌───┐",
             "│ A │",
@@ -1683,11 +2267,63 @@ mod tests {
             "└─┬─┘",
             "  │",
             "  ▼",
-            "┌───┐",
-            "│ A │",
-            "└───┘",
+            " ↺ A",
         ];
-        assert_eq!(rows("flowchart TD\n A --> B --> A\n", 80), expected);
+        assert_eq!(rows(source, needed - 1), expected);
+        assert!(draw(source, 4, &theme()).is_none(), "a box does not fit");
+    }
+
+    /// A node's lane exit and a lane entering it share a cell; the second
+    /// back edge on the node is a stub instead of a smear.
+    #[test]
+    fn a_node_that_is_both_ends_of_lanes_gets_one_and_a_stub() {
+        let expected = vec![
+            "┌───┐",
+            "│ A │◀┐",
+            "└─┬─┘ │",
+            "  │   │",
+            "  ▼   │",
+            "┌───┐ │",
+            "│ B ├─┘",
+            "└─┬─┘",
+            "  │",
+            "  ▼",
+            " ↺ B",
+        ];
+        assert_eq!(
+            rows("flowchart TD\n A --> B\n B --> A\n B --> B\n", 80),
+            expected
+        );
+    }
+
+    #[test]
+    fn an_ascii_preset_draws_the_lane_in_ascii() {
+        let theme = Theme::new(
+            "ascii".to_owned(),
+            HashMap::new(),
+            HashMap::new(),
+            ColorMode::Truecolor,
+            SymbolPreset::Ascii,
+            HashMap::new(),
+            None,
+            None,
+        )
+        .expect("theme builds");
+        let expected = vec![
+            "+---+", "| A |<+", "+-+-+ |", "  |   |", "  v   |", "+---+ |", "| B +-+", "+---+",
+        ];
+        let drawn: Vec<String> = draw("flowchart TD\n A --> B --> A\n", 80, &theme)
+            .expect("draws")
+            .iter()
+            .map(|row| visible(row).trim_end().to_owned())
+            .collect();
+        assert_eq!(drawn, expected);
+        let walled: Vec<String> = draw("flowchart TD\n A --> B\n A --> C\n B --> A\n", 80, &theme)
+            .expect("draws")
+            .iter()
+            .map(|row| visible(row).trim_end().to_owned())
+            .collect();
+        assert!(walled.iter().all(|row| row.is_ascii()), "{walled:?}");
     }
 
     #[test]
@@ -1750,6 +2386,10 @@ mod tests {
             ("flowchart TD\n A --> B\n A --> C\n B --> D\n C --> D\n", 80),
             ("flowchart TD\n A[Start] -->|yes| B[End]\n", 80),
             ("flowchart TD\n A --> B --> A\n", 80),
+            ("flowchart TD\n A[Start] -->|again| A\n", 80),
+            ("flowchart TD\n A --> B --> C --> A\n", 80),
+            ("flowchart LR\n A --> B\n B -->|retry| A\n", 80),
+            ("flowchart LR\n A --> A\n", 80),
             ("flowchart TD\n A --- B\n", 80),
         ] {
             let drawn = draw(source, width, &theme()).expect("draws");
@@ -1768,7 +2408,6 @@ mod tests {
             "flowchart TD\n A[Start] --> B[End]\n",
             "flowchart LR\n A[Start] --> B[End]\n",
             "flowchart TD\n A --> B\n A --> C\n A --> D\n",
-            "flowchart TD\n A --> B --> A\n",
         ] {
             let drawn = draw(source, 80, &theme()).expect("draws");
             let needed = drawn
