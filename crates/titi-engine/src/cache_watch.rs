@@ -119,7 +119,7 @@ pub enum Change {
     System {
         /// 1-based, in the order the blocks appear.
         block: usize,
-        /// Characters gained (positive) or lost.
+        /// Characters the system prompt gained (positive) or lost in all.
         delta: i64,
     },
     /// A message the earlier request already sent is different now; 1-based
@@ -220,10 +220,13 @@ pub fn diff(previous: &Fingerprint, current: &Fingerprint) -> Change {
             .zip(&current.system)
             .position(|(old, new)| old != new)
             .unwrap_or_else(|| previous.system.len().min(current.system.len()));
-        let chars = |side: &Fingerprint| side.system.get(at).map_or(0, |block| block.chars);
+        // The size of the whole change, not of the block it starts in: a
+        // heading-less tail (a mode's brief) moves into a new block when one
+        // is inserted ahead of it, and block `at` alone would show only that.
+        let total = |side: &Fingerprint| side.system.iter().map(|block| block.chars).sum::<usize>();
         return Change::System {
             block: at + 1,
-            delta: chars(current) as i64 - chars(previous) as i64,
+            delta: total(current) as i64 - total(previous) as i64,
         };
     }
     if let Some(at) = previous
@@ -452,6 +455,29 @@ mod tests {
         });
         assert_eq!(rewound.describe(), "history rewound (1 messages dropped)");
         assert_eq!(Change::First.describe(), "first request");
+    }
+
+    /// A block inserted ahead of a heading-less tail moves the tail into the
+    /// new block: the first block that differs is the one it left, and the
+    /// size said is what the whole prompt grew by.
+    #[test]
+    fn an_inserted_block_is_sized_by_what_the_prompt_grew_by() {
+        let mut base = Request::base();
+        base.messages[0] = message(Role::System, "# Manual\nwork\nbrief\n");
+        let mut inserted = Request::base();
+        inserted.messages[0] = message(Role::System, "# Manual\nwork\n# Skills\n- a\nbrief\n");
+        let change = diff(&base.print(), &inserted.print());
+        assert_eq!(
+            change,
+            Change::System {
+                block: 1,
+                delta: 13
+            }
+        );
+        assert_eq!(
+            change.describe(),
+            "system prompt changed (block 1, +13 chars)"
+        );
     }
 
     #[test]
