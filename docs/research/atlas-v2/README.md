@@ -1,10 +1,21 @@
 # atlas v2 — a live, task-conditioned map of the repository
 
-Design note, 2026-10-21. **No product code**: this is the plan for the work after the `genome` → `atlas`
-rename lands. Code is referred to by its new names (`titi-atlas`, `Atlas`, `AtlasHandle`); every `file:line`
-is of master `c327866`, before the rename, which is mechanical and does not move lines. Numbers marked
-**pilot** were measured for this note on the corpus clones (`/tmp/titi-qa/genome-corpus`, deepened to
-150+ commits); the scripts are in `pilot/` and reproduce them. Anything not measured is marked **[INFERENCE]**.
+Design note, 2026-10-21, updated after the `genome` → `atlas` rename (master `134041c`). Code is referred to by
+its current names (`titi-atlas`, `Atlas`, `AtlasHandle`, `SharedAtlas`, `atlas.limit`); every `file:line` is
+of `134041c`. Numbers marked **pilot** were measured for this note on the corpus clones
+(`/tmp/titi-qa/genome-corpus`, deepened to 150+ commits); the scripts are in `pilot/` and reproduce them.
+Anything not measured is marked **[INFERENCE]**.
+
+### Owner decisions (2026-10-21)
+
+1. **No model call on the hot path.** Index-only by default; a model-assisted mode may exist later only as
+   an explicit opt-in.
+2. **`atlas.limit` is replaced by token budgets in one clean cutover**: `atlas.budget` (tokens), which the
+   allocator splits between the skeleton and the lens. No fallback to the old key; the CHANGELOG says so.
+3. **The `atlas` tool is on by default from step 6** (read tier); the step-9 A/B may revise that.
+4. **The background git-history probe is accepted**: off the hot path, bounded (commit cap and time cap),
+   cached per `HEAD`, never blocking the first frame or a turn.
+5. **A persisted index, if any, lives in the agent directory**, never in the repository.
 
 ## 0. The thesis
 
@@ -17,7 +28,7 @@ live, what matters, and what would a change touch?** Three measured facts say th
    plus git co-change, finds **86 % in the top 24 and 71 % in the top 10** — more than twice as good with
    fewer than half the files shown. Same graph, same cost class (a PageRank over ≤ 20 k nodes is single-digit ms).
 2. Static quality has plateaued: the audit and corpus round took the static map from p@10 0.30 → 0.41 and
-   recall@24 0.70 → 0.87 on a hand-written truth list (`docs/research/genome-eval/README.md`), and the pilot shows
+   recall@24 0.70 → 0.87 on a hand-written truth list (`docs/research/atlas-eval/README.md`), and the pilot shows
    what that truth list hides: on large repos (okio, ky, gson, ripgrep) the static map holds 1–43 % of the
    files a task actually touches.
 3. The published localisation literature agrees on the shape of the answer: a graph over code plus a few
@@ -136,7 +147,7 @@ the file. The eval in §A6 closes these.
   (`graph.rs:7-8, 46-150`); personalisation exists only as a *render-time multiplier* — `TOUCHED_BOOST = 3.0`
   on files the session read/edited (`project.rs:12, 45-53`), which is far too weak for the leaves one actually
   edits (their static rank is the minimum), and not seeded by anything in the prompt.
-* The engine rebuilds the map each turn from the published snapshot: `genome_map` asks the worker for
+* The engine rebuilds the map each turn from the published snapshot: `atlas_map` asks the worker for
   `Priority(touched)` + `Resync`, waits 40 ms (`runtime.rs:128, 147-186`), renders `project_with_pending`,
   attaches it to the **newest user message** (`prompt_with_context`, `runtime.rs:212-234`) only when it differs
   byte-for-byte from the newest copy in history (`previous_copy_matches`, `runtime.rs:245-251`).
@@ -275,26 +286,27 @@ corpus eval's edge-coverage report (`pilot/edge_cover.py` productised).
 
 ### Current state
 A file line is `path (→N) [RECENT]`, then up to 4 `  +Export (users)` lines (`project.rs:8, 62-93`); 24 files
-≈ 2.4 KB ≈ 600 tokens (this repo, measured); the cap is a *file count* (`genome.limit` 1..64, default 24,
-`runtime.rs:733`). Paths are ≈ 44 % of the bytes (1037 of 2376); grouping files by directory would save
+≈ 2.4 KB ≈ 600 tokens (this repo, measured); the cap is a *file count* (`atlas.limit` 1..64, default 24,
+`runtime.rs:732`). Paths are ≈ 44 % of the bytes (1037 of 2376); grouping files by directory would save
 ≈ 13 % by itself (pilot arithmetic on titi's map). No signature, no role tag besides RECENT, no names for the
 dependents; export lines are ranked by user count, so a symbol that is central by flow but little-used is hidden.
 
 ### Target design
-**Budgeted allocator.** The unit of budget is **tokens**, not files: `atlas.mapTokens` (default scaled with
-repo size: 400 for < 200 files, 700 for < 2 k, 1000 beyond) and `atlas.lensTokens` (default 400).
+**Budgeted allocator.** The unit of budget is **tokens**, not files: one setting, `atlas.budget`
+(default scaled with repo size: 600 tokens for < 200 files, 900 for < 2 k, 1200 beyond), which the allocator splits
+between the skeleton and the lens (lens ≤ 40 %, and the skeleton takes what the lens leaves).
 Tokens are estimated as `ceil(chars / 3.4)` for code-ish text, calibrated against the provider's reported
 usage in the eval (`ContextUsage` events exist); no tokenizer dependency. A greedy allocator picks items by
 marginal rank-per-token — a file header costs its path tokens (a directory header is amortised across its
 files), a symbol line costs its signature tokens — and stops at the budget (Aider binary-searches a prefix of
-a ranked list; greedy-by-value is strictly better when item costs differ by 3×). The `genome.limit` setting is
-replaced by the token budgets in one cut-over (no alias; config docs and `titi atlas` verb updated together).
+a ranked list; greedy-by-value is strictly better when item costs differ by 3×). The `atlas.limit` setting is
+replaced by `atlas.budget` in one cut-over (no alias; config docs and the `titi atlas` verb updated together).
 
 **Line grammar** (illustrative; `§` = 1 token ≈ 3.4 chars):
 ```
 <atlas gen=412 files=351 shown=19>
 crates/titi-engine/src/
-  runtime.rs  →56 R   struct EngineRuntime · fn genome_map(root, limit, genome, touched, quiesce) -> Option<SmolStr>
+  runtime.rs  →56 R   struct EngineRuntime · fn atlas_map(root, limit, genome, touched, quiesce) -> Option<SmolStr>
   tool_loop.rs →31    fn run_tool_round(…) -> RoundOutcome   used by: runtime, subagent +9
 crates/titi-atlas/src/
   graph.rs →1  [core]  fn rank(files, layout) -> (ranks, dependents)
@@ -304,7 +316,7 @@ crates/titi-atlas/src/
 * **Signatures** for the top symbols of a file: one line, from the stored `signature`, truncated at the first
   `{`/`=`/`:`-body boundary and at 100 chars; types of parameters kept, default values dropped; doc comments off
   by default (`atlas.docs: first-line` as an option). Aider shows signatures for the same reason, Agentless'
-  skeleton step is built on them, and the model can answer "what does `genome_map` take?" without a `read`.
+  skeleton step is built on them, and the model can answer "what does `atlas_map` take?" without a `read`.
 * **Role tags** from `role.rs` and a small config detector: `[entry]`, `[test]`, `[cfg]` (Cargo.toml,
   package.json, `*.config.*`, CI files — currently not indexed at all, so they could only ever be in the
   skeleton as a one-line list of manifests), `[gen]`. `R` = recent (today's `[RECENT]`).
@@ -360,7 +372,7 @@ all `&self` on an immutable snapshot, no I/O). The engine's tool and `titi atlas
 it — identical semantics in both, and the LSP's `references`/`definition` get use sites for free. The LSP stays a
 separate stdio process (that is the protocol), so it keeps building its own index; it adopts the same
 incremental updates (`didSave` ⇒ `apply_changes`, watched-file poll tier, A5) and, optionally later, a
-content-hash-keyed on-disk index cache (`.titi/atlas/`) so both processes start warm — `genome-incremental.md` §7
+content-hash-keyed on-disk index cache (`.titi/atlas/`) so both processes start warm — `atlas-incremental.md` §7
 named this the next ticket; cold index is 0.1–0.9 s on the corpus, so it is an optimisation, not a prerequisite.
 
 **Prompt interplay.** With the tool, the skeleton can shrink on big repos (structure only) and the model asks
@@ -392,7 +404,7 @@ sites from the same data as `uses`; A6 scripted-query recall.
   (perf README); debounce 120 ms, turn waits 40 ms and otherwise names `pending` (`runtime.rs:128`, `live.rs:88`).
   Verified in the audit: external edit/delete/rename between turns appear the next turn; the live map equals a
   cold index modulo the touched boost; `pending` never stuck in any scenario.
-* **No watcher**; `notify` was owner-gated (`genome-incremental.md` §4). A `bash` side effect (`rm`, `mv`, a
+* **No watcher**; `notify` was owner-gated (`atlas-incremental.md` §4). A `bash` side effect (`rm`, `mv`, a
   formatter) is seen only at the next turn's walk (audit scenario 2: map after `delete card` unchanged within the
   turn). Importers of a deleted file keep a stale `imports` entry (ranker ignores it; the diagnostic is stale —
   STATE.md open item).
@@ -449,7 +461,7 @@ returns without a re-parse (parse counter); a rename test (hash match ⇒ `parse
 ## A6 — Measurement: a task-level eval on real commits
 
 ### Why the current eval is not enough
-`scripts/genome_eval.py` scores the static map against hand-picked "central files": useful as a smoke test
+`scripts/atlas_eval.py` scores the static map against hand-picked "central files": useful as a smoke test
 (it found 14 real problems), but the truth list is a judgement, p@10 has 10 slots of noise, and it cannot see
 whether a map helps *a task*.
 
@@ -491,19 +503,19 @@ whether a map helps *a task*.
 ### Proof that the harness is right
 It runs in CI on a **fixture repo with synthetic history** (script builds ~40 commits with known changed sets and
 asserts deterministic recall for each condition — including a deliberate "no seeds ⇒ equals static" case); the
-corpus run is a nightly/manual job writing `docs/research/atlas-eval/README.md` like `genome-eval` does.
+corpus run is a nightly/manual job writing `docs/research/atlas-eval/README.md` like `atlas-eval` does.
 
 ## 3. Cross-cutting design
 
 * **Data model.** `Atlas` snapshot = files (records with `signature`, spans, bindings, use sites, import specs),
   CSR edge arrays (structural + reverse + co-change), inverted indexes (name → symbols, path token → files),
   `gen`. Everything the five front ends need is a pure function of it. Publication stays `Arc` swap
-  (`SharedGenome`→`SharedAtlas`).
-* **Config.** `atlas.enabled` (today `genome.enabled`), `atlas.mapTokens`, `atlas.lensTokens`, `atlas.tool`
+  (`SharedAtlas`→`SharedAtlas`).
+* **Config.** `atlas.enabled`, `atlas.budget` (replaces `atlas.limit`, no fallback), `atlas.tool`
   (on by default), `atlas.coChange` (on if git history present), `atlas.poll` (adaptive/off). One cut-over,
   no aliases.
-* **Duck mode** stays repo-blind: no skeleton, no lens, no tool (`genome_root = None`, `runtime.rs:159`).
-* **Subagents** get the same snapshot through the existing `with_genome` handle (now `with_atlas`); a subagent
+* **Duck mode** stays repo-blind: no skeleton, no lens, no tool (`atlas_root = None`, `runtime.rs:159`).
+* **Subagents** get the same snapshot through the existing `with_atlas` handle (now `with_atlas`); a subagent
   inherits the parent's *lens seeds* (its task text is seeds too).
 * **Failure modes** degrade to today's behaviour: no seeds ⇒ static skeleton; no git ⇒ no co-change/RECENT by
   mtime; index error ⇒ no atlas (the prompt goes through unchanged).
@@ -519,7 +531,7 @@ commit body.
 | 1 | **`atlas dump` + `scripts/atlas_eval.py`** (pilot productised; `titi atlas graph --json`), fixture repo CI test, baseline table committed | numbers before code; pilot already shows the gap | M | harness self-test; baseline in docs |
 | 2 | **Seeds + personalised PageRank (`Atlas::lens`)** with both-way edges and the static fallback; engine attaches `<atlas-lens>` to the newest user message; masking of old lenses at compaction | the biggest measured effect: recall@10 0.29 → ~0.7 | M | lens unit tests; engine prefix-stability test; A6 `lens` vs `static` |
 | 3 | **Co-change edges** (git probe beside recency, decay, caps, shallow fallback) | +0.03–0.09 recall@10; a signal no static analysis has | S–M | synthetic-history test; A6 ablation |
-| 4 | **Token-budgeted skeleton**: directory-grouped sorted render, role tags, named dependents in lens, `atlas.mapTokens`/`lensTokens` replacing `genome.limit`, skeleton delta policy | tokens/cache; makes 2 affordable | M | golden render + calibration tests; A6 tokens columns |
+| 4 | **Token-budgeted skeleton**: directory-grouped sorted render, role tags, named dependents in lens, `atlas.budget` replacing `atlas.limit`, skeleton delta policy | tokens/cache; makes 2 affordable | M | golden render + calibration tests; A6 tokens columns |
 | 5 | **Spans, signatures, use sites** in `ExportSite`/`FileRecord` (all languages, `lang/*`) and signatures in map lines | needed by 6 and by symbol-level truth | M–L | per-language fixture tests |
 | 6 | **`atlas` tool** (`find`/`outline`/`uses`/`impact`/`related`) on the query layer; LSP `references` and `didSave` on the same layer; manual sentence | multi-hop reach the prompt cannot carry | L | per-op golden tests; LSP test; A6 conditions C/D |
 | 7 | **Binding-level uses + test↔source pairing** | precision of `uses`/`impact`, test discovery, trace seeds | M | fixture tests; compiler-oracle test |
@@ -530,17 +542,14 @@ Steps 2–4 are the core of the concept and are independently shippable behind `
 is the second big lever; 5/7/8 are precision and freshness work that the earlier steps expose the need for in
 the eval rather than assume.
 
-## 5. Open questions for the owner
+## 5. Questions, as decided (2026-10-21)
 
-1. **Model-free forever?** Marionette's default is a model call (`fast`); this design is index-only. Is a cheap
-   re-ranking model call ever allowed on the hot path (adds 1–3 s per prompt), or only as `atlas.lens: assist`?
-2. **`genome.limit` cut-over**: replace with token budgets in one commit (recommended) or keep the file-count
-   cap as a second constraint?
-3. **Tool default**: on for everyone from step 6, or off until the end-to-end A/B (step 9) shows use?
-4. **Git history cost**: 1.5 s background probe per index build is the same budget as RECENT today; acceptable on
-   repos with 100 k+ commits (it is bounded by `-n 500`)?
-5. **Persisted index** (`.titi/atlas/`): do we want a cache directory in repositories (needs its own
-   `.gitignore`, like `.titi/pastes/`), or in the agent directory keyed by repo path?
+1. *Model call on the hot path?* **No.** Index-only; an assisted mode only as an explicit later opt-in.
+2. *`atlas.limit`?* **Replaced** by `atlas.budget` (tokens) in one cutover, no fallback key, CHANGELOG says so.
+3. *Tool default?* **On from step 6**, read tier; the step-9 A/B may revise it.
+4. *Git history probe?* **Fine**: background, capped by commits and time, cached per `HEAD`, never blocks the first
+   frame or a turn.
+5. *Persisted index?* **Agent directory**, never the repository.
 
 ## Appendix — pilot files and how to reproduce
 
@@ -549,10 +558,10 @@ the eval rather than assume.
 the graph dumper `pilot/graph_dump.rs` built as a scratch crate that depends on `titi-atlas` — the repo's
 public API only), `pilot/edge_cover.py` (import/use vs co-change coverage). Corpus clones deepened with
 `git fetch --deepen 150`. Paths inside the scripts point at this machine's `/tmp` layout and the pre-rename
-crate name (`titi-genome`); the rename sweep should update them with the rest.
+crate name (`titi-atlas`); the rename sweep should update them with the rest.
 
 Sources: Aider repo-map blog and `repomap.py` (aider.chat/2023/10/22/repomap.html,
 github.com/Aider-AI/aider); LocAgent, arXiv 2503.09089 (Table 4: file Acc@5 94.2 % vs BM25 61.7 %, CodeRankEmbed
 84.7 %, Agentless 74–79 %, SWE-agent 69–90 %); Agentless, arXiv 2407.01489; RepoGraph, arXiv 2410.14684;
 Empryo docs `concepts/genome` and `concepts/marionette` (empryo.com, public, ideas only); titi
-`docs/research/{agent-practices,prompt-cache,genome-incremental,perf,genome-eval}`.
+`docs/research/{agent-practices,prompt-cache,atlas-incremental,perf,atlas-eval}`.
