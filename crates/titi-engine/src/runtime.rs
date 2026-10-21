@@ -1445,6 +1445,20 @@ impl EngineRuntime {
                                 from,
                                 to: model,
                             }).await;
+                            // What the new model is sent for the session's
+                            // effort is its own question: the surface that
+                            // shows the effort would otherwise keep showing
+                            // the old model's answer.
+                            if self.config.effort.is_some() {
+                                let report = crate::effort::changed(
+                                    self.resolver.as_ref(),
+                                    &primary_model,
+                                    self.config.effort,
+                                    self.config.effort,
+                                    false,
+                                );
+                                let _ = self.events.send(report).await;
+                            }
                         }
                         EngineCommand::RunGoal { text } => {
                             self.spawn_goal(text, primary_model.clone());

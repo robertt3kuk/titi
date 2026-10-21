@@ -244,3 +244,28 @@ async fn changing_effort_after_a_turn_says_the_cache_is_lost_and_clearing_sends_
         "each request carries the effort in force when it was made"
     );
 }
+
+#[tokio::test]
+async fn switching_model_reports_what_the_new_model_is_sent() {
+    let transport = recording(ApiKind::OpenAiCompletions);
+    let mut config = EngineConfig::new("reasoner");
+    config.effort = Some(Effort::Medium);
+    let mut engine = EngineRuntime::start(config, Arc::new(Resolver(Arc::clone(&transport))));
+    effort_report(&mut engine).await;
+
+    engine
+        .send(EngineCommand::SwitchModel {
+            model: "plain".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        effort_report(&mut engine).await,
+        EngineEvent::EffortChanged {
+            effort: Some(Effort::Medium),
+            applied: None,
+            cache_miss: false,
+        },
+        "the setting stands, and the model it moved to takes none"
+    );
+}
