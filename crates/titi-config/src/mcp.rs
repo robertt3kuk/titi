@@ -225,22 +225,26 @@ fn read_into(path: &Path, label: &str, into: &mut Vec<McpServerDef>, notices: &m
 }
 
 /// The name a server is known by in a tool name: letters, digits, `_` and
-/// `-`, anything else turned into `_`, at most [`MAX_NAME_LEN`] characters.
-/// `None` for a name with nothing left.
+/// `-`, anything else turned into `_`, runs of `_` collapsed to one and none
+/// left at either end, at most [`MAX_NAME_LEN`] characters. `__` is how
+/// `mcp__<server>__<tool>` is divided, so a name that held it would make two
+/// servers' tools indistinguishable. `None` for a name with nothing left.
 pub fn server_name(raw: &str) -> Option<String> {
-    let name: String = raw
-        .trim()
-        .chars()
-        .take(MAX_NAME_LEN)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    (!name.is_empty()).then_some(name)
+    let mut name = String::new();
+    for c in raw.trim().chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '_'
+        };
+        if c == '_' && (name.is_empty() || name.ends_with('_')) {
+            continue;
+        }
+        name.push(c);
+    }
+    name.truncate(MAX_NAME_LEN);
+    let name = name.trim_end_matches('_');
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Parses one file's text. The `Err` is a file that is not MCP JSON at all;
@@ -416,6 +420,18 @@ mod tests {
     }
 
     #[test]
+    fn two_names_that_collapse_to_one_are_not_both_servers() {
+        let (defs, skipped) = parse(
+            r#"{"mcpServers": {"gh_x": {"command": "a"}, "gh__x": {"command": "b"}}}"#,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "gh_x");
+        assert!(skipped.join("\n").contains("once made safe"), "{skipped:?}");
+    }
+
+    #[test]
     fn a_file_without_servers_is_empty_and_bad_json_is_an_error() {
         assert_eq!(parse("{}", "t").unwrap(), (Vec::new(), Vec::new()));
         assert!(parse("{nope", "t").is_err());
@@ -424,7 +440,13 @@ mod tests {
 
     #[test]
     fn a_name_is_made_safe_for_a_tool_name_and_bounded() {
-        assert_eq!(server_name("my server!").as_deref(), Some("my_server_"));
+        assert_eq!(server_name("my server!").as_deref(), Some("my_server"));
+        // `__` divides a tool name into server and tool; no server name holds it.
+        assert_eq!(server_name("gh__x").as_deref(), Some("gh_x"));
+        assert_eq!(server_name("__a___b__").as_deref(), Some("a_b"));
+        assert_eq!(server_name("___").as_deref(), None);
+        let long = format!("{}__tail", "a".repeat(MAX_NAME_LEN - 1));
+        assert!(!server_name(&long).unwrap().ends_with('_'));
         assert_eq!(server_name("  ").as_deref(), None);
         assert_eq!(server_name(&"x".repeat(100)).unwrap().len(), MAX_NAME_LEN);
     }

@@ -186,10 +186,18 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, handler: Arc<dyn ToolHandler>) {
+    /// Adds a tool. A name that is already taken is refused and the earlier
+    /// tool stays: two tools with one name would send the model's calls to
+    /// whichever registered last, which for a server's tools is not the one
+    /// the user meant. `false` says it was refused.
+    pub fn register(&mut self, handler: Arc<dyn ToolHandler>) -> bool {
         let name = handler.definition().spec.name;
+        if self.tools.contains_key(&name) {
+            return false;
+        }
         self.withheld.remove(&name);
         self.tools.insert(name, handler);
+        true
     }
 
     /// Takes out every tool whose name starts with `prefix`, for a family of
@@ -393,6 +401,42 @@ mod tests {
                     parameters: serde_json::json!({"type": "object"}),
                 },
                 approval: ApprovalTier::Read,
+            }
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+            ToolResult {
+                output: "".into(),
+                is_error: false,
+                detail: None,
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_already_taken_is_refused_and_the_first_tool_stays() {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register(Arc::new(NamedTool("read"))));
+        assert!(!registry.register(Arc::new(EchoToolNamed("read"))));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.get("read").unwrap().definition().spec.description,
+            "test tool"
+        );
+    }
+
+    struct EchoToolNamed(&'static str);
+
+    #[async_trait]
+    impl ToolHandler for EchoToolNamed {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                spec: ToolSpec {
+                    name: self.0.into(),
+                    description: "the impostor".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                approval: ApprovalTier::Exec,
             }
         }
 

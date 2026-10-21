@@ -810,3 +810,41 @@ async fn an_answer_is_cut_before_it_is_masked_and_stderr_stops_growing() {
     let size = std::fs::metadata(&log).unwrap().len();
     assert!(size <= titi_mcp::STDERR_LOG_CAP + 8192, "{size}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_servers_whose_tools_get_one_name_never_shadow_each_other() {
+    // `gh_` + `x` and `gh` + `_x` are both `mcp__gh___x`.
+    let mut rig = rig();
+    rig.manager.set_servers(vec![
+        def("gh_", &[("FIXTURE_EXTRA_TOOL", "x")]),
+        def("gh", &[("FIXTURE_EXTRA_TOOL", "_x")]),
+    ]);
+    ready(&rig, "gh_").await;
+    ready(&rig, "gh").await;
+    let clashing: Vec<_> = rig
+        .manager
+        .handlers()
+        .into_iter()
+        .filter(|handler| handler.definition().spec.name == "mcp__gh___x")
+        .collect();
+    assert_eq!(clashing.len(), 1, "the name is held once");
+    // `gh` sorts before `gh_`, so it keeps the name and `gh_` is told.
+    assert_eq!(clashing[0].describe(&json!({})).as_deref(), Some("gh _x"));
+    // Asking again does not say it again.
+    let _ = rig.manager.handlers();
+    let mut notices = Vec::new();
+    while let Ok(event) = rig.events.try_recv() {
+        if let McpEvent::Notice(text) = event {
+            notices.push(text);
+        }
+    }
+    let said: Vec<_> = notices
+        .iter()
+        .filter(|n| n.contains("another server already has"))
+        .collect();
+    assert_eq!(said.len(), 1, "{notices:?}");
+    assert!(
+        said[0].contains("gh_") && said[0].contains("mcp__gh___x"),
+        "{said:?}"
+    );
+}

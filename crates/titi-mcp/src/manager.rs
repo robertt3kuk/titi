@@ -233,6 +233,8 @@ pub struct McpManager {
     config: ManagerConfig,
     events: UnboundedSender<McpEvent>,
     servers: Mutex<BTreeMap<String, Entry>>,
+    /// Name clashes already reported, so each is said once.
+    collisions: Mutex<HashSet<String>>,
 }
 
 impl McpManager {
@@ -241,6 +243,7 @@ impl McpManager {
             config,
             events,
             servers: Mutex::new(BTreeMap::new()),
+            collisions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -304,7 +307,12 @@ impl McpManager {
     /// approval tier is the one the user set for it, else `exec`.
     pub fn handlers(&self) -> Vec<Arc<dyn ToolHandler>> {
         let mut handlers: Vec<Arc<dyn ToolHandler>> = Vec::new();
-        for entry in locked(&self.servers).values() {
+        // Names are only unique within a server. Across servers the first, in
+        // name order, keeps a name and the other is left out and reported, so
+        // a call the model meant for one server never reaches another.
+        let mut taken: HashSet<String> = HashSet::new();
+        let servers = locked(&self.servers);
+        for entry in servers.values() {
             let slot = &entry.slot;
             let state = locked(&slot.inner);
             if state.state != ServerState::Ready {
@@ -316,6 +324,10 @@ impl McpManager {
                 Some(McpApproval::Exec) | None => ApprovalTier::Exec,
             };
             for tool in &state.listing {
+                if !taken.insert(tool.name.clone()) {
+                    self.report_collision(&slot.name, &tool.name);
+                    continue;
+                }
                 handlers.push(Arc::new(McpTool {
                     slot: Arc::clone(slot),
                     remote_name: tool.remote.clone(),
@@ -329,6 +341,15 @@ impl McpManager {
             }
         }
         handlers
+    }
+
+    fn report_collision(&self, server: &str, tool: &str) {
+        let key = format!("{server}\0{tool}");
+        if locked(&self.collisions).insert(key) {
+            let _ = self.events.send(McpEvent::Notice(format!(
+                "mcp: {server}: the tool {tool} is left out — another server already has a tool of that name"
+            )));
+        }
     }
 
     /// Stops every server, the process groups included, and forgets them.

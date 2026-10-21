@@ -97,14 +97,22 @@ impl McpHost {
         digest
     }
 
-    /// Replaces the MCP tools in `tools` with those of the ready servers.
-    pub(crate) fn install(&self, tools: &mut ToolRegistry) {
+    /// Replaces the MCP tools in `tools` with those of the ready servers, and
+    /// returns a line for each one the registry refused.
+    pub(crate) fn install(&self, tools: &mut ToolRegistry) -> Vec<String> {
         tools.unregister_prefix(PREFIX);
+        let mut refused = Vec::new();
         if let Some(manager) = &self.manager {
             for handler in manager.handlers() {
-                tools.register(Arc::clone(&handler));
+                if !tools.register(Arc::clone(&handler)) {
+                    refused.push(format!(
+                        "mcp: the tool {} is left out — the name is already taken",
+                        handler.definition().spec.name
+                    ));
+                }
             }
         }
+        refused
     }
 
     pub(crate) fn shutdown(&mut self) {

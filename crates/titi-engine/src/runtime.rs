@@ -2140,7 +2140,14 @@ impl EngineRuntime {
                 .await;
         }
         if digest.changed {
-            self.mcp.install(&mut self.tools);
+            for message in self.mcp.install(&mut self.tools) {
+                let _ = self
+                    .events
+                    .send(EngineEvent::Notice {
+                        message: message.into(),
+                    })
+                    .await;
+            }
             self.report_mcp().await;
         }
     }
