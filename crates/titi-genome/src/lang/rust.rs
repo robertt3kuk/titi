@@ -79,8 +79,48 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     let mut external_uses = Vec::new();
     // Names `use std::…::Name` binds: a mention of one is the standard
     // library's, whatever else in the workspace is called `Name`.
-    let mut std_names: Vec<&str> = Vec::new();
+    let mut std_names: Vec<String> = Vec::new();
+    let mut published: Vec<String> = Vec::new();
+    // `mod engine;` beside `pub use engine::Engine;`: a bare first segment that
+    // names a module this file declares is `self::engine::…`, not a crate.
+    let declared_mods: Vec<(&[String], &str)> = rust_imports
+        .iter()
+        .filter(|item| item.is_mod)
+        .filter_map(|item| Some((item.mods.as_slice(), item.segments.first()?.as_str())))
+        .collect();
+    let local_names = local_item_names(tree.root_node(), bytes);
     for item in &rust_imports {
+        let rewritten;
+        let item = match item.segments.first().map(String::as_str) {
+            Some(first)
+                if !item.is_mod
+                    && !matches!(first, "crate" | "self" | "super")
+                    && declared_mods
+                        .iter()
+                        .any(|(mods, name)| *mods == item.mods.as_slice() && *name == first) =>
+            {
+                rewritten = RustImport {
+                    segments: std::iter::once("self".to_owned())
+                        .chain(item.segments.iter().cloned())
+                        .collect(),
+                    ..item.clone()
+                };
+                &rewritten
+            }
+            _ => item,
+        };
+        // `use self::Kind::*` and `use self::imp::*`: the first name after
+        // `self` is an item or an inline module of this very file.
+        if !item.is_mod
+            && item.segments.first().map(String::as_str) == Some("self")
+            && item
+                .segments
+                .get(1)
+                .is_some_and(|name| local_names.contains(name))
+            && item.segments.len() > 2
+        {
+            continue;
+        }
         // A bare path is an external crate or a std path — `serde_json::json`,
         // `std::collections::HashMap` — not a workspace lookup for *this*
         // file. Only the three crate/super/self prefixes name a file here,
@@ -96,7 +136,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
             if let Some(root) = item.segments.first() {
                 if matches!(root.as_str(), "std" | "core" | "alloc") {
                     if let Some(name) = item.segments.last() {
-                        std_names.push(name);
+                        std_names.push(name.clone());
                     }
                 } else {
                     external_uses.push(root.clone());
@@ -119,6 +159,11 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         if let Some(target) = &resolved {
             if item.public {
                 reexports.push(target.clone());
+                // The facade line `pub use engine::Engine;` publishes `Engine`;
+                // it is not a use of it.
+                if let Some(name) = item.segments.last().filter(|name| *name != "*") {
+                    published.push(name.clone());
+                }
             }
             if item.inherits_scope() {
                 inherits.push(target.clone());
@@ -145,11 +190,34 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     }
     parsed
         .refs
-        .retain(|name| !std_names.contains(&name.as_str()));
+        .retain(|name| !std_names.contains(name) && !published.contains(name));
     parsed.reexports = reexports;
     parsed.inherits = inherits;
     parsed.external_uses = external_uses;
     parsed
+}
+
+/// Names of the enums, structs, unions, traits, type aliases and inline
+/// modules declared anywhere in the file (`mod x;` names a file, not an item): what a `self::Name::…` path can mean without
+/// naming another file.
+fn local_item_names(root: Node, source: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "mod_item" | "enum_item" | "struct_item" | "union_item" | "trait_item" | "type_item"
+        ) && (node.kind() != "mod_item" || node.child_by_field_name("body").is_some())
+            && let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| text(n, source))
+        {
+            names.insert(name);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    names
 }
 
 /// Tree-sitter `ERROR` nodes, with the pinned grammar's `&raw` token ambiguity
@@ -285,7 +353,16 @@ fn use_path_candidates(dir: &str, segments: &[&str]) -> Vec<Candidate> {
         return module_file_candidates(dir);
     }
     if segments.last() == Some(&"*") {
-        return module_path_candidates(dir, &segments[..segments.len() - 1]);
+        // `use super::Token::*` globs an enum's variants: a CamelCase segment
+        // is an item of the module before it, which is where the file is.
+        let mut module = &segments[..segments.len() - 1];
+        while module
+            .last()
+            .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_uppercase()))
+        {
+            module = &module[..module.len() - 1];
+        }
+        return module_path_candidates(dir, module);
     }
     let mut candidates = Vec::new();
     for take in (1..=segments.len()).rev() {

@@ -224,3 +224,93 @@ fn a_module_in_a_directory_resolves_from_a_plain_file() {
     );
     assert!(unresolved(&genome, "src/outer.rs").is_empty());
 }
+
+/// `mod engine; pub use engine::Engine;` is the facade idiom: `engine` is a
+/// child module declared in this very file, so the path is `self::engine::…`
+/// and not an external crate. The edge and the re-export must exist.
+#[test]
+fn a_use_of_a_module_declared_in_the_same_file_is_an_import_and_a_reexport() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        "mod engine;\nmod hidden;\npub use engine::Engine;\nuse hidden::Secret;\n",
+    );
+    write(root, "src/engine.rs", "pub struct Engine;\n");
+    write(root, "src/hidden/mod.rs", "pub struct Secret;\n");
+
+    let genome = Genome::index(root).unwrap();
+    let lib = &genome.files["src/lib.rs"];
+    assert!(
+        lib.reexports.contains(&"src/engine.rs".to_owned()),
+        "{:?}",
+        lib.reexports
+    );
+    assert!(
+        !lib.reexports.contains(&"src/hidden/mod.rs".to_owned()),
+        "a private `use` is not a re-export: {:?}",
+        lib.reexports
+    );
+    assert!(
+        lib.imports.contains(&"src/engine.rs".to_owned()),
+        "{:?}",
+        lib.imports
+    );
+    assert!(
+        lib.imports.contains(&"src/hidden/mod.rs".to_owned()),
+        "{:?}",
+        lib.imports
+    );
+    assert!(lib.external_uses.is_empty(), "{:?}", lib.external_uses);
+}
+
+/// A glob over an enum's variants, over an inline module, or over a type of
+/// the parent module names an item, not a file: none of them is unresolved.
+#[test]
+fn globs_over_enums_and_private_modules_are_not_missing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub mod human;\npub mod parent;\n");
+    write(
+        root,
+        "src/human.rs",
+        "use self::Kind::*;\nuse self::imp::*;\n\npub enum Kind { A, B }\n\nmod imp {\n    pub fn f() {}\n}\n",
+    );
+    write(
+        root,
+        "src/parent/mod.rs",
+        "pub enum Token { X }\npub mod child;\n",
+    );
+    write(
+        root,
+        "src/parent/child.rs",
+        "use super::Token::*;\nuse super::Missing::*;\npub fn t() {}\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+    assert!(
+        unresolved(&genome, "src/human.rs").is_empty(),
+        "{:?}",
+        unresolved(&genome, "src/human.rs")
+    );
+    // `Token` is CamelCase: a type of the parent module, which is a file. A
+    // second CamelCase glob is indistinguishable from it, so it is quiet too.
+    assert!(
+        unresolved(&genome, "src/parent/child.rs").is_empty(),
+        "{:?}",
+        unresolved(&genome, "src/parent/child.rs")
+    );
+    assert!(
+        genome.files["src/parent/child.rs"]
+            .imports
+            .contains(&"src/parent/mod.rs".to_owned())
+    );
+    // A snake_case module that does not exist is still a finding.
+    write(root, "src/missing_user.rs", "use crate::nowhere::*;\n");
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(
+        unresolved(&genome, "src/missing_user.rs"),
+        vec!["crate::nowhere::*".to_owned()]
+    );
+}
