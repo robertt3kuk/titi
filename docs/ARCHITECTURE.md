@@ -1,4 +1,4 @@
-# ARCHITECTURE — genome, tools, and agent state
+# ARCHITECTURE — atlas, tools, and agent state
 
 How titi orients itself in an unfamiliar repo, how it acts safely, and where
 it keeps its state. Every number and name below is taken from the code; the
@@ -14,7 +14,7 @@ source files are listed at the end. If the code changes, the code wins.
 | titi-providers | Transport and stream parsing |
 | titi-tools | Tools and the read / write / exec tiers |
 | titi-mcp | MCP client over stdio: servers, their tools as `mcp__<server>__<tool>` |
-| titi-genome | Repo walk, PageRank, projection into the system message |
+| titi-atlas | Repo walk, PageRank, projection into the system message |
 | titi-core | JSONL sessions, search, trajectory |
 | titi-memory | Memory index: full text and local embeddings |
 | titi-soul | Identity slot, validated before it enters the prompt |
@@ -24,15 +24,15 @@ source files are listed at the end. If the code changes, the code wins.
 A surface (TUI or headless) never calls a model. It sends `EngineCommand`
 and renders `EngineEvent`; everything else sits under `titi-engine`.
 
-## Genome: a ranked map instead of blind search
+## Atlas: a ranked map instead of blind search
 
-Code: `crates/titi-genome/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
-`crates/titi-genome/src/lang/{mod,support}.rs` and one module per language,
+Code: `crates/titi-atlas/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
+`crates/titi-atlas/src/lang/{mod,support}.rs` and one module per language,
 example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
 
 ### What gets built
 
-`Genome` holds `files: HashMap<String, FileRecord>`, `ranks`, `dependents`,
+`Atlas` holds `files: HashMap<String, FileRecord>`, `ranks`, `dependents`,
 `symbols: HashMap<String, SymbolRecord>` and `used_by`.
 
 - `FileRecord { path, language, exports, imports, reexports, inherits,
@@ -87,7 +87,7 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   counts distinct files whose uses of `Name` resolve to *this* file. Two files
   defining `Shared` are counted separately.
 - **`MAX_DEFINERS = 1` is no longer an edge rule.** It still decides what
-  `titi genome check` calls an ambiguous symbol and whether goto-definition
+  `titi atlas check` calls an ambiguous symbol and whether goto-definition
   has one answer.
 - **References come from use sites.** `collect_refs` takes calls (`name(`),
   path-qualified names (`::name`), and capitalised identifiers (types and
@@ -106,7 +106,7 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
 
 ### Languages
 
-One language is one module under `crates/titi-genome/src/lang/` plus one row
+One language is one module under `crates/titi-atlas/src/lang/` plus one row
 in `LANGS`. The row is the only place that says how a language is recognised:
 its extensions, its grammar when one is linked, and its parser. So
 `Language::from_path`, the extensions the scanner indexes, the grammar
@@ -136,15 +136,15 @@ Every `Language` has a **level**, which is what a user sees when they ask:
   which "unknown extension" is the current instance.
 
 The level is surfaced where a user asks for it, never in the findings.
-`Genome::capabilities()` returns one entry per language — its level, its
+`Atlas::capabilities()` returns one entry per language — its level, its
 extensions and its note — and it is a property of the build rather than of
-the workspace, so it answers without indexing anything. `titi genome
+the workspace, so it answers without indexing anything. `titi atlas
 capabilities` prints it as a table (`rust  Full  .rs  exported items and
 use/mod paths come from a syntax tree`, then `13 languages: 13 full,
-0 heuristic`) and `titi genome lsp` reports the
-same roster in `initialize`'s `experimental.titiGenome.languages`. `titi
-genome check` reports findings only, so a tree with nothing wrong still
-answers `genome: clean`, and the per-file LSP `diagnostic` reply never
+0 heuristic`) and `titi atlas lsp` reports the
+same roster in `initialize`'s `experimental.titiAtlas.languages`. `titi
+atlas check` reports findings only, so a tree with nothing wrong still
+answers `atlas: clean`, and the per-file LSP `diagnostic` reply never
 carries a capability: a constant hint in every file is noise, and a vetter
 that also narrated its own reach could no longer say "clean".
 
@@ -195,19 +195,19 @@ grammar report zero: this crate does not invent errors it did not parse.
 
 `EngineRuntime::system_prompt()` (`titi-engine/src/runtime.rs`) joins three
 parts: identity (`titi_soul::SystemPromptBuilder`), recalled memory
-(`titi_memory::index::MemoryIndex`), and the genome (`genome_system()`). The
+(`titi_memory::index::MemoryIndex`), and the atlas (`atlas_system()`). The
 result goes first in the turn as `ChatMessage { role: Role::System, … }`.
 Before each turn the index is refreshed and rendered with
-`genome.project_with(limit, &touched)`:
+`atlas.project_with(limit, &touched)`:
 
 ```
-<genome>
+<atlas>
 src/lib.rs (→12)
-  +Genome (9)
+  +Atlas (9)
   +render (4)
 src/runtime.rs (→3) [RECENT]
   +EngineRuntime (7)
-</genome>
+</atlas>
 ```
 
 - `(→N)` — files that depend on this one (file and symbol edges).
@@ -226,11 +226,11 @@ src/runtime.rs (→3) [RECENT]
   (tested).
 - Paths containing `<` or `>` are dropped, so a file name cannot forge the
   closing tag — prompt-injection hygiene.
-- File limit: `EngineConfig::genome_limit`, default 24, overridden by the
-  `genome.limit` setting (1..=64, the project `.titi/config.yml` winning);
-  `TITI_NO_GENOME=1` drops the map.
+- File limit: `EngineConfig::atlas_limit`, default 24, overridden by the
+  `atlas.limit` setting (1..=64, the project `.titi/config.yml` winning);
+  `TITI_NO_ATLAS=1` drops the map.
 - The turn also carries a `<diff>` block — `git diff HEAD`, bounded to 8
-  files, 120 lines and 6000 bytes — right after `<genome>`, and its paths join
+  files, 120 lines and 6000 bytes — right after `<atlas>`, and its paths join
   the touched set the map reads. Secret-named files and hunks with
   secret-shaped assignments are dropped whole, and duck mode gets neither
   block (`crates/titi-engine/src/difftrack.rs`).
@@ -242,25 +242,25 @@ where work is happening — for the cost of one text block.
 ### Commands
 
 ```bash
-cargo run -p titi-genome --example map -- <path> <N>   # defaults: . and 24
-titi-map <path> <N>                                    # prebuilt, skill genome-map
-titi genome check                                      # index diagnostics, exit 1 on any
-titi genome capabilities                               # level and extensions per language
-titi genome lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
+cargo run -p titi-atlas --example map -- <path> <N>   # defaults: . and 24
+titi-map <path> <N>                                    # prebuilt, skill atlas-map
+titi atlas check                                      # index diagnostics, exit 1 on any
+titi atlas capabilities                               # level and extensions per language
+titi atlas lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
 ```
 
 stderr prints `"{files} files, {edges} edges"`, stdout the projection.
-`TITI_NO_GENOME=1` disables the map: `crates/titi-cli/src/engine.rs` sets
-`genome_root` to the cwd only when the variable is unset, and
-`genome_root = None` means no genome at all. `titi genome check` prints
+`TITI_NO_ATLAS=1` disables the map: `crates/titi-cli/src/engine.rs` sets
+`atlas_root` to the cwd only when the variable is unset, and
+`atlas_root = None` means no atlas at all. `titi atlas check` prints
 `path:line: code: message` per diagnostic and exits 1 on any Warning or
-Error (`genome: clean`, exit 0, when there is nothing wrong — an
+Error (`atlas: clean`, exit 0, when there is nothing wrong — an
 `ambiguous-symbol` line is `Info` and does not change the exit code). The
 line is the one the problem is on (the import's, the first syntax error's),
-`Genome::check()` returns every finding, and the command prints the first 200
+`Atlas::check()` returns every finding, and the command prints the first 200
 and ends with `… and N more (T total: code n, …)` rather than a silent cap.
-`titi genome capabilities` prints the per-language roster described above
-and needs no workspace at all. `titi genome lsp` serves those symbols over
+`titi atlas capabilities` prints the per-language roster described above
+and needs no workspace at all. `titi atlas lsp` serves those symbols over
 LSP stdio framing.
 
 ## Tools and approval
@@ -387,9 +387,9 @@ clone carries no one's chat history or credentials.
 
 ## Sources
 
-- `crates/titi-genome/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
-  `crates/titi-genome/src/lang/*.rs`, `examples/map.rs`
+- `crates/titi-atlas/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
+  `crates/titi-atlas/src/lang/*.rs`, `examples/map.rs`
 - `crates/titi-tools/src/{lib,fs,cache}.rs`
 - `crates/titi-engine/src/{runtime,tool_loop,tool_agent,protocol}.rs`
 - `crates/titi-config/src/{lib,settings}.rs`, `crates/titi-cli/src/engine.rs`
-- `README.md` (Genome, tool jail, subagents, state storage)
+- `README.md` (Atlas, tool jail, subagents, state storage)

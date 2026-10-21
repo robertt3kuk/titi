@@ -66,7 +66,7 @@ describe.
    `~/.titi/agent`.
 3. Subject: `type(scope): summary` — English, imperative, lowercase, no
    trailing dot, ~50 cols. Types: feat fix docs refactor test ci style chore.
-   Scope: crate short name (`cli`, `engine`, `tui`, `genome`, …) or `ci`,
+   Scope: crate short name (`cli`, `engine`, `tui`, `atlas`, …) or `ci`,
    `cargo`, `workspace`, `readme`, `agents`, `commits`, `conveyor`, `skills`,
    `brain`.
 4. Body, wrapped ~78 cols, prose: why, what invariant now holds, why this

@@ -6793,7 +6793,7 @@ fn context_renders_parts_that_sum_to_the_reported_total() {
                 tokens: 300,
             },
             ContextPart {
-                label: "genome map".into(),
+                label: "atlas map".into(),
                 tokens: 500,
             },
             ContextPart {
@@ -6824,7 +6824,7 @@ fn context_renders_parts_that_sum_to_the_reported_total() {
     assert!(
         rendered
             .iter()
-            .any(|line| line.starts_with("genome map") && line.contains("50%")),
+            .any(|line| line.starts_with("atlas map") && line.contains("50%")),
         "{rendered:?}"
     );
 }
@@ -7979,7 +7979,7 @@ fn diagnose_summarises_and_never_prints_a_key() {
         "providers: ",
         "openai (",
         "config: ",
-        "genome: ",
+        "atlas: ",
         "repo: ",
     ] {
         assert!(summary.text.contains(part), "{part} missing: {summary:?}");
@@ -8164,71 +8164,71 @@ fn switch_role_unknown_fails() {
     );
 }
 
-/// `/genome off` writes a false `genome.enabled` on the agent's own
-/// config, and a following `/genome` note reads its own file back: the
+/// `/atlas off` writes a false `atlas.enabled` on the agent's own
+/// config, and a following `/atlas` note reads its own file back: the
 /// note is the file's word, not the input echoed.
 #[test]
-fn genome_off_persists_and_the_next_note_reads_it_back() {
+fn atlas_off_persists_and_the_next_note_reads_it_back() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/genome off");
+    type_text(&mut chat, "/atlas off");
     let applied = chat.on_key(Key::Enter, Instant::now());
     assert!(applied.effect.is_none());
-    assert!(chat.lines.iter().any(|line| line.text == "genome: off"));
+    assert!(chat.lines.iter().any(|line| line.text == "atlas: off"));
     let config = std::fs::read_to_string(chat.agent_dir.join("config.yml")).unwrap();
-    assert_eq!(config, "genome:\n  enabled: false\n");
+    assert_eq!(config, "atlas:\n  enabled: false\n");
 
     chat.lines.clear();
-    type_text(&mut chat, "/genome");
+    type_text(&mut chat, "/atlas");
     let applied = chat.on_key(Key::Enter, Instant::now());
     assert!(applied.effect.is_none());
     let note = chat
         .lines
         .iter()
-        .find(|line| line.text.contains("genome: off"))
+        .find(|line| line.text.contains("atlas: off"))
         .expect("the status note names the off state");
     assert!(note.text.contains("reason: setting"), "{}", note.text);
     assert!(note.text.contains("limit: 24"), "{}", note.text);
 }
 
-/// An in-range `/genome limit` persists on its own key and the note
+/// An in-range `/atlas limit` persists on its own key and the note
 /// reports it; the limit is not coupled to the enabled state.
 #[test]
-fn genome_limit_persists_and_is_reported() {
+fn atlas_limit_persists_and_is_reported() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/genome limit 4");
+    type_text(&mut chat, "/atlas limit 4");
     chat.on_key(Key::Enter, Instant::now());
     let config = std::fs::read_to_string(chat.agent_dir.join("config.yml")).unwrap();
     assert!(config.contains("limit: 4"), "{config}");
     assert!(!config.contains("enabled"), "{config}");
 
     chat.lines.clear();
-    type_text(&mut chat, "/genome");
+    type_text(&mut chat, "/atlas");
     chat.on_key(Key::Enter, Instant::now());
     let note = chat
         .lines
         .iter()
         .find(|line| line.text.contains("limit: 4"))
         .expect("the note states the saved cap");
-    assert!(note.text.contains("genome: on"), "{}", note.text);
+    assert!(note.text.contains("atlas: on"), "{}", note.text);
 }
 
-/// An out-of-range `/genome limit` writes nothing and says the range.
+/// An out-of-range `/atlas limit` writes nothing and says the range.
 #[test]
-fn genome_limit_out_of_range_is_refused_without_a_write() {
+fn atlas_limit_out_of_range_is_refused_without_a_write() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/genome limit 0");
+    type_text(&mut chat, "/atlas limit 0");
     chat.on_key(Key::Enter, Instant::now());
     assert!(
         !chat.agent_dir.join("config.yml").exists(),
@@ -8237,14 +8237,14 @@ fn genome_limit_out_of_range_is_refused_without_a_write() {
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "genome limit: expected an integer from 1 to 64")
+            .any(|line| line.text == "atlas limit: expected an integer from 1 to 64")
     );
 }
 
-/// `/genome check` runs the real index over the workspace and pushes the
+/// `/atlas check` runs the real index over the workspace and pushes the
 /// diagnostic lines as a note; a broken import names itself with its code.
 #[test]
-fn genome_check_reports_diagnostics_from_the_workspace() {
+fn atlas_check_reports_diagnostics_from_the_workspace() {
     let dir = tempfile::tempdir().expect("temp");
     let src_dir = dir.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
@@ -8261,7 +8261,7 @@ fn genome_check_reports_diagnostics_from_the_workspace() {
     // The workspace comes in as a value: the test hands it the temp tree
     // directly instead of moving the process `current_dir`, which every
     // parallel test reads.
-    local_genome_note(&mut chat, "check", dir.path());
+    local_atlas_note(&mut chat, "check", dir.path());
     let names: Vec<&str> = chat.lines.iter().map(|line| line.text.as_str()).collect();
     let hit = names
         .iter()
@@ -8275,46 +8275,46 @@ fn genome_check_reports_diagnostics_from_the_workspace() {
     );
 }
 
-/// `/genome lsp` never starts a stdio server inside the chat: the note
+/// `/atlas lsp` never starts a stdio server inside the chat: the note
 /// names the terminal command, exactly, instead of pretending.
 #[test]
-fn genome_lsp_names_the_terminal_command() {
+fn atlas_lsp_names_the_terminal_command() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/genome lsp");
+    type_text(&mut chat, "/atlas lsp");
     let applied = chat.on_key(Key::Enter, Instant::now());
     assert!(applied.effect.is_none());
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "genome: lsp is 'titi genome lsp', not a chat command"),
+            .any(|line| line.text == "atlas: lsp is 'titi atlas lsp', not a chat command"),
         "{:?}",
         chat.lines
     );
 }
 
-/// An unknown `/genome` word names itself and shows the usage line.
+/// An unknown `/atlas` word names itself and shows the usage line.
 #[test]
-fn genome_unknown_subcommand_shows_usage() {
+fn atlas_unknown_subcommand_shows_usage() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/genome wat");
+    type_text(&mut chat, "/atlas wat");
     chat.on_key(Key::Enter, Instant::now());
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "genome: unknown command wat")
+            .any(|line| line.text == "atlas: unknown command wat")
     );
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "usage: titi genome [on|off|limit <n>|check|lsp]")
+            .any(|line| line.text == "usage: titi atlas [on|off|limit <n>|check|lsp]")
     );
 }
 

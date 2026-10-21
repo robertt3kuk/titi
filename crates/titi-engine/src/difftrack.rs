@@ -1,6 +1,6 @@
 //! Working-tree diff captured at the start of a turn.
 //!
-//! A completion engine treats the edit as its strongest signal. The genome
+//! A completion engine treats the edit as its strongest signal. The atlas
 //! rank boost only reorders files; it does not show what changed. This is
 //! that text, bounded and stripped of secrets. It does not typecheck, and it
 //! does not complete at the cursor.
@@ -21,7 +21,7 @@ use titi_tools::SensitivePolicy;
 
 /// Files changed relative to `HEAD`, and the bounded diff text.
 ///
-/// `files` is what the genome boost should see. It is capped with the text so
+/// `files` is what the atlas boost should see. It is capped with the text so
 /// a huge tree cannot flood the touched set. A later line or byte cut may
 /// omit a path's hunk; the path is still an edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,7 +305,7 @@ fn strip_side(token: &str, side: char) -> Option<String> {
 
 /// Strips control characters from a section's header lines: everything up to
 /// the first `@@` hunk. A path holding `\r` or an escape could otherwise
-/// rewrite what the model reads as a line, and the genome map prunes the same
+/// rewrite what the model reads as a line, and the atlas map prunes the same
 /// shapes.
 ///
 /// Diff body lines are left byte for byte: they are code, where a tab is

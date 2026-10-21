@@ -55,7 +55,7 @@ pub struct ToolAgentRunner {
     /// The session's live index, when there is one. A subagent's `write` or
     /// `edit` folds its path in through this exactly as the main turn's does,
     /// instead of waiting for the session's next walk to notice the file.
-    genome: Option<titi_genome::GenomeHandle>,
+    atlas: Option<titi_atlas::AtlasHandle>,
     approval_mode: ApprovalMode,
     max_rounds: u32,
     mask_ips: bool,
@@ -90,7 +90,7 @@ impl ToolAgentRunner {
             tools,
             claims,
             touched,
-            genome: None,
+            atlas: None,
             // Read-tier calls proceed; the registry decides what else exists.
             approval_mode: ApprovalMode::Write,
             max_rounds: DEFAULT_AGENT_ROUNDS,
@@ -126,8 +126,8 @@ impl ToolAgentRunner {
     /// — a caller with no root, or a test with no graph: the write still
     /// happens, and the session's next turn picks it up the way it picks up
     /// any other change no tool named.
-    pub fn with_genome(mut self, genome: Option<titi_genome::GenomeHandle>) -> Self {
-        self.genome = genome;
+    pub fn with_atlas(mut self, atlas: Option<titi_atlas::AtlasHandle>) -> Self {
+        self.atlas = atlas;
         self
     }
 
@@ -467,7 +467,7 @@ impl ToolAgentRunner {
                 // session's next map is current by construction rather than
                 // by the walk that would otherwise be the only thing to see
                 // it.
-                self.genome.as_ref().map(titi_genome::GenomeHandle::shared),
+                self.atlas.as_ref().map(titi_atlas::AtlasHandle::shared),
                 &self.claims,
                 &request.id,
                 self.mask_ips,
@@ -501,7 +501,7 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use titi_genome::GenomeHandle;
+    use titi_atlas::AtlasHandle;
     use titi_providers::mock::{MockBody, MockTransport};
     use titi_providers::{BlockId, StopReason, StreamEvent, ToolCallRef, Transport};
     use titi_tools::{ApprovalMode, ToolRegistry};
@@ -575,9 +575,9 @@ mod tests {
         let root = dir.path();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/hub.rs"), "pub fn hub() {}\n").unwrap();
-        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        let atlas = AtlasHandle::spawn(root, titi_atlas::live::Options::default()).unwrap();
         assert!(
-            genome.last_stats().is_some_and(|stats| stats.walked),
+            atlas.last_stats().is_some_and(|stats| stats.walked),
             "the cold start is a walk"
         );
 
@@ -599,7 +599,7 @@ mod tests {
             TouchedSink::default(),
         )
         .with_approval_mode(ApprovalMode::Yolo)
-        .with_genome(Some(genome.clone()));
+        .with_atlas(Some(atlas.clone()));
 
         let summary = runner
             .run(
@@ -617,16 +617,16 @@ mod tests {
             .expect("the subagent finished");
         assert_eq!(summary, "wrote it");
 
-        let stats = genome.last_stats().expect("the fold was recorded");
+        let stats = atlas.last_stats().expect("the fold was recorded");
         assert!(
             !stats.walked,
             "the write folded in as it happened, not by a walk: {stats:?}"
         );
         assert_eq!(stats.parsed, 1, "one path, one parse: {stats:?}");
         assert!(
-            genome.snapshot().0.files.contains_key("src/fresh.rs"),
+            atlas.snapshot().0.files.contains_key("src/fresh.rs"),
             "the index knows the file the subagent wrote: {:?}",
-            genome.snapshot().0.files.keys().collect::<Vec<_>>()
+            atlas.snapshot().0.files.keys().collect::<Vec<_>>()
         );
     }
 }

@@ -5,7 +5,7 @@
 //! slash command, every picker-backed panel and every setting the config
 //! knows. It is the same panel the other pickers use, filtered with the same
 //! [`fuzzy_score`]. Enter on a command that needs nothing runs it; on one that
-//! takes a word from a short list (`/theme`, `/details`, `/mouse`, `/genome`,
+//! takes a word from a short list (`/theme`, `/details`, `/mouse`, `/atlas`,
 //! `/statusline`) it opens that list instead, with the value in force marked.
 //! Typing the command and a space in the composer opens the same list.
 
@@ -31,14 +31,8 @@ const NEEDS_TEXT: [&str; 5] = ["btw", "loop", "goal", "council", "graph"];
 
 /// Commands whose argument is one of a short list: [`command_values`] knows
 /// the list for each.
-pub(crate) const VALUE_COMMANDS: [&str; 6] = [
-    "theme",
-    "statusline",
-    "mouse",
-    "genome",
-    "details",
-    "effort",
-];
+pub(crate) const VALUE_COMMANDS: [&str; 6] =
+    ["theme", "statusline", "mouse", "atlas", "details", "effort"];
 
 /// What `/effort` and `model.effort` take: `off` sends nothing, and each
 /// other word is a level of [`titi_providers::Effort`].
@@ -106,12 +100,12 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Themes,
     ),
     setting(
-        cfg::GENOME_ENABLED_KEY,
+        cfg::ATLAS_ENABLED_KEY,
         "build the repo map for the prompt",
         Values::Bool,
     ),
     setting(
-        cfg::GENOME_LIMIT_KEY,
+        cfg::ATLAS_LIMIT_KEY,
         "files the repo map keeps",
         Values::Free,
     ),
@@ -299,7 +293,7 @@ pub(crate) enum Action {
 /// One row of the palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
-    /// What is shown and matched: `/context`, `models`, `genome.enabled`.
+    /// What is shown and matched: `/context`, `models`, `atlas.enabled`.
     pub(crate) label: String,
     pub(crate) about: String,
     pub(crate) action: Action,
@@ -582,14 +576,14 @@ pub(crate) fn command_values(chat: &Chat, name: &str) -> Option<Vec<ArgValue>> {
             .iter()
             .map(|name| ArgValue::new(*name, chat.mouse_preset.name() == *name))
             .collect(),
-        "genome" => {
+        "atlas" => {
             let on = titi_config::settings::Settings::load(
                 &chat.agent_dir,
                 &crate::session_fs::current_workspace(),
                 &[],
             )
             .ok()
-            .map(|settings| !cfg::switch_off(&settings, cfg::GENOME_ENABLED_KEY));
+            .map(|settings| !cfg::switch_off(&settings, cfg::ATLAS_ENABLED_KEY));
             vec![
                 ArgValue::new("on", on == Some(true)),
                 ArgValue::new("off", on == Some(false)),

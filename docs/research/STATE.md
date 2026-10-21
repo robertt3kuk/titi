@@ -55,7 +55,7 @@
 Восемь коммитов по карте в промпте, по одному на правку:
 
 - `ae1aa96` fix(genome): ignore method calls when counting symbol uses — вызовы методов и std-квалифицированные пути больше не считаются использованием символа: `path.join` и `Path::join` — не использование уникального `join`, а `hub::join` — по-прежнему использование;
-- `9437b5d` fix(genome): mark recently modified files as recent — маркер `[RECENT]` вместо `[NEW]`: «недавно изменён», а не «недавно создан», окно те же 48 часов (`NEW_WINDOW`, `crates/titi-genome/src/project.rs:6`);
+- `9437b5d` fix(genome): mark recently modified files as recent — маркер `[RECENT]` вместо `[NEW]`: «недавно изменён», а не «недавно создан», окно те же 48 часов (`NEW_WINDOW`, `crates/titi-atlas/src/project.rs:6`);
 - `ba6343b` fix(genome): drop unused exports from the prompt map — в промпте не больше четырёх экспортов на файл (`PROMPT_EXPORTS`), экспорт с нулём пользователей не показывается, ранжирование файлов не изменилось;
 - `5038c0f` feat(cli): read genome.limit from settings — лимит файлов из настройки `genome.limit` (1..=64, умолчание 24, проектный `.titi/config.yml` побеждает);
 - `05548f8` docs(cli): document genome.limit and TITI_NO_GENOME — `--help` называет и настройку, и переменную;
@@ -68,7 +68,7 @@
 Карта в промпте перестала быть только картой; семь коммитов, по одному на правку:
 
 - `4eef588` feat(cli): turn the genome on and off from the terminal — `titi genome` идёт до движка и ключа не требует: голый печатает четыре строки статуса (вкл/выкл, причина — `setting`, `TITI_NO_GENOME` или `default` для незаданного ключа, действующий cap 1..=64 иначе 24, путь к agent-конфигу), `on`/`off` пишут булево в agent-конфиг, `limit <n>` — cap после проверки диапазона (0, 65 и не-число отвергаются с кодом 2 и без записи), а `/genome` в чате повторяет те же глаголы тем же форматтером (`engine::genome_note`), чтобы поверхности не разъезжались;
-- `6291441` feat(genome): check the index and serve a stdio LSP — `titi genome check` печатает по строке на диагностику (`path:line: code: message`), на чистом дереве `genome: clean` и выход 0, любая диагностика — выход 1; `titi genome lsp` поднимает stdio-LSP без сокета: `initialize`, `shutdown`, `textDocument/documentSymbol`, `textDocument/definition`, `textDocument/references`, `textDocument/diagnostic`, кадры — `Content-Length` (`crates/titi-genome/src/lsp.rs`), из новых зависимостей только `serde_json`;
+- `6291441` feat(genome): check the index and serve a stdio LSP — `titi genome check` печатает по строке на диагностику (`path:line: code: message`), на чистом дереве `genome: clean` и выход 0, любая диагностика — выход 1; `titi genome lsp` поднимает stdio-LSP без сокета: `initialize`, `shutdown`, `textDocument/documentSymbol`, `textDocument/definition`, `textDocument/references`, `textDocument/diagnostic`, кадры — `Content-Length` (`crates/titi-atlas/src/lsp.rs`), из новых зависимостей только `serde_json`;
 - `9b20f79` fix(genome): an unreadable root is an error, not an empty index — индекс, который не построился, винит себя (`genome: check failed (…)`, выход 1), а не отдаёт мнимо чистое дерево;
 - `79319d0` feat(cli): serve genome check and lsp — `check` работает локально и из чата, а `/genome lsp` в чате только называет терминальную команду (`crates/titi-cli/src/chat.rs`);
 - `c7813b9` feat(engine): show the working-tree diff to the turn — ход несёт блок `<diff>` с `git diff HEAD` сразу после `<genome>`: до 8 файлов, 120 строк, 6000 байт (`crates/titi-engine/src/difftrack.rs`), файлы с секретными именами и куски с секрето-образными присваиваниями выбрасываются целиком, пути диффа вливаются в touched-набор, который читает карта, а duck-режим не получает ни карты, ни диффа;
@@ -376,7 +376,7 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   not added — go, java, c/c++, c#, kotlin, php, ruby and swift; every one must
   emit ABI 14, the range the workspace's `tree-sitter 0.24` accepts, because
   newer releases emit ABI 15 and would need a core bump
-  (`crates/titi-genome/Cargo.toml:12-14`, guarded by
+  (`crates/titi-atlas/Cargo.toml:12-14`, guarded by
   `grammars_match_the_core_abi`)~~ all nine added 2026-10-09 in 9c81d63 (Go),
   ea73eec (Java), 583f27c (C and C++), a43ac34 (Kotlin), 2e46e36 (C#), 918604a
   (Ruby), ddee4be (PHP) and d658a45 (Swift), each with its grammar crate, its
@@ -425,7 +425,7 @@ in `8b33ed9` (with the bearer-header prefilter in `d24f5b1` and the test pin in
   `crates/titi-tui/Cargo.toml:8,13`, `crates/titi-tools/Cargo.toml:17`,
   `crates/titi-core/Cargo.toml:10`, `crates/titi-cli/Cargo.toml:25` vs `:29`.
 - [x] `low` ~~a module-wide `#![allow(clippy::expect_used)]` hides a
-  caller-supplied pattern — `crates/titi-genome/src/lang/mod.rs:17` (the file
+  caller-supplied pattern — `crates/titi-atlas/src/lang/mod.rs:17` (the file
   the audit named, `src/parse.rs:3,553`, became `lang/` in `714824d`)~~ fixed
   2026-10-09 in `1cf904a`: the four regex literals now call one
   `support::literal_regex`, which is the single place a literal pattern is
@@ -595,7 +595,7 @@ next, and the two worker notes it could not see yet.
   `type GenomeIndex = Arc<tokio::sync::Mutex<Option<Genome>>>` is gone.
 - [ ] `medium` Taimyr **phase 3 — the watcher and its debounce — is the only
   phase left**, and it stays blocked on the owner's word about `notify` (per
-  `docs/research/genome-incremental.md` §4 and §6): adding the dependency goes
+  `docs/research/atlas-incremental.md` §4 and §6): adding the dependency goes
   through the `dependency-update` procedure and its health is **unverified
   offline**, which is why nothing was added. Everything else landed on
   2026-10-09 — phase 1 (`eac8a9c`, `3a7aafa`, `b4b1401`), phase 2 (`a4716a6`,
@@ -659,7 +659,7 @@ owner can take; none is a code question.
 
 - [ ] `medium` **Taimyr phase 3 — the watcher** — blocked on the owner's word
   about the `notify` crate: the decision is written as phase 3's in
-  `docs/research/genome-incremental.md` §4, adding it goes through the
+  `docs/research/atlas-incremental.md` §4, adding it goes through the
   `dependency-update` procedure, and its health is **unverified offline**.
   Phases 1, 2, 4 and 5 are in the tree.
 - [ ] `medium` **a `cargo audit` gate in CI** — `cargo audit` is not installed
@@ -718,7 +718,7 @@ The grammar wave (2026-10-09) finished that genome work: every language row now
 reads its declarations from a syntax tree instead of patterns, so all 13
 languages are `Full` and `Level::Heuristic` has no instance left — it stays as
 the name of the state a `grammar: None` row describes, pinned by
-`crates/titi-genome/src/lang/mod.rs:508-522`. Terminal chrome landed with it:
+`crates/titi-atlas/src/lang/mod.rs:508-522`. Terminal chrome landed with it:
 notifications on a finished, failed or asking turn (`notify.completion`,
 `notify.error`, `notify.ask`, f8ea043), the terminal's own progress for a
 running turn (`terminal.progress`, e7cd8ae), and the generation rate on the
@@ -892,7 +892,7 @@ beside the thirteen cli ones — one concern, two crates. The docs surface lande
 with it: a `CHANGELOG.md` exists, newest-first and user-facing, and the README's
 placeholder link is gone (`240db13`).
 
-Taimyr phase 0 landed in `crates/titi-genome` only, one concern per commit:
+Taimyr phase 0 landed in `crates/titi-atlas` only, one concern per commit:
 `91f17d8` (a file's content hash in `FileRecord`, so a same-size rewrite inside
 one mtime tick is not re-parsed), `d8f3deb` (the graph is recomputed only when
 a file's `(exports, imports, used_symbols)` tuple moved — the condition phase 1
@@ -907,7 +907,7 @@ tuple did not move, and the walk when the paths are named. Its own check is
 counters until `92b97ff` made them the touched file's, because several agents
 edit this tree at once. The snapshot type has no production reader yet: the
 engine still keeps `Arc<Mutex<Option<Genome>>>` (queued). The design is
-`docs/research/genome-incremental.md` — dated, with its pipeline, its
+`docs/research/atlas-incremental.md` — dated, with its pipeline, its
 update-strategy table, its consistency contract, phases 0–5 each with the test
 that fails without it, and the `notify` decision confined to phase 3.
 
@@ -952,7 +952,7 @@ rate into a token cap. The mechanism that would make `/budget $2` real is
 queued — a `micro_usd` on `SetBudget` and a cost accumulated from `TurnUsage` in
 `Runtime::over_budget`, which today reads token counts (`runtime.rs:1309`).
 
-Taimyr phases 1 and 2 landed, both in `crates/titi-genome` plus the engine's
+Taimyr phases 1 and 2 landed, both in `crates/titi-atlas` plus the engine's
 two files. Phase 1 (`eac8a9c`, `3a7aafa`, `b4b1401`): raw mentions are kept and
 inverted into a name index, imports resolve from candidates rather than from a
 filtered answer (every language row's `resolve_*` now returns candidates), and a

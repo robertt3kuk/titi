@@ -4,6 +4,10 @@ All notable user-facing changes to titi, newest first.
 
 ## Unreleased — 2026-10-08
 
+### Changed (breaking)
+
+- The genome is now the atlas. The crate is `titi-atlas`, the command is `titi atlas [on|off|limit <n>|check|capabilities|lsp]`, the chat command is `/atlas`, the settings are `atlas.enabled` and `atlas.limit`, the switch is `TITI_NO_ATLAS=1`, the prompt block is `<atlas>` (`<atlas pending="N">`), and the LSP reports `titi-atlas` (`serverInfo`, diagnostic `source`) and `experimental.titiAtlas`. Nothing reads the old names any more: rename a `genome:` block in your `config.yml` to `atlas:`, `TITI_NO_GENOME` to `TITI_NO_ATLAS`, and `titi genome …` to `titi atlas …` in scripts and editor configs. The first turn after upgrading is a prompt-cache miss because the block's tag changed.
+
 ### Added
 
 - Cache-break diagnostics. When the provider reads under half of what the previous request left in its prompt cache, one line names what changed first, in the order the provider reads a request: `cache miss · model or effort switched`, `· tool list changed (+web −bash ~read)`, `· system prompt changed (block 3, +120 chars)`, `· message 12 edited`, `· history rewound (2 messages dropped)`, `· first request`, or — with nothing changed and a provider that has served from its cache before — `· prefix unchanged (the provider's cache expired or was evicted)`. Only names, counts and block numbers are ever printed, never prompt text; counts titi had to estimate because the provider reported none are never judged, and a change the provider's cache survived is not a line. `/cache [n]` (and Ctrl+K) lists the last requests with their cached share, size and the reason (`#14  turn 5   96% · 4.9k of 5.1k · ok   · prefix unchanged`). The engine sends each sized request as `CacheObserved` (prompt, cached, change, missed) for other surfaces, and the headless stream carries it too.

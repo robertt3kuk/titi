@@ -1,6 +1,6 @@
 # Research Map — titi: порт reference product на Rust
 
-**Канон:** reference product задаёт продуктовую архитектуру (agent loop, Genome, workbench, surfaces). OMP — reference для TUI и tool UX. Hermes и Vellum — точечные источники идей, не равные источники архитектуры.
+**Канон:** reference product задаёт продуктовую архитектуру (agent loop, Atlas, workbench, surfaces). OMP — reference для TUI и tool UX. Hermes и Vellum — точечные источники идей, не равные источники архитектуры.
 
 Историческая формула «слияние трёх харнессов» сохранена в тематических README как comparative research 2026-08. Действующие решения и crate-карта живут в тематических README (каждая тема: решение, Rust-маппинг, Definition of Done).
 
@@ -47,7 +47,7 @@
 - [evals/README.md](evals/README.md) — `scripts/eval.py` harness: tasks graded by their own check, tokens, cost and tool-error rate from the event stream (practice #10).
 - [perf/README.md](perf/README.md) — `scripts/bench.py` method, baseline, hotspots and measured fixes.
 - [agent-tracing.md](agent-tracing.md) — span model, viewer, engine sink; phases B/C owner-gated.
-- [genome-incremental.md](genome-incremental.md) — Taimyr incremental index; phase 3 (watcher) owner-gated.
+- [atlas-incremental.md](atlas-incremental.md) — Taimyr incremental index; phase 3 (watcher) owner-gated.
 - [prompt-cache.md](prompt-cache.md) — prompt-cache measurements and the open A/B decision.
 - [product-review.md](product-review.md) — product review notes.
 

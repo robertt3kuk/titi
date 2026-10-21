@@ -34,7 +34,7 @@ local one gives real HTTP turns through the real binary, no key involved:
    docstring) and logs every request body to `$T/requests.jsonl`.
 3. Write a scenario (`pip install pyte` once) and run
    `python3 scripts/pty-drive.py scenario.json`. Set `env` explicitly —
-   `TITI_AGENT_DIR=$T/agent`, `TITI_NO_GENOME=1`, `TERM`, `PATH` — so no real
+   `TITI_AGENT_DIR=$T/agent`, `TITI_NO_ATLAS=1`, `TERM`, `PATH` — so no real
    key or agent dir leaks in. Each `shot` prints the screen as numbered rows.
 4. Check the screen and `requests.jsonl` (what the model was really sent).
    `--prompt` and `--headless` need no PTY: pipe them with the same `env`.

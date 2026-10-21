@@ -91,7 +91,7 @@ titi --mode plan
 | `/recap` | Prints what the session did: turns, tools, files, problems |
 | `/fork` | Starts a new session from this one, keeping what has happened so far |
 | `/export` | Writes the transcript to `<session-id>.md` in the current directory. `/export <path>` chooses where, and a path ending in `.jsonl` exports JSONL instead of markdown |
-| `/context` | What fills the context window now: system prompt, project rules, skills, recalled memory, genome map, history, tool specs, each with its estimated tokens and share. The numbers are estimates, not provider counts |
+| `/context` | What fills the context window now: system prompt, project rules, skills, recalled memory, atlas map, history, tool specs, each with its estimated tokens and share. The numbers are estimates, not provider counts |
 | `/compact` | Folds the history now instead of waiting for the threshold. `/compact auth` keeps the folded lines that mention `auth` in the digest |
 | `/memory` | `/memory` or `/memory list` shows what is remembered. `/memory search <query>` looks it up, `/memory forget <id>` drops one |
 | `/plan` | Plan mode: only read-only tools are registered, so the next turns read the repository and change nothing |
@@ -105,7 +105,7 @@ titi --mode plan
 | `/council` | Puts a question to a council of independent briefs on models and efforts of their own; one fold names who dissents |
 | `/graph` | Runs the orchestrator graph: the council decides, the goal loop works |
 | `/git` | Shows git status or diff, read-only |
-| `/genome` | Manages the prompt map: `/genome on`, `/genome off`, `/genome limit <n>` |
+| `/atlas` | Manages the prompt map: `/atlas on`, `/atlas off`, `/atlas limit <n>` |
 | `/diagnose` | Prints a diagnostics block to paste into a bug report |
 | `←` `→` / `alt+←` `alt+→` / `home` `end` | Move the caret: a character, a word, the ends of the draft. `ctrl+a` / `ctrl+e` are the ends too |
 | `delete` / `ctrl+u` | Delete what is after the caret, and everything before it |
@@ -151,7 +151,7 @@ A subagent definition is a `*.md` with YAML frontmatter under `.titi/agents`, `.
 
 The screen is a ratatui chat: model and session on top — plus a `plan` or `duck` badge when the engine confirms that mode — the transcript in the middle, one input line at the bottom. `/mouse` turns mouse reporting over (`off`, `wheel`, `buttons`, `all`; a drag selects, releasing inside the transcript copies), and its choice is remembered for the next run.
 
-The same settings style as `genome.enabled` and `genome.limit` covers the screen's own switches: `statusLine.preset` (`default|minimal|compact|full|ascii`, `default` when unset) chooses which row of the preset table the top line paints, and `statusLine.contextLine` (`off|percentage|embedded`, **default off** — the default frame stays byte-identical until a turn reports a context window for the gauge to fill) lets the gap between the status line's groups double as a context gauge. `notify.completion`, `notify.error` and `notify.ask` (each unset = on) raise a desktop notification when a turn finishes, fails or stops on an approval — OSC 777 where the terminal speaks it, a bell fallback where it does not; `terminal.progress` (unset = on) raises the terminal's own OSC 9;4 progress bar for a running turn; `composer.tokenRate` (unset = on) shows the generation rate on the working row, an estimate marked `~`, not a provider count.
+The same settings style as `atlas.enabled` and `atlas.limit` covers the screen's own switches: `statusLine.preset` (`default|minimal|compact|full|ascii`, `default` when unset) chooses which row of the preset table the top line paints, and `statusLine.contextLine` (`off|percentage|embedded`, **default off** — the default frame stays byte-identical until a turn reports a context window for the gauge to fill) lets the gap between the status line's groups double as a context gauge. `notify.completion`, `notify.error` and `notify.ask` (each unset = on) raise a desktop notification when a turn finishes, fails or stops on an approval — OSC 777 where the terminal speaks it, a bell fallback where it does not; `terminal.progress` (unset = on) raises the terminal's own OSC 9;4 progress bar for a running turn; `composer.tokenRate` (unset = on) shows the generation rate on the working row, an estimate marked `~`, not a provider count.
 
 In Kitty or Ghostty, a local photo named in the transcript is drawn in place: png, jpeg, gif, bmp, or ico, including a markdown image. The pixels are sent once. Other terminals leave the path as text. `TITI_NO_KITTY_PLACEHOLDERS=1` turns the pictures off.
 
@@ -187,7 +187,7 @@ TUI / headless
       │
       ├── titi-providers     HTTP/SSE: OpenAI, Anthropic, Gemini; fallback chain
       ├── titi-tools         read  write  edit  hashline  glob  grep  bash  settings
-      ├── titi-genome        file and symbol graph → a prompt fragment
+      ├── titi-atlas        file and symbol graph → a prompt fragment
       ├── titi-memory        what to recall on this turn
       ├── titi-core          sessions, trajectory, the local hub broker
       └── titi-soul          SOUL.md and personality
@@ -204,7 +204,7 @@ On Anthropic the request is also built for the prompt cache. Tool specs go out s
 | `titi-engine` | Protocol, loop, provider registry, modes, subagents, council, goal loop, background jobs |
 | `titi-providers` | Transport, stream decoding, prompt-cache layout, fallback chain |
 | `titi-tools` | Tools and the `read` / `write` / `exec` tiers, pty bash, hashline edits |
-| `titi-genome` | Walk the repo, tree-sitter symbols, PageRank, project into a system message |
+| `titi-atlas` | Walk the repo, tree-sitter symbols, PageRank, project into a system message |
 | `titi-core` | JSONL sessions, search, trajectory, the hub broker, the share package |
 | `titi-memory` | Memory index: full-text search and local embeddings |
 | `titi-soul` | Identity slot, scanned before it enters the prompt |
@@ -224,14 +224,14 @@ The engine also seats a council: two to four briefs answer the same question on 
 Print the repository map on its own:
 
 ```bash
-cargo run -p titi-genome --example map -- . 40
+cargo run -p titi-atlas --example map -- . 40
 ```
 
-`TITI_NO_GENOME=1` leaves the map out of the prompt. `genome.enabled` in the agent or project config turns the map on or off, `genome.limit` (1 to 64, default 24) caps the files it projects; the project file wins, and `TITI_NO_GENOME=1` forces one run off without touching either. A turn also carries a `<diff>` block: the working tree's changes next to the genome map, so the model sees its own edits since the turn began. Genome indexes thirteen languages, and every one of them is read from a syntax tree: a tree-sitter grammar sits on each row (`crates/titi-genome/src/lang/mod.rs`), so the symbols in Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, C#, Ruby, Kotlin, Swift and PHP come from the parse, not from patterns. `titi genome capabilities` prints the roster — level, extensions, and one honest note per language — and the LSP handshake carries the same table.
+`TITI_NO_ATLAS=1` leaves the map out of the prompt. `atlas.enabled` in the agent or project config turns the map on or off, `atlas.limit` (1 to 64, default 24) caps the files it projects; the project file wins, and `TITI_NO_ATLAS=1` forces one run off without touching either. A turn also carries a `<diff>` block: the working tree's changes next to the atlas map, so the model sees its own edits since the turn began. Atlas indexes thirteen languages, and every one of them is read from a syntax tree: a tree-sitter grammar sits on each row (`crates/titi-atlas/src/lang/mod.rs`), so the symbols in Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, C#, Ruby, Kotlin, Swift and PHP come from the parse, not from patterns. `titi atlas capabilities` prints the roster — level, extensions, and one honest note per language — and the LSP handshake carries the same table.
 
 ### What is already here
 
-The engine, streaming, model switching and a fallback chain across providers, tools jailed to the current directory, approval for dangerous calls, hashline edits that refuse a stale read, `bash` with a deadline that Ctrl+C can cut short, on a real pty when asked, agent / plan / duck modes, sessions that restore, fork, export, and rewind, compaction of a long context, a coder-and-reviewer goal loop with an exit code CI can read, background loops and a token budget, a toolless advisor, a local hub, subagents that can only read unless asked otherwise, Genome over thirteen languages, every one read from a syntax tree, memory, SOUL, skills that are discovered and expanded by name, prompt caching on Anthropic, and local photos in Kitty and Ghostty.
+The engine, streaming, model switching and a fallback chain across providers, tools jailed to the current directory, approval for dangerous calls, hashline edits that refuse a stale read, `bash` with a deadline that Ctrl+C can cut short, on a real pty when asked, agent / plan / duck modes, sessions that restore, fork, export, and rewind, compaction of a long context, a coder-and-reviewer goal loop with an exit code CI can read, background loops and a token budget, a toolless advisor, a local hub, subagents that can only read unless asked otherwise, Atlas over thirteen languages, every one read from a syntax tree, memory, SOUL, skills that are discovered and expanded by name, prompt caching on Anthropic, and local photos in Kitty and Ghostty.
 
 ### What is not
 
@@ -368,7 +368,7 @@ titi --mode plan
 | `/council` | Отдаёт вопрос совету независимых брифов, каждый на своей модели и со своим усилием; свёртка называет несогласных |
 | `/graph` | Гоняет оркестратор-граф: совет решает, цикл цели работает |
 | `/git` | Показывает git status или diff, только чтение |
-| `/genome` | Управляет картой промпта: `/genome on`, `/genome off`, `/genome limit <n>` |
+| `/atlas` | Управляет картой промпта: `/atlas on`, `/atlas off`, `/atlas limit <n>` |
 | `/diagnose` | Печатает блок диагностики, чтобы вставить в баг-репорт |
 | `/btw` | Сообщение, которое не пишется в историю; во время хода это steering, а не новый ход |
 | `/pause` | Держит ввод и останавливает ход. Ещё раз `/pause` продолжает |
@@ -433,7 +433,7 @@ TUI / headless
       │
       ├── titi-providers     HTTP/SSE: OpenAI, Anthropic, Gemini; цепочка фолбэков
       ├── titi-tools         read  write  edit  hashline  glob  grep  bash  settings
-      ├── titi-genome        граф файлов и символов → кусок промпта
+      ├── titi-atlas        граф файлов и символов → кусок промпта
       ├── titi-memory        что вспомнить в этот ход
       ├── titi-core          сессии, траектория, брокер локального хаба
       └── titi-soul          SOUL.md и личность
@@ -450,7 +450,7 @@ TUI / headless
 | `titi-engine` | Протокол, цикл, реестр провайдеров, режимы, субагенты, совет, цикл цели, фоновые задания |
 | `titi-providers` | Транспорт, разбор потока, раскладка под кэш промпта, цепочка фолбэков |
 | `titi-tools` | Инструменты и уровни `read` / `write` / `exec`, bash на pty, hashline-правки |
-| `titi-genome` | Обход репозитория, символы через tree-sitter, PageRank, проекция в системное сообщение |
+| `titi-atlas` | Обход репозитория, символы через tree-sitter, PageRank, проекция в системное сообщение |
 | `titi-core` | Сессии JSONL, поиск, траектория, брокер хаба, share-пакет |
 | `titi-memory` | Индекс памяти: полнотекст и локальные эмбеддинги |
 | `titi-soul` | Слот идентичности, проверка до входа в промпт |
@@ -470,14 +470,14 @@ TUI / headless
 Карту репозитория можно напечатать отдельно:
 
 ```bash
-cargo run -p titi-genome --example map -- . 40
+cargo run -p titi-atlas --example map -- . 40
 ```
 
-`TITI_NO_GENOME=1` убирает карту из промпта. `genome.enabled` в агентском или проектном конфиге включает и выключает карту, `genome.limit` (от 1 до 64, по умолчанию 24) ограничивает число файлов в проекции; проектный файл решает, а `TITI_NO_GENOME=1` выключает на один прогон, не трогая ни то, ни другое. Каждый ход несёт и блок `<diff>`: изменения рабочего дерева рядом с картой репозитория, чтобы модель видела собственные правки. Genome индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
+`TITI_NO_ATLAS=1` убирает карту из промпта. `atlas.enabled` в агентском или проектном конфиге включает и выключает карту, `atlas.limit` (от 1 до 64, по умолчанию 24) ограничивает число файлов в проекции; проектный файл решает, а `TITI_NO_ATLAS=1` выключает на один прогон, не трогая ни то, ни другое. Каждый ход несёт и блок `<diff>`: изменения рабочего дерева рядом с картой репозитория, чтобы модель видела собственные правки. Atlas индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
 
 ### Что уже есть
 
-Движок, стриминг, смена модели и цепочка фолбэков между провайдерами, инструменты в пределах текущего каталога, подтверждение опасных вызовов, hashline-правки, которые отказывают на устаревшем чтении, `bash` с дедлайном, который прерывает Ctrl+C, и на настоящем pty по запросу, режимы agent / plan / duck, сессии с восстановлением, форком, выгрузкой и откатом, компакция длинного контекста, цикл «кодер и ревьюер» с кодом выхода для CI, фоновые циклы и бюджет в токенах, советчик без инструментов, локальный хаб, субагенты (по умолчанию только чтение), Genome по двенадцати языкам с tree-sitter для Rust, TypeScript и Python, память, SOUL, скиллы, которые находятся и разворачиваются по имени, кэш промпта у Anthropic и локальные фото в Kitty и Ghostty.
+Движок, стриминг, смена модели и цепочка фолбэков между провайдерами, инструменты в пределах текущего каталога, подтверждение опасных вызовов, hashline-правки, которые отказывают на устаревшем чтении, `bash` с дедлайном, который прерывает Ctrl+C, и на настоящем pty по запросу, режимы agent / plan / duck, сессии с восстановлением, форком, выгрузкой и откатом, компакция длинного контекста, цикл «кодер и ревьюер» с кодом выхода для CI, фоновые циклы и бюджет в токенах, советчик без инструментов, локальный хаб, субагенты (по умолчанию только чтение), Atlas по двенадцати языкам с tree-sitter для Rust, TypeScript и Python, память, SOUL, скиллы, которые находятся и разворачиваются по имени, кэш промпта у Anthropic и локальные фото в Kitty и Ghostty.
 
 ### Чего ещё нет
 

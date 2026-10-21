@@ -16,7 +16,7 @@
       "Bash(gh run watch:*)",
       "Bash(cargo fmt --all --check)",
       "Bash(cargo run -p titi-cli:*)",
-      "Bash(cargo run -p titi-genome --example map:*)",
+      "Bash(cargo run -p titi-atlas --example map:*)",
       "Bash(titi-map:*)",
       "Bash(bash scripts/check-research.sh)"
     ],

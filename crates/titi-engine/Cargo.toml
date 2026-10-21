@@ -14,7 +14,7 @@ titi-core = { workspace = true }
 titi-providers = { workspace = true }
 titi-secrets = { workspace = true }
 titi-tools = { workspace = true }
-titi-genome = { workspace = true }
+titi-atlas = { workspace = true }
 titi-mcp = { workspace = true }
 titi-soul = { workspace = true }
 titi-memory = { workspace = true }

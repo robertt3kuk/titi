@@ -41,19 +41,19 @@ session.autoResume in the agent config.yml or the project .titi/config.yml
 means off. Either way the session continued is the newest one the agent
 directory holds.
 
-  titi genome [on|off|limit <n>|check|lsp]
+  titi atlas [on|off|limit <n>|check|lsp]
                               manage the prompt map build: on, off, or a file cap
                               (default: on, cap is 24; setting wins over default,
-                              TITI_NO_GENOME=1 forces off for one run)
+                              TITI_NO_ATLAS=1 forces off for one run)
 
-genome.limit in the agent config.yml or the project .titi/config.yml
+atlas.limit in the agent config.yml or the project .titi/config.yml
 (project wins) caps the map: an integer from 1 to 64; unset keeps 24,
-out of range or not an integer keeps 24. TITI_NO_GENOME=1 omits the
+out of range or not an integer keeps 24. TITI_NO_ATLAS=1 omits the
 map for one run without touching the limit.
 
-genome.enabled in the agent config.yml or project .titi/config.yml
+atlas.enabled in the agent config.yml or project .titi/config.yml
 (project wins) turns the prompt map on or off; unset means on,
-TITI_NO_GENOME=1 forces off for one run without touching this setting.
+TITI_NO_ATLAS=1 forces off for one run without touching this setting.
 
 bash.autoBackground.thresholdMs in the agent config.yml or project
 .titi/config.yml (project wins) sets, in milliseconds, how long a bash
@@ -86,10 +86,10 @@ fn main() -> io::Result<()> {
     if std::env::args().any(|arg| arg == "--panic-test") {
         panic!("deliberate panic for the panic-report check\x07");
     }
-    // `titi genome` never reaches the engine and never needs a model key, so
+    // `titi atlas` never reaches the engine and never needs a model key, so
     // it is short-circuited before the flag loop touched it or could mistake
     // its subcommands for positionals.
-    if titi_cli::genome_cmd::run(
+    if titi_cli::atlas_cmd::run(
         &titi_config::agent_dir(),
         &titi_cli::session_fs::current_workspace(),
     )
@@ -98,7 +98,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
     // `titi trace` is a reader too: it prints the spans a session recorded and
-    // never reaches the engine, so it is short-circuited beside `titi genome`
+    // never reaches the engine, so it is short-circuited beside `titi atlas`
     // before the flag loop could mistake its session id for a prompt.
     if titi_cli::trace_cmd::run(&titi_config::agent_dir()).is_some() {
         return Ok(());

@@ -343,7 +343,7 @@ fn workspace_with_hub_and_leaf() -> tempfile::TempDir {
 /// built for instead of sitting in the system prompt: everything in front
 /// of that message stays byte-identical from turn to turn.
 #[tokio::test]
-async fn genome_is_indexed_and_injected_ahead_of_the_prompt() {
+async fn atlas_is_indexed_and_injected_ahead_of_the_prompt() {
     let workspace = workspace_with_hub_and_leaf();
     let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
         StreamEvent::TextDelta {
@@ -355,7 +355,7 @@ async fn genome_is_indexed_and_injected_ahead_of_the_prompt() {
         },
     ])]));
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(
         config,
         resolver(vec![("primary", Arc::clone(&transport) as _)]),
@@ -373,7 +373,7 @@ async fn genome_is_indexed_and_injected_ahead_of_the_prompt() {
     let prompt = messages.last().expect("a prompt");
     assert_eq!(prompt.role, Role::User);
     assert!(
-        prompt.content.starts_with("<genome>\n"),
+        prompt.content.starts_with("<atlas>\n"),
         "{}",
         prompt.content
     );
@@ -383,13 +383,13 @@ async fn genome_is_indexed_and_injected_ahead_of_the_prompt() {
     assert!(
         messages
             .iter()
-            .all(|m| m.role != Role::System || !m.content.contains("<genome>")),
+            .all(|m| m.role != Role::System || !m.content.contains("<atlas>")),
         "the map must stay out of the frozen prefix"
     );
 }
 
 #[tokio::test]
-async fn genome_refreshes_between_turns() {
+async fn atlas_refreshes_between_turns() {
     let workspace = workspace_with_hub_and_leaf();
     let transport = Arc::new(MockTransport::new(vec![
         MockBody::Events(vec![StreamEvent::Done {
@@ -400,7 +400,7 @@ async fn genome_refreshes_between_turns() {
         }]),
     ]));
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(
         config,
         resolver(vec![("primary", Arc::clone(&transport) as _)]),
@@ -482,7 +482,7 @@ async fn a_tool_write_reaches_the_next_turns_map() {
     }
 
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     config.approval_mode = ApprovalMode::Yolo;
     let mut engine = EngineRuntime::start_with_tools(
         config,
@@ -648,7 +648,7 @@ async fn restore_history_replaces_what_the_model_sees() {
 }
 
 #[tokio::test]
-async fn no_genome_means_prompt_only() {
+async fn no_atlas_means_prompt_only() {
     let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
         StreamEvent::Done {
             reason: StopReason::Stop,
@@ -716,7 +716,7 @@ async fn touched_file_leads_the_next_projection() {
     tools.register(Arc::new(EchoTool));
 
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     config.approval_mode = ApprovalMode::Yolo;
     let mut engine = EngineRuntime::start_with_tools(
         config,
@@ -817,7 +817,7 @@ async fn queued_prompts_each_get_a_well_formed_frame() {
         }]),
     ]));
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(
         config,
         resolver(vec![("primary", Arc::clone(&transport) as _)]),
@@ -850,13 +850,13 @@ async fn queued_prompts_each_get_a_well_formed_frame() {
     for (turn, request) in requests.iter().enumerate() {
         let prompt = &request.messages.last().expect("a prompt").content;
         if turn == 0 {
-            assert!(prompt.starts_with("<genome>\n"), "{prompt}");
+            assert!(prompt.starts_with("<atlas>\n"), "{prompt}");
         }
         // A map identical to the one the first turn sent is not sent again;
         // whatever is sent must still be a whole frame in front of the prompt.
-        if prompt.starts_with("<genome") {
+        if prompt.starts_with("<atlas") {
             assert!(
-                prompt.contains("</genome>\n\n"),
+                prompt.contains("</atlas>\n\n"),
                 "the frame must be closed before the prompt: {prompt}"
             );
         } else {
@@ -1644,7 +1644,7 @@ fn anthropic_body(request: &titi_providers::WireRequest) -> serde_json::Value {
 /// turn 1 sent is still there, byte for byte, in front of what turn 2 adds.
 /// That needs all three pieces at once — a tool array that does not depend
 /// on a `HashMap` walk, a system prompt with nothing volatile in it, and a
-/// genome map and recall welded to the message they were built for.
+/// atlas map and recall welded to the message they were built for.
 #[tokio::test]
 async fn a_turns_request_is_a_byte_prefix_of_the_next_turns() {
     use titi_tools::{ToolRegistry, workspace_tools};
@@ -1677,7 +1677,7 @@ async fn a_turns_request_is_a_byte_prefix_of_the_next_turns() {
     }
     let mut config = EngineConfig::new("primary");
     config.agent_dir = Some(agent.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start_with_tools(
         config,
         resolver(vec![("primary", Arc::clone(&transport) as _)]),

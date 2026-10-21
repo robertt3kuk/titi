@@ -1,13 +1,13 @@
 //! Privacy settings: the user's config decides, a project can only tighten.
 //!
-//! `genome.limit` shares the same load path: an out-of-range or non-integer
+//! `atlas.limit` shares the same load path: an out-of-range or non-integer
 //! value keeps the engine default instead of failing startup.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::Path;
 
-use titi_cli::engine::{genome_limit_from, privacy_policy};
+use titi_cli::engine::{atlas_limit_from, privacy_policy};
 use titi_config::settings::{PROJECT_SUBPATH, Settings};
 
 fn write(path: &Path, text: &str) {
@@ -73,118 +73,118 @@ fn the_user_can_loosen_their_own_privacy() {
 }
 
 #[test]
-fn genome_limit_read_from_settings() {
+fn atlas_limit_read_from_settings() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    write(&agent.path().join("config.yml"), "genome:\n  limit: 4\n");
+    write(&agent.path().join("config.yml"), "atlas:\n  limit: 4\n");
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(genome_limit_from(&settings), 4);
+    assert_eq!(atlas_limit_from(&settings), 4);
 }
 
 #[test]
-fn a_project_can_set_its_own_genome_limit() {
+fn a_project_can_set_its_own_atlas_limit() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    write(&agent.path().join("config.yml"), "genome:\n  limit: 4\n");
+    write(&agent.path().join("config.yml"), "atlas:\n  limit: 4\n");
     write(
         &project.path().join(PROJECT_SUBPATH),
-        "genome:\n  limit: 8\n",
+        "atlas:\n  limit: 8\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(genome_limit_from(&settings), 8);
+    assert_eq!(atlas_limit_from(&settings), 8);
 }
 
 #[test]
-fn genome_limit_missing_keeps_default() {
+fn atlas_limit_missing_keeps_default() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(genome_limit_from(&settings), 24);
+    assert_eq!(atlas_limit_from(&settings), 24);
 }
 
 #[test]
-fn genome_limit_out_of_range_or_not_integer_keeps_default() {
+fn atlas_limit_out_of_range_or_not_integer_keeps_default() {
     for raw in [
-        "genome:\n  limit: 0\n",
-        "genome:\n  limit: 65\n",
-        "genome:\n  limit: no\n",
+        "atlas:\n  limit: 0\n",
+        "atlas:\n  limit: 65\n",
+        "atlas:\n  limit: no\n",
     ] {
         let agent = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         write(&agent.path().join("config.yml"), raw);
         let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-        assert_eq!(genome_limit_from(&settings), 24, "for {raw:?}");
+        assert_eq!(atlas_limit_from(&settings), 24, "for {raw:?}");
     }
 }
 
 #[test]
-fn genome_enabled_from_missing_key() {
+fn atlas_enabled_from_missing_key() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(titi_cli::engine::genome_enabled_from(&settings));
+    assert!(titi_cli::engine::atlas_enabled_from(&settings));
 }
 
 #[test]
-fn genome_enabled_from_bool_true() {
+fn atlas_enabled_from_bool_true() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write(
         &agent.path().join("config.yml"),
-        "genome:\n  enabled: true\n",
+        "atlas:\n  enabled: true\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(titi_cli::engine::genome_enabled_from(&settings));
+    assert!(titi_cli::engine::atlas_enabled_from(&settings));
 }
 
 #[test]
-fn genome_enabled_from_bool_false() {
+fn atlas_enabled_from_bool_false() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write(
         &agent.path().join("config.yml"),
-        "genome:\n  enabled: false\n",
+        "atlas:\n  enabled: false\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+    assert!(!titi_cli::engine::atlas_enabled_from(&settings));
 }
 
 #[test]
-fn genome_enabled_from_string_off() {
+fn atlas_enabled_from_string_off() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write(
         &agent.path().join("config.yml"),
-        "genome:\n  enabled: \"off\"\n",
+        "atlas:\n  enabled: \"off\"\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+    assert!(!titi_cli::engine::atlas_enabled_from(&settings));
 }
 
 #[test]
-fn genome_enabled_from_string_maybe() {
+fn atlas_enabled_from_string_maybe() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write(
         &agent.path().join("config.yml"),
-        "genome:\n  enabled: \"maybe\"\n",
+        "atlas:\n  enabled: \"maybe\"\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(titi_cli::engine::genome_enabled_from(&settings));
+    assert!(titi_cli::engine::atlas_enabled_from(&settings));
 }
 
 #[test]
-fn genome_enabled_project_overrides_global() {
+fn atlas_enabled_project_overrides_global() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write(
         &agent.path().join("config.yml"),
-        "genome:\n  enabled: true\n",
+        "atlas:\n  enabled: true\n",
     );
     write(
         &project.path().join(PROJECT_SUBPATH),
-        "genome:\n  enabled: false\n",
+        "atlas:\n  enabled: false\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert!(!titi_cli::engine::genome_enabled_from(&settings));
+    assert!(!titi_cli::engine::atlas_enabled_from(&settings));
 }

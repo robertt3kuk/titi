@@ -107,7 +107,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "the turn-end check (usage: /verify [save|trust])",
     },
     Command {
-        name: "genome",
+        name: "atlas",
         about: "manage the prompt map: on, off, or limit",
     },
     Command {

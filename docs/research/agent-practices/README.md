@@ -92,7 +92,7 @@ Method and limits:
   - `/review` exists (`change_review.rs`).
   - In an ordinary turn nothing runs a check, and the prompt never says to (#1).
   - ast_edit's reparse guard (`BrokenResult`, `ast_edit.rs:253-263`) is not reachable from any tool.
-  - Update (branch `wt/verify`): `write`/`edit`/`hashline_edit` now append a `syntax:` line when an edit changed the file's tree-sitter error count (`titi_genome::syntax_check`), and `verify.command` runs when a turn that edited files ends, feeding a failure back once. The reparse guard is still not a tool.
+  - Update (branch `wt/verify`): `write`/`edit`/`hashline_edit` now append a `syntax:` line when an edit changed the file's tree-sitter error count (`titi_atlas::syntax_check`), and `verify.command` runs when a turn that edited files ends, feeding a failure back once. The reparse guard is still not a tool.
 - **Do:**
   - Add a post-edit cheap syntax/diagnostic check to `edit`/`write` results, reported as "introduced N errors" (empryo-parity #18, still open).
   - Add an optional `verify.command` setting that runs when the model ends its turn, and feeds failures back once (a Stop-hook equivalent).
@@ -217,7 +217,7 @@ Method and limits:
   - [Anthropic](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) describes Claude Code's hybrid.
   - Aider found a PageRank'd tree-sitter map lets the model "figure out which files it needs" ([Aider](https://aider.chat/2023/10/22/repomap.html), 1k-token default).
   - Cursor: semantic search added +12.5% accuracy, +2.6% retention on repos ≥1000 files ([Cursor](https://cursor.com/blog/semsearch)).
-- **titi:** have, with the unproven part being value versus cost. About 1k tokens of genome (24 files by default, `runtime.rs:740`) rides on the user message, sent only when changed. 13 languages from syntax trees.
+- **titi:** have, with the unproven part being value versus cost. About 1k tokens of atlas (24 files by default, `runtime.rs:740`) rides on the user message, sent only when changed. 13 languages from syntax trees.
 - **Do:** A/B the map on and off in #10. Keep the budget tied to repo size.
 
 ### 17. Semantic search tool
@@ -275,8 +275,8 @@ Method and limits:
 
 ### 25. AST/symbol edits and code intelligence
 - **Evidence:** Empryo sells symbol edits ([docs](https://empryo.com/docs/tools/ast-edit.md)); Claude Code says LSP plugins replace grep+read chains and report type errors after edits ([costs](https://code.claude.com/docs/en/costs.md)). I found no independent measurement of either.
-- **titi:** partial. `ast_edit` is "a library capability" (`titi-genome/src/ast_edit.rs:10-14`) for Rust, TS/JS and Python. `titi genome lsp` is an LSP *server* for symbols; there is no LSP *client* (diagnostics, definition, rename); compound refactors are gated (empryo-parity #22).
-- **Do:** First expose a read-only `symbols`/`refs` tool from the genome the engine already holds (cheap, no LSP). Then an LSP client for post-edit diagnostics (#4). Make `ast_edit` a tool only after the eval shows edit failures worth fixing.
+- **titi:** partial. `ast_edit` is "a library capability" (`titi-atlas/src/ast_edit.rs:10-14`) for Rust, TS/JS and Python. `titi atlas lsp` is an LSP *server* for symbols; there is no LSP *client* (diagnostics, definition, rename); compound refactors are gated (empryo-parity #22).
+- **Do:** First expose a read-only `symbols`/`refs` tool from the atlas the engine already holds (cheap, no LSP). Then an LSP client for post-edit diagnostics (#4). Make `ast_edit` a tool only after the eval shows edit failures worth fixing.
 
 ### 26. Parallel tool calls
 - **Evidence:** Anthropic's research system cut time up to 90% with parallel subagents and parallel tool calls; Codex says "maximise parallelism" for reads.
@@ -365,7 +365,7 @@ Method and limits:
 - **Status, 2026-10-21:** have for tools — stdio client and manager (`2dc8e69`, `e61952a`), `/mcp` and the consent panel (`bc5a197`), Streamable HTTP (`331a3cb`), one-read status and registry (`3a557aa`). No OAuth, no resources or prompts, no sampling.
 
 ### 41. Prompt-injection hygiene
-- **titi:** have. The soul scan, the genome path sanitiser (paths containing `<`/`>` dropped) and secret redaction cover memory, genome and tool output. Project rules and skills pass an injection scanner (STATE.md:164).
+- **titi:** have. The soul scan, the atlas path sanitiser (paths containing `<`/`>` dropped) and secret redaction cover memory, atlas and tool output. Project rules and skills pass an injection scanner (STATE.md:164).
 - **Do:** also tag `fetch`/`web_search` output as untrusted data in the tool result.
 
 ---

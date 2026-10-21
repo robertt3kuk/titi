@@ -3,7 +3,7 @@
 //! A reader, not a runner: it opens the trace files the engine wrote under
 //! `<agent_dir>/traces/<session>/` and prints them, so it never needs a model
 //! key and never starts an engine. It is short-circuited in `main` beside
-//! `titi genome`, before the flag loop could mistake the session id for a
+//! `titi atlas`, before the flag loop could mistake the session id for a
 //! prompt.
 //!
 //! The tree shows what the ask called a stack trace: one line per span with

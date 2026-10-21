@@ -51,7 +51,7 @@
 
 ## M9 — GPUI Workbench + Packaging
 - Темы: gui-gpui, packaging-headless.
-- Код: `titi-desktop` на Zed GPUI поверх того же `EngineCommand`/`EngineEvent`; Work, Files, Changes, Genome, Tools, Costs, Settings, Help; RPC/headless, packaging/signing.
+- Код: `titi-desktop` на Zed GPUI поверх того же `EngineCommand`/`EngineEvent`; Work, Files, Changes, Atlas, Tools, Costs, Settings, Help; RPC/headless, packaging/signing.
 - Запрет: никаких provider/tool/session реализаций внутри desktop crate.
 - DoD: TUI, headless и GPUI управляют одной engine-сессией; RPC-клиент управляет turn; .app собирается и подписывается.
 

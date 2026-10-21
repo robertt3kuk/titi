@@ -11,12 +11,12 @@ standard library's pty/os only. Suites (--only takes a comma list):
              the first byte and to the first painted frame, CPU and peak RSS
              of a short session (rusage from wait4, the same number
              `/usr/bin/time -l` prints).
-  genome     index build, prompt-map render, no-op refresh, one edited file.
+  atlas     index build, prompt-map render, no-op refresh, one edited file.
   tools      glob / grep / read through the titi-tools API.
   render     markdown render of a long mixed session, per message / per frame.
   streaming  one turn against the scripted provider: first token, total, CPU.
   prompt     request body per turn from the provider's request log: system
-             prompt, tool schemas, genome, diff and history, in bytes and
+             prompt, tool schemas, atlas, diff and history, in bytes and
              estimated tokens (bytes/4, titi's own estimator).
 
 The scripted provider (scripts/fake-provider.py) must listen on 127.0.0.1:18999;
@@ -104,7 +104,7 @@ def build(cargo):
     env = dict(os.environ, PATH=os.path.dirname(cargo) + os.pathsep + os.environ["PATH"])
     for argv in (
         ["build", "--release", "--locked", "-p", "titi-cli"],
-        ["build", "--release", "--locked", "--examples", "-p", "titi-genome", "-p", "titi-tools", "-p", "titi-tui"],
+        ["build", "--release", "--locked", "--examples", "-p", "titi-atlas", "-p", "titi-tools", "-p", "titi-tui"],
     ):
         log("cargo " + " ".join(argv))
         subprocess.run([cargo, *argv], cwd=ROOT, env=env, check=True)
@@ -156,10 +156,10 @@ def make_workspace(base, template_agent):
     return ws, agent
 
 
-def titi_env(base, agent, genome=True):
+def titi_env(base, agent, atlas=True):
     env = {"PATH": "/usr/bin:/bin", "TITI_AGENT_DIR": agent, "TERM": "xterm-256color", "HOME": base}
-    if not genome:
-        env["TITI_NO_GENOME"] = "1"
+    if not atlas:
+        env["TITI_NO_ATLAS"] = "1"
     return env
 
 
@@ -294,10 +294,10 @@ def pty_session(binary, ws, env, settle=2.0, marker=b"titi"):
 
 def bench_startup(binary, ws, env, runs):
     out = {"help": bench_help(binary, env, runs)}
-    for label, genome in (("tui", True), ("tui_no_genome", False)):
+    for label, atlas in (("tui", True), ("tui_no_atlas", False)):
         env2 = dict(env)
-        if not genome:
-            env2["TITI_NO_GENOME"] = "1"
+        if not atlas:
+            env2["TITI_NO_ATLAS"] = "1"
         samples = [pty_session(binary, ws, env2) for _ in range(runs)]
         out[label] = {
             key: summarize([s[key] for s in samples])
@@ -415,7 +415,7 @@ def pty_resume(binary, ws, env, settle=1.5):
 def bench_resume(binary, ws, env, runs, turns):
     """Build a session of `turns` turns (markdown, tables, maths, wide text) and
     reopen it in the TUI."""
-    env = dict(env, TITI_NO_GENOME="1")
+    env = dict(env, TITI_NO_ATLAS="1")
     session = Headless(binary, ws, env)
     session.ready()
     for i in range(turns):
@@ -525,13 +525,13 @@ def bench_streaming_mode(binary, ws, env, runs):
 
 
 def bench_streaming(binary, ws, env, runs):
-    """Both with the genome index (the default) and without it: with it, the
+    """Both with the atlas index (the default) and without it: with it, the
     process's CPU is dominated by the one-off index, so the turn's own CPU is
     only readable in the second."""
-    off = dict(env, TITI_NO_GENOME="1")
+    off = dict(env, TITI_NO_ATLAS="1")
     return {
-        "genome": bench_streaming_mode(binary, ws, env, runs),
-        "no_genome": bench_streaming_mode(binary, ws, off, runs),
+        "atlas": bench_streaming_mode(binary, ws, env, runs),
+        "no_atlas": bench_streaming_mode(binary, ws, off, runs),
     }
 
 
@@ -550,7 +550,7 @@ SCENARIO = [
     "hello a fifth time",
 ]
 BLOCKS = {
-    "genome": re.compile(r"<genome\b.*?</genome>", re.S),
+    "atlas": re.compile(r"<atlas\b.*?</atlas>", re.S),
     "diff": re.compile(r"<diff>.*?</diff>", re.S),
     "recall": re.compile(r"<recall\b.*?</recall>", re.S),
 }
@@ -568,7 +568,7 @@ def content_text(message):
 
 
 def breakdown(body):
-    """Bytes of one request body by what they are. `genome`/`diff`/`recall` split
+    """Bytes of one request body by what they are. `atlas`/`diff`/`recall` split
     into the newest user message's copy (this turn's) and copies riding in
     older messages (history)."""
     messages = body.get("messages", [])
@@ -576,8 +576,8 @@ def breakdown(body):
     parts = {
         "system": 0,
         "tools": wire_len(body.get("tools", [])),
-        "genome_fresh": 0,
-        "genome_stale": 0,
+        "atlas_fresh": 0,
+        "atlas_stale": 0,
         "diff_fresh": 0,
         "diff_stale": 0,
         "recall_fresh": 0,
@@ -695,7 +695,7 @@ def report(results):
         s = results["startup"]
         body = [["titi --help wall ms", *[f(s["help"]["wall_ms"][k]) for k in ("n", "min", "median", "p95")]]]
         body.append(["titi --help peak RSS MB", *[f(s["help"]["rss_mb"][k]) for k in ("n", "min", "median", "p95")]])
-        for label in ("tui", "tui_no_genome"):
+        for label in ("tui", "tui_no_atlas"):
             for key, name in (
                 ("first_byte_ms", "first byte ms"),
                 ("first_frame_ms", "first frame ms"),
@@ -706,7 +706,7 @@ def report(results):
                 if key in s[label]:
                     body.append([f"{label} {name}", *[f(s[label][key][k]) for k in ("n", "min", "median", "p95")]])
         out += ["## Startup", "", table(["case", "n", "min", "median", "p95"], body), ""]
-    for suite, title in (("genome", "Genome"), ("tools", "Tools"), ("render", "Render")):
+    for suite, title in (("atlas", "Atlas"), ("tools", "Tools"), ("render", "Render")):
         if suite in results:
             out += [f"## {title}", "", example_table(results[suite]), ""]
     if "resume" in results:
@@ -719,7 +719,7 @@ def report(results):
         out += [f"## Resumed session ({r['turns']} turns, TUI 120x40)", "", table(["case", "n", "min", "median", "p95"], body), ""]
     if "streaming" in results:
         body = []
-        for mode in ("genome", "no_genome"):
+        for mode in ("atlas", "no_atlas"):
             s = results["streaming"][mode]
             body.append([f"{mode} ready ms", *[f(s["ready_ms"][k]) for k in ("n", "min", "median", "p95")]])
             body.append([f"{mode} idle process CPU ms", *[f(s["idle_cpu_ms"][k]) for k in ("n", "min", "median", "p95")]])
@@ -739,8 +739,8 @@ def report(results):
         cols = [
             "system",
             "tools",
-            "genome_fresh",
-            "genome_stale",
+            "atlas_fresh",
+            "atlas_stale",
             "diff_fresh",
             "diff_stale",
             "recall_fresh",
@@ -773,7 +773,7 @@ def main():
     parser.add_argument("--requests", default=DEFAULT_REQUESTS, help="provider request log (read only)")
     parser.add_argument("--agent-template", default="/tmp/titi-qa/run/agent", help="agent dir to copy SOUL.md etc. from")
     args = parser.parse_args()
-    suites = args.only.split(",") if args.only else ["startup", "genome", "tools", "render", "resume", "streaming", "prompt"]
+    suites = args.only.split(",") if args.only else ["startup", "atlas", "tools", "render", "resume", "streaming", "prompt"]
     runs = 3 if args.quick else 7
 
     global EXAMPLE_DIR
@@ -790,9 +790,9 @@ def main():
     try:
         ws, agent = make_workspace(base, args.agent_template)
         env = titi_env(base, agent)
-        if "genome" in suites:
-            log("genome")
-            results["genome"] = bench_example("bench_genome", [*quick, ws])
+        if "atlas" in suites:
+            log("atlas")
+            results["atlas"] = bench_example("bench_atlas", [*quick, ws])
         if "tools" in suites:
             log("tools")
             results["tools"] = bench_example("bench_tools", [*quick, ws])

@@ -2624,6 +2624,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "titi-atlas"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-swift",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "titi-cli"
 version = "0.1.0"
 dependencies = [
@@ -2632,10 +2655,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "titi-atlas",
  "titi-config",
  "titi-core",
  "titi-engine",
- "titi-genome",
  "titi-mcp",
  "titi-memory",
  "titi-providers",
@@ -2684,9 +2707,9 @@ dependencies = [
  "smol_str",
  "tempfile",
  "thiserror 2.0.20",
+ "titi-atlas",
  "titi-config",
  "titi-core",
- "titi-genome",
  "titi-mcp",
  "titi-memory",
  "titi-providers",
@@ -2694,29 +2717,6 @@ dependencies = [
  "titi-soul",
  "titi-tools",
  "tokio",
-]
-
-[[package]]
-name = "titi-genome"
-version = "0.1.0"
-dependencies = [
- "regex",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-kotlin-ng",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-swift",
- "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -2797,7 +2797,7 @@ dependencies = [
  "smol_str",
  "tempfile",
  "thiserror 2.0.20",
- "titi-genome",
+ "titi-atlas",
  "titi-providers",
  "tokio",
 ]

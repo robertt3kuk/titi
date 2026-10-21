@@ -109,7 +109,7 @@ async fn the_turn_shows_the_working_tree_diff_and_boosts_the_edited_file() {
     let captured = Arc::clone(&transport);
     let mut config = EngineConfig::new("primary");
     config.workspace_root = Some(workspace.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(config, resolver(transport));
     engine
         .send(EngineCommand::SubmitPrompt {
@@ -129,13 +129,13 @@ async fn the_turn_shows_the_working_tree_diff_and_boosts_the_edited_file() {
         prompt.content
     );
     assert!(prompt.content.contains("</diff>"), "{}", prompt.content);
-    let genome_at = prompt.content.find("</genome>").expect("genome");
+    let atlas_at = prompt.content.find("</atlas>").expect("atlas");
     let diff_at = prompt.content.find("<diff>").expect("diff");
-    assert!(genome_at < diff_at, "{}", prompt.content);
+    assert!(atlas_at < diff_at, "{}", prompt.content);
     assert!(!prompt.content.contains("sk-test"), "{}", prompt.content);
     assert!(!prompt.content.contains(".env"), "{}", prompt.content);
 
-    let map = &prompt.content[..genome_at];
+    let map = &prompt.content[..atlas_at];
     let leaf_at = map.find("src/leaf.rs").expect("leaf in the map");
     let hub_at = map.find("src/hub.rs").expect("hub in the map");
     assert!(
@@ -199,7 +199,7 @@ async fn a_modified_key_file_is_not_sent_to_the_provider() {
     let captured = Arc::clone(&transport);
     let mut config = EngineConfig::new("primary");
     config.workspace_root = Some(workspace.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(config, resolver(transport));
     engine
         .send(EngineCommand::SubmitPrompt {
@@ -300,7 +300,7 @@ async fn a_duck_turn_is_not_shown_the_working_tree() {
     let mut config = EngineConfig::new("primary");
     config.mode = SessionMode::Duck;
     config.workspace_root = Some(workspace.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(config, resolver(transport));
     engine
         .send(EngineCommand::SubmitPrompt {
@@ -340,7 +340,7 @@ async fn an_unchanged_diff_is_not_sent_again_and_a_changed_one_is() {
     let captured = Arc::clone(&transport);
     let mut config = EngineConfig::new("primary");
     config.workspace_root = Some(workspace.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start(config, resolver(transport));
     for text in ["what changed", "and now", "and again"] {
         engine

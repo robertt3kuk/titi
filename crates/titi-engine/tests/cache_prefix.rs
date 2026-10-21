@@ -163,7 +163,7 @@ async fn nothing_rebuilt_per_turn_moves_the_prefix() {
     let mut config = EngineConfig::new("primary");
     config.agent_dir = Some(agent.path().to_path_buf());
     config.workspace_root = Some(workspace.path().to_path_buf());
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     config.agent_model = Some("primary".into());
     config.approval_mode = ApprovalMode::Yolo;
     let resolver = Arc::new(MapResolver(

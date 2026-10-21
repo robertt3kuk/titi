@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use smol_str::SmolStr;
-use titi_genome::SharedGenome;
+use titi_atlas::SharedAtlas;
 use titi_providers::{BlockId, ChatMessage, Role, StreamEvent, ToolCallRef};
 use titi_tools::{ApprovalMode, ApprovalTier, ToolHandler, ToolRegistry, ToolResult};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -80,7 +80,7 @@ impl ToolCallCollector {
 pub(crate) type ApprovalWaiters = Arc<Mutex<HashMap<SmolStr, oneshot::Sender<bool>>>>;
 pub type TrajectorySink = Arc<Mutex<Option<titi_core::trajectory::TrajectoryRecorder>>>;
 
-/// How many touched files the Genome boost tracks. Past this every file in a
+/// How many touched files the Atlas boost tracks. Past this every file in a
 /// long session is "touched" and the boost stops discriminating.
 pub const TOUCHED_CAPACITY: usize = 64;
 
@@ -134,7 +134,7 @@ impl TouchedSet {
     }
 }
 
-/// Workspace paths the session read or edited; the Genome boosts them.
+/// Workspace paths the session read or edited; the Atlas boosts them.
 pub type TouchedSink = Arc<Mutex<TouchedSet>>;
 
 /// Tools whose `path` argument counts as "touched by this session".
@@ -177,7 +177,7 @@ fn may_group(
     if hooks.watches_tool(&call.name) {
         return false;
     }
-    // A tool that writes is never grouped, whatever its tier says: the genome
+    // A tool that writes is never grouped, whatever its tier says: the atlas
     // fold and the file claim below key on the name, and a write that ran
     // beside another call would race both.
     if BLOCKING_TOOLS.contains(&call.name.as_str()) || WRITING_TOOLS.contains(&call.name.as_str()) {
@@ -478,7 +478,7 @@ pub(crate) async fn execute_tools(
     // The session's live index, when it has one: a mutating tool call folds
     // the path it wrote into it before returning. `None` for a caller with no
     // index of its own — a subagent — which is the fallback walk's business.
-    genome: Option<&SharedGenome>,
+    atlas: Option<&SharedAtlas>,
     claims: &Claims,
     agent_id: &SmolStr,
     mask_ips: bool,
@@ -606,9 +606,9 @@ pub(crate) async fn execute_tools(
             touched.lock().await.mark_edit();
         }
         if !result.is_error
-            && let (Some(genome), Some(path)) = (genome.cloned(), prepared.write_path.clone())
+            && let (Some(atlas), Some(path)) = (atlas.cloned(), prepared.write_path.clone())
         {
-            let _ = tokio::task::spawn_blocking(move || genome.apply_changes(&[path])).await;
+            let _ = tokio::task::spawn_blocking(move || atlas.apply_changes(&[path])).await;
         }
         finish(
             turn_id,
@@ -926,7 +926,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/hub.rs"), "pub fn hub() {}\n").unwrap();
-        let live = SharedGenome::index(root).unwrap();
+        let live = SharedAtlas::index(root).unwrap();
         assert!(
             live.last_stats().is_some_and(|stats| stats.walked),
             "the first index is a walk"

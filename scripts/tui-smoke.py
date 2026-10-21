@@ -174,7 +174,7 @@ def child_env(agent_dir: str, home: str) -> dict:
     env["TERM"] = "xterm-256color"
     env["HOME"] = home
     env["TITI_AGENT_DIR"] = agent_dir
-    env["TITI_NO_GENOME"] = "1"  # No repo scan: the screen is what is under test.
+    env["TITI_NO_ATLAS"] = "1"  # No repo scan: the screen is what is under test.
     env.pop("TITI_PROFILE", None)
     env.pop("TITI_CONFIG_FILES", None)
     return env

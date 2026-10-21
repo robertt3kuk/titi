@@ -1,0 +1,35 @@
+[package]
+name = "titi-atlas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+regex = "1"
+# Symbol extraction. The grammars are pinned to ABI 14, the range the
+# workspace's tree-sitter 0.24 accepts; newer grammar releases emit ABI 15 and
+# would need a core bump. `grammars_match_the_core_abi` guards this.
+tree-sitter = { workspace = true }
+tree-sitter-rust = "0.23.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.23.6"
+tree-sitter-go = "0.23.4"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.23.4"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-kotlin-ng = "1.1.0"
+# `=` only where the caret range would reach an ABI-15 release.
+tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.23.11"
+tree-sitter-swift = "=0.7.0"
+# Typed ast-edit errors. Already in the workspace tree (titi-core,
+# titi-providers, titi-memory), so this adds no new compile unit.
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

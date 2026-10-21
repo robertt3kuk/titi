@@ -744,16 +744,16 @@ pub fn privacy_policy(settings: &titi_config::settings::Settings) -> (SensitiveP
     (SensitivePolicy::new(extra, allow), mask_ips)
 }
 
-/// Genome prompt-map cap from settings; `genome.limit` as a plain integer.
+/// Atlas prompt-map cap from settings; `atlas.limit` as a plain integer.
 ///
 /// Read through the effective view, so a project's `.titi/config.yml` may set
 /// it: unlike privacy and approval, the cap is not a latch a cloned repo must
 /// not loosen. Anything but an integer in 1..=64 — missing key, failed load,
 /// wrong type, out of range — keeps the engine default: a bad cap must not
 /// stop startup.
-pub fn genome_limit_from(settings: &titi_config::settings::Settings) -> usize {
+pub fn atlas_limit_from(settings: &titi_config::settings::Settings) -> usize {
     settings
-        .get(titi_config::settings::GENOME_LIMIT_KEY)
+        .get(titi_config::settings::ATLAS_LIMIT_KEY)
         .and_then(|value| value.as_i64())
         .filter(|limit| (1..=64).contains(limit))
         .map_or(24, |limit| limit as usize)
@@ -805,14 +805,14 @@ pub fn model_roles_from(
         .collect()
 }
 
-/// Whether the genome prompt map is enabled from settings; `genome.enabled` as a boolean.
+/// Whether the atlas prompt map is enabled from settings; `atlas.enabled` as a boolean.
 ///
 /// Missing key → true (default on). JSON bool true/false → that. String `on`/`true`/`yes` →
 /// true, `off`/`false`/`no` → false (ascii case-insensitive). Anything else (number, array,
-/// `maybe`) → true (do not refuse startup). The `TITI_NO_GENOME` env var is handled separately,
+/// `maybe`) → true (do not refuse startup). The `TITI_NO_ATLAS` env var is handled separately,
 /// at engine startup, and takes precedence over this setting.
-pub fn genome_enabled_from(settings: &titi_config::settings::Settings) -> bool {
-    match settings.get(titi_config::settings::GENOME_ENABLED_KEY) {
+pub fn atlas_enabled_from(settings: &titi_config::settings::Settings) -> bool {
+    match settings.get(titi_config::settings::ATLAS_ENABLED_KEY) {
         None => true, // unset means on
         Some(value) => {
             if let Some(b) = value.as_bool() {
@@ -855,23 +855,23 @@ pub fn session_auto_resume_from(settings: &titi_config::settings::Settings) -> b
     }
 }
 
-/// The status note `/genome` prints: the four facts as plain lines.
+/// The status note `/atlas` prints: the four facts as plain lines.
 ///
-/// One formatter is shared by the chat and `titi genome`, so a note cannot
+/// One formatter is shared by the chat and `titi atlas`, so a note cannot
 /// disagree with what the terminal command prints for the same directory.
 /// `reason` is about the *key*: a fresh directory that loads fine reads
 /// `default`, and the env switch says so ahead of everything else.
-pub fn genome_note(
+pub fn atlas_note(
     settings: &Option<titi_config::settings::Settings>,
     agent_dir: &std::path::Path,
 ) -> String {
-    let enabled = settings.as_ref().is_none_or(genome_enabled_from);
+    let enabled = settings.as_ref().is_none_or(atlas_enabled_from);
     let key_set = settings
         .as_ref()
-        .and_then(|s| s.resolve_source(titi_config::settings::GENOME_ENABLED_KEY))
+        .and_then(|s| s.resolve_source(titi_config::settings::ATLAS_ENABLED_KEY))
         .is_some();
-    let (state, reason) = if std::env::var_os("TITI_NO_GENOME").is_some() {
-        ("off", "TITI_NO_GENOME")
+    let (state, reason) = if std::env::var_os("TITI_NO_ATLAS").is_some() {
+        ("off", "TITI_NO_ATLAS")
     } else if key_set {
         if enabled {
             ("on", "setting")
@@ -881,9 +881,9 @@ pub fn genome_note(
     } else {
         ("on", "default")
     };
-    let limit = settings.as_ref().map(genome_limit_from).unwrap_or(24);
+    let limit = settings.as_ref().map(atlas_limit_from).unwrap_or(24);
     format!(
-        "genome: {state}\nreason: {reason}\nlimit: {limit}\nconfig: {}",
+        "atlas: {state}\nreason: {reason}\nlimit: {limit}\nconfig: {}",
         agent_dir.join("config.yml").display()
     )
 }
@@ -1013,13 +1013,13 @@ pub fn start_engine_with(
     }
     engine_config.fallback_models = models.iter().skip(1).map(|id| id.clone().into()).collect();
     let workspace = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    // Load settings early so genome.enabled can be checked.
+    // Load settings early so atlas.enabled can be checked.
     let agent_dir = titi_config::agent_dir();
     let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
-    // Clear genome_root if TITI_NO_GENOME env is set or genome.enabled is false.
-    let genome_enabled = settings.as_ref().map_or(true, genome_enabled_from);
-    if std::env::var_os("TITI_NO_GENOME").is_none() && genome_enabled {
-        engine_config.genome_root = Some(workspace.clone());
+    // Clear atlas_root if TITI_NO_ATLAS env is set or atlas.enabled is false.
+    let atlas_enabled = settings.as_ref().map_or(true, atlas_enabled_from);
+    if std::env::var_os("TITI_NO_ATLAS").is_none() && atlas_enabled {
+        engine_config.atlas_root = Some(workspace.clone());
     }
     // A subagent runs the same tool loop as the main turn, in the workspace,
     // on the chosen model. Read-only by default; writes stay with the main
@@ -1061,7 +1061,7 @@ pub fn start_engine_with(
         titi_config::settings::switch_on(settings, titi_config::settings::TRACE_THINKING_KEY)
     });
     if let Some(settings) = &settings {
-        engine_config.genome_limit = genome_limit_from(settings);
+        engine_config.atlas_limit = atlas_limit_from(settings);
         // The setting names how long a `bash` call may hold the turn before
         // it is handed to the background. A value that is zero or absurd is
         // refused here, by name, instead of starting with a bound nobody

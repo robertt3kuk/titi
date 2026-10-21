@@ -76,19 +76,19 @@ pub const THEME_DARK_KEY: &str = "theme.dark";
 /// The theme the user chose for a light terminal. See [`THEME_DARK_KEY`].
 pub const THEME_LIGHT_KEY: &str = "theme.light";
 
-/// How many files the genome prompt map keeps.
+/// How many files the atlas prompt map keeps.
 ///
 /// Unset means the engine default (`EngineConfig::new` picks it, currently 24).
 /// This crate does not own that number — the constant is a key name, not a
 /// second source of the default, so it deliberately carries no value.
-pub const GENOME_LIMIT_KEY: &str = "genome.limit";
+pub const ATLAS_LIMIT_KEY: &str = "atlas.limit";
 
 /// Whether the prompt map is built.
 ///
 /// Unset means on. This crate does not own the default boolean; what this
-/// key owns is the name only. `TITI_NO_GENOME=1` forces off for one run and
+/// key owns is the name only. `TITI_NO_ATLAS=1` forces off for one run and
 /// is not this key.
-pub const GENOME_ENABLED_KEY: &str = "genome.enabled";
+pub const ATLAS_ENABLED_KEY: &str = "atlas.enabled";
 
 /// Whether a turn that finished cleanly raises a desktop notification.
 ///
@@ -337,7 +337,7 @@ pub const SESSION_AUTO_RESUME_KEY: &str = "session.autoResume";
 /// background, in milliseconds: `bash.autoBackground.thresholdMs`.
 ///
 /// Unset means the engine default; this crate owns the name only, as with
-/// [`GENOME_LIMIT_KEY`], so it carries no number. A value must be an integer
+/// [`ATLAS_LIMIT_KEY`], so it carries no number. A value must be an integer
 /// from 1 to [`MAX_AUTO_BACKGROUND_MS`]; 0 or anything larger is refused by
 /// [`Settings::auto_background_threshold`] rather than silently guessed.
 /// `TITI_BASH_BACKGROUND_MS` overrides this key when set.
@@ -799,7 +799,7 @@ pub fn pinned_model(settings: &Settings) -> Option<String> {
 /// Whether an on-by-default switch is off at `key`.
 ///
 /// Written for the cosmetic switches whose name this crate owns — the
-/// notification, progress and rate keys — and modelled on the genome switch
+/// notification, progress and rate keys — and modelled on the atlas switch
 /// the engine reads: unset means on, a JSON `false` means off, and the
 /// strings `off`/`false`/`no` (case-insensitive) mean off. Anything else — a
 /// number, a list, `maybe` — leaves the switch on, because a typo in a

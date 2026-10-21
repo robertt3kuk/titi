@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::StreamExt;
 use smol_str::SmolStr;
+use titi_atlas::AtlasHandle;
+use titi_atlas::live::Request as IndexRequest;
 use titi_core::trace::{SpanKind, SpanStatus, THINKING_CHARS_ATTR, THINKING_MS_ATTR};
-use titi_genome::GenomeHandle;
-use titi_genome::live::Request as IndexRequest;
 use titi_providers::{
     ChatMessage, Credential, ErrorReason, RequestCtx, Role, StreamEvent, TokenUsage, Transport,
     TransportError, WireRequest,
@@ -125,7 +125,7 @@ async fn recalled_memory(
 }
 
 /// How long a turn waits for the index before it names the backlog instead.
-const GENOME_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40);
+const ATLAS_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// Point the index at this turn's files and render the map from what it
 /// publishes.
@@ -135,7 +135,7 @@ const GENOME_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40)
 /// paths no tool named, then waits at most `quiesce` for that window to land.
 /// When it lands, the map is what the old synchronous walk produced. When it
 /// does not, the map is the **previous consistent graph** with its header
-/// naming how much is outstanding — `<genome pending="3">` — so the model
+/// naming how much is outstanding — `<atlas pending="3">` — so the model
 /// reading it knows the map may be one batch behind and can re-read a file
 /// instead of trusting it. A silent stale map is the one outcome the contract
 /// forbids, and blocking until the walk finished is the latency this phase
@@ -143,11 +143,11 @@ const GENOME_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40)
 ///
 /// `quiesce` is a parameter so a test can drive the not-caught-up branch
 /// exactly rather than by racing a real walk; the turn passes
-/// [`GENOME_QUIESCE`].
-async fn genome_map(
+/// [`ATLAS_QUIESCE`].
+async fn atlas_map(
     root: Option<PathBuf>,
     limit: usize,
-    genome: Option<&GenomeHandle>,
+    atlas: Option<&AtlasHandle>,
     touched: &TouchedSink,
     quiesce: std::time::Duration,
 ) -> Option<SmolStr> {
@@ -156,28 +156,28 @@ async fn genome_map(
     // duck mode clears the root on its own clone and must stay repo-blind. A
     // root whose index could not be built has no handle either, which is the
     // same answer for the same reason.
-    let genome = genome.filter(|_| root.is_some())?.clone();
+    let atlas = atlas.filter(|_| root.is_some())?.clone();
     let touched = Arc::clone(touched);
     run_off_thread(move || {
         // The first index runs on the handle's worker; a map rendered before
         // it lands would be an empty graph, which `pending` cannot describe.
-        genome.wait_ready();
+        atlas.wait_ready();
         let touched: Vec<String> = touched.blocking_lock().snapshot();
         let mut urgent = touched.clone();
         urgent.reverse();
-        genome.request(IndexRequest::Priority(urgent));
-        genome.request(IndexRequest::Resync);
+        atlas.request(IndexRequest::Priority(urgent));
+        atlas.request(IndexRequest::Resync);
         // Wait, but do not decide on the wait's own answer. A wait that timed
         // out a microsecond before the batch landed would report a backlog
         // that is gone, and a batch that *failed* to apply reports nothing at
         // all through it. The count is the contract; the wait is the courtesy
         // that keeps the common case — and so the header — at zero.
-        genome.quiesce(quiesce);
+        atlas.quiesce(quiesce);
         // Read the backlog before the graph: a count that is still moving
         // means the batch had not landed when the snapshot was taken, and
         // over-reporting staleness costs a re-read, never a wrong answer.
-        let pending = genome.pending();
-        let (snapshot, _generation) = genome.snapshot();
+        let pending = atlas.pending();
+        let (snapshot, _generation) = atlas.snapshot();
         Some(SmolStr::from(
             snapshot.project_with_pending(limit, &touched, pending),
         ))
@@ -212,7 +212,7 @@ async fn working_tree_diff(
 fn prompt_with_context(
     prompt: &str,
     recalled: Option<&str>,
-    genome: Option<&str>,
+    atlas: Option<&str>,
     diff: Option<&str>,
 ) -> SmolStr {
     let diff = diff.and_then(render_diff);
@@ -220,7 +220,7 @@ fn prompt_with_context(
     if let Some(block) = recalled.filter(|block| !block.is_empty()) {
         parts.push(block);
     }
-    if let Some(block) = genome.filter(|block| !block.is_empty()) {
+    if let Some(block) = atlas.filter(|block| !block.is_empty()) {
         parts.push(block);
     }
     if let Some(block) = diff.as_deref() {
@@ -236,7 +236,7 @@ fn prompt_with_context(
 /// Whether the newest copy of a context block in `history` is `block`, byte for
 /// byte.
 ///
-/// `marker` is what opens a block of this kind (`<genome`, `<diff>`), so the
+/// `marker` is what opens a block of this kind (`<atlas`, `<diff>`), so the
 /// newest user message carrying one is the copy the model is reading. A block
 /// that equals it adds nothing: the model has that text, a few messages up.
 /// Sending it again costs its full size on every turn — the map alone is about
@@ -252,7 +252,7 @@ fn previous_copy_matches(history: &[ChatMessage], marker: &str, block: &str) -> 
         .is_some_and(|message| message.content.contains(block))
 }
 
-/// `<diff>` after the genome block. Whitespace-only text is not a snapshot.
+/// `<diff>` after the atlas block. Whitespace-only text is not a snapshot.
 fn render_diff(text: &str) -> Option<String> {
     if text.trim().is_empty() {
         return None;
@@ -278,15 +278,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_run_passes_the_map_through() {
-        let map = run_off_thread(|| Some(SmolStr::new_inline("<genome>\n</genome>"))).await;
-        assert_eq!(map.as_deref(), Some("<genome>\n</genome>"));
+        let map = run_off_thread(|| Some(SmolStr::new_inline("<atlas>\n</atlas>"))).await;
+        assert_eq!(map.as_deref(), Some("<atlas>\n</atlas>"));
     }
 
     /// A turn whose index cannot catch up **names the backlog** instead of
     /// rendering a graph it knows may be behind.
     ///
     /// The deadline is a parameter so this drives the branch exactly: the turn
-    /// passes [`GENOME_QUIESCE`] (40 ms), the test passes 1 ms and gives the
+    /// passes [`ATLAS_QUIESCE`] (40 ms), the test passes 1 ms and gives the
     /// index a tree whose first walk is far slower than that, so the outcome
     /// does not depend on racing a walk that happens to be quick. What is
     /// under test is the outcome — the model must see that the map it is
@@ -297,7 +297,7 @@ mod tests {
         let root = dir.path();
         // The handle is spawned over an empty tree and the tree arrives after,
         // so the first walk is the slow one and the spawn itself is not.
-        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        let atlas = AtlasHandle::spawn(root, titi_atlas::live::Options::default()).unwrap();
         for index in 0..150 {
             let mut body = String::new();
             for line in 0..120 {
@@ -311,25 +311,25 @@ mod tests {
         }
         let touched = TouchedSink::default();
 
-        let behind = genome_map(
+        let behind = atlas_map(
             Some(root.to_path_buf()),
             8,
-            Some(&genome),
+            Some(&atlas),
             &touched,
             std::time::Duration::from_millis(1),
         )
         .await
         .expect("a map");
         assert!(
-            behind.contains("<genome pending=\""),
+            behind.contains("<atlas pending=\""),
             "a map that could not be brought current must say so: {behind}"
         );
 
         // Given time, the same call renders the graph the batch landed in.
-        let settled = genome_map(
+        let settled = atlas_map(
             Some(root.to_path_buf()),
             8,
-            Some(&genome),
+            Some(&atlas),
             &touched,
             std::time::Duration::from_secs(30),
         )
@@ -356,12 +356,12 @@ mod tests {
             )
             .unwrap();
         }
-        let genome =
-            GenomeHandle::spawn_deferred(root, titi_genome::live::Options::default()).unwrap();
-        let map = genome_map(
+        let atlas =
+            AtlasHandle::spawn_deferred(root, titi_atlas::live::Options::default()).unwrap();
+        let map = atlas_map(
             Some(root.to_path_buf()),
             200,
-            Some(&genome),
+            Some(&atlas),
             &TouchedSink::default(),
             std::time::Duration::from_secs(30),
         )
@@ -376,16 +376,16 @@ mod tests {
     async fn a_turn_without_a_root_renders_no_map() {
         let touched = TouchedSink::default();
         assert!(
-            genome_map(None, 8, None, &touched, GENOME_QUIESCE)
+            atlas_map(None, 8, None, &touched, ATLAS_QUIESCE)
                 .await
                 .is_none()
         );
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
-        let genome = GenomeHandle::spawn(root, titi_genome::live::Options::default()).unwrap();
+        let atlas = AtlasHandle::spawn(root, titi_atlas::live::Options::default()).unwrap();
         assert!(
-            genome_map(None, 8, Some(&genome), &touched, GENOME_QUIESCE)
+            atlas_map(None, 8, Some(&atlas), &touched, ATLAS_QUIESCE)
                 .await
                 .is_none()
         );
@@ -394,19 +394,19 @@ mod tests {
     #[test]
     fn the_volatile_blocks_sit_in_front_of_the_prompt() {
         let built =
-            prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"), None);
-        assert_eq!(built, "<recall/>\n\n<genome/>\n\nfix the parser");
+            prompt_with_context("fix the parser", Some("<recall/>"), Some("<atlas/>"), None);
+        assert_eq!(built, "<recall/>\n\n<atlas/>\n\nfix the parser");
         assert_eq!(prompt_with_context("bare", None, None, None), "bare");
         assert_eq!(prompt_with_context("bare", Some(""), None, None), "bare");
     }
 
     #[test]
-    fn a_diff_block_follows_the_genome_and_is_absent_without_a_snapshot() {
+    fn a_diff_block_follows_the_atlas_and_is_absent_without_a_snapshot() {
         let added = "+fn added_for_the_turn() {}";
         let with = prompt_with_context(
             "fix the parser",
             Some("<recall/>"),
-            Some("<genome/>"),
+            Some("<atlas/>"),
             Some(added),
         );
         assert!(with.contains("<diff>"), "{with}");
@@ -416,26 +416,26 @@ mod tests {
             with.as_str(),
             [
                 "<recall/>",
-                "<genome/>",
+                "<atlas/>",
                 "<diff>\n+fn added_for_the_turn() {}\n</diff>",
                 "fix the parser",
             ]
             .join("\n\n")
         );
-        let genome_at = with.find("<genome/>").expect("genome");
+        let atlas_at = with.find("<atlas/>").expect("atlas");
         let diff_at = with.find("<diff>").expect("diff");
         let prompt_at = with.find("fix the parser").expect("prompt");
-        assert!(genome_at < diff_at && diff_at < prompt_at, "{with}");
+        assert!(atlas_at < diff_at && diff_at < prompt_at, "{with}");
 
         let without =
-            prompt_with_context("fix the parser", Some("<recall/>"), Some("<genome/>"), None);
-        assert_eq!(without, "<recall/>\n\n<genome/>\n\nfix the parser");
+            prompt_with_context("fix the parser", Some("<recall/>"), Some("<atlas/>"), None);
+        assert_eq!(without, "<recall/>\n\n<atlas/>\n\nfix the parser");
         assert!(!without.contains("<diff>"), "{without}");
         assert_eq!(
             prompt_with_context(
                 "fix the parser",
                 Some("<recall/>"),
-                Some("<genome/>"),
+                Some("<atlas/>"),
                 Some(""),
             ),
             without
@@ -444,7 +444,7 @@ mod tests {
             prompt_with_context(
                 "fix the parser",
                 Some("<recall/>"),
-                Some("<genome/>"),
+                Some("<atlas/>"),
                 Some(" \n"),
             ),
             without
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn a_turn_leaves_the_previous_turns_messages_untouched() {
         let system = SmolStr::new("identity, project rules, skills");
-        let first = prompt_with_context("first", Some("<recall v1/>"), Some("<genome v1/>"), None);
+        let first = prompt_with_context("first", Some("<recall v1/>"), Some("<atlas v1/>"), None);
         let turn_one = vec![
             message(Role::System, &system),
             message(Role::User, &first),
@@ -467,16 +467,15 @@ mod tests {
         ];
 
         let history = visible_history(turn_one.clone(), Some(&system));
-        let second =
-            prompt_with_context("second", Some("<recall v2/>"), Some("<genome v2/>"), None);
+        let second = prompt_with_context("second", Some("<recall v2/>"), Some("<atlas v2/>"), None);
         let mut turn_two = vec![message(Role::System, &system)];
         turn_two.extend(history);
         turn_two.push(message(Role::User, &second));
 
         assert_eq!(turn_two[..turn_one.len()], turn_one[..]);
         assert_eq!(turn_two.len(), turn_one.len() + 1);
-        assert!(turn_two[1].content.contains("<genome v1/>"));
-        assert!(turn_one[1].content.contains("<genome v1/>"));
+        assert!(turn_two[1].content.contains("<atlas v1/>"));
+        assert!(turn_one[1].content.contains("<atlas v1/>"));
     }
 
     /// A block the model already has, as its newest copy, is not sent again;
@@ -484,28 +483,28 @@ mod tests {
     /// hide the older one.
     #[test]
     fn a_block_the_newest_copy_already_holds_is_not_repeated() {
-        let first = prompt_with_context("first", None, Some("<genome v1/>"), None);
+        let first = prompt_with_context("first", None, Some("<atlas v1/>"), None);
         let history = vec![
             message(Role::User, &first),
             message(Role::Assistant, "an answer"),
         ];
-        assert!(previous_copy_matches(&history, "<genome", "<genome v1/>"));
-        assert!(!previous_copy_matches(&history, "<genome", "<genome v2/>"));
+        assert!(previous_copy_matches(&history, "<atlas", "<atlas v1/>"));
+        assert!(!previous_copy_matches(&history, "<atlas", "<atlas v2/>"));
 
         let mut skipped = history.clone();
         skipped.push(message(Role::User, "second, which sent no map"));
         skipped.push(message(Role::Assistant, "another answer"));
-        assert!(previous_copy_matches(&skipped, "<genome", "<genome v1/>"));
+        assert!(previous_copy_matches(&skipped, "<atlas", "<atlas v1/>"));
 
         let mut moved = skipped.clone();
         moved.push(message(
             Role::User,
-            &prompt_with_context("third", None, Some("<genome v2/>"), None),
+            &prompt_with_context("third", None, Some("<atlas v2/>"), None),
         ));
-        assert!(!previous_copy_matches(&moved, "<genome", "<genome v1/>"));
-        assert!(previous_copy_matches(&moved, "<genome", "<genome v2/>"));
+        assert!(!previous_copy_matches(&moved, "<atlas", "<atlas v1/>"));
+        assert!(previous_copy_matches(&moved, "<atlas", "<atlas v2/>"));
 
-        assert!(!previous_copy_matches(&[], "<genome", "<genome v1/>"));
+        assert!(!previous_copy_matches(&[], "<atlas", "<atlas v1/>"));
     }
 
     fn message(role: Role, text: &str) -> ChatMessage {
@@ -636,10 +635,10 @@ pub struct EngineConfig {
     /// summarise what is done and what is left.
     pub max_tool_rounds: u32,
     pub approval_mode: ApprovalMode,
-    /// Workspace root kept indexed turn-by-turn. `None` disables the Genome.
-    pub genome_root: Option<PathBuf>,
+    /// Workspace root kept indexed turn-by-turn. `None` disables the Atlas.
+    pub atlas_root: Option<PathBuf>,
     /// Ranked files injected per prompt.
-    pub genome_limit: usize,
+    pub atlas_limit: usize,
     /// Workspace a subagent's tools are jailed to. `None` keeps its registry
     /// empty even when `agent_model` is set.
     pub workspace_root: Option<PathBuf>,
@@ -662,7 +661,7 @@ pub struct EngineConfig {
     /// When and how the oldest messages are folded away.
     pub compaction: titi_core::compaction::CompactionPolicy,
     /// Agent directory holding `SOUL.md`, `PERSONALITY.md` and the memory
-    /// index. `None` sends no identity — only the genome map.
+    /// index. `None` sends no identity — only the atlas map.
     pub agent_dir: Option<PathBuf>,
     /// `skills.foreignUserDirs`: also read skills and commands from `~/.agents`
     /// and `~/.claude`, which belong to other tools.
@@ -729,8 +728,8 @@ impl EngineConfig {
             event_capacity: 256,
             max_tool_rounds: crate::tool_budget::DEFAULT_TOOL_ROUNDS,
             approval_mode: ApprovalMode::Write,
-            genome_root: None,
-            genome_limit: 24,
+            atlas_root: None,
+            atlas_limit: 24,
             workspace_root: None,
             agent_model: None,
             agent_writes: false,
@@ -1061,8 +1060,8 @@ pub struct EngineRuntime {
     /// root is configured. Written by the tool loop as it runs — synchronously,
     /// so a turn's own prompt is current by construction — and fed a resync per
     /// turn through the worker, whose backlog the map names when it cannot
-    /// catch up inside [`GENOME_QUIESCE`].
-    genome: Option<GenomeHandle>,
+    /// catch up inside [`ATLAS_QUIESCE`].
+    atlas: Option<AtlasHandle>,
     /// Files this session read or edited; boosts their rank in the projection.
     touched: TouchedSink,
     /// Per-file write claims shared by every agent in this runtime.
@@ -1225,12 +1224,12 @@ impl EngineRuntime {
         // be read leaves the session without a map, which is the same
         // degradation the per-turn refresh already had. The cold walk runs on
         // the worker rather than on this thread, because this thread is on the
-        // path to the surface's first frame; `genome_map` waits for it, so the
+        // path to the surface's first frame; `atlas_map` waits for it, so the
         // first turn's map is still a snapshot instead of a walk. The handle
         // exists before the subagent runner below so that runner can fold its
         // own writes in the same way the main turn does.
-        let genome = config.genome_root.as_ref().and_then(|root| {
-            GenomeHandle::spawn_deferred(root, titi_genome::live::Options::default()).ok()
+        let atlas = config.atlas_root.as_ref().and_then(|root| {
+            AtlasHandle::spawn_deferred(root, titi_atlas::live::Options::default()).ok()
         });
         // The model's questions reach the surface through this door, and the
         // answers come back as commands. Installed here because it is the only
@@ -1250,7 +1249,7 @@ impl EngineRuntime {
             config
                 .workspace_root
                 .clone()
-                .or_else(|| config.genome_root.clone())
+                .or_else(|| config.atlas_root.clone())
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from(".")),
             config.interrupt.clone(),
@@ -1260,7 +1259,7 @@ impl EngineRuntime {
             config
                 .workspace_root
                 .clone()
-                .or_else(|| config.genome_root.clone())
+                .or_else(|| config.atlas_root.clone())
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from(".")),
             config.interrupt.clone(),
@@ -1271,7 +1270,7 @@ impl EngineRuntime {
             config
                 .workspace_root
                 .clone()
-                .or_else(|| config.genome_root.clone()),
+                .or_else(|| config.atlas_root.clone()),
         );
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
@@ -1312,7 +1311,7 @@ impl EngineRuntime {
                 .with_approval_mode(approval)
                 .with_max_rounds(config.agent_rounds)
                 .with_mask_ips(config.mask_ips)
-                .with_genome(genome.clone())
+                .with_atlas(atlas.clone())
                 .with_spans(Arc::clone(&spans), config.trace_thinking)
                 .with_hooks(&hooks)
                 .with_router(router.clone()),
@@ -1369,7 +1368,7 @@ impl EngineRuntime {
             ask_waiters,
             trajectory,
             spans,
-            genome,
+            atlas,
             touched,
             claims: claims.clone(),
             steering: Steering::default(),
@@ -2090,7 +2089,7 @@ impl EngineRuntime {
     /// the point: this text sits in front of the whole conversation, so a
     /// single byte moving in it invalidates the provider's cache for every
     /// token behind it. The parts rebuilt every turn — recalled memory, the
-    /// genome map, and the working-tree diff — ride on the newest user
+    /// atlas map, and the working-tree diff — ride on the newest user
     /// message instead (see [`prompt_with_context`]).
     ///
     /// A missing agent directory degrades to whatever is left rather than
@@ -2232,7 +2231,7 @@ impl EngineRuntime {
             .config
             .workspace_root
             .as_deref()
-            .or(self.config.genome_root.as_deref());
+            .or(self.config.atlas_root.as_deref());
         crate::project_context::render(
             cwd,
             self.config.agent_dir.as_deref(),
@@ -2266,13 +2265,13 @@ impl EngineRuntime {
 
     /// This turn's map. As with the recall, the turn builds the copy the
     /// model sees and this one only measures.
-    async fn genome_system(&self) -> Option<SmolStr> {
-        genome_map(
-            self.config.genome_root.clone(),
-            self.config.genome_limit,
-            self.genome.as_ref(),
+    async fn atlas_system(&self) -> Option<SmolStr> {
+        atlas_map(
+            self.config.atlas_root.clone(),
+            self.config.atlas_limit,
+            self.atlas.as_ref(),
             &self.touched,
-            GENOME_QUIESCE,
+            ATLAS_QUIESCE,
         )
         .await
     }
@@ -2280,7 +2279,7 @@ impl EngineRuntime {
     /// What fills the context window right now, one part per piece a turn
     /// assembles, measured with the estimator that feeds `ContextUsage`.
     ///
-    /// The genome map and the recalled memory are their own parts on
+    /// The atlas map and the recalled memory are their own parts on
     /// purpose: they are rebuilt every turn, so they are both the largest
     /// moving weight and the reason a prompt cache misses.
     async fn context_parts(&self) -> Vec<ContextPart> {
@@ -2304,7 +2303,7 @@ impl EngineRuntime {
             context_part("project rules", self.project_context().as_deref()),
             context_part("skills", self.skill_list().as_deref()),
             context_part("recalled memory", self.recalled_memory().await.as_deref()),
-            context_part("genome map", self.genome_system().await.as_deref()),
+            context_part("atlas map", self.atlas_system().await.as_deref()),
             ContextPart {
                 label: "history".into(),
                 tokens: crate::compaction::estimate_request(&self.config.restored_messages),
@@ -2340,7 +2339,7 @@ impl EngineRuntime {
         if self.mode == crate::protocol::SessionMode::Duck {
             // No ranked file list rides the prompt: a duck that can quote
             // the repository is not repo-blind, whatever the brief says.
-            config.genome_root = None;
+            config.atlas_root = None;
             // `mode_tools` left this turn [`DUCK_TIERS`] and nothing else, so
             // everything it can call is network tier: reach that stops
             // outside this machine. Asking the user to approve the one thing
@@ -2357,7 +2356,7 @@ impl EngineRuntime {
         let trajectory = Arc::clone(&self.trajectory);
         let spans = Arc::clone(&self.spans);
         let touched = Arc::clone(&self.touched);
-        let genome = self.genome.clone();
+        let atlas = self.atlas.clone();
         let claims = self.claims.clone();
         let steering = self.steering.clone();
         let spent = Arc::clone(&self.spent);
@@ -2389,7 +2388,7 @@ impl EngineRuntime {
                 trajectory,
                 spans,
                 touched,
-                genome,
+                atlas,
                 claims,
                 steering,
                 spent,
@@ -2760,7 +2759,7 @@ fn extension_sources(config: &EngineConfig) -> crate::sources::Sources {
         cwd: config
             .workspace_root
             .clone()
-            .or_else(|| config.genome_root.clone()),
+            .or_else(|| config.atlas_root.clone()),
         agent_dir: config.agent_dir.clone(),
         home: process_home(),
         foreign_user_dirs: config.foreign_user_dirs,
@@ -2908,7 +2907,7 @@ async fn run_turn(
     trajectory: TrajectorySink,
     spans: SpanSink,
     touched: TouchedSink,
-    genome: Option<GenomeHandle>,
+    atlas: Option<AtlasHandle>,
     claims: Claims,
     steering: Steering,
     // Session-wide token meter the turn adds its own spend to.
@@ -2962,12 +2961,12 @@ async fn run_turn(
         }
     }
     let recalled = recalled_memory(config.agent_dir.clone(), &touched, &prompt).await;
-    let genome_text = genome_map(
-        config.genome_root.clone(),
-        config.genome_limit,
-        genome.as_ref(),
+    let atlas_text = atlas_map(
+        config.atlas_root.clone(),
+        config.atlas_limit,
+        atlas.as_ref(),
         &touched,
-        GENOME_QUIESCE,
+        ATLAS_QUIESCE,
     )
     .await;
     let history = &config.restored_messages;
@@ -2976,9 +2975,9 @@ async fn run_turn(
         recalled
             .as_deref()
             .filter(|block| !previous_copy_matches(history, "# Recalled\n", block)),
-        genome_text
+        atlas_text
             .as_deref()
-            .filter(|block| !previous_copy_matches(history, "<genome", block)),
+            .filter(|block| !previous_copy_matches(history, "<atlas", block)),
         snapshot
             .as_ref()
             .map(|shot| shot.text.as_str())
@@ -3334,16 +3333,16 @@ async fn run_turn(
                                 &trajectory,
                                 &spans,
                                 &touched,
-                                // No genome root means no index to feed: a
+                                // No atlas root means no index to feed: a
                                 // write has nowhere to go. The handle's
                                 // publish point is handed over rather than
                                 // the handle, because the tool loop folds the
                                 // write in synchronously — the turn's own
                                 // prompt must see it.
-                                genome
+                                atlas
                                     .as_ref()
-                                    .filter(|_| config.genome_root.is_some())
-                                    .map(GenomeHandle::shared),
+                                    .filter(|_| config.atlas_root.is_some())
+                                    .map(AtlasHandle::shared),
                                 &claims,
                                 &MAIN_AGENT,
                                 config.mask_ips,

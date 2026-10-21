@@ -20,7 +20,7 @@ otherwise run it yourself. Every finding needs file:line.
 - Paths resolved inside the workspace; no `..`/symlink escape.
 - bash: no shell string built from model text without the approval gate.
 
-## Prompt and injection (`titi-soul`, genome, memory)
+## Prompt and injection (`titi-soul`, atlas, memory)
 - Untrusted text (files, tool output, recalled memory, AGENTS.md of other
   repos) is data; injection-scan still runs on it.
 - Nothing lets recalled memory or file content change approval policy.

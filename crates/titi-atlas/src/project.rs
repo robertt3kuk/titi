@@ -1,0 +1,94 @@
+use std::collections::HashSet;
+
+use crate::Atlas;
+use crate::role::{Role, classify};
+
+/// Symbol lines shown under one file in the prompt map. File ranking is
+/// untouched. An export nobody uses is omitted: a zero is not a blast radius.
+const PROMPT_EXPORTS: usize = 4;
+
+/// Multiplier applied to files the session just edited or read, so the map
+/// follows the work instead of the static graph alone.
+const TOUCHED_BOOST: f64 = 3.0;
+
+/// What a test, example or generated file keeps of its rank on the page.
+/// Touching one is the way back: someone editing a test wants it listed.
+const AUXILIARY_FACTOR: f64 = 0.25;
+
+/// What an entry point is worth on the page beyond its rank, which counts who
+/// imports it and so is nothing for a binary's `main`.
+const ENTRY_FACTOR: f64 = 2.0;
+
+/// Render the prompt map.
+///
+/// `pending` is how much work the background indexer has accepted and not yet
+/// folded in; `0` means the graph is current and the header is plain
+/// `<atlas>`. A non-zero count is named in the header — `<atlas pending="3">`
+/// — because the alternative to naming it is a map the model cannot tell from
+/// a current one, and the cheap recovery (re-read the file) is only available
+/// to a model that knows.
+pub fn render(atlas: &Atlas, limit: usize, touched: &HashSet<String>, pending: usize) -> String {
+    let mut ranked: Vec<(&str, f64)> = atlas
+        .files
+        .keys()
+        // Angle brackets would forge a closing tag and break the frame.
+        .filter(|path| !path.contains(['<', '>']))
+        .map(|path| {
+            let base = atlas.ranks.get(path).copied().unwrap_or(0.0);
+            let score = if touched.contains(path) {
+                base * TOUCHED_BOOST
+            } else {
+                match classify(path) {
+                    Role::Auxiliary => base * AUXILIARY_FACTOR,
+                    Role::Entry => base * ENTRY_FACTOR,
+                    Role::Source => base,
+                }
+            };
+            (path.as_str(), score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    ranked.truncate(limit.max(1));
+
+    let mut out = if pending == 0 {
+        String::from("<atlas>\n")
+    } else {
+        format!("<atlas pending=\"{pending}\">\n")
+    };
+    for (path, _) in ranked {
+        let file = &atlas.files[path];
+        let dependents = atlas.dependents.get(&file.path).copied().unwrap_or(0);
+        let recent = atlas.is_recent(&file.path, file.mtime);
+        out.push_str(&file.path);
+        out.push_str(" (→");
+        out.push_str(&dependents.to_string());
+        out.push(')');
+        if recent {
+            out.push_str(" [RECENT]");
+        }
+        out.push('\n');
+        // `+Name (users)` — distinct files whose uses of that name resolve to
+        // this file, highest first. Unused exports are not listed, and at most
+        // four are shown.
+        for (name, users) in atlas
+            .used_by
+            .get(&file.path)
+            .into_iter()
+            .flatten()
+            .take(PROMPT_EXPORTS)
+        {
+            out.push_str("  +");
+            out.push_str(name);
+            out.push_str(" (");
+            out.push_str(&users.to_string());
+            out.push(')');
+            out.push('\n');
+        }
+    }
+    out.push_str("</atlas>");
+    out
+}

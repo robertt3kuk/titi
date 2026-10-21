@@ -27,7 +27,7 @@ gh run view <run-id> --repo robertt3kuk/titi --log-failed
 
 A `cancelled` run was superseded by a newer push (`cancel-in-progress`);
 read the latest run instead. Exceptions to "nothing local": TUI checks
-(skill `tui-smoke`) and the genome map (skill `genome-map`).
+(skill `tui-smoke`) and the atlas map (skill `atlas-map`).
 
 `gh run watch --exit-status` blocks until the run finishes and exits
 non-zero if it failed. `--log-failed` prints only the failing steps —

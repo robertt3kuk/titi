@@ -29,7 +29,7 @@ Code loads it through `CLAUDE.md` (`@AGENTS.md`), Gemini CLI through
   - `titi-core` sessions and trajectory · `titi-config` layered settings ·
     `titi-secrets` .env and auth store · `titi-providers` HTTP/SSE transports ·
     `titi-tools` read/write/edit/glob/grep/bash plus approval tiers ·
-    `titi-genome` ranked repo map · `titi-memory` stores and embeddings ·
+    `titi-atlas` ranked repo map · `titi-memory` stores and embeddings ·
     `titi-soul` system prompt and SOUL.md · `titi-tui` ratatui renderer ·
     `titi-cli` the `titi` binary (screen, headless, keys, slash commands).
 - Agent state, keys, sessions, and memory live in `~/.titi/agent`, never in
@@ -53,9 +53,9 @@ One exception: check TUI changes by hand as well, in a real terminal with
 `tui-smoke`). A live model turn needs a provider key that the user sets with
 `titi --set-key`. Never ask for the key or handle it yourself.
 
-To map the code, run `cargo run -p titi-genome --example map -- <path> <N>`
-(skill `genome-map`); `~/bin/titi-map` is the optional prebuilt binary the
-skill documents, which may be older than the source. `titi genome check`
+To map the code, run `cargo run -p titi-atlas --example map -- <path> <N>`
+(skill `atlas-map`); `~/bin/titi-map` is the optional prebuilt binary the
+skill documents, which may be older than the source. `titi atlas check`
 vets the tree the same way — index diagnostics, exit 1 on any.
 
 ## Code style

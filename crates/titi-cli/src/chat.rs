@@ -2483,7 +2483,7 @@ impl Chat {
             "council" => self.council(args),
             "graph" => self.graph(args),
             "memory" => self.memory(args),
-            "genome" => self.genome(args),
+            "atlas" => self.atlas(args),
             "usage" => self.usage(),
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
@@ -2616,7 +2616,7 @@ impl Chat {
             }
         }
     }
-    fn genome(&mut self, args: &str) -> Applied {
+    fn atlas(&mut self, args: &str) -> Applied {
         // The same effective view the engine reads, so a note cannot disagree
         // with what a run would do: project `.titi/config.yml` wins.
         let workspace = crate::session_fs::current_workspace();
@@ -2628,7 +2628,7 @@ impl Chat {
                 // about the switch still states what the load could salvage.
                 self.push(
                     LineKind::Error,
-                    format!("genome: config load said: {reason}"),
+                    format!("atlas: config load said: {reason}"),
                 );
                 None
             }
@@ -2642,45 +2642,45 @@ impl Chat {
             "" => {
                 self.push(
                     LineKind::Note,
-                    crate::engine::genome_note(&settings, &self.agent_dir),
+                    crate::engine::atlas_note(&settings, &self.agent_dir),
                 );
             }
             "on" | "off" => {
                 let enabled = bound == "on";
-                match genome_set_enabled(settings, enabled) {
+                match atlas_set_enabled(settings, enabled) {
                     // The refreshed view is what a later status reads, so the
                     // note is the file's own word, not the input echoed back.
                     Ok(saved) => self.push(
                         LineKind::Note,
-                        if saved { "genome: on" } else { "genome: off" }.to_owned(),
+                        if saved { "atlas: on" } else { "atlas: off" }.to_owned(),
                     ),
-                    Err(why) => self.push(LineKind::Error, format!("genome: not saved ({why})")),
+                    Err(why) => self.push(LineKind::Error, format!("atlas: not saved ({why})")),
                 };
             }
             "limit" => match rest.parse::<i64>() {
                 // Out of range or not an integer is refused before anything
-                // is written, so a typo cannot seed `genome.limit` with a
+                // is written, so a typo cannot seed `atlas.limit` with a
                 // value every later run has to ignore.
-                Ok(n) if (1..=64).contains(&n) => match genome_set_limit(settings, n) {
-                    Ok(()) => self.push(LineKind::Note, format!("genome limit: {n}")),
-                    Err(why) => self.push(LineKind::Error, format!("genome: not saved ({why})")),
+                Ok(n) if (1..=64).contains(&n) => match atlas_set_limit(settings, n) {
+                    Ok(()) => self.push(LineKind::Note, format!("atlas limit: {n}")),
+                    Err(why) => self.push(LineKind::Error, format!("atlas: not saved ({why})")),
                 },
                 _ => {
                     self.push(
                         LineKind::Error,
-                        "genome limit: expected an integer from 1 to 64".to_owned(),
+                        "atlas limit: expected an integer from 1 to 64".to_owned(),
                     );
                 }
             },
             "check" | "lsp" => {
                 let workspace = crate::session_fs::current_workspace();
-                local_genome_note(self, bound, &workspace)
+                local_atlas_note(self, bound, &workspace)
             }
             name => {
-                self.push(LineKind::Error, format!("genome: unknown command {name}"));
+                self.push(LineKind::Error, format!("atlas: unknown command {name}"));
                 self.push(
                     LineKind::Error,
-                    "usage: titi genome [on|off|limit <n>|check|lsp]".to_owned(),
+                    "usage: titi atlas [on|off|limit <n>|check|lsp]".to_owned(),
                 );
             }
         }
@@ -3720,12 +3720,12 @@ impl Chat {
         // The ranked map itself lives in the engine, behind its lock; what the
         // screen can say without indexing the repo is whether it is on, and
         // `/context` reports what this turn's map costs.
-        let genome = if std::env::var_os("TITI_NO_GENOME").is_none() {
+        let atlas = if std::env::var_os("TITI_NO_ATLAS").is_none() {
             "on"
         } else {
-            "off (TITI_NO_GENOME)"
+            "off (TITI_NO_ATLAS)"
         };
-        rows.push(format!("genome: {genome}"));
+        rows.push(format!("atlas: {atlas}"));
         rows.push(format!(
             "tokens: {} prompt + {} completion this session",
             self.session_prompt_tokens, self.session_completion_tokens
@@ -4476,7 +4476,7 @@ pub fn run(
     // config sets over what the terminal says it supports — resolved before
     // the first frame, because a sequence sent to a terminal that does not
     // know it is rubbish in the byte stream. A config that fails to load
-    // leaves every switch at its default (`on`), exactly as `/genome` reads it.
+    // leaves every switch at its default (`on`), exactly as `/atlas` reads it.
     let settings = titi_config::settings::Settings::load(
         &chat.agent_dir,
         &crate::session_fs::current_workspace(),
@@ -5216,37 +5216,37 @@ fn repo_state(root: &Path) -> String {
     }
 }
 
-/// Writes `genome.enabled` on the chat's own view: the canonical agent file,
+/// Writes `atlas.enabled` on the chat's own view: the canonical agent file,
 /// never the project's `.titi`, which this API cannot write.
-fn genome_set_enabled(
+fn atlas_set_enabled(
     settings: Option<titi_config::settings::Settings>,
     enabled: bool,
 ) -> Result<bool, String> {
     let mut settings = settings.ok_or_else(|| "config could not be loaded".to_owned())?;
     settings
         .set(
-            titi_config::settings::GENOME_ENABLED_KEY,
+            titi_config::settings::ATLAS_ENABLED_KEY,
             serde_json::json!(enabled),
         )
         .map_err(|why| why.to_string())?;
     Ok(enabled)
 }
 
-/// Writes `genome.limit` after the range check, on the same canonical file.
-fn genome_set_limit(
+/// Writes `atlas.limit` after the range check, on the same canonical file.
+fn atlas_set_limit(
     settings: Option<titi_config::settings::Settings>,
     limit: i64,
 ) -> Result<(), String> {
     let mut settings = settings.ok_or_else(|| "config could not be loaded".to_owned())?;
     settings
         .set(
-            titi_config::settings::GENOME_LIMIT_KEY,
+            titi_config::settings::ATLAS_LIMIT_KEY,
             serde_json::json!(limit),
         )
         .map_err(|why| why.to_string())
 }
 
-/// `/genome check` and `/genome lsp`.
+/// `/atlas check` and `/atlas lsp`.
 ///
 /// Check runs the same index + diagnostics pass the terminal verb runs, over
 /// the workspace passed in — the live caller passes
@@ -5254,27 +5254,27 @@ fn genome_set_limit(
 /// message` lines — or one error line when the index itself fails. Lsp never
 /// starts a stdio server inside the chat: the pipe is the terminal's, so the
 /// note names the command instead.
-fn local_genome_note(chat: &mut Chat, verb: &str, workspace: &Path) {
+fn local_atlas_note(chat: &mut Chat, verb: &str, workspace: &Path) {
     if verb == "lsp" {
         chat.push(
             LineKind::Note,
-            "genome: lsp is 'titi genome lsp', not a chat command".to_owned(),
+            "atlas: lsp is 'titi atlas lsp', not a chat command".to_owned(),
         );
         return;
     }
-    let genome = match titi_genome::Genome::index(workspace) {
-        Ok(genome) => genome,
+    let atlas = match titi_atlas::Atlas::index(workspace) {
+        Ok(atlas) => atlas,
         Err(reason) => {
-            chat.push(LineKind::Error, format!("genome: check failed ({reason})"));
+            chat.push(LineKind::Error, format!("atlas: check failed ({reason})"));
             return;
         }
     };
-    let diagnostics = genome.check();
+    let diagnostics = atlas.check();
     if diagnostics.is_empty() {
-        chat.push(LineKind::Note, "genome: clean".to_owned());
+        chat.push(LineKind::Note, "atlas: clean".to_owned());
         return;
     }
-    for line in titi_genome::format_check_report(&diagnostics, 50) {
+    for line in titi_atlas::format_check_report(&diagnostics, 50) {
         chat.push(LineKind::Note, line);
     }
 }

@@ -26,13 +26,13 @@ min, median and p95, and the machine's load average is recorded with it.
 
 | suite | what it measures | how |
 |---|---|---|
-| `startup` | `titi --help` wall; the TUI on a 120x40 PTY: first byte, first painted frame (the banner text arrives), bytes written in the next 2 s, CPU and peak RSS of the session, with and without the genome index | `pty.fork` + `os.wait4` (its rusage is what `/usr/bin/time -l` prints) |
-| `genome` | cold index, prompt-map render, no-op refresh, one edited file by `refresh` and by `apply_changes`; on this repo and on a synthetic 5,000-file tree (half TypeScript, half Rust, imports between them) | `crates/titi-genome/examples/bench_genome.rs`, public API only |
+| `startup` | `titi --help` wall; the TUI on a 120x40 PTY: first byte, first painted frame (the banner text arrives), bytes written in the next 2 s, CPU and peak RSS of the session, with and without the atlas index | `pty.fork` + `os.wait4` (its rusage is what `/usr/bin/time -l` prints) |
+| `atlas` | cold index, prompt-map render, no-op refresh, one edited file by `refresh` and by `apply_changes`; on this repo and on a synthetic 5,000-file tree (half TypeScript, half Rust, imports between them) | `crates/titi-atlas/examples/bench_atlas.rs`, public API only |
 | `tools` | `glob`, `grep`, `read` (cold and cache-warm) through `ToolHandler::invoke`, on the same two trees | `crates/titi-tools/examples/bench_tools.rs` |
 | `render` | markdown renderer on a 2,000-message mixed session (prose, headings, lists, code, tables) at 120 columns: whole session, per message, the rows one 40-row frame needs, and a 300-delta streamed answer re-rendered from scratch each delta | `crates/titi-tui/examples/bench_render.rs` |
 | `resume` | a 200-turn session reopened with `--continue` on a PTY: first bytes, screen filled, repaint after ten typed characters and ten PageUps | headless runner builds the session, PTY reopens it |
-| `streaming` | `--headless` against the scripted provider, with and without the genome: time to ready, first token, turn total, CPU, RSS; plain text and the 60-chunk `slow` keyword | JSONL on pipes |
-| `prompt` | every request body of a 9-request session (hello, a README read, the user edits a tracked file, six more turns), split into system prompt, tool schemas, genome map, diff, history | the provider's request log, filtered by a per-run tag |
+| `streaming` | `--headless` against the scripted provider, with and without the atlas: time to ready, first token, turn total, CPU, RSS; plain text and the 60-chunk `slow` keyword | JSONL on pipes |
+| `prompt` | every request body of a 9-request session (hello, a README read, the user edits a tracked file, six more turns), split into system prompt, tool schemas, atlas map, diff, history | the provider's request log, filtered by a per-run tag |
 
 What the examples cannot reach: `titi-cli` keeps its transcript renderer
 private (`transcript.rs`, owned by another change), so the render example times
@@ -53,16 +53,16 @@ distribution. Commit `2497d97` is the "after"; the baseline is `238e911`.
 
 ### 1. The first frame waited for the code map's index (fixed)
 
-Evidence: `tui first byte` 246 ms with the genome on against 16 ms with
-`TITI_NO_GENOME=1`; first frame 264 ms against 34 ms; the process burns ~1.0 s
+Evidence: `tui first byte` 246 ms with the atlas on against 16 ms with
+`TITI_NO_ATLAS=1`; first frame 264 ms against 34 ms; the process burns ~1.0 s
 of CPU (`tui session CPU`) against 70 ms. `Engine::start_inner` called
-`GenomeHandle::spawn`, which parses every source file on the caller's thread
+`AtlasHandle::spawn`, which parses every source file on the caller's thread
 before returning — the surface cannot draw until the engine exists. A sample of
 the index shows the time is tree-sitter itself (`ts_parser_parse`,
 `ts_lex`), so the work is real; what was wrong was where it ran.
 
-Fix (`b7514c1`): `GenomeHandle::spawn_deferred` hands the first walk to the
-worker thread; `wait_ready` blocks for it, and `genome_map` calls it first, so
+Fix (`b7514c1`): `AtlasHandle::spawn_deferred` hands the first walk to the
+worker thread; `wait_ready` blocks for it, and `atlas_map` calls it first, so
 the first prompt still sees the whole tree and no reader gets an empty graph.
 
 ### 2. Context the model already had was sent again on every turn (fixed)
@@ -118,9 +118,9 @@ sort, `stat`) and the host's load are in it; the rest was not profiled.
 
 ### 6. A refresh that found nothing still copied the graph (fixed)
 
-Evidence: through `SharedGenome` (the engine's path) a no-op refresh cost 6.5 ms
+Evidence: through `SharedAtlas` (the engine's path) a no-op refresh cost 6.5 ms
 here and 23 ms at 5,000 files, against 3.4 and 10.4 ms for the same walk on an
-in-place `Genome`: the difference is the copy of the whole graph that is made
+in-place `Atlas`: the difference is the copy of the whole graph that is made
 before anyone knows whether the walk changes it.
 
 Fix (`4a78144`): list the tree first and ask the published snapshot whether the
@@ -142,7 +142,7 @@ host at load 8–14, first frame in ms:
 | median first frame | 111 | 78 | 51 | 41 | 35 | 34 | 34 |
 
 (Two sweeps: the column for 8 comes from the first, where "all" measured 97.)
-The cost to the index (`bench_genome --quick`, `index_cold`, median of 3,
+The cost to the index (`bench_atlas --quick`, `index_cold`, median of 3,
 repo / 5k, ms): 238 / 400 on every core, 223 / 341 on 8, 224 / 369 on 6,
 281 / 426 on 4.
 
@@ -175,7 +175,7 @@ wording fix.
 * **The system prompt is 9.4 KB in a repo like this one** (`AGENTS.md` and the
   skill list ride in it). Constant per session, so cheap for the cache, but it
   is a fixed cost of every request.
-* **The genome costs ~48 MB of resident memory** on this repo (59 MB with it,
+* **The atlas costs ~48 MB of resident memory** on this repo (59 MB with it,
   11.6 MB without). Fix 6 removed the per-turn copy but not the graph itself.
 * **`grep` over 5,000 files is still ~52 ms**, ten times what listing the same
   files costs (`glob`, 4.6 ms). The gap to the core count is not explained and
@@ -230,21 +230,21 @@ leaving it out of that registry costs nothing.
 ## Numbers
 
 Baseline `238e911` against after `2497d97`. Medians unless a row says min.
-"Genome on/off" is the default against `TITI_NO_GENOME=1`.
+"Atlas on/off" is the default against `TITI_NO_ATLAS=1`.
 
 ### Startup (TUI on a 120x40 PTY, ms)
 
 | case | baseline | after | change |
 |---|---|---|---|
 | `titi --help` wall | 4.7 | 5.0 | noise |
-| first byte, genome on | 246 | 15 | −94% |
-| first frame, genome on | 264 | 94 | −64% |
-| first frame, genome off | 34 | 33 | — |
-| session CPU, genome on | 1031 | 1127 | the index is the same work, later |
-| peak RSS MB, genome on / off | 59.5 / 11.5 | 59.9 / 11.7 | — |
-| headless ready (genome on) | 261 | 11 | −96% |
+| first byte, atlas on | 246 | 15 | −94% |
+| first frame, atlas on | 264 | 94 | −64% |
+| first frame, atlas off | 34 | 33 | — |
+| session CPU, atlas on | 1031 | 1127 | the index is the same work, later |
+| peak RSS MB, atlas on / off | 59.5 / 11.5 | 59.9 / 11.7 | — |
+| headless ready (atlas on) | 261 | 11 | −96% |
 
-### Genome (ms, minimum of 7; two back-to-back rounds)
+### Atlas (ms, minimum of 7; two back-to-back rounds)
 
 | case | baseline | after |
 |---|---|---|
@@ -263,21 +263,21 @@ Baseline `238e911` against after `2497d97`. Medians unless a row says min.
 
 | case | baseline | after |
 |---|---|---|
-| genome off: first token / turn total (plain) | 32 / 283 | 31 / 282 |
-| genome off: first token (slow) | 30 | 29 |
-| genome on: first token / turn total (plain) | 48 / 288 | 224 / 464 |
-| genome on: ready + first token, from process start | 308 | 235 |
+| atlas off: first token / turn total (plain) | 32 / 283 | 31 / 282 |
+| atlas off: first token (slow) | 30 | 29 |
+| atlas on: first token / turn total (plain) | 48 / 288 | 224 / 464 |
+| atlas on: ready + first token, from process start | 308 | 235 |
 
-With the genome on, the first turn of a *fresh process* now pays the index the
+With the atlas on, the first turn of a *fresh process* now pays the index the
 startup used to pay (`ready` 261 ms → 11 ms, first token 48 → 224 ms): the
 bench submits the instant the process is ready. A person types for longer
 than that, and `ready` + first token, which is what a script sees, is lower
-(308 → 235 ms). Later turns are unchanged. The `genome` rows of "turn CPU" in
+(308 → 235 ms). Later turns are unchanged. The `atlas` rows of "turn CPU" in
 `bench.py`'s own table include the index for the same reason.
 
 ### Prompt (9-request session, bytes)
 
-| | system | tools | genome fresh | genome stale | diff fresh | diff stale | history | JSON framing | total | est. tokens |
+| | system | tools | atlas fresh | atlas stale | diff fresh | diff stale | history | JSON framing | total | est. tokens |
 |---|---|---|---|---|---|---|---|---|---|---|
 | baseline, summed | 84,249 | 101,430 | 25,083 | 69,675 | 8,718 | 15,983 | 257,344 | 20,665 | 583,147 | 145,786 |
 | after, summed | 84,249 | 101,430 | 2,787 | 22,296 | 1,453 | 7,265 | 257,170 | 17,031 | 493,681 | 123,420 |
@@ -331,7 +331,7 @@ the two rounds. Three rows are new in `bench.py` (`7a28fe0`):
 
 `glob` (2.0 / 4.6 ms) and `read` (0.15 ms) did not move.
 
-#### Genome refresh through the publish point (min of 7 runs, ms)
+#### Atlas refresh through the publish point (min of 7 runs, ms)
 
 | case | baseline | after |
 |---|---|---|
@@ -346,11 +346,11 @@ The shared no-op now costs what the in-place one does: the walk.
 
 | case | baseline | after |
 |---|---|---|
-| first frame, genome on, median (`bench.py`, 7 launches) | 119.7 / 124.6 | 101.0 / 94.8 |
-| first frame, genome on, median (40 alternating launches) | 117 / 112 | 69 / 84 |
-| first frame, genome off, median | 33.7 / 32.2 | 35.5 / 36.5 |
-| first byte, genome on, median | 15.0 / 15.0 | 15.3 / 18.5 |
-| session CPU, genome on, median | 1226 / 1154 | 1134 / 1119 |
+| first frame, atlas on, median (`bench.py`, 7 launches) | 119.7 / 124.6 | 101.0 / 94.8 |
+| first frame, atlas on, median (40 alternating launches) | 117 / 112 | 69 / 84 |
+| first frame, atlas off, median | 33.7 / 32.2 | 35.5 / 36.5 |
+| first byte, atlas on, median | 15.0 / 15.0 | 15.3 / 18.5 |
+| session CPU, atlas on, median | 1226 / 1154 | 1134 / 1119 |
 | headless first token (`streaming`, min of 7) | 241 / 225 | 227 / 211 |
 
 The index itself did not get slower (the last row waits for it).

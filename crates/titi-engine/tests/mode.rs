@@ -224,7 +224,7 @@ async fn duck_mode_sends_no_tools_and_no_repository_map() {
     let transport = Arc::new(MockTransport::new(vec![done(), done()]));
     let captured = Arc::clone(&transport);
     let mut config = EngineConfig::new("primary");
-    config.genome_root = Some(workspace.path().to_path_buf());
+    config.atlas_root = Some(workspace.path().to_path_buf());
     let mut engine = EngineRuntime::start_with_tools(config, resolver(transport), mixed_registry());
 
     // The map is there in agent mode, which is what makes its absence in
@@ -275,7 +275,7 @@ async fn duck_mode_sends_no_tools_and_no_repository_map() {
     // user message.
     let prompt = request.messages.last().expect("a prompt");
     assert!(
-        !prompt.content.contains("<genome>"),
+        !prompt.content.contains("<atlas>"),
         "the duck turn was handed a repository map: {}",
         prompt.content
     );

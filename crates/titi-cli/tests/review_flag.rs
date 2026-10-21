@@ -112,7 +112,7 @@ fn run(args: &[&str], workspace: &Path, agent: &Path) -> Output {
         .args(args)
         .current_dir(workspace)
         .env("TITI_AGENT_DIR", agent)
-        .env("TITI_NO_GENOME", "1")
+        .env("TITI_NO_ATLAS", "1")
         .stdin(Stdio::null())
         .output()
         .expect("the binary runs")

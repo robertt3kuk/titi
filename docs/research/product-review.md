@@ -41,7 +41,7 @@ GAP's omp side is sound: every settings id and line number I re-read (`autoResum
 `collapseCompacted :693`, `paste.largeMenuThreshold :1012`, `readLineNumbers/defaultLimit/renderMarkdown
 tools/settings.ts:149,161,180`) still matches. What went stale is the **titi** half, because
 `crates/titi-tui/{composer,transcript,renderer,history,viewport,input,cursor,focus,slash,hub,overlay}.rs`
-were deleted in `1ff6889` and `titi-genome/src/parse.rs` became `lang/`. Per entry:
+were deleted in `1ff6889` and `titi-atlas/src/parse.rs` became `lang/`. Per entry:
 
 | entry | GAP says | now (2026-10-08) | evidence |
 |---|---|---|---|

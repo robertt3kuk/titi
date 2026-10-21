@@ -102,7 +102,7 @@ fn commands_panels_and_settings_share_one_list() {
         "tree",
         "statusline preset",
         "login",
-        "genome.enabled",
+        "atlas.enabled",
     ] {
         assert!(
             all.iter().any(|entry| entry.label == expected),
@@ -444,13 +444,13 @@ fn every_value_command_has_a_list_and_no_other_command_does() {
 #[test]
 fn enter_on_a_setting_says_its_value_and_source_then_offers_its_words() {
     let dir = tempfile::tempdir().expect("temp");
-    std::fs::write(dir.path().join("config.yml"), "genome:\n  enabled: false\n").expect("config");
+    std::fs::write(dir.path().join("config.yml"), "atlas:\n  enabled: false\n").expect("config");
     let mut chat = chat_in(dir.path());
     press(&mut chat, Key::CtrlK);
-    type_text(&mut chat, "genome.enabled");
+    type_text(&mut chat, "atlas.enabled");
     press(&mut chat, Key::Enter);
     assert!(
-        notes(&chat).contains(&"genome.enabled = false (agent)".to_owned()),
+        notes(&chat).contains(&"atlas.enabled = false (agent)".to_owned()),
         "{:?}",
         notes(&chat)
     );
@@ -471,14 +471,14 @@ fn enter_on_a_setting_says_its_value_and_source_then_offers_its_words() {
     )
     .expect("settings");
     assert_eq!(
-        settings.get("genome.enabled"),
+        settings.get("atlas.enabled"),
         Some(serde_json::json!(true)),
         "the pick was saved"
     );
     assert!(
         notes(&chat)
             .iter()
-            .any(|line| line.starts_with("genome.enabled = true · saved")),
+            .any(|line| line.starts_with("atlas.enabled = true · saved")),
         "{:?}",
         notes(&chat)
     );
@@ -489,12 +489,12 @@ fn a_free_setting_is_only_reported() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat_in(dir.path());
     press(&mut chat, Key::CtrlK);
-    type_text(&mut chat, "genome.limit");
+    type_text(&mut chat, "atlas.limit");
     press(&mut chat, Key::Enter);
     assert!(
         notes(&chat)
             .iter()
-            .any(|line| line.starts_with("genome.limit: not set")),
+            .any(|line| line.starts_with("atlas.limit: not set")),
         "{:?}",
         notes(&chat)
     );

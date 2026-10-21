@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod actions;
+pub mod atlas_cmd;
 pub(crate) mod cache_cmd;
 pub mod changelog;
 pub mod chat;
@@ -20,7 +21,6 @@ pub mod first_frame;
 pub(crate) mod footer_actions;
 #[cfg(test)]
 mod footer_tests;
-pub mod genome_cmd;
 pub mod git_checkpoint;
 pub mod headless;
 pub mod herdr;

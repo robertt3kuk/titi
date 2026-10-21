@@ -16,7 +16,7 @@ titi-config = { workspace = true }
 titi-secrets = { workspace = true }
 titi-tools = { workspace = true }
 titi-mcp = { workspace = true }
-titi-genome = { workspace = true }
+titi-atlas = { workspace = true }
 titi-memory = { workspace = true }
 titi-tui = { workspace = true }
 crossterm = "0.29"
