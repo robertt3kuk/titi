@@ -63,8 +63,12 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   itself, and a path ending in one (`tokio::sync`) is not collected at all.
   `use std::…::Name` and a `std::…::Name` path are the standard library's, never
   a project's.
-- **Ranking is PageRank** (`graph.rs`): `DAMPING = 0.85`, `ITERATIONS = 20`,
-  start at `1.0 / n` per node.
+- **Ranking is weighted PageRank** (`graph.rs`): `DAMPING = 0.85`,
+  `ITERATIONS = 20`, start at `1.0 / n` per node. An edge weighs the square
+  root of the evidence behind it — one unit per import and per scoped use, a
+  quarter per guess — so a file that leans on four names of another is more
+  tied to it than one that mentions a single name, and a file spreads its rank
+  over its edges in proportion to their weights.
 - **`(→N)` counts distinct files with an edge to this one**, and `+Name (n)`
   counts distinct files whose uses of `Name` resolve to *this* file. Two files
   defining `Shared` are counted separately.

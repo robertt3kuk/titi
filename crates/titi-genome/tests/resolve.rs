@@ -293,6 +293,41 @@ fn a_short_unique_name_is_not_distinctive() {
     assert_eq!(dependents(&genome, "src/hub.rs"), 0);
 }
 
+// ---- weights --------------------------------------------------------------
+
+/// One incidental mention weighs less than a real dependency: of two hubs
+/// that each have one importer, the one whose importer uses four of its names
+/// ranks above the one whose importer uses one.
+#[test]
+fn many_resolved_names_weigh_more_than_one() {
+    let (_dir, genome) = index(&[
+        ("src/lib.rs", "mod deep;\nmod thin;\nmod user;\n"),
+        (
+            "src/deep.rs",
+            "pub fn deep_one() {}\npub fn deep_two() {}\npub fn deep_three() {}\npub fn deep_four() {}\n",
+        ),
+        (
+            "src/thin.rs",
+            "pub fn thin_one() {}\npub fn thin_two() {}\n",
+        ),
+        (
+            "src/user.rs",
+            "use crate::deep::*;\nuse crate::thin::thin_one;\n\
+             pub fn go() { deep_one(); deep_two(); deep_three(); deep_four(); thin_one(); }\n",
+        ),
+    ]);
+    assert_eq!(
+        dependents(&genome, "src/deep.rs"),
+        dependents(&genome, "src/thin.rs")
+    );
+    assert!(
+        genome.ranks["src/deep.rs"] > genome.ranks["src/thin.rs"],
+        "{} vs {}",
+        genome.ranks["src/deep.rs"],
+        genome.ranks["src/thin.rs"]
+    );
+}
+
 /// A name `use std::…` binds is the standard library's, even when a project
 /// file the importer also reaches defines a `Command` of its own.
 #[test]

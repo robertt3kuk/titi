@@ -5,8 +5,15 @@ use crate::{Basis, FileRecord};
 const DAMPING: f64 = 0.85;
 const ITERATIONS: usize = 20;
 
+/// What an import, or a use resolved by scope, is worth as evidence. An edge
+/// is as heavy as the square root of the evidence behind it: a file that
+/// leans on four names of another is more tied to it than a file that
+/// mentions one, but not four times more.
 const EVIDENCE: f64 = 1.0;
-const GUESS: f64 = 1.0;
+
+/// What a use resolved only because the name is distinctive and defined once
+/// is worth. Four guesses weigh as much as one real dependency.
+const GUESS: f64 = 0.25;
 
 /// PageRank over the file graph, and each file's dependent count.
 ///
@@ -98,9 +105,9 @@ pub fn rank(files: &HashMap<String, FileRecord>) -> (HashMap<String, f64>, HashM
     (ranks, dependents)
 }
 
-/// Every edge counts once, however much evidence backs it.
-fn edge_weight(_evidence: f64) -> f64 {
-    1.0
+/// The weight of an edge backed by `evidence` units of imports and uses.
+fn edge_weight(evidence: f64) -> f64 {
+    evidence.sqrt()
 }
 
 #[cfg(test)]
@@ -168,7 +175,7 @@ mod tests {
             }
             let mut total = 0.0;
             for (to, units) in evidence {
-                let weight = if units > 0.0 { 1.0 } else { 0.0 };
+                let weight = f64::sqrt(units);
                 total += weight;
                 inbound
                     .entry(to.clone())
@@ -240,6 +247,62 @@ mod tests {
             );
         }
         assert!(dependents.values().any(|count| *count > 1));
+    }
+
+    /// An edge's weight is the square root of its evidence, so the same two
+    /// importers rank a hub differently by how many of its names they use.
+    #[test]
+    fn an_edge_weighs_the_square_root_of_its_evidence() {
+        let mut files = HashMap::new();
+        for (path, uses) in [
+            ("deep.rs", vec![]),
+            ("thin.rs", vec![]),
+            (
+                "user.rs",
+                vec![
+                    ("deep.rs", Basis::Scope),
+                    ("deep.rs", Basis::Scope),
+                    ("deep.rs", Basis::Scope),
+                    ("deep.rs", Basis::Scope),
+                    ("thin.rs", Basis::Scope),
+                ],
+            ),
+        ] {
+            files.insert(path.to_owned(), record(path, &[], &uses));
+        }
+        let (ranks, dependents) = rank(&files);
+        assert_eq!(dependents["deep.rs"], 1);
+        assert_eq!(dependents["thin.rs"], 1);
+        // user.rs spreads its rank 2 : 1 over the two hubs.
+        let teleport = (1.0 - DAMPING) / 3.0;
+        let share = |score: f64| (score - teleport) / DAMPING;
+        let ratio = share(ranks["deep.rs"]) / share(ranks["thin.rs"]);
+        assert!((ratio - 2.0).abs() < 1e-9, "{ratio}");
+    }
+
+    /// A guess is worth a quarter of a dependency: four of them weigh what one
+    /// scoped use does.
+    #[test]
+    fn four_guesses_weigh_one_scoped_use() {
+        let mut files = HashMap::new();
+        files.insert("hub.rs".to_owned(), record("hub.rs", &[], &[]));
+        files.insert("guess.rs".to_owned(), record("guess.rs", &[], &[]));
+        files.insert(
+            "user.rs".to_owned(),
+            record(
+                "user.rs",
+                &[],
+                &[
+                    ("hub.rs", Basis::Scope),
+                    ("guess.rs", Basis::Unique),
+                    ("guess.rs", Basis::Unique),
+                    ("guess.rs", Basis::Unique),
+                    ("guess.rs", Basis::Unique),
+                ],
+            ),
+        );
+        let (ranks, _) = rank(&files);
+        assert!((ranks["hub.rs"] - ranks["guess.rs"]).abs() < 1e-12);
     }
 
     #[test]
