@@ -168,9 +168,10 @@ impl ToolHandler for SettingsTool {
 }
 
 /// Subtrees that decide what the agent may do or where a key is sent:
-/// privacy, the provider catalog, approval, and the hooks, verify and trust
-/// switches (a hook or a verify command is run on the user's behalf, and trust
-/// is the user's consent to one). Loosening any of them is a human decision, never the
+/// privacy, the provider catalog, approval, and the hooks, verify, MCP and
+/// trust switches (a hook or a verify command is run on the user's behalf,
+/// `mcp.*.approval` sets how freely a server's tools run, and trust is the
+/// user's consent to one). Loosening any of them is a human decision, never the
 /// model's.
 const PROTECTED: &[&[&str]] = &[
     &["privacy"],
@@ -183,6 +184,8 @@ const PROTECTED: &[&[&str]] = &[
     &["trust"],
     // A command the engine runs when a turn ends: code, like a hook.
     &["verify"],
+    // `mcp.<server>.approval` lowers what a tool the model drives may do.
+    &["mcp"],
 ];
 
 /// A key is protected when it lies inside a protected subtree or contains
@@ -294,6 +297,11 @@ mod tests {
             ("verify.onEdit", serde_json::json!(false)),
             ("Trust", serde_json::json!({ "workspaces": {} })),
             ("trust.workspaces", serde_json::json!({})),
+            (
+                "mcp",
+                serde_json::json!({ "files": { "approval": "read" } }),
+            ),
+            ("mcp.files.approval", serde_json::json!("read")),
         ] {
             let res = call(&backend, serde_json::json!({ "key": key, "value": value })).await;
             assert!(res.is_error, "{key} was accepted");

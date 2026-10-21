@@ -110,8 +110,8 @@ pub(crate) fn refuse_control_paths(
     refuse_hook_config(relative, raw)
 }
 
-/// The files a hook is read from. One written by a model is a command it chose
-/// to run on the user's machine, so the write tools refuse them like `.git/`
+/// The files a hook or an MCP server is read from. One written by a model is a
+/// command it chose to run on the user's machine, so the write tools refuse them like `.git/`
 /// (the trust hash in `titi-config` is the second line: a changed hook is
 /// untrusted at the next start). Names compare case-insensitively, as a macOS
 /// volume does.
@@ -121,15 +121,16 @@ fn refuse_hook_config(relative: &Path, raw: &str) -> Result<(), String> {
         .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
         .collect();
     let hit = match parts.as_slice() {
-        [dir, file] if dir == ".titi" => file == "hooks.json",
+        [file] => file == ".mcp.json",
+        [dir, file] if dir == ".titi" => file == "hooks.json" || file == "mcp.json",
         [dir, file] if dir == ".claude" => file == "settings.json" || file == "settings.local.json",
         [dir, folder, ..] if dir == ".claude" => folder == "hooks",
         _ => false,
     };
     if hit {
         return Err(format!(
-            "{raw} is a hook file — titi refuses to write one: a hook is a command \
-             run on the user's machine, which the user adds themselves"
+            "{raw} is a hook or MCP server file — titi refuses to write one: it is a \
+             command run on the user's machine, which the user adds themselves"
         ));
     }
     Ok(())
@@ -3278,6 +3279,34 @@ mod tests {
     /// model that could write one would be writing its own way out of the
     /// approval prompt. The trust hash would catch it at the next start; the
     /// tool refusing is the first line.
+    #[tokio::test]
+    async fn a_write_to_an_mcp_server_file_is_refused() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".titi")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+            policy: SensitivePolicy::default(),
+        };
+        for path in [".mcp.json", ".titi/mcp.json", ".MCP.json", ".titi/MCP.json"] {
+            let result = write
+                .invoke(serde_json::json!({ "path": path, "content": "{}" }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(
+                result.output.to_string().contains("MCP"),
+                "{path}: {}",
+                result.output
+            );
+            assert!(!root.join(path).exists(), "{path} was written");
+        }
+        let ordinary = write
+            .invoke(serde_json::json!({ "path": "src/mcp.json", "content": "{}" }))
+            .await;
+        assert!(!ordinary.is_error, "{}", ordinary.output);
+    }
+
     #[tokio::test]
     async fn a_write_to_a_hook_file_is_refused() {
         let root = temp_root();
