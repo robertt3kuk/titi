@@ -240,6 +240,14 @@ pub(crate) fn mcp_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
             ServerState::Starting if !server.reason.is_empty() => server.reason.clone(),
             _ => String::new(),
         };
+        // An HTTP server says where it is, after what it is doing.
+        let what = if server.host.is_empty() {
+            what
+        } else if what.is_empty() {
+            format!("http {}", server.host)
+        } else {
+            format!("{what} · http {}", server.host)
+        };
         lines.push(PanelLine::Row {
             text: one_line(
                 &format!(
@@ -307,7 +315,13 @@ fn detail_lines(chat: &Chat, selected: usize, room: usize) -> Option<Vec<String>
             "  ",
             &mut lines,
         );
-        wrapped(format!("$ {}", sanitize(&server.command)), "  ", &mut lines);
+        // A URL is not typed at a shell: no prompt in front of it.
+        let shown = if server.host.is_empty() {
+            format!("$ {}", sanitize(&server.command))
+        } else {
+            sanitize(&server.command)
+        };
+        wrapped(shown, "  ", &mut lines);
         if !server.source.is_empty() {
             wrapped(
                 format!("from {}", sanitize(&server.source)),
@@ -315,14 +329,17 @@ fn detail_lines(chat: &Chat, selected: usize, room: usize) -> Option<Vec<String>
                 &mut lines,
             );
         }
-        wrapped(
-            format!(
-                "log {}",
-                titi_mcp::log_path(&chat.agent_dir, &server.name).display()
-            ),
-            "  ",
-            &mut lines,
-        );
+        // Only a program has a standard error to log.
+        if server.host.is_empty() {
+            wrapped(
+                format!(
+                    "log {}",
+                    titi_mcp::log_path(&chat.agent_dir, &server.name).display()
+                ),
+                "  ",
+                &mut lines,
+            );
+        }
         for tool in &server.tools {
             let description = sanitize(tool.description.lines().next().unwrap_or(""));
             wrapped(
@@ -461,6 +478,29 @@ mod tests {
             "{frame}"
         );
         assert!(frame.contains("starting"), "{frame}");
+    }
+
+    #[test]
+    fn an_http_server_shows_its_host_in_the_row_and_its_url_without_a_prompt_or_a_log() {
+        let mut chat = chat();
+        let mut web = server("web", ServerState::Ready, "", &["search"]);
+        web.command = "http https://mcp.example.invalid:8443/v1/mcp?…".to_owned();
+        web.host = "mcp.example.invalid:8443".to_owned();
+        chat.on_event(EngineEvent::McpStatus { servers: vec![web] });
+        chat.slash("/mcp");
+        let frame = draw(&chat).join("\n");
+        assert!(
+            frame.contains("1 tool · http mcp.example.invalid:8443"),
+            "{frame}"
+        );
+        press(&mut chat, Key::Enter);
+        let frame = draw(&chat).join("\n");
+        assert!(
+            frame.contains("http https://mcp.example.invalid:8443/v1/mcp?…"),
+            "{frame}"
+        );
+        assert!(!frame.contains("$ http"), "no shell prompt: {frame}");
+        assert!(!frame.contains("web.log"), "no stderr log: {frame}");
     }
 
     #[test]

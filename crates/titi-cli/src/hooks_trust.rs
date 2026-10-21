@@ -317,6 +317,39 @@ fn server_lines(
         &def.hash(workspace)[..8],
         def.timeout()
     ));
+    if def.is_http() {
+        // The URL whole, since where titi talks is what is being approved;
+        // header names, never their values.
+        let url = sanitize_keep_newlines(&def.command_line());
+        for (row, text) in wrap_plain(&url, room.saturating_sub(12).max(8))
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(if row == 0 {
+                format!("     http  {text}")
+            } else {
+                format!("           {text}")
+            });
+        }
+        if !def.headers.is_empty() {
+            let names: Vec<String> = def.headers.keys().map(|name| sanitize(name)).collect();
+            for (row, text) in wrap_plain(&names.join(", "), room.saturating_sub(12).max(8))
+                .into_iter()
+                .enumerate()
+            {
+                lines.push(if row == 0 {
+                    format!("     headers  {text}")
+                } else {
+                    format!("              {text}")
+                });
+            }
+            lines.push(
+                "     header values are sent as written and not shown here; ${VAR} is not expanded"
+                    .to_owned(),
+            );
+        }
+        return lines;
+    }
     let command = sanitize_keep_newlines(&def.command_line());
     for (row, text) in wrap_plain(&command, room.saturating_sub(7).max(8))
         .into_iter()
@@ -792,6 +825,27 @@ mod tests {
         assert!(all.contains("cwd  tools"), "{all}");
         assert!(all.contains("timeout 60s"), "{all}");
         assert!(all.contains(".mcp.json") && all.contains(" · #"), "{all}");
+    }
+
+    #[test]
+    fn an_http_server_is_shown_with_its_url_and_header_names_and_never_a_value() {
+        let servers = r#"{"mcpServers": {"docs": {"type": "http",
+            "url": "https://mcp.example.invalid/v1/mcp?team=7",
+            "headers": {"X-Api-Key": "hunter2-literal", "X-Team": "${TEAM_TOKEN}"}}}}"#;
+        let mut screen = screen_with_servers(servers, false);
+        let all = scroll_to_the_end(&mut screen);
+        assert!(all.contains("1/1  MCP server docs"), "{all}");
+        assert!(
+            all.contains("http  https://mcp.example.invalid/v1/mcp?team=7"),
+            "the whole url: {all}"
+        );
+        assert!(all.contains("headers  X-Api-Key, X-Team"), "{all}");
+        assert!(
+            !all.contains("hunter2-literal") && !all.contains("TEAM_TOKEN"),
+            "never a header value: {all}"
+        );
+        assert!(!all.contains("$ "), "it is not a command line: {all}");
+        assert!(!all.contains("repository code is not hashed"), "{all}");
     }
 
     #[test]

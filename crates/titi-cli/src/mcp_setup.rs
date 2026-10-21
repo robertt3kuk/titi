@@ -218,6 +218,33 @@ mod tests {
     }
 
     #[test]
+    fn an_http_project_server_is_trusted_by_its_url_and_header_text_and_asked_again_when_they_change()
+     {
+        let one = r#"{"mcpServers": {"docs": {"type": "http", "url": "https://mcp.example.invalid/mcp",
+            "headers": {"X-Key": "${KEY}"}}}}"#;
+        let s = setup(".mcp.json", one);
+        let mut start = resolve(&s, false);
+        assert_eq!(start.pending.len(), 1);
+        assert!(start.pending[0].is_http());
+        let text = start.headless_notices().join("\n");
+        assert!(text.contains("https://mcp.example.invalid/mcp"), "{text}");
+        assert!(
+            !text.contains("KEY"),
+            "no header value in the notice: {text}"
+        );
+        start.decide(Choice::Trust).unwrap();
+        assert!(resolve(&s, false).pending.is_empty());
+        for changed in [
+            r#"{"mcpServers": {"docs": {"type": "http", "url": "https://other.example.invalid/mcp", "headers": {"X-Key": "${KEY}"}}}}"#,
+            r#"{"mcpServers": {"docs": {"type": "http", "url": "https://mcp.example.invalid/mcp", "headers": {"X-Key": "${OTHER}"}}}}"#,
+            r#"{"mcpServers": {"docs": {"type": "http", "url": "https://mcp.example.invalid/mcp"}}}"#,
+        ] {
+            std::fs::write(s.repo.path().join(".mcp.json"), changed).unwrap();
+            assert_eq!(resolve(&s, false).pending.len(), 1, "{changed}");
+        }
+    }
+
+    #[test]
     fn trust_project_starts_them_once_and_records_nothing() {
         let s = setup(".titi/mcp.json", REPO);
         let start = resolve(&s, true);
