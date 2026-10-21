@@ -605,6 +605,9 @@ impl Chat {
         if self.errors.picker.is_some() {
             return self.errors_key(key, now);
         }
+        if self.mcp.picker.is_some() {
+            return self.mcp_key(key, now);
+        }
         if self.extensions.is_some() {
             return self.extensions_key(key, now);
         }

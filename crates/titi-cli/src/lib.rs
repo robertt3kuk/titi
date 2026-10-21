@@ -29,6 +29,7 @@ pub(crate) mod hooks_trust;
 pub mod hub;
 pub mod keys;
 pub mod login;
+pub(crate) mod mcp_panel;
 pub mod mcp_setup;
 pub(crate) mod mention;
 pub(crate) mod mode_cycle;

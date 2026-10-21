@@ -398,6 +398,25 @@ fn main() -> io::Result<()> {
             hooks: hooks_startup.approved.clone(),
         });
     }
+    // The same rule for MCP servers: the user's own start now, in the
+    // background, and a repository's wait for the panel (screen) or are
+    // skipped (headless). Starting is not waited on.
+    let mcp_startup = {
+        let agent_dir = titi_config::agent_dir();
+        let workspace = titi_cli::session_fs::current_workspace();
+        let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
+        titi_cli::mcp_setup::McpStartup::resolve(
+            &agent_dir,
+            &workspace,
+            settings.as_ref(),
+            trust_project,
+        )
+    };
+    if !mcp_startup.approved.is_empty() {
+        let _ = engine.try_send(titi_engine::EngineCommand::SetMcp {
+            servers: mcp_startup.approved.clone(),
+        });
+    }
     let session_log =
         titi_cli::session_log::SessionLog::open(&titi_config::agent_dir(), &session_id);
     if session_log.is_none() {
@@ -418,6 +437,9 @@ fn main() -> io::Result<()> {
             eprintln!("{note}");
         }
         for note in hooks_startup.headless_notices() {
+            eprintln!("{note}");
+        }
+        for note in mcp_startup.headless_notices() {
             eprintln!("{note}");
         }
         for note in &verify_startup.notices {
@@ -468,6 +490,7 @@ fn main() -> io::Result<()> {
             .chain(verify_startup.notices)
             .collect(),
         hooks_startup,
+        mcp_startup,
     )
 }
 

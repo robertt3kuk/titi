@@ -903,6 +903,8 @@ pub struct Chat {
     pub(crate) errors: crate::errors_panel::ErrorsState,
     /// The question about a repository's untrusted hooks, while it is up.
     pub(crate) hook_trust: Option<crate::hooks_trust::TrustPanel>,
+    /// The MCP servers the engine reported, and the `/mcp` panel over them.
+    pub(crate) mcp: crate::mcp_panel::McpState,
     /// The session's usage by the model that ran each turn (`/usage`).
     pub(crate) usage_ledger: titi_tui::status::UsageLedger,
     /// Which transcript sections are drawn, and how: the `/details` state.
@@ -1041,6 +1043,7 @@ impl Chat {
             footer_hits: Vec::new(),
             errors: crate::errors_panel::ErrorsState::default(),
             hook_trust: None,
+            mcp: crate::mcp_panel::McpState::default(),
             usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
@@ -1930,6 +1933,10 @@ impl Chat {
                 self.jobs.push(job);
                 Applied::none()
             }
+            EngineEvent::McpStatus { servers } => {
+                self.set_mcp_status(servers);
+                Applied::none()
+            }
             EngineEvent::JobList { jobs } => {
                 self.show_jobs(&jobs);
                 self.jobs = jobs;
@@ -2471,6 +2478,7 @@ impl Chat {
             "diagnose" => self.diagnose(args),
             "copy" => self.copy_command(args),
             "errors" => self.errors_command(args),
+            "mcp" => self.mcp_command(args),
             "skills" => self.skills_command(args),
             "verify" => self.verify_command(args),
             _ => {
@@ -4419,6 +4427,7 @@ pub fn run(
     theme_name: Option<String>,
     startup_notes: Vec<String>,
     hooks: crate::hooks_setup::HookStartup,
+    mcp: crate::mcp_setup::McpStartup,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -4562,8 +4571,11 @@ pub fn run(
     for note in &hooks.notices {
         chat.push(LineKind::Note, note.clone());
     }
-    if !hooks.pending.is_empty() {
-        chat.hook_trust = Some(crate::hooks_trust::TrustPanel::new(hooks));
+    for note in &mcp.notices {
+        chat.push(LineKind::Note, note.clone());
+    }
+    if !hooks.pending.is_empty() || !mcp.pending.is_empty() {
+        chat.hook_trust = Some(crate::hooks_trust::TrustPanel::new(hooks).with_mcp(mcp));
     }
     chat.catalog = catalog;
     chat.refresh_extensions();

@@ -227,6 +227,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "every error this session showed, newest first",
     },
     Command {
+        name: "mcp",
+        about: "MCP servers and their tools; /mcp restart <name>",
+    },
+    Command {
         name: "skills",
         about: "skills and file commands found, where, and what was left out",
     },
@@ -1736,6 +1740,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     if chat.errors.picker.is_some() {
         return Some(crate::errors_panel::errors_panel(chat, total, width));
     }
+    if chat.mcp.picker.is_some() {
+        return Some(crate::mcp_panel::mcp_panel(chat, total, width));
+    }
     if chat.extensions.is_some() {
         return Some(crate::extensions::extensions_panel(chat, total, width));
     }
@@ -2615,6 +2622,7 @@ impl Chat {
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.errors.picker.is_some()
+            || self.mcp.picker.is_some()
             || self.extensions.is_some()
             || self.emoji_picker.is_visible()
             || self.arg_rows().is_some()

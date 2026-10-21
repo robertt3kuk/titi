@@ -1,12 +1,15 @@
-//! The start-up panel that asks whether to run a repository's hooks.
+//! The start-up panel that asks whether to run a repository's hooks and MCP
+//! servers.
 //!
-//! Shown before the first prompt when the project defines hooks the trust
-//! store does not hold: `this repo defines 2 hooks · trust · once · no`.
-//! `trust` remembers them until their text changes, `once` runs them for this
-//! session only, `no` skips them.
+//! Shown before the first prompt when the project defines hooks or MCP
+//! servers the trust store does not hold: `this repo defines 2 hooks and 1 MCP
+//! server · trust · once · no`. `trust` remembers them until their text
+//! changes, `once` runs them for this session only, `no` skips them. One
+//! panel, one answer, for both kinds: both are commands the repository wants
+//! run on the user's machine.
 //!
 //! A consent has to be to something the user saw. The panel therefore lists
-//! *every* pending hook, scrolling, with its whole command (control characters
+//! *every* pending hook and server, scrolling, with its whole command (control characters
 //! stripped, long lines wrapped), where it was defined and a short hash, and
 //! `trust` / `once` are refused until the cursor has gone down past the last
 //! hook. `no` is always available. Only a key press here enables a
@@ -21,9 +24,10 @@ use std::time::Instant;
 
 use titi_engine::EngineCommand;
 
-use crate::chat::{Applied, Chat, Key};
+use crate::chat::{Applied, Chat, ChatEffect, Key};
 use crate::composer::wrap_plain;
 use crate::hooks_setup::{Choice, HookStartup, sanitize};
+use crate::mcp_setup::McpStartup;
 use crate::pickers::{PanelLine, PanelView, panel_body, panel_label_room, panel_view};
 use crate::transcript::LineKind;
 
@@ -56,6 +60,8 @@ struct Drawn {
 #[derive(Debug)]
 pub(crate) struct TrustPanel {
     start: HookStartup,
+    /// The repository's MCP servers, listed after its hooks.
+    mcp: Option<McpStartup>,
     /// The line the cursor is on: the hooks' lines first, then the answers.
     cursor: usize,
     drawn: Drawn,
@@ -68,15 +74,31 @@ impl TrustPanel {
     pub(crate) fn new(start: HookStartup) -> Self {
         Self {
             start,
+            mcp: None,
             cursor: 0,
             drawn: Drawn::default(),
             opened: Cell::new(None),
         }
     }
 
-    /// Whether every hook has been scrolled past.
+    /// The same question, about the MCP servers as well.
+    pub(crate) fn with_mcp(mut self, mcp: McpStartup) -> Self {
+        self.mcp = Some(mcp);
+        self
+    }
+
+    fn servers(&self) -> &[titi_config::mcp::McpServerDef] {
+        self.mcp.as_ref().map_or(&[], |mcp| &mcp.pending)
+    }
+
+    /// Hooks and servers waiting on the answer.
+    fn total(&self) -> usize {
+        self.start.pending.len() + self.servers().len()
+    }
+
+    /// Whether every hook and server has been scrolled past.
     fn all_shown(&self) -> bool {
-        self.drawn.shown.get() >= self.start.pending.len()
+        self.drawn.shown.get() >= self.total()
     }
 
     fn settled(&self, now: Instant) -> bool {
@@ -147,18 +169,19 @@ impl Chat {
     }
 
     /// Applies the answer: records it, tells the transcript what happened,
-    /// and hands the engine the hooks it may now run. A `trust` or `once`
-    /// before the whole list has been read is refused and the panel stays.
+    /// and hands the engine the hooks and servers it may now run. A `trust`
+    /// or `once` before the whole list has been read is refused and the panel
+    /// stays.
     fn answer_hook_trust(&mut self, choice: Choice) -> Applied {
         if choice != Choice::No
             && let Some(panel) = self.hook_trust.as_ref()
             && !panel.all_shown()
         {
-            let count = panel.start.pending.len();
+            let count = panel.total();
             self.push(
                 LineKind::Note,
                 format!(
-                    "hooks: read all {count} first — scroll down past the last one, then choose"
+                    "trust: read all {count} first — scroll down past the last one, then choose"
                 ),
             );
             return Applied::none();
@@ -166,33 +189,76 @@ impl Chat {
         let Some(mut panel) = self.hook_trust.take() else {
             return Applied::none();
         };
+        let mut commands = Vec::new();
         let count = panel.start.pending.len();
-        let hooks = if count == 1 { "hook" } else { "hooks" };
-        match panel.start.decide(choice) {
-            Ok(Some(all)) => {
-                let what = match choice {
-                    Choice::Trust => {
-                        format!("trusted {count} project {hooks} (until their text changes)")
-                    }
-                    _ => format!("running {count} project {hooks} this session"),
-                };
-                self.push(LineKind::Note, format!("hooks: {what}"));
-                Applied::send(EngineCommand::SetHooks { hooks: all }, None)
+        if count > 0 {
+            let hooks = if count == 1 { "hook" } else { "hooks" };
+            match panel.start.decide(choice) {
+                Ok(Some(all)) => {
+                    let what = match choice {
+                        Choice::Trust => {
+                            format!("trusted {count} project {hooks} (until their text changes)")
+                        }
+                        _ => format!("running {count} project {hooks} this session"),
+                    };
+                    self.push(LineKind::Note, format!("hooks: {what}"));
+                    commands.push(EngineCommand::SetHooks { hooks: all });
+                }
+                Ok(None) => {
+                    self.push(
+                        LineKind::Note,
+                        format!("hooks: skipped {count} project {hooks}"),
+                    );
+                }
+                Err(error) => {
+                    self.push(
+                        LineKind::Error,
+                        format!("hooks: not enabled — the trust could not be recorded: {error}"),
+                    );
+                }
             }
-            Ok(None) => {
-                self.push(
-                    LineKind::Note,
-                    format!("hooks: skipped {count} project {hooks}"),
-                );
-                Applied::none()
+        }
+        if let Some(mcp) = panel.mcp.as_mut()
+            && !mcp.pending.is_empty()
+        {
+            let count = mcp.pending.len();
+            let servers = if count == 1 { "server" } else { "servers" };
+            match mcp.decide(choice) {
+                Ok(Some(all)) => {
+                    let what = match choice {
+                        Choice::Trust => {
+                            format!(
+                                "trusted {count} project {servers} (until their definition changes)"
+                            )
+                        }
+                        _ => format!("starting {count} project {servers} this session"),
+                    };
+                    self.push(LineKind::Note, format!("mcp: {what}"));
+                    commands.push(EngineCommand::SetMcp { servers: all });
+                }
+                Ok(None) => {
+                    self.push(
+                        LineKind::Note,
+                        format!("mcp: skipped {count} project {servers}"),
+                    );
+                    self.mcp.untrusted = mcp
+                        .pending
+                        .iter()
+                        .map(|def| (def.name.clone(), def.command_line(), def.source.clone()))
+                        .collect();
+                }
+                Err(error) => {
+                    self.push(
+                        LineKind::Error,
+                        format!("mcp: not started — the trust could not be recorded: {error}"),
+                    );
+                }
             }
-            Err(error) => {
-                self.push(
-                    LineKind::Error,
-                    format!("hooks: not enabled — the trust could not be recorded: {error}"),
-                );
-                Applied::none()
-            }
+        }
+        match commands.len() {
+            0 => Applied::none(),
+            1 => Applied::send(commands.remove(0), None),
+            _ => Applied::effect(ChatEffect::SendAll(commands)),
         }
     }
 }
@@ -241,6 +307,66 @@ fn hook_lines(
     lines
 }
 
+/// The lines of one MCP server as the panel lists them: what it is, where it
+/// came from, the whole command line, and what else it starts with.
+fn server_lines(
+    index: usize,
+    count: usize,
+    def: &titi_config::mcp::McpServerDef,
+    workspace: &std::path::Path,
+    room: usize,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{}/{count}  MCP server {}",
+        index + 1,
+        sanitize(&def.name)
+    )];
+    lines.push(format!(
+        "     {} · #{}",
+        sanitize(&def.source),
+        &def.hash(workspace)[..8]
+    ));
+    let command = sanitize_keep_newlines(&def.command_line());
+    for (row, text) in wrap_plain(&command, room.saturating_sub(7).max(8))
+        .into_iter()
+        .enumerate()
+    {
+        lines.push(if row == 0 {
+            format!("     $ {text}")
+        } else {
+            format!("       {text}")
+        });
+    }
+    for (key, value) in &def.env {
+        let pair = sanitize(&format!("{key}={value}"));
+        for (row, text) in wrap_plain(&pair, room.saturating_sub(12).max(8))
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(if row == 0 {
+                format!("     env  {text}")
+            } else {
+                format!("          {text}")
+            });
+        }
+    }
+    if let Some(cwd) = def.cwd.as_deref() {
+        lines.push(format!("     cwd  {}", sanitize(cwd)));
+    }
+    if let Some(script) = def.script(workspace) {
+        let state = if script.sha256.is_some() {
+            "its content is part of the hash"
+        } else {
+            "not there yet"
+        };
+        lines.push(format!(
+            "     runs repository files: {} ({state})",
+            sanitize(&script.path.to_string_lossy())
+        ));
+    }
+    lines
+}
+
 /// `PreToolUse Bash|Edit`: the event and its matcher, without the program
 /// name `describe` adds.
 fn describe_event(def: &titi_config::hooks::HookDef) -> String {
@@ -265,13 +391,30 @@ pub(crate) fn trust_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
         return panel_view(None, Vec::new(), None, panel_body(total));
     };
     let pending = &panel.start.pending;
+    let servers = panel.servers();
+    let total_items = panel.total();
     let room = panel_label_room(width).saturating_sub(3);
-    let mut lines: Vec<String> = vec!["read every hook below (↓), then choose".to_owned()];
-    let mut ends = Vec::with_capacity(pending.len());
+    let what = match (pending.is_empty(), servers.is_empty()) {
+        (_, true) => "hook",
+        (true, false) => "MCP server",
+        (false, false) => "hook and MCP server",
+    };
+    let mut lines: Vec<String> = vec![format!("read every {what} below (↓), then choose")];
+    let mut ends = Vec::with_capacity(total_items);
     for (index, def) in pending.iter().enumerate() {
         lines.extend(hook_lines(
             index,
-            pending.len(),
+            total_items,
+            def,
+            &panel.start.workspace,
+            room,
+        ));
+        ends.push(lines.len() - 1);
+    }
+    for (index, def) in servers.iter().enumerate() {
+        lines.extend(server_lines(
+            pending.len() + index,
+            total_items,
             def,
             &panel.start.workspace,
             room,
@@ -295,11 +438,19 @@ pub(crate) fn trust_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
         panel.opened.set(Some(Instant::now()));
     }
     let cursor = panel.cursor.min(rows.len() - 1);
-    let title = format!(
-        "this repo defines {} {} · trust · once · no",
-        pending.len(),
-        if pending.len() == 1 { "hook" } else { "hooks" }
-    );
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    let defines = match (pending.len(), servers.len()) {
+        (hooks, 0) => plural(hooks, "hook", "hooks"),
+        (0, mcp) => plural(mcp, "MCP server", "MCP servers"),
+        (hooks, mcp) => format!(
+            "{} and {}",
+            plural(hooks, "hook", "hooks"),
+            plural(mcp, "MCP server", "MCP servers")
+        ),
+    };
+    let title = format!("this repo defines {defines} · trust · once · no");
     let view = panel_view(Some(title), rows, Some(cursor), panel_body(total));
     let seen_to = view.window.start + view.window.count;
     let shown = ends.iter().filter(|end| **end < seen_to).count();
@@ -344,6 +495,7 @@ pub(crate) fn hook_row(
 mod tests {
     use super::*;
     use crate::chat::ChatEffect;
+    use crate::mcp_setup::McpStartup;
     use crate::pickers::panel_view_for;
     use std::sync::Arc;
     use titi_engine::protocol::HookOutcome;
@@ -588,6 +740,120 @@ mod tests {
             Some(ChatEffect::Send(EngineCommand::SetHooks { ref hooks })) if hooks.len() == 2
         ));
         assert_eq!(pending_after(&screen), 2, "once is not recorded");
+    }
+
+    const SERVER: &str = r#"{"mcpServers": {"files": {"command": "npx",
+        "args": ["-y", "some-server", "--root", "."], "env": {"TOKEN_FILE": "./t\u001b[2Jxt"}, "cwd": "tools"}}}"#;
+
+    /// A screen whose repository defines MCP servers (and, when `hooks`, the
+    /// two hooks of [`TWO`]).
+    fn screen_with_servers(servers: &str, hooks: bool) -> Screen {
+        let agent = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".mcp.json"), servers).unwrap();
+        if hooks {
+            std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+            std::fs::write(repo.path().join(".claude/settings.json"), TWO).unwrap();
+        }
+        let start = HookStartup::resolve(agent.path(), repo.path(), None, false);
+        let mcp = McpStartup::resolve(agent.path(), repo.path(), None, false);
+        assert!(!mcp.pending.is_empty());
+        let mut chat = Chat::new("openai/gpt-4.1", "session-123", theme());
+        chat.set_agent_dir(agent.path());
+        chat.hook_trust = Some(TrustPanel::new(start).with_mcp(mcp));
+        Screen { agent, repo, chat }
+    }
+
+    fn mcp_pending_after(screen: &Screen) -> usize {
+        McpStartup::resolve(screen.agent.path(), screen.repo.path(), None, false)
+            .pending
+            .len()
+    }
+
+    #[test]
+    fn a_repository_with_only_servers_is_asked_about_them_with_the_whole_command() {
+        let mut screen = screen_with_servers(SERVER, false);
+        let view = panel_view_for(&screen.chat, 40, 100).expect("the panel is up");
+        assert_eq!(
+            view.title.as_deref(),
+            Some("this repo defines 1 MCP server · trust · once · no")
+        );
+        let all = scroll_to_the_end(&mut screen);
+        assert!(all.contains("1/1  MCP server files"), "{all}");
+        assert!(all.contains("$ npx -y some-server --root ."), "{all}");
+        assert!(all.contains("env  TOKEN_FILE=./t[2Jxt"), "{all}");
+        assert!(!all.contains('\u{1b}'), "control characters are stripped");
+        assert!(all.contains("cwd  tools"), "{all}");
+        assert!(all.contains(".mcp.json") && all.contains(" · #"), "{all}");
+    }
+
+    #[test]
+    fn hooks_and_servers_are_one_question_and_one_answer() {
+        let mut screen = screen_with_servers(SERVER, true);
+        let view = panel_view_for(&screen.chat, 40, 100).expect("the panel is up");
+        assert_eq!(
+            view.title.as_deref(),
+            Some("this repo defines 2 hooks and 1 MCP server · trust · once · no")
+        );
+        let all = scroll_to_the_end(&mut screen);
+        assert!(
+            all.contains("1/3") && all.contains("3/3  MCP server files"),
+            "{all}"
+        );
+        // Trust is refused until the server, the last item, has been read.
+        press(&mut screen, Key::Up);
+        press(&mut screen, Key::Up);
+        let applied = press(&mut screen, Key::Enter);
+        let Some(ChatEffect::SendAll(commands)) = applied.effect else {
+            panic!("two commands: {applied:?}");
+        };
+        assert!(matches!(&commands[0], EngineCommand::SetHooks { hooks } if hooks.len() == 2));
+        assert!(matches!(&commands[1], EngineCommand::SetMcp { servers } if servers.len() == 1));
+        assert_eq!(pending_after(&screen), 0);
+        assert_eq!(
+            mcp_pending_after(&screen),
+            0,
+            "trusted servers are remembered"
+        );
+    }
+
+    #[test]
+    fn a_server_below_the_fold_cannot_be_trusted_unread() {
+        let mut screen = screen_with_servers(SERVER, true);
+        draw(&screen);
+        for letter in ['t', 'o'] {
+            assert!(press(&mut screen, Key::Char(letter)).effect.is_none());
+        }
+        press(&mut screen, Key::Enter);
+        assert!(screen.chat.hook_trust.is_some(), "the panel stays");
+        assert_eq!(mcp_pending_after(&screen), 1);
+    }
+
+    #[test]
+    fn once_starts_the_servers_without_remembering_and_no_lists_them_as_untrusted() {
+        let mut screen = screen_with_servers(SERVER, false);
+        scroll_to_the_end(&mut screen);
+        press(&mut screen, Key::Up);
+        let applied = press(&mut screen, Key::Enter);
+        assert!(matches!(
+            applied.effect,
+            Some(ChatEffect::Send(EngineCommand::SetMcp { ref servers })) if servers.len() == 1
+        ));
+        assert_eq!(mcp_pending_after(&screen), 1, "once is not recorded");
+
+        let mut screen = screen_with_servers(SERVER, false);
+        draw(&screen);
+        let applied = press(&mut screen, Key::Char('n'));
+        assert!(applied.effect.is_none(), "no starts nothing");
+        assert_eq!(
+            screen.chat.mcp.untrusted,
+            vec![(
+                "files".to_owned(),
+                "npx -y some-server --root .".to_owned(),
+                ".mcp.json".to_owned()
+            )]
+        );
+        assert_eq!(mcp_pending_after(&screen), 1);
     }
 
     #[test]
