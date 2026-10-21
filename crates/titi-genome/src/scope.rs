@@ -173,7 +173,8 @@ fn manifest_name(manifest: &str) -> Option<String> {
             table = header.trim_end_matches(']').trim();
             continue;
         }
-        let Some(("name", value)) = line.split_once('=').map(|(key, value)| (key.trim(), value)) else {
+        let Some(("name", value)) = line.split_once('=').map(|(key, value)| (key.trim(), value))
+        else {
             continue;
         };
         let value = value.trim().trim_matches(['"', '\'']).to_owned();

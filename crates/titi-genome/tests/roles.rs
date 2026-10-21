@@ -84,20 +84,15 @@ fn a_test_helper_does_not_outrank_the_library_it_exercises() {
 /// wants it on the page.
 #[test]
 fn a_touched_test_file_is_not_demoted() {
-    let mut files: Vec<(String, String)> = vec![(
-        "src/lib.rs".into(),
-        "pub fn lib_fn() {}\n".into(),
-    )];
+    let mut files: Vec<(String, String)> =
+        vec![("src/lib.rs".into(), "pub fn lib_fn() {}\n".into())];
     for n in 0..6 {
         files.push((
             format!("src/user{n}.rs"),
             "use crate::lib_fn;\npub fn f() { lib_fn(); }\n".into(),
         ));
     }
-    files.push((
-        "tests/support.rs".into(),
-        "pub fn support_fn() {}\n".into(),
-    ));
+    files.push(("tests/support.rs".into(), "pub fn support_fn() {}\n".into()));
     for name in ["a", "b", "c"] {
         files.push((
             format!("tests/{name}.rs"),
@@ -124,10 +119,7 @@ fn an_entry_point_makes_the_map_though_nothing_imports_it() {
         "z/main.rs".into(),
         "mod engine;\nfn main() { engine::run(); }\n".into(),
     )];
-    files.push((
-        "z/engine.rs".into(),
-        "pub fn run() {}\n".into(),
-    ));
+    files.push(("z/engine.rs".into(), "pub fn run() {}\n".into()));
     // Plenty of busier files around it.
     for n in 0..10 {
         files.push((
@@ -160,10 +152,7 @@ fn an_entry_point_makes_the_map_though_nothing_imports_it() {
 #[test]
 fn generated_and_fixture_files_rank_below_source() {
     let mut files: Vec<(String, String)> = vec![
-        (
-            "src/api.ts".into(),
-            "export class ApiClient {}\n".into(),
-        ),
+        ("src/api.ts".into(), "export class ApiClient {}\n".into()),
         (
             "src/api.generated.ts".into(),
             "export class GeneratedModels {}\n".into(),
@@ -213,9 +202,7 @@ fn a_production_file_does_not_guess_a_definition_into_test_code() {
     let (_dir, genome) = index(&refs);
 
     assert_eq!(
-        genome.dependents["src/UnitTests/Bug.cs"],
-        0,
+        genome.dependents["src/UnitTests/Bug.cs"], 0,
         "production code pointed at a test-local class by name alone"
     );
 }
-

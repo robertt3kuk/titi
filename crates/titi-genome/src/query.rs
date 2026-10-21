@@ -107,10 +107,7 @@ impl Genome {
             }
             // One name, several crates: not a collision a reader can act on.
             let crate_of = self.crate_of(path);
-            if definers
-                .iter()
-                .any(|file| self.crate_of(file) != crate_of)
-            {
+            if definers.iter().any(|file| self.crate_of(file) != crate_of) {
                 continue;
             }
             let listed: Vec<&str> = definers.iter().map(|file| file.as_str()).collect();
@@ -139,16 +136,12 @@ impl Genome {
         definers
             .iter()
             .filter(|candidate| {
-                let Some(record) = self
-                    .files
-                    .get(candidate.as_str())
-                    .filter(|record| {
-                        matches!(
-                            record.language,
-                            crate::Language::TypeScript | crate::Language::JavaScript
-                        )
-                    })
-                else {
+                let Some(record) = self.files.get(candidate.as_str()).filter(|record| {
+                    matches!(
+                        record.language,
+                        crate::Language::TypeScript | crate::Language::JavaScript
+                    )
+                }) else {
                     return true;
                 };
                 !definers

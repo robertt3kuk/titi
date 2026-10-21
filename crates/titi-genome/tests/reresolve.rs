@@ -33,7 +33,11 @@ fn an_esm_import_of_the_emitted_name_finds_the_typescript_source() {
 
     let index = &genome.files["src/index.ts"];
     assert_eq!(index.imports, vec!["src/b.ts"]);
-    assert_eq!(index.reexports, vec!["src/b.ts"], "export … from re-publishes");
+    assert_eq!(
+        index.reexports,
+        vec!["src/b.ts"],
+        "export … from re-publishes"
+    );
     assert!(index.unresolved_imports.is_empty(), "{index:?}");
 
     let c = &genome.files["src/sub/c.ts"];
@@ -47,7 +51,10 @@ fn a_relative_import_of_nothing_is_still_reported() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "src/a.ts", "import { x } from './gone.js';\n");
     let genome = Genome::index(dir.path()).unwrap();
-    assert_eq!(genome.files["src/a.ts"].unresolved_imports, vec!["./gone.js"]);
+    assert_eq!(
+        genome.files["src/a.ts"].unresolved_imports,
+        vec!["./gone.js"]
+    );
 }
 
 /// A Go package is a directory of the module; a path outside the module is a

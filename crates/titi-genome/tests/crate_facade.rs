@@ -32,7 +32,11 @@ fn workspace() -> (tempfile::TempDir, Genome) {
     write(root, "crates/core/src/engine.rs", "pub struct Engine {}\n");
     // A second definer of the same name: only the crate the file names can
     // settle which one it means.
-    write(root, "crates/other/Cargo.toml", "[package]\nname = \"other\"\n");
+    write(
+        root,
+        "crates/other/Cargo.toml",
+        "[package]\nname = \"other\"\n",
+    );
     write(root, "crates/other/src/lib.rs", "pub struct Engine {}\n");
     write(
         root,

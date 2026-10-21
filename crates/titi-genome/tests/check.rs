@@ -747,11 +747,16 @@ fn check_keeps_every_diagnostic_and_the_report_says_how_many_it_cut() {
     let lines = titi_genome::format_check_report(&diagnostics, 50);
     assert_eq!(lines.len(), 51, "{lines:?}");
     assert!(
-        lines[50].contains("10 more") && lines[50].contains("60") && lines[50].contains("unresolved-import"),
+        lines[50].contains("10 more")
+            && lines[50].contains("60")
+            && lines[50].contains("unresolved-import"),
         "{}",
         lines[50]
     );
-    assert_eq!(titi_genome::format_check_report(&diagnostics[..3], 50).len(), 3);
+    assert_eq!(
+        titi_genome::format_check_report(&diagnostics[..3], 50).len(),
+        3
+    );
 }
 
 /// `export { Button } from './button'` lists `Button` among the barrel's
@@ -761,10 +766,17 @@ fn a_barrel_that_re_exports_a_name_does_not_make_it_ambiguous() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "src/ui/button.ts", "export const Button = 1;\n");
-    write(root, "src/ui/index.ts", "export { Button } from './button';\n");
+    write(
+        root,
+        "src/ui/index.ts",
+        "export { Button } from './button';\n",
+    );
     let genome = Genome::index(root).unwrap();
     assert!(
-        genome.check().iter().all(|item| item.code != "ambiguous-symbol"),
+        genome
+            .check()
+            .iter()
+            .all(|item| item.code != "ambiguous-symbol"),
         "{:?}",
         genome.check()
     );
