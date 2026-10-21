@@ -31,19 +31,62 @@ impl std::error::Error for RoleError {}
 /// `None` means the map is absent: return `current`. A present map that does
 /// not contain `role` is [`RoleError::Unknown`].
 pub fn resolve_role(map: Option<&Value>, role: &str, current: &str) -> Result<String, RoleError> {
-    let Some(map) = map else {
+    if map.is_none() {
         return Ok(current.to_owned());
+    }
+    match role_slot(map, role)? {
+        None => Err(RoleError::Unknown(role.to_owned())),
+        Some(RoleSlot {
+            model: Some(model), ..
+        }) => Ok(model),
+        Some(_) => Err(RoleError::Invalid(format!("role {role} names no model"))),
+    }
+}
+
+/// What one `modelRoles` entry says: a plain model id, or a map
+/// `{model, effort}` where either key may be left out.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleSlot {
+    pub model: Option<String>,
+    /// The word as written; the caller knows what levels exist.
+    pub effort: Option<String>,
+}
+
+/// The slot for `role`, `None` when the map or the role is absent.
+pub fn role_slot(map: Option<&Value>, role: &str) -> Result<Option<RoleSlot>, RoleError> {
+    let Some(map) = map else {
+        return Ok(None);
     };
     let Some(object) = map.as_object() else {
         return Err(RoleError::Invalid(
             "modelRoles must be a map of role to model id".into(),
         ));
     };
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
     match object.get(role) {
-        None => Err(RoleError::Unknown(role.to_owned())),
-        Some(Value::String(id)) if !id.trim().is_empty() => Ok(id.clone()),
+        None => Ok(None),
+        Some(Value::String(id)) if !id.trim().is_empty() => Ok(Some(RoleSlot {
+            model: Some(id.trim().to_owned()),
+            effort: None,
+        })),
+        Some(Value::Object(slot)) => {
+            let model = text(slot.get("model"));
+            let effort = text(slot.get("effort"));
+            if model.is_none() && effort.is_none() {
+                return Err(RoleError::Invalid(format!(
+                    "role {role} needs a model or an effort"
+                )));
+            }
+            Ok(Some(RoleSlot { model, effort }))
+        }
         Some(_) => Err(RoleError::Invalid(format!(
-            "role {role} must be a non-empty model id"
+            "role {role} must be a model id or a map with model and effort"
         ))),
     }
 }
@@ -126,6 +169,66 @@ mod tests {
         );
         assert!(matches!(
             resolve_model_role(&settings, "slow", "current-model"),
+            Err(RoleError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn a_slot_is_a_model_id_or_a_map_with_a_model_and_an_effort() {
+        let map = json!({
+            "plain": "a-id",
+            "both": { "model": "b-id", "effort": "low" },
+            "effort_only": { "effort": "high" },
+            "model_only": { "model": "c-id" },
+            "empty": {},
+            "blank": "  ",
+            "number": 7
+        });
+        let slot = |role| role_slot(Some(&map), role);
+        assert_eq!(
+            slot("plain").unwrap(),
+            Some(RoleSlot {
+                model: Some("a-id".into()),
+                effort: None
+            })
+        );
+        assert_eq!(
+            slot("both").unwrap(),
+            Some(RoleSlot {
+                model: Some("b-id".into()),
+                effort: Some("low".into())
+            })
+        );
+        assert_eq!(
+            slot("effort_only").unwrap(),
+            Some(RoleSlot {
+                model: None,
+                effort: Some("high".into())
+            })
+        );
+        assert_eq!(slot("model_only").unwrap().unwrap().effort, None);
+        assert_eq!(slot("missing").unwrap(), None);
+        for bad in ["empty", "blank", "number"] {
+            assert!(matches!(slot(bad), Err(RoleError::Invalid(_))), "{bad}");
+        }
+        assert_eq!(role_slot(None, "plain").unwrap(), None);
+    }
+
+    /// `/switch @role` and every other reader of a role's model take the
+    /// nested form too; a slot that names only an effort has no model to give.
+    #[test]
+    fn resolve_role_reads_the_model_out_of_a_nested_slot() {
+        let map = json!({
+            "review": { "model": "r-id", "effort": "low" },
+            "think": { "effort": "high" }
+        });
+        assert_eq!(resolve_role(Some(&map), "review", "cur").unwrap(), "r-id");
+        assert!(matches!(
+            resolve_role(Some(&map), "think", "cur"),
+            Err(RoleError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_role(Some(&map), "other", "cur"),
             Err(RoleError::Unknown(_))
         ));
     }
