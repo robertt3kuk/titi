@@ -23,7 +23,7 @@ For each task × run it
    or deletes a test cannot pass that way; the report row says whether it tried
    (`tests_touched`, from `git status` against the start commit, taken before
    `hidden/` goes back).
-   `check.sh` Exit 0 is *solved*. It is
+   Exit 0 from `check.sh` is *solved*. It is
    graded even after a timeout, because the work may already be done.
 
 The environment is inherited except `TITI_AGENT_DIR`, so `PATH` finds `cargo`
