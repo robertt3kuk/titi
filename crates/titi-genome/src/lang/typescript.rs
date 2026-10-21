@@ -56,6 +56,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     };
     let mut sites = Vec::new();
     ts_module(tree.root_node(), source.as_bytes(), &mut sites);
+    cjs_module(tree.root_node(), source.as_bytes(), &mut sites);
     let masked = mask_comments(source, Comments::Slashes);
     let mut imports = Vec::new();
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
@@ -170,6 +171,142 @@ fn ts_export(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     }
 }
 
+/// CommonJS: what `module.exports` and `exports` publish.
+///
+/// `exports.x = …`, `module.exports.x = …`, `module.exports = { a, b }`,
+/// `module.exports = name` and `module.exports = function name() {}` each
+/// publish names. A variable that is assigned `module.exports` — either in a
+/// chain (`var app = exports = module.exports = {}`) or later
+/// (`module.exports = res`) — is an alias, and `app.x = …` publishes `x`.
+fn cjs_module(root: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    let mut aliases: HashSet<String> = HashSet::from(["exports".to_owned()]);
+    let statements: Vec<Node> = {
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor).collect()
+    };
+    // Pass one: the aliases.
+    for statement in &statements {
+        let Some((targets, value)) = cjs_chain(*statement) else {
+            continue;
+        };
+        if !targets
+            .iter()
+            .any(|node| is_module_exports(*node, source, &aliases))
+        {
+            continue;
+        }
+        for target in &targets {
+            if target.kind() == "identifier" {
+                if let Some(name) = text(*target, source) {
+                    aliases.insert(name);
+                }
+            }
+        }
+        if let Some(value) = value {
+            if value.kind() == "identifier" {
+                if let Some(name) = text(value, source) {
+                    aliases.insert(name);
+                }
+            }
+        }
+    }
+    // Pass two, in source order.
+    for statement in &statements {
+        let Some((targets, value)) = cjs_chain(*statement) else {
+            continue;
+        };
+        let publishes = targets
+            .iter()
+            .any(|node| is_module_exports(*node, source, &aliases));
+        if publishes {
+            if let Some(value) = value {
+                cjs_value(value, source, out);
+            }
+        }
+        for target in &targets {
+            if target.kind() != "member_expression" {
+                continue;
+            }
+            let (Some(object), Some(property)) = (
+                target.child_by_field_name("object"),
+                target.child_by_field_name("property"),
+            ) else {
+                continue;
+            };
+            if property.kind() == "property_identifier"
+                && is_module_exports(object, source, &aliases)
+            {
+                push_site(property, source, out);
+            }
+        }
+    }
+}
+
+/// `a = b = value` or `var a = b = value`: the assignment targets, outermost
+/// first, and the final value.
+fn cjs_chain(statement: Node) -> Option<(Vec<Node>, Option<Node>)> {
+    let mut targets = Vec::new();
+    let mut current = match statement.kind() {
+        "expression_statement" => statement.named_child(0)?,
+        "variable_declaration" | "lexical_declaration" => {
+            let declarator = statement.named_child(0)?;
+            if declarator.kind() != "variable_declarator" {
+                return None;
+            }
+            targets.push(declarator.child_by_field_name("name")?);
+            declarator.child_by_field_name("value")?
+        }
+        _ => return None,
+    };
+    while current.kind() == "assignment_expression" {
+        targets.push(current.child_by_field_name("left")?);
+        current = current.child_by_field_name("right")?;
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    Some((targets, Some(current)))
+}
+
+fn is_module_exports(node: Node, source: &[u8], aliases: &HashSet<String>) -> bool {
+    match node.kind() {
+        "identifier" => text(node, source).is_some_and(|name| aliases.contains(&name)),
+        "member_expression" => text(node, source).is_some_and(|text| text == "module.exports"),
+        _ => false,
+    }
+}
+
+/// The value assigned to `module.exports`: an object literal publishes its
+/// keys, an identifier or a named function/class publishes its name.
+fn cjs_value(value: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
+    match value.kind() {
+        "identifier" => push_site(value, source, out),
+        "function_expression" | "function" | "generator_function" | "class" => {
+            push_field(value, source, out);
+        }
+        "object" => {
+            let mut cursor = value.walk();
+            for member in value.named_children(&mut cursor) {
+                match member.kind() {
+                    "shorthand_property_identifier" => push_site(member, source, out),
+                    "pair" | "method_definition" => {
+                        let key = member
+                            .child_by_field_name("key")
+                            .or_else(|| member.child_by_field_name("name"));
+                        if let Some(key) = key {
+                            if matches!(key.kind(), "property_identifier" | "identifier") {
+                                push_site(key, source, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
@@ -260,5 +397,62 @@ function helper() {}
         // Re-exports publish the alias, not the local name.
         assert!(names.contains(&"publicHelper".to_owned()));
         assert!(!names.contains(&"helper".to_owned()));
+    }
+    #[test]
+    fn commonjs_exports_assignments_are_exports() {
+        let names = names(
+            "lib/utils.js",
+            r#"
+exports.methods = ['get'];
+exports.etag = createETagGenerator({ weak: false })
+exports.normalizeType = function(type){ return type }
+function createETagGenerator() {}
+function notExported() {}
+"#,
+        );
+        for want in ["methods", "etag", "normalizeType"] {
+            assert!(names.contains(&want.to_owned()), "{want}: {names:?}");
+        }
+        assert!(!names.contains(&"notExported".to_owned()));
+        assert!(!names.contains(&"createETagGenerator".to_owned()));
+    }
+
+    #[test]
+    fn commonjs_module_exports_shapes() {
+        let object = names(
+            "lib/a.js",
+            "function one() {}\nmodule.exports = { one, two: function() {}, three() {} };\n",
+        );
+        for want in ["one", "two", "three"] {
+            assert!(object.contains(&want.to_owned()), "{want}: {object:?}");
+        }
+        let ident = names(
+            "lib/express.js",
+            "exports = module.exports = createApplication;\nfunction createApplication() {}\nexports.Router = Router;\n",
+        );
+        assert!(ident.contains(&"createApplication".to_owned()), "{ident:?}");
+        assert!(ident.contains(&"Router".to_owned()), "{ident:?}");
+        let named = names(
+            "lib/b.js",
+            "module.exports = function build() {};\nmodule.exports.version = 1;\n",
+        );
+        assert!(named.contains(&"build".to_owned()), "{named:?}");
+        assert!(named.contains(&"version".to_owned()), "{named:?}");
+    }
+
+    #[test]
+    fn commonjs_alias_of_module_exports_publishes_its_members() {
+        let app = names(
+            "lib/application.js",
+            "var app = exports = module.exports = {};\napp.init = function init() {};\napp.handle = function handle() {};\nvar local = {};\nlocal.x = 1;\n",
+        );
+        assert!(app.contains(&"init".to_owned()), "{app:?}");
+        assert!(app.contains(&"handle".to_owned()), "{app:?}");
+        assert!(!app.contains(&"x".to_owned()), "{app:?}");
+        let res = names(
+            "lib/response.js",
+            "var res = Object.create(proto);\nmodule.exports = res;\nres.send = function send() {};\n",
+        );
+        assert!(res.contains(&"send".to_owned()), "{res:?}");
     }
 }

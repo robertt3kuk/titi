@@ -149,3 +149,54 @@ fn typescript_reports_its_level_in_the_capability_roster() {
     assert_eq!(javascript.level, Level::Full, "{}", javascript.note);
     assert_eq!(javascript.extensions, vec!["js", "jsx", "mjs", "cjs"]);
 }
+
+/// An express-shaped tree: `require('../..')` and `require('..')` name a
+/// directory's `index.js`, and CommonJS exports give lib files symbols, so a
+/// use of `createApplication` in an example is an edge to `lib/express.js`.
+#[test]
+fn commonjs_directory_requires_and_exports_reach_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "index.js",
+        "module.exports = require('./lib/express');\n",
+    );
+    write(
+        root,
+        "lib/express.js",
+        "exports = module.exports = createApplication;\nfunction createApplication() {}\nexports.Router = function Router() {};\n",
+    );
+    write(
+        root,
+        "examples/auth/index.js",
+        "var express = require('../..');\nvar app = createApplication();\n",
+    );
+    write(
+        root,
+        "lib/use.js",
+        "var root = require('..');\nvar router = require('./express');\nRouter();\n",
+    );
+
+    let genome = index(root);
+    assert_eq!(
+        genome.files["lib/express.js"].exports,
+        vec!["Router".to_owned(), "createApplication".to_owned()]
+    );
+    assert_eq!(
+        genome.files["examples/auth/index.js"].imports,
+        vec!["index.js".to_owned()]
+    );
+    assert_eq!(
+        genome.files["lib/use.js"].imports,
+        vec!["index.js".to_owned(), "lib/express.js".to_owned()]
+    );
+    assert!(
+        genome
+            .check()
+            .iter()
+            .all(|item| item.code != "unresolved-import"),
+        "{:?}",
+        genome.check()
+    );
+}
