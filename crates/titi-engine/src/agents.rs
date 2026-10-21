@@ -69,6 +69,17 @@ impl AgentContext {
         &self.agent_id
     }
 
+    /// Tells the person at the surface something about this agent's setup,
+    /// outside its transcript: a model that could not be used.
+    pub async fn notice(&self, message: impl Into<SmolStr>) {
+        let _ = self
+            .events
+            .send(EngineEvent::Notice {
+                message: message.into(),
+            })
+            .await;
+    }
+
     /// The model's own text, as it arrives.
     pub async fn progress(&self, text: impl Into<SmolStr>) {
         let _ = self
@@ -402,6 +413,7 @@ impl AgentSupervisor {
 pub struct StreamingAgentRunner {
     resolver: Arc<dyn TransportResolver>,
     model: SmolStr,
+    effort: Option<titi_providers::Effort>,
 }
 
 impl StreamingAgentRunner {
@@ -409,7 +421,14 @@ impl StreamingAgentRunner {
         Self {
             resolver,
             model: model.into(),
+            effort: None,
         }
+    }
+
+    /// The effort this runner asks for; a model that takes none is sent none.
+    pub fn with_effort(mut self, effort: Option<titi_providers::Effort>) -> Self {
+        self.effort = effort;
+        self
     }
 }
 
@@ -428,6 +447,7 @@ impl AgentRunner for StreamingAgentRunner {
             ..Default::default()
         });
         let aborted = Arc::new(AtomicBool::new(false));
+        wire.reasoning = crate::router::reasoning_for(&resolved, self.effort);
         let ctx = RequestCtx {
             credential: resolved.credential,
             aborted: Arc::clone(&aborted),

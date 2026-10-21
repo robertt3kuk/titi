@@ -1070,6 +1070,8 @@ pub struct EngineRuntime {
     agents: Option<crate::agents::AgentSupervisor>,
     /// Where the `agent` tool's definitions are read; set with `agents`.
     agent_catalog: Option<Arc<crate::agent_defs::AgentCatalog>>,
+    /// Which model, and how much effort, each kind of side work runs on.
+    router: crate::router::Router,
     tools: ToolRegistry,
     approval_waiters: ApprovalWaiters,
     /// The questions the model has asked and nobody has answered yet. See
@@ -1289,6 +1291,13 @@ impl EngineRuntime {
             config.interrupt.clone(),
             config.mask_ips,
         );
+        let router = crate::router::Router::new(
+            config.agent_dir.clone(),
+            config
+                .workspace_root
+                .clone()
+                .or_else(|| config.genome_root.clone()),
+        );
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
@@ -1330,7 +1339,8 @@ impl EngineRuntime {
                 .with_mask_ips(config.mask_ips)
                 .with_genome(genome.clone())
                 .with_spans(Arc::clone(&spans), config.trace_thinking)
-                .with_hooks(&hooks),
+                .with_hooks(&hooks)
+                .with_router(router.clone()),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
         // The surface builds the session's tools before the engine starts —
@@ -1378,6 +1388,7 @@ impl EngineRuntime {
             next_turn: Arc::new(AtomicU64::new(1)),
             agents,
             agent_catalog,
+            router,
             tools,
             approval_waiters: ApprovalWaiters::default(),
             ask_waiters,
@@ -2525,19 +2536,29 @@ impl EngineRuntime {
         let coder = Arc::new(crate::RunnerCoder::new(Arc::new(
             crate::StreamingAgentRunner::new(Arc::clone(&self.resolver), model.clone()),
         )));
-        let reviewer = Arc::new(crate::AgentReviewer::new(
-            Arc::new(crate::StreamingAgentRunner::new(
-                Arc::clone(&self.resolver),
-                model,
-            )),
-            "reviewer",
-        ));
         let gates = crate::CommandGates::new(self.config.goal_gates.clone());
         let gates: Arc<dyn crate::Gates> = Arc::new(match &self.config.workspace_root {
             Some(root) => gates.in_dir(root.clone()),
             None => gates,
         });
+        let router = self.router.clone();
+        let resolver = Arc::clone(&self.resolver);
         tokio::spawn(async move {
+            // The coder stays on the session model; the reviewer is the
+            // `review` role's work.
+            let routed = router
+                .route_async(crate::router::Role::Review, &model, &resolver)
+                .await;
+            for notice in routed.notices {
+                let _ = events.send(EngineEvent::Notice { message: notice }).await;
+            }
+            let reviewer = Arc::new(crate::AgentReviewer::new(
+                Arc::new(
+                    crate::StreamingAgentRunner::new(Arc::clone(&resolver), routed.route.model)
+                        .with_effort(routed.route.effort),
+                ),
+                "reviewer",
+            ));
             let outcome = crate::GoalLoop::new(coder, reviewer)
                 .with_gates(gates)
                 .run(text)
@@ -2580,7 +2601,7 @@ impl EngineRuntime {
         // session's, and must not reorder its repository map.
         let runner = crate::tool_agent::ToolAgentRunner::new(
             Arc::clone(&self.resolver),
-            model,
+            model.clone(),
             tools,
             Claims::new(),
             TouchedSink::default(),
@@ -2589,7 +2610,8 @@ impl EngineRuntime {
         .with_max_rounds(crate::REVIEW_ROUNDS)
         .with_mask_ips(self.config.mask_ips)
         .with_hooks(&self.hooks);
-        let reviewer = crate::AgentReviewer::new(Arc::new(runner), "reviewer");
+        let router = self.router.clone();
+        let resolver = Arc::clone(&self.resolver);
         tokio::spawn(async move {
             let edited: Vec<String> = edited.iter().map(ToString::to_string).collect();
             let scope = {
@@ -2600,7 +2622,21 @@ impl EngineRuntime {
                     .flatten()
             };
             let report = match scope {
-                Some(scope) => crate::review_change(&reviewer, &scope).await,
+                Some(scope) => {
+                    // Routed only now that a model will be called: a review of
+                    // nothing has no model to say anything about.
+                    let routed = router
+                        .route_async(crate::router::Role::Review, &model, &resolver)
+                        .await;
+                    for notice in routed.notices {
+                        let _ = events.send(EngineEvent::Notice { message: notice }).await;
+                    }
+                    let runner = runner
+                        .with_model(routed.route.model)
+                        .with_effort(routed.route.effort);
+                    let reviewer = crate::AgentReviewer::new(Arc::new(runner), "reviewer");
+                    crate::review_change(&reviewer, &scope).await
+                }
                 None => crate::ReviewReport::nothing("nothing to review"),
             };
             let _ = events.send(EngineEvent::ReviewFinished { report }).await;

@@ -22,13 +22,14 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use smol_str::SmolStr;
 use titi_providers::{ChatMessage, RequestCtx, Role, StreamEvent, WireRequest};
-use titi_tools::{ApprovalMode, ToolRegistry};
+use titi_tools::{ApprovalMode, ApprovalTier, ToolRegistry};
 use tokio::sync::mpsc;
 
 use crate::agents::{AgentContext, AgentRequest, AgentRunner};
 use crate::claims::Claims;
 use crate::hooks::Hooks;
 use crate::protocol::TurnId;
+use crate::router::{Role as RouteRole, Router};
 use crate::runtime::TransportResolver;
 use crate::spans::{self, OpenSpan, SpanSink};
 use crate::tool_budget::{IssuedCall, LoopWatch};
@@ -69,6 +70,8 @@ pub struct ToolAgentRunner {
     /// `PreToolUse` gate as the main turn's: a policy a hook states must not
     /// be one delegation away from being skipped.
     hooks: Hooks,
+    router: Option<Router>,
+    effort: Option<titi_providers::Effort>,
 }
 
 impl ToolAgentRunner {
@@ -95,6 +98,8 @@ impl ToolAgentRunner {
             spans: SpanSink::default(),
             trace_thinking: false,
             hooks: Hooks::default(),
+            router: None,
+            effort: None,
         }
     }
 
@@ -132,6 +137,12 @@ impl ToolAgentRunner {
         self
     }
 
+    /// The model runs use when no definition or role names another.
+    pub fn with_model(mut self, model: impl Into<SmolStr>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     /// Sets the round cap.
     pub fn with_max_rounds(mut self, rounds: u32) -> Self {
         self.max_rounds = rounds.max(1);
@@ -146,9 +157,58 @@ impl ToolAgentRunner {
         self
     }
 
+    /// Routes this runner's subagents by role (`modelRoles.explore`,
+    /// `modelRoles.subagent`). Without it they run on the model the runner
+    /// was built with.
+    pub fn with_router(mut self, router: Router) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// The effort every run asks for unless a definition or a role says
+    /// otherwise.
+    pub fn with_effort(mut self, effort: Option<titi_providers::Effort>) -> Self {
+        self.effort = effort;
+        self
+    }
+
     /// Tools this runner may call.
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+}
+
+impl ToolAgentRunner {
+    /// The model this run uses, and the effort its role asks for.
+    ///
+    /// A definition's own `model` wins; otherwise the `explore` role for a
+    /// subagent whose tools can only read and `subagent` for one that can do
+    /// more, and failing both the model the runner was built with. Without a
+    /// router, or with no role set, that is the runner's model and no effort.
+    async fn routed(
+        &self,
+        profile: Option<&crate::agent_defs::AgentProfile>,
+        tools: &ToolRegistry,
+        context: &AgentContext,
+    ) -> (SmolStr, Option<titi_providers::Effort>) {
+        let own = profile.and_then(|profile| profile.model.clone());
+        let Some(router) = &self.router else {
+            return (own.unwrap_or_else(|| self.model.clone()), None);
+        };
+        let reads_only = tools
+            .names()
+            .iter()
+            .all(|name| tools.approval_tier(name) == ApprovalTier::Read);
+        let role = if reads_only {
+            RouteRole::Explore
+        } else {
+            RouteRole::Subagent
+        };
+        let routed = router.route_async(role, &self.model, &self.resolver).await;
+        for notice in routed.notices {
+            context.notice(notice).await;
+        }
+        (own.unwrap_or(routed.route.model), routed.route.effort)
     }
 }
 
@@ -196,25 +256,6 @@ impl ToolAgentRunner {
         agent_span_id: Option<String>,
     ) -> Result<SmolStr, SmolStr> {
         let profile = request.profile.as_deref();
-        let model = profile
-            .and_then(|profile| profile.model.as_deref())
-            .unwrap_or(&self.model);
-        let resolved = self
-            .resolver
-            .resolve(model)
-            .map_err(|error| SmolStr::from(error.to_string()))?;
-        let credential = resolved.credential;
-        let reasoning = profile
-            .and_then(|profile| profile.effort)
-            .and_then(|effort| {
-                titi_providers::resolve_reasoning(
-                    resolved.transport.api(),
-                    resolved.reasoning.as_ref(),
-                    &titi_providers::RequestOpts {
-                        effort: Some(effort),
-                    },
-                )
-            });
         // A definition narrows what this runner was built with: its tools can
         // only be a subset, and its cap only lower, so a file in a repository
         // never makes a subagent more than the session's settings allow.
@@ -239,6 +280,18 @@ impl ToolAgentRunner {
             tool_calls: Vec::new(),
             ..Default::default()
         });
+        let (model, role_effort) = self.routed(profile, &tools, context).await;
+        let resolved = self
+            .resolver
+            .resolve(&model)
+            .map_err(|error| SmolStr::from(error.to_string()))?;
+        let effort = profile
+            .and_then(|profile| profile.effort)
+            .or(role_effort)
+            .or(self.effort);
+        let reasoning =
+            effort.and_then(|effort| crate::router::reasoning_for(&resolved, Some(effort)));
+        let credential = resolved.credential;
         let mut summary = String::new();
 
         // The subagent's own cancellation flag, chained to the caller's.
