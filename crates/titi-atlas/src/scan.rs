@@ -29,6 +29,9 @@ struct Rule {
     dir_only: bool,
     from_root: bool,
     pattern: String,
+    /// The directory (index-relative, no trailing slash) whose ignore file
+    /// declared the rule; empty for the root's. Patterns match relative to it.
+    base: String,
 }
 
 /// Lists the source files under `root`, which must be a readable directory.
@@ -43,6 +46,7 @@ pub fn list_files(root: &Path) -> std::io::Result<Vec<ListedFile>> {
     let mut rules = Vec::new();
     rules.extend(load_rules(root, ".gitignore"));
     rules.extend(load_rules(root, ".reference-productignore"));
+    rules.extend(load_rules(root, ATLASIGNORE));
     let mut out = Vec::new();
     walk(root, "", &rules, &mut out, true)?;
     Ok(out)
@@ -74,6 +78,12 @@ pub fn stat(root: &Path, path: &str) -> Option<ListedFile> {
         mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
     })
 }
+
+/// The atlas's own ignore file: gitignore syntax, read at the root and in any
+/// directory below it, on top of `.gitignore`. It says what is not part of the
+/// project's code as far as the map is concerned (eval fixtures, vendored
+/// samples) without hiding it from git.
+const ATLASIGNORE: &str = ".atlasignore";
 
 fn load_rules(root: &Path, name: &str) -> Vec<Rule> {
     let Ok(text) = fs::read_to_string(root.join(name)) else {
@@ -107,6 +117,7 @@ fn parse_rule(line: &str) -> Option<Rule> {
         dir_only,
         from_root,
         pattern: line.to_owned(),
+        base: String::new(),
     })
 }
 
@@ -133,6 +144,25 @@ fn walk(
         Ok(entries) => entries,
         Err(_) if !root => return Ok(()),
         Err(why) => return Err(why),
+    };
+    // A nested `.atlasignore` applies to its own directory's subtree only.
+    let nested: Vec<Rule> = if root || rel.is_empty() {
+        Vec::new()
+    } else {
+        load_rules(dir, ATLASIGNORE)
+            .into_iter()
+            .map(|rule| Rule {
+                base: rel.to_owned(),
+                ..rule
+            })
+            .collect()
+    };
+    let combined: Vec<Rule>;
+    let rules = if nested.is_empty() {
+        rules
+    } else {
+        combined = rules.iter().cloned().chain(nested).collect();
+        &combined
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -195,6 +225,17 @@ fn is_source(name: &str) -> bool {
 fn is_ignored(rel: &str, is_dir: bool, rules: &[Rule]) -> bool {
     let mut ignored = false;
     for rule in rules {
+        let rel = if rule.base.is_empty() {
+            rel
+        } else {
+            match rel
+                .strip_prefix(rule.base.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                Some(rest) => rest,
+                None => continue,
+            }
+        };
         if rule.matches(rel, is_dir) {
             ignored = !rule.negated;
         }
@@ -295,6 +336,37 @@ fn last_segment(rel: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap_or(root)).unwrap_or_default();
+        fs::write(path, body).unwrap_or_default();
+    }
+
+    #[test]
+    fn atlasignore_hides_trees_at_the_root_and_in_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/keep.rs", "pub fn keep() {}\n");
+        write(root, "evals/tasks/a/repo/x.py", "def x(): pass\n");
+        write(root, ".atlasignore", "evals/tasks/\n");
+        write(root, "pkg/real.rs", "pub fn real() {}\n");
+        write(root, "pkg/samples/s.rs", "pub fn s() {}\n");
+        write(root, "pkg/.atlasignore", "samples/\n");
+        write(root, "other/samples/o.rs", "pub fn o() {}\n");
+
+        let mut found: Vec<String> = list_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            ["other/samples/o.rs", "pkg/real.rs", "src/keep.rs"],
+            "the root file hides evals/tasks, the nested one only pkg/samples"
+        );
+    }
 
     #[test]
     fn glob_star_matches_one_segment() {
@@ -431,6 +503,7 @@ mod tests {
                             dir_only: false,
                             from_root,
                             pattern: pattern.to_owned(),
+                            base: String::new(),
                         };
                         assert_eq!(
                             rule.matches(path, is_dir),
