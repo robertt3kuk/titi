@@ -44,7 +44,7 @@ pub use pipe::{
     BACKGROUND_AFTER, BACKGROUND_ENV, Background, BackgroundCancel, BackgroundSink, HookRun,
     PipeError, background_after, background_after_with, hook_environment, run_hook,
 };
-pub use project::{ProjectError, ProjectTool};
+pub use project::{ProjectError, ProjectTool, check_command};
 pub use pty::{Interrupt, PtyError};
 pub use sensitive::SensitivePolicy;
 pub use settings::SettingsTool;

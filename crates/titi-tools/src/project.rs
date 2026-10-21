@@ -744,6 +744,23 @@ fn clip_block(lines: impl Iterator<Item = String>) -> String {
     clipped
 }
 
+/// The command `project check` would run at `root`, as one line: every
+/// resolved typecheck, lint and test command, each of which has to pass.
+/// `None` when no project owns `root` or none of the three stages resolves.
+///
+/// Detection only: nothing runs. It is what `/verify` offers to save as the
+/// turn-end `verify.command`, so a person sees the exact line before it is
+/// theirs.
+pub fn check_command(root: &Path) -> Option<String> {
+    let project = locate(root, None).ok()?;
+    let commands: Vec<String> = Stage::CHECK
+        .into_iter()
+        .flat_map(|stage| project.plan(stage, None, &on_path).steps)
+        .map(|step| step.command)
+        .collect();
+    (!commands.is_empty()).then(|| commands.join(" && "))
+}
+
 pub struct ProjectTool {
     pub root: PathBuf,
     /// Shared with `bash`, so the cancel key stops a build the same way.
@@ -939,6 +956,46 @@ mod tests {
 
     fn labels(project: &Project) -> Vec<&'static str> {
         project.found.iter().map(Detected::label).collect()
+    }
+
+    #[test]
+    fn the_check_command_joins_the_stages_project_check_runs() {
+        let root = dir();
+        put(root.path(), "Cargo.toml", "[workspace]\nmembers = []\n");
+        assert_eq!(
+            check_command(root.path()).as_deref(),
+            Some(
+                "cargo check --workspace --all-targets && cargo clippy --workspace \
+                 --all-targets && cargo test --workspace"
+            )
+        );
+    }
+
+    #[test]
+    fn the_check_command_needs_a_project_with_a_runnable_stage() {
+        let empty = dir();
+        assert_eq!(check_command(empty.path()), None);
+        let bare = dir();
+        put(
+            bare.path(),
+            "package.json",
+            "{\"scripts\": {\"start\": \"node .\"}}",
+        );
+        assert_eq!(
+            check_command(bare.path()),
+            None,
+            "no test, lint or typecheck script"
+        );
+        let node = dir();
+        put(
+            node.path(),
+            "package.json",
+            "{\"scripts\": {\"lint\": \"eslint .\", \"test\": \"vitest\"}}",
+        );
+        assert_eq!(
+            check_command(node.path()).as_deref(),
+            Some("npm run lint && npm run test")
+        );
     }
 
     #[test]
