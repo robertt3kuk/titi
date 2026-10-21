@@ -521,6 +521,16 @@ fn every_engine_event_round_trips_through_its_fixture() {
         r#"{"TurnUsage":{"turn_id":1,"prompt_tokens":11,"completion_tokens":22,"cached_tokens":3}}"#,
     );
     event(
+        EngineEvent::CacheObserved {
+            turn_id: TurnId(2),
+            prompt_tokens: 5000,
+            cached_tokens: 120,
+            change: "tool list changed (+web)".into(),
+            missed: true,
+        },
+        r#"{"CacheObserved":{"turn_id":2,"prompt_tokens":5000,"cached_tokens":120,"change":"tool list changed (+web)","missed":true}}"#,
+    );
+    event(
         EngineEvent::TurnFinished {
             turn_id: TurnId(1),
             reason: StopReason::ToolUse,

@@ -399,6 +399,24 @@ pub enum EngineEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_micro_usd: Option<u64>,
     },
+    /// What one model request read from the provider's prompt cache, and what
+    /// had changed in the request since the previous one. Sent for each
+    /// request the provider reported a prompt size for; a surface keeps the
+    /// last few for `/cache`.
+    CacheObserved {
+        turn_id: TurnId,
+        prompt_tokens: u32,
+        /// The part of `prompt_tokens` served from the cache.
+        #[serde(default)]
+        cached_tokens: u32,
+        /// What differed first from the previous request, as a short phrase
+        /// of names and counts: `prefix unchanged`, `tool list changed (+x)`,
+        /// `first request`. Never any prompt text.
+        change: SmolStr,
+        /// The provider read much less than the earlier request left cached.
+        #[serde(default)]
+        missed: bool,
+    },
     TurnFinished {
         turn_id: TurnId,
         reason: StopReason,

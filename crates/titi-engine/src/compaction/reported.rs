@@ -63,14 +63,17 @@ struct Carried {
 /// has changed length, and whoever rewrites it in place (a rewind, a manual
 /// compaction) calls [`forget`](Self::forget).
 #[derive(Clone, Default)]
-pub struct PromptMemory(Arc<Mutex<Option<Carried>>>);
+pub struct PromptMemory {
+    carried: Arc<Mutex<Option<Carried>>>,
+    cache: crate::cache_watch::CacheWatch,
+}
 
 impl PromptMemory {
     /// The carried count as a [`Reported`] over a request that opens with
     /// `lead` system messages and then the `history_len` messages the count
     /// was taken from.
     pub fn recall(&self, history_len: usize, lead: usize) -> Option<Reported> {
-        let carried = (*self.0.lock().unwrap_or_else(PoisonError::into_inner))?;
+        let carried = (*self.carried.lock().unwrap_or_else(PoisonError::into_inner))?;
         (carried.history_len == history_len).then_some(Reported {
             prompt_tokens: carried.prompt_tokens,
             messages: lead + carried.at,
@@ -86,11 +89,18 @@ impl PromptMemory {
             at: seen.messages.saturating_sub(stripped).min(history_len),
             history_len,
         });
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = carried;
+        *self.carried.lock().unwrap_or_else(PoisonError::into_inner) = carried;
     }
 
     pub fn forget(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.carried.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The session's memory of its previous request's prefix, which lives
+    /// here because it is the same thing kept for the same reason: what the
+    /// last request looked like and what the provider said about it.
+    pub fn cache(&self) -> &crate::cache_watch::CacheWatch {
+        &self.cache
     }
 }
 

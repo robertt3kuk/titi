@@ -313,12 +313,6 @@ impl CacheWatch {
             notice,
         }
     }
-
-    /// Forgets the earlier request: after a rewind or a fold the next one is
-    /// compared with nothing rather than blamed for the rewrite.
-    pub fn forget(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = State::default();
-    }
 }
 
 #[cfg(test)]
@@ -572,16 +566,6 @@ mod tests {
         assert!(!text.contains("SECRET"), "{text}");
         assert!(!text.contains("PROMPT"), "{text}");
         assert!(!text.contains("DESCRIPTION"), "{text}");
-    }
-
-    #[test]
-    fn forgetting_makes_the_next_request_a_first_one() {
-        let watch = CacheWatch::default();
-        watch.observe(Request::base().print(), 5000, 4000);
-        watch.forget();
-        let next = watch.observe(Request::base().print(), 5000, 4000);
-        assert_eq!(next.change, Change::First);
-        assert!(!next.missed);
     }
 
     #[test]

@@ -2814,6 +2814,41 @@ fn compacted_event(turn_id: TurnId, done: &crate::compaction::Compacted) -> Engi
     }
 }
 
+/// Compares this request with the session's previous one and tells the
+/// surface what the provider read from its cache: a [`EngineEvent::CacheObserved`]
+/// for every request the provider sized, and a Notice when it missed.
+async fn note_cache(
+    watch: &crate::cache_watch::CacheWatch,
+    events: &mpsc::Sender<EngineEvent>,
+    turn_id: TurnId,
+    fingerprint: crate::cache_watch::Fingerprint,
+    report: &RoundReport,
+) {
+    // An estimate says nothing about what the provider cached: the request
+    // is remembered, and no miss is judged from it.
+    let (prompt, cached) = if report.measured {
+        (report.prompt, report.cached)
+    } else {
+        (0, 0)
+    };
+    let seen = watch.observe(fingerprint, prompt, cached);
+    if prompt == 0 {
+        return;
+    }
+    if let Some(message) = seen.notice {
+        let _ = events.send(EngineEvent::Notice { message }).await;
+    }
+    let _ = events
+        .send(EngineEvent::CacheObserved {
+            turn_id,
+            prompt_tokens: u32::try_from(report.prompt).unwrap_or(u32::MAX),
+            cached_tokens: u32::try_from(report.cached).unwrap_or(u32::MAX),
+            change: seen.change.describe(),
+            missed: seen.missed,
+        })
+        .await;
+}
+
 /// The Notice that says why a fold fell back to the structural digest.
 fn summary_failed_notice(failure: &str) -> EngineEvent {
     EngineEvent::Notice {
@@ -3240,6 +3275,12 @@ async fn run_turn(
                         }
                     }
                     let request_len = messages.len();
+                    let fingerprint = crate::cache_watch::Fingerprint::of(
+                        &wire_model,
+                        reasoning.as_ref().map(|reasoning| reasoning.effort),
+                        &tools.specs(),
+                        &messages,
+                    );
                     match stream_attempt(
                         turn_id,
                         &messages,
@@ -3258,6 +3299,8 @@ async fn run_turn(
                     {
                         Ok((text, calls, thinking, report)) if calls.is_empty() => {
                             reported = crate::compaction::Reported::new(report.prompt, request_len);
+                            note_cache(prompt_memory.cache(), &events, turn_id, fingerprint, &report)
+                                .await;
                             round_report = Some(report);
                             if !text.is_empty() {
                                 messages.push(ChatMessage {
@@ -3273,6 +3316,8 @@ async fn run_turn(
                         }
                         Ok((text, calls, thinking, report)) => {
                             reported = crate::compaction::Reported::new(report.prompt, request_len);
+                            note_cache(prompt_memory.cache(), &events, turn_id, fingerprint, &report)
+                                .await;
                             round_report = Some(report);
                             let issued = crate::tool_budget::IssuedCall::of(&calls);
                             tool_rounds += 1;
@@ -3608,6 +3653,9 @@ struct RoundReport {
     prompt: u64,
     completion: u64,
     cached: u64,
+    /// The provider reported these counts. When it did not, they are the
+    /// project's estimate and say nothing about its cache.
+    measured: bool,
     /// Reasoning output tokens. Zero until a provider reports them apart from
     /// the completion count, which none does yet: the span says what it was
     /// told and nothing it was not.
@@ -3865,6 +3913,7 @@ async fn stream_attempt(
                 // meter is bumped here rather than once per turn. The
                 // provider's own count wins; a provider that reports none
                 // (or a malformed one) is charged the project's estimate.
+                let measured = reported.is_some();
                 let (prompt, completion, cached) = match reported {
                     Some(usage) => (
                         usage.prompt_tokens,
@@ -3882,6 +3931,7 @@ async fn stream_attempt(
                     prompt,
                     completion,
                     cached,
+                    measured,
                     cost_micro_usd,
                     finish: finish_reason(reason).to_owned(),
                     thinking: thinking_text,
