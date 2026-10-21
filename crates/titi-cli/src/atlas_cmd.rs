@@ -60,6 +60,9 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         Some("dump") => {
             dump_cmd(workspace, &args[1..]);
         }
+        Some("lens") => {
+            lens_cmd(workspace, &args[1..]);
+        }
         Some("capabilities") => {
             capabilities_cmd();
         }
@@ -75,7 +78,7 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         }
         Some(name) => {
             eprintln!("atlas: unknown command {name}");
-            eprintln!("usage: titi atlas [on|off|limit <n>|check|dump|capabilities|lsp]");
+            eprintln!("usage: titi atlas [on|off|limit <n>|check|dump|lens|capabilities|lsp]");
             std::process::exit(USAGE_EXIT);
         }
     }
@@ -212,6 +215,132 @@ fn save_setting(
             eprintln!("atlas: not saved ({why})");
             std::process::exit(1);
         }
+    }
+}
+
+/// `titi atlas lens (--task <text> | --task-file <path>) [--touched a,b]
+/// [--changed a,b] [--tokens <n>] [--json]`: the files a task is about, read-only.
+///
+/// The same seeds and walk the turn runs before each prompt, for a task given
+/// on the command line: what an evaluation replays and what a person can ask
+/// "what would the model have been shown for this prompt". Plain output is the
+/// block the model reads; `--json` is the ranked entries with their reasons.
+fn lens_cmd(workspace: &Path, args: &[String]) {
+    let mut task = None;
+    let mut touched: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+    let mut tokens = 400usize;
+    let mut files = titi_atlas::MAX_LENS_FILES;
+    let mut json = false;
+    let usage = "usage: titi atlas lens (--task <text> | --task-file <path>) [--touched a,b] [--changed a,b] [--tokens <n>] [--files <n>] [--json]";
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let mut value = |what: &str| -> String {
+            match words.next() {
+                Some(value) => value.clone(),
+                None => {
+                    eprintln!("atlas lens: {what} expects a value");
+                    eprintln!("{usage}");
+                    std::process::exit(USAGE_EXIT);
+                }
+            }
+        };
+        match word.as_str() {
+            "--json" => json = true,
+            "--task" => task = Some(value("--task")),
+            "--task-file" => {
+                let path = value("--task-file");
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => task = Some(text),
+                    Err(reason) => {
+                        eprintln!("atlas lens: cannot read {path} ({reason})");
+                        std::process::exit(USAGE_EXIT);
+                    }
+                }
+            }
+            "--touched" => touched = value("--touched").split(',').map(str::to_owned).collect(),
+            "--changed" => changed = value("--changed").split(',').map(str::to_owned).collect(),
+            "--tokens" => match value("--tokens").parse::<usize>() {
+                Ok(n) if (40..=4000).contains(&n) => tokens = n,
+                _ => {
+                    eprintln!("atlas lens: --tokens expects an integer from 40 to 4000");
+                    std::process::exit(USAGE_EXIT);
+                }
+            },
+            "--files" => match value("--files").parse::<usize>() {
+                Ok(n) if (1..=64).contains(&n) => files = n,
+                _ => {
+                    eprintln!("atlas lens: --files expects an integer from 1 to 64");
+                    std::process::exit(USAGE_EXIT);
+                }
+            },
+            other => {
+                eprintln!("atlas lens: unknown argument {other}");
+                eprintln!("{usage}");
+                std::process::exit(USAGE_EXIT);
+            }
+        }
+    }
+    let Some(task) = task else {
+        eprintln!("{usage}");
+        std::process::exit(USAGE_EXIT);
+    };
+    let atlas = match titi_atlas::Atlas::index(workspace) {
+        Ok(atlas) => atlas,
+        Err(reason) => {
+            eprintln!("atlas: lens failed ({reason})");
+            std::process::exit(1);
+        }
+    };
+    let seeds = atlas.seeds(&titi_atlas::SeedInput {
+        prompt: &task,
+        touched: &touched,
+        changed: &changed,
+    });
+    let lens = atlas.lens(&seeds, titi_atlas::LensBudget { tokens, files });
+    if json {
+        let entries: Vec<serde_json::Value> = lens
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "score": entry.score,
+                    "why": entry.why,
+                    "dependents": entry.dependents,
+                    "symbols": entry.symbols,
+                })
+            })
+            .collect();
+        let paths: Vec<&str> = lens
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        // What the model holds when the lens rides on the prompt map: the lens
+        // files first, then the map's own order for the rest.
+        let mut union: Vec<&str> = paths.clone();
+        for entry in titi_atlas::ranking(&atlas, &std::collections::HashSet::new()) {
+            if union.len() >= files {
+                break;
+            }
+            if !union.contains(&entry.path) {
+                union.push(entry.path);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "paths": paths,
+                "union": union,
+                "entries": entries,
+                "unmapped": lens.unmapped,
+            })
+        );
+    } else if lens.is_empty() {
+        println!("atlas: no seeds in that task");
+    } else {
+        println!("{}", lens.render(0));
     }
 }
 

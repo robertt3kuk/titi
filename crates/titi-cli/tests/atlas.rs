@@ -302,7 +302,7 @@ fn an_unknown_atlas_subcommand_is_named_and_shows_usage() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("atlas: unknown command wat\n"), "{stderr}");
     assert!(
-        stderr.contains("usage: titi atlas [on|off|limit <n>|check|dump|capabilities|lsp]\n"),
+        stderr.contains("usage: titi atlas [on|off|limit <n>|check|dump|lens|capabilities|lsp]\n"),
         "{stderr}"
     );
 }

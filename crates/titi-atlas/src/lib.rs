@@ -25,6 +25,7 @@ pub mod ast_edit;
 mod content;
 mod graph;
 mod lang;
+mod lens;
 pub mod live;
 mod lsp;
 mod patterns;
@@ -42,6 +43,7 @@ mod symbols;
 pub mod syntax_check;
 
 pub use lang::{Capability, Language, Level};
+pub use lens::{Lens, LensBudget, LensEntry, MAX_LENS_FILES, SeedInput, SeedKind, Seeds};
 pub use live::AtlasHandle;
 pub use lsp::serve_lsp;
 pub use project::{RankedFile, ranking, render};
@@ -365,6 +367,8 @@ pub struct Atlas {
     recency: Option<recency::Recency>,
     /// What the set of paths says about scope; see [`scope`].
     layout: scope::Layout,
+    /// What the lens walks, built on first use; see [`lens`].
+    lens: lens::LensCache,
 }
 
 /// One refresh's file-level outcome, before the graph decision is folded in.
@@ -978,6 +982,8 @@ impl Atlas {
             return 0;
         }
         let reresolved = self.index_symbols(dirty, scope_moved);
+        // The lens index is a function of the same inputs as the ranks.
+        self.lens = lens::LensCache::default();
         let (ranks, dependents) = graph::rank(&self.files, &self.layout);
         self.ranks = ranks;
         self.dependents = dependents;
@@ -1118,6 +1124,13 @@ impl Atlas {
         let touched: HashSet<String> = touched.iter().filter_map(|path| self.key(path)).collect();
         render(self, limit, &touched, pending)
     }
+}
+
+/// What `text` costs in prompt tokens, without a tokenizer: about one token per
+/// 3.4 characters of code or paths. The budgets in this crate and the engine's
+/// accounting both use it, so a block sized here is the size the engine sees.
+pub fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() as f64 / 3.4).ceil() as usize
 }
 
 /// `path` with the symlinks of its longest existing prefix resolved.

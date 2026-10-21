@@ -60,7 +60,45 @@ pub fn mask_tool_results(messages: &mut [ChatMessage], end: usize) -> Masked {
         masked.originals.push((at, original));
         masked.count += 1;
     }
+    mask_lenses(messages, end, &mut masked);
     masked
+}
+
+const LENS_OPEN: &str = "<atlas-lens";
+const LENS_CLOSE: &str = "</atlas-lens>";
+
+/// Swaps the `<atlas-lens>` block of every user message before `end` for a
+/// one-line stub. A lens says where the work was when a prompt was sent; once
+/// the work has moved on it is the stalest text in the request, and the
+/// newest lens is always attached to the message it belongs to. Done in the
+/// same pass as the tool results, so the cache restarts once, not twice.
+fn mask_lenses(messages: &mut [ChatMessage], end: usize, masked: &mut Masked) {
+    for message in messages.iter_mut().take(end) {
+        if message.role != Role::User {
+            continue;
+        }
+        let Some(start) = message.content.find(LENS_OPEN) else {
+            continue;
+        };
+        let Some(len) = message.content[start..].find(LENS_CLOSE) else {
+            continue;
+        };
+        let stop = start + len + LENS_CLOSE.len();
+        let block = &message.content[start..stop];
+        let files = block
+            .lines()
+            .filter(|line| !line.starts_with('<') && !line.starts_with("unmapped:"))
+            .count();
+        let stub = format!("[atlas lens elided: {files} files]");
+        masked.saved_tokens += estimate_tokens(block).saturating_sub(estimate_tokens(&stub));
+        let content = format!(
+            "{}{stub}{}",
+            &message.content[..start],
+            &message.content[stop..]
+        );
+        message.content = content.into();
+        masked.count += 1;
+    }
 }
 
 /// The call a result answers: by id when the result carries one, else by its
@@ -139,6 +177,36 @@ mod tests {
             tool_call_id: id.map(Into::into),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_old_lens_becomes_a_stub_and_the_prompt_around_it_stays() {
+        let lens = "<atlas-lens>\nsrc/a.rs (→2) named in the prompt +A\nsrc/b.rs (→1) used by src/a.rs\nunmapped: foo_bar\n</atlas-lens>";
+        let user = |text: &str| ChatMessage {
+            role: Role::User,
+            content: text.into(),
+            ..Default::default()
+        };
+        let mut messages = vec![
+            user(&format!(
+                "<atlas>\nmap\n</atlas>\n\n{lens}\n\nfix the parser"
+            )),
+            user(&format!("{lens}\n\nnewest, kept")),
+        ];
+        let masked = mask_tool_results(&mut messages, 1);
+
+        assert_eq!(masked.count, 1);
+        assert_eq!(
+            messages[0].content,
+            "<atlas>\nmap\n</atlas>\n\n[atlas lens elided: 2 files]\n\nfix the parser"
+        );
+        assert!(
+            messages[1].content.contains("<atlas-lens>"),
+            "past `end` stays"
+        );
+        assert!(masked.saved_tokens > 10, "{}", masked.saved_tokens);
+        // Idempotent: a stub is not a lens.
+        assert_eq!(mask_tool_results(&mut messages, 1).count, 0);
     }
 
     #[test]

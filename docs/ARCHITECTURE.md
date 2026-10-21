@@ -239,6 +239,25 @@ src/runtime.rs (→3) [RECENT]
 - File limit: `EngineConfig::atlas_limit`, default 24, overridden by the
   `atlas.limit` setting (1..=64, the project `.titi/config.yml` winning);
   `TITI_NO_ATLAS=1` drops the map.
+- **The lens** (`lens.rs`, `<atlas-lens>`) is the part of the repository *this*
+  prompt is about, built per turn from seeds and a personalised PageRank, no
+  model involved. Seeds: files the prompt names (`src/a.rs`, `a.rs:42`, a
+  stack frame; 5), identifiers it spells like an exported symbol (3 exact,
+  1.5 ignoring case, a plain lowercase word only 0.4 and only when 6+
+  characters and not a common word), prompt words that are a file stem (2) or
+  a path component (0.5), files the session touched (2, decaying by 0.85 per
+  step back) and files the working tree changed (2). The walk follows each
+  dependency edge both ways, the reverse at half weight, 20 passes at
+  damping 0.85, and a seed's own weight is added back so the file the task
+  names is listed first. The block lists up to 12 files within 400 estimated
+  tokens (`estimate_tokens`, one token per 3.4 characters), each as `path
+  (→N) reason +Symbol…` where the reason says why (`named in the prompt`,
+  `defines X`, `touched this session`, `uses a.rs`, `used by a.rs`), and ends
+  with `unmapped: …` for identifier-looking prompt words no symbol carries. A
+  prompt with no seed has no lens. It rides on the newest user message after
+  `<atlas>`, is left out when the newest earlier lens lists the same files,
+  and is replaced by a one-line stub in the pass that masks old tool results
+  at compaction, so the cached prefix is never edited between turns.
 - The turn also carries a `<diff>` block — `git diff HEAD`, bounded to 8
   files, 120 lines and 6000 bytes — right after `<atlas>`, and its paths join
   the touched set the map reads. Secret-named files and hunks with
@@ -256,6 +275,7 @@ cargo run -p titi-atlas --example map -- <path> <N>   # defaults: . and 24
 titi-map <path> <N>                                    # prebuilt, skill atlas-map
 titi atlas check                                      # index diagnostics, exit 1 on any
 titi atlas dump [--json] [--limit n]                  # the whole index in map order: role, rank, dependents, exports, edges
+titi atlas lens --task <text> [--touched a,b] [--json]   # the lens a prompt would get (the files the task is about)
 titi atlas capabilities                               # level and extensions per language
 titi atlas lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
 ```

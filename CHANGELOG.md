@@ -10,6 +10,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- The code map now has a lens: a short `<atlas-lens>` block on the prompt that lists the files **this** task is about, found without a model. It is seeded by the files, symbols and stack frames the prompt names, the files the session touched and the files the working tree changed, spread over the dependency graph in both directions, and each file says why it is there (`named in the prompt`, `defines SessionStore`, `used by src/service.rs`). Identifier-looking words that match no symbol are listed as `unmapped`. A prompt that points nowhere gets no lens, the same files again are not resent, and old lenses shrink to a stub when a long session compacts. On 80 replayed commits from eight repos the files a commit changed were in the top 10 of the lens-first view 73% of the time against 29% for the map alone (top 24: 83% against 52%); `titi atlas lens --task "…"` shows what a prompt would get.
+
 - `titi atlas dump [--json] [--limit <n>]` prints the whole index read-only, one entry per file in the order the prompt map lists it: role, graph rank, map score, dependents, exports, imports, re-exports and resolved uses; `--json` adds the projected map text. It is what the evaluation harness replays.
 
 - `.atlasignore`: a gitignore-syntax file the atlas reads at the workspace root and in nested directories, on top of `.gitignore`, to keep fixtures and samples out of the map without hiding them from git. titi's own repo ignores `evals/tasks/`, so `titi atlas check` is clean on it.

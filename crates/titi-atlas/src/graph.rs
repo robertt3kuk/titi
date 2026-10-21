@@ -159,6 +159,76 @@ pub(crate) fn rank(
     (ranks, dependents)
 }
 
+/// The dependency edges the ranking runs on, owned and indexed by position, for
+/// walks that start somewhere other than the uniform start (see `lens`).
+#[derive(Debug, Default)]
+pub(crate) struct WeightedEdges {
+    pub nodes: Vec<String>,
+    /// For each file, the files it depends on and what the edge weighs: the
+    /// same evidence and weights [`rank`] uses, without its rank-only
+    /// header/implementation companion edges.
+    pub out: Vec<Vec<(u32, f64)>>,
+}
+
+/// [`rank`]'s edges, kept. The aggregation is the same as in `rank`; a test
+/// pins that both see the same set of dependents.
+pub(crate) fn weighted_edges(
+    files: &HashMap<String, FileRecord>,
+    layout: &Layout,
+) -> WeightedEdges {
+    let mut nodes: Vec<String> = files.keys().cloned().collect();
+    nodes.sort();
+    let index: HashMap<&str, u32> = nodes
+        .iter()
+        .enumerate()
+        .map(|(at, path)| (path.as_str(), at as u32))
+        .collect();
+    let mut out: Vec<Vec<(u32, f64)>> = Vec::with_capacity(nodes.len());
+    for (from_at, from) in nodes.iter().enumerate() {
+        let record = &files[from];
+        let from_edge = if classify(from) == Role::Auxiliary {
+            AUXILIARY_EDGE
+        } else {
+            1.0
+        };
+        let mut evidence: Vec<(u32, f64)> = Vec::new();
+        for import in &record.imports {
+            if let Some(&to_at) = index.get(import.as_str()) {
+                evidence.push((to_at, EVIDENCE));
+            }
+        }
+        for used in &record.uses {
+            if let Some(&to_at) = index.get(used.definer.as_str()) {
+                let worth = match used.basis {
+                    Basis::Scope => EVIDENCE,
+                    Basis::Unique => GUESS,
+                };
+                evidence.push((to_at, worth));
+            }
+        }
+        for facade in layout.facades(record) {
+            if let Some(&to_at) = index.get(facade) {
+                evidence.push((to_at, EVIDENCE));
+            }
+        }
+        evidence.retain(|(to_at, _)| *to_at as usize != from_at);
+        evidence.sort_by_key(|(to_at, _)| *to_at);
+        let mut edges: Vec<(u32, f64)> = Vec::new();
+        let mut at = 0;
+        while at < evidence.len() {
+            let to_at = evidence[at].0;
+            let mut total = 0.0;
+            while at < evidence.len() && evidence[at].0 == to_at {
+                total += evidence[at].1;
+                at += 1;
+            }
+            edges.push((to_at, edge_weight(total) * from_edge));
+        }
+        out.push(edges);
+    }
+    WeightedEdges { nodes, out }
+}
+
 const HEADERS: &[&str] = &["h", "hh", "hpp", "hxx"];
 const IMPLEMENTATIONS: &[&str] = &["c", "cc", "cpp", "cxx", "m", "mm"];
 
@@ -198,7 +268,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    use super::{DAMPING, EVIDENCE, GUESS, ITERATIONS, rank};
+    use super::{DAMPING, EVIDENCE, GUESS, ITERATIONS, rank, weighted_edges};
     use crate::scope::Layout;
     use crate::{Basis, FileRecord, Language, SymbolUse};
 
@@ -417,5 +487,44 @@ mod tests {
     fn an_empty_graph_ranks_to_nothing() {
         let (ranks, dependents) = rank(&HashMap::new(), &Layout::default());
         assert!(ranks.is_empty() && dependents.is_empty());
+    }
+
+    /// `weighted_edges` repeats `rank`'s evidence aggregation so the lens can
+    /// keep the edges; this pins that both see the same dependents.
+    #[test]
+    fn the_kept_edges_are_the_ranks_dependents() {
+        let mut files = HashMap::new();
+        files.insert(
+            "a.rs".to_owned(),
+            record("a.rs", &["b.rs", "c.rs"], &[("c.rs", Basis::Scope)]),
+        );
+        files.insert(
+            "b.rs".to_owned(),
+            record("b.rs", &["c.rs"], &[("a.rs", Basis::Unique)]),
+        );
+        files.insert("c.rs".to_owned(), record("c.rs", &[], &[]));
+        files.insert(
+            "tests/t.rs".to_owned(),
+            record("tests/t.rs", &["a.rs"], &[]),
+        );
+        let layout = Layout::default();
+        let (_, dependents) = rank(&files, &layout);
+        let edges = weighted_edges(&files, &layout);
+        let mut counted: HashMap<&str, usize> = HashMap::new();
+        for targets in &edges.out {
+            for (to, weight) in targets {
+                assert!(*weight > 0.0);
+                *counted
+                    .entry(edges.nodes[*to as usize].as_str())
+                    .or_default() += 1;
+            }
+        }
+        for (path, count) in &dependents {
+            assert_eq!(
+                counted.get(path.as_str()).copied().unwrap_or(0),
+                *count,
+                "{path}"
+            );
+        }
     }
 }

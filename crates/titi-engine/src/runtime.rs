@@ -185,6 +185,66 @@ async fn atlas_map(
     .await
 }
 
+/// What the lens may cost per turn, in estimated tokens. The prompt map
+/// alongside it is its own budget; the two together are what the atlas adds.
+const LENS_TOKENS: usize = 400;
+
+/// The part of the repository this prompt is about: seeds from the text, the
+/// session's touched files and the working tree's changes, walked over the
+/// dependency graph. `None` when nothing in the prompt, the session or the tree
+/// points anywhere — the map stands alone then.
+///
+/// Built from the snapshot [`atlas_map`] has just settled, so it answers for
+/// the same generation and names the same backlog. No model is asked.
+async fn atlas_lens(
+    root: Option<PathBuf>,
+    atlas: Option<&AtlasHandle>,
+    prompt: &str,
+    touched: &TouchedSink,
+    changed: Vec<String>,
+) -> Option<SmolStr> {
+    let atlas = atlas.filter(|_| root.is_some())?.clone();
+    let touched = Arc::clone(touched);
+    let prompt = prompt.to_owned();
+    run_off_thread(move || {
+        atlas.wait_ready();
+        let touched: Vec<String> = touched.blocking_lock().snapshot();
+        let pending = atlas.pending();
+        let (snapshot, _generation) = atlas.snapshot();
+        let seeds = snapshot.seeds(&titi_atlas::SeedInput {
+            prompt: &prompt,
+            touched: &touched,
+            changed: &changed,
+        });
+        let lens = snapshot.lens(&seeds, titi_atlas::LensBudget::tokens(LENS_TOKENS));
+        (!lens.is_empty()).then(|| SmolStr::from(lens.render(pending)))
+    })
+    .await
+}
+
+/// Whether the newest lens in `history` already lists exactly the files
+/// `block` lists. A lens is about where the work is; the same files again add
+/// nothing, and the reasons beside them are not worth a repeat on their own.
+fn previous_lens_matches(history: &[ChatMessage], block: &str) -> bool {
+    let newest = history
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::User)
+        .find_map(|message| {
+            let start = message.content.find("<atlas-lens")?;
+            let end = message.content[start..].find("</atlas-lens>")?;
+            Some(&message.content[start..start + end + "</atlas-lens>".len()])
+        });
+    let Some(newest) = newest else {
+        return false;
+    };
+    let mut before = titi_atlas::Lens::paths_in(newest);
+    let mut now = titi_atlas::Lens::paths_in(block);
+    before.sort_unstable();
+    now.sort_unstable();
+    before == now
+}
+
 /// The working-tree diff, off the async threads. Not a repo, no git, or a
 /// call that does not finish in time is no snapshot — the turn still runs.
 async fn working_tree_diff(
@@ -248,8 +308,18 @@ fn previous_copy_matches(history: &[ChatMessage], marker: &str, block: &str) -> 
     history
         .iter()
         .rev()
-        .find(|message| message.role == Role::User && message.content.contains(marker))
+        .find(|message| message.role == Role::User && has_marker(&message.content, marker))
         .is_some_and(|message| message.content.contains(block))
+}
+
+/// Whether `content` carries a block opened by `marker`. `<atlas` is the prompt
+/// map's, and `<atlas-lens>` — a different block — must not read as it: a turn
+/// that only added a lens would otherwise look like one that already sent the
+/// map.
+fn has_marker(content: &str, marker: &str) -> bool {
+    content
+        .match_indices(marker)
+        .any(|(at, _)| marker != "<atlas" || !content[at + marker.len()..].starts_with('-'))
 }
 
 /// `<diff>` after the atlas block. Whitespace-only text is not a snapshot.
@@ -505,6 +575,109 @@ mod tests {
         assert!(previous_copy_matches(&moved, "<atlas", "<atlas v2/>"));
 
         assert!(!previous_copy_matches(&[], "<atlas", "<atlas v1/>"));
+    }
+
+    /// The lens is about *this* prompt: it names the file the prompt's symbol
+    /// lives in, answers for the same snapshot as the map, and is absent when
+    /// the prompt, the session and the tree point nowhere.
+    #[tokio::test]
+    async fn a_prompt_naming_a_symbol_gets_a_lens_and_a_bare_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("store.rs"), "pub struct SessionStore;\n").unwrap();
+        std::fs::write(
+            root.join("service.rs"),
+            "use crate::store::SessionStore;\npub fn run_service() { let _ = SessionStore; }\n",
+        )
+        .unwrap();
+        let atlas = AtlasHandle::spawn(root, titi_atlas::live::Options::default()).unwrap();
+        let touched = TouchedSink::default();
+
+        let lens = atlas_lens(
+            Some(root.to_path_buf()),
+            Some(&atlas),
+            "why does SessionStore lose entries?",
+            &touched,
+            Vec::new(),
+        )
+        .await
+        .expect("a lens");
+        assert!(lens.starts_with("<atlas-lens>"), "{lens}");
+        assert!(
+            lens.contains("store.rs") && lens.contains("service.rs"),
+            "{lens}"
+        );
+
+        assert!(
+            atlas_lens(
+                Some(root.to_path_buf()),
+                Some(&atlas),
+                "hello",
+                &touched,
+                Vec::new()
+            )
+            .await
+            .is_none()
+        );
+        // Repo-blind without a root, like the map.
+        assert!(
+            atlas_lens(None, Some(&atlas), "SessionStore", &touched, Vec::new())
+                .await
+                .is_none()
+        );
+        // The session alone is a signal: a touched file, in any spelling.
+        touched
+            .lock()
+            .await
+            .insert(root.join("service.rs").display().to_string());
+        let from_session = atlas_lens(
+            Some(root.to_path_buf()),
+            Some(&atlas),
+            "continue",
+            &touched,
+            Vec::new(),
+        )
+        .await
+        .expect("a lens from the session");
+        assert!(
+            from_session.contains("touched this session"),
+            "{from_session}"
+        );
+    }
+
+    /// The same files again are not sent again, whatever order or reason; a
+    /// different set is. The lens never reads as the map and the map never as
+    /// the lens.
+    #[test]
+    fn a_lens_over_the_same_files_is_not_repeated_and_is_not_the_map() {
+        let lens_a = "<atlas-lens>\nsrc/a.rs (→2) named in the prompt\nsrc/b.rs (→1) used by src/a.rs\n</atlas-lens>";
+        let lens_a_again = "<atlas-lens>\nsrc/b.rs (→1) touched this session\nsrc/a.rs (→2) defines X +X\n</atlas-lens>";
+        let lens_b = "<atlas-lens>\nsrc/c.rs (→0) named in the prompt\n</atlas-lens>";
+        let history = vec![
+            message(
+                Role::User,
+                &format!("<atlas>\nmap\n</atlas>\n\n{lens_a}\n\nfix it"),
+            ),
+            message(Role::Assistant, "done"),
+        ];
+        assert!(previous_lens_matches(&history, lens_a_again));
+        assert!(!previous_lens_matches(&history, lens_b));
+        assert!(!previous_lens_matches(&[], lens_a));
+
+        // A turn that carried only a lens is not a newer copy of the map, so
+        // the map it left behind still counts as the newest one.
+        let mut later = history.clone();
+        later.push(message(Role::User, &format!("{lens_b}\n\nnext")));
+        assert!(previous_copy_matches(
+            &later,
+            "<atlas",
+            "<atlas>\nmap\n</atlas>"
+        ));
+        assert!(!previous_copy_matches(
+            &later,
+            "<atlas",
+            "<atlas>\nother\n</atlas>"
+        ));
     }
 
     fn message(role: Role, text: &str) -> ChatMessage {
@@ -2969,15 +3142,41 @@ async fn run_turn(
         ATLAS_QUIESCE,
     )
     .await;
+    // Duck mode is repo-blind, so its root is already gone and there is no
+    // lens either.
+    let lens_text = atlas_lens(
+        config.atlas_root.clone(),
+        atlas.as_ref(),
+        &prompt,
+        &touched,
+        snapshot
+            .as_ref()
+            .map(|shot| shot.files.clone())
+            .unwrap_or_default(),
+    )
+    .await;
     let history = &config.restored_messages;
+    // The map and the lens ride together on the newest user message, each only
+    // when it differs from the copy the model already has.
+    let atlas_block: Option<String> = {
+        let map = atlas_text
+            .as_deref()
+            .filter(|block| !previous_copy_matches(history, "<atlas", block));
+        let lens = lens_text
+            .as_deref()
+            .filter(|block| !previous_lens_matches(history, block));
+        match (map, lens) {
+            (Some(map), Some(lens)) => Some(format!("{map}\n\n{lens}")),
+            (Some(block), None) | (None, Some(block)) => Some(block.to_owned()),
+            (None, None) => None,
+        }
+    };
     let contextual_prompt = prompt_with_context(
         &prompt,
         recalled
             .as_deref()
             .filter(|block| !previous_copy_matches(history, "# Recalled\n", block)),
-        atlas_text
-            .as_deref()
-            .filter(|block| !previous_copy_matches(history, "<atlas", block)),
+        atlas_block.as_deref(),
         snapshot
             .as_ref()
             .map(|shot| shot.text.as_str())
