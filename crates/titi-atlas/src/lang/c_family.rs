@@ -26,10 +26,12 @@ use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
 use super::ParsedFile;
-use super::support::{finish, internal, normalize_join, parent, record};
+use super::support::{
+    finish, inside, internal, normalize_join, parent, record, symbols_from_sites,
+};
 
 use crate::symbols::{self, Grammar, push_site, text};
-use crate::{Candidate, UnresolvedImport};
+use crate::{Candidate, SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(grammar) = super::grammar_for(path) else {
@@ -56,13 +58,38 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &c_kind);
+    parsed
+}
+
+/// The kind of a C/C++ declaration node, for the symbols list. A function
+/// defined with a `Class::` qualifier, or declared in a class body, is a method.
+fn c_kind(node: Node, name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "struct_specifier" | "union_specifier" => SymbolKind::Struct,
+        "enum_specifier" => SymbolKind::Enum,
+        "class_specifier" => SymbolKind::Class,
+        "function_definition" | "declaration" | "field_declaration" => {
+            if node.kind() == "field_declaration"
+                || inside(node, &["field_declaration_list"])
+                || name
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "qualified_identifier")
+            {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// The tree to read the file from. A `.h` is claimed by C, but the C grammar
@@ -321,5 +348,78 @@ Engine::Engine(int) {}
         for good in ["convert", "Engine", "start", "run"] {
             assert!(names.contains(&good.to_owned()), "{good}: {names:?}");
         }
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const C_SRC: &str = r#"#include <stdio.h>
+
+struct Hash {
+    int size;
+};
+
+enum Level { INFO, WARN };
+
+int hash(const char *key, unsigned seed);
+
+int hash(const char *key, unsigned seed)
+{
+    return 0;
+}
+"#;
+
+    #[test]
+    fn c_symbols_carry_kind_span_and_signature() {
+        let hash_type = symbol("src/hash.c", C_SRC, "Hash");
+        assert_eq!(
+            (hash_type.kind, hash_type.span),
+            (SymbolKind::Struct, (3, 5))
+        );
+        assert_eq!(hash_type.signature.as_deref(), Some("struct Hash"));
+        assert_eq!(symbol("src/hash.c", C_SRC, "Level").kind, SymbolKind::Enum);
+        let hash = symbol("src/hash.c", C_SRC, "hash");
+        assert_eq!(hash.kind, SymbolKind::Function);
+        assert_eq!(
+            hash.signature.as_deref(),
+            Some("int hash(const char *key, unsigned seed)")
+        );
+    }
+
+    const CPP_SRC: &str = r#"class Engine : public Base {
+public:
+    void start(int id) noexcept;
+};
+
+void Engine::start(int id) noexcept
+{
+}
+"#;
+
+    #[test]
+    fn cpp_symbols_carry_kind_span_and_signature() {
+        let engine = symbol("src/engine.cpp", CPP_SRC, "Engine");
+        assert_eq!((engine.kind, engine.span), (SymbolKind::Class, (1, 4)));
+        assert_eq!(
+            engine.signature.as_deref(),
+            Some("class Engine : public Base")
+        );
+        let start = symbol("src/engine.cpp", CPP_SRC, "start");
+        assert_eq!(start.kind, SymbolKind::Method);
+        assert_eq!(
+            start.signature.as_deref(),
+            Some("void start(int id) noexcept")
+        );
+    }
+
+    #[test]
+    fn a_long_c_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("int argument{n}")).collect();
+        let source = format!("int long_fn({}) {{ return 0; }}\n", params.join(", "));
+        let signature = symbol("a.c", &source, "long_fn")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }

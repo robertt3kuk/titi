@@ -18,10 +18,13 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
+use super::support::{
+    Placement, finish, inside, is_workspace_spec, record, resolve_suffix, root_segment,
+    symbols_from_sites,
+};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_field, push_site, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Kotlin, source) else {
@@ -46,13 +49,57 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols =
+        symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &kotlin_kind);
+    parsed
+}
+
+/// The kind of a Kotlin declaration node, for the symbols list.
+fn kotlin_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "class_declaration" => {
+            let mut cursor = node.walk();
+            let mut kind = SymbolKind::Class;
+            for child in node.children(&mut cursor) {
+                if child.kind() == "interface" {
+                    kind = SymbolKind::Interface;
+                }
+                if child.kind() == "modifiers" && has_enum_modifier(child) {
+                    kind = SymbolKind::Enum;
+                }
+            }
+            kind
+        }
+        "object_declaration" => SymbolKind::Class,
+        "function_declaration" => {
+            if inside(node, &["class_body", "enum_class_body"]) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        "property_declaration" => SymbolKind::Const,
+        "type_alias" => SymbolKind::Type,
+        _ => return None,
+    })
+}
+
+/// Whether a `modifiers` node holds the `enum` class modifier.
+fn has_enum_modifier(modifiers: Node) -> bool {
+    let mut cursor = modifiers.walk();
+    modifiers.children(&mut cursor).any(|modifier| {
+        modifier.kind() == "enum"
+            || modifier
+                .child(0)
+                .is_some_and(|first| first.kind() == "enum")
+    })
 }
 
 /// Declarations reachable from outside their body: a `class`/`interface`/
@@ -193,5 +240,73 @@ mod tests {
         for good in ["jvmOnly", "plain"] {
             assert!(jvm.contains(&good.to_owned()), "{good}: {jvm:?}");
         }
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"package app
+
+/** Docs. */
+@Suppress("x")
+class Client<T>(val url: String) : Base() {
+    fun send(body: String, retries: Int = 3): Result<Unit> {
+        return Result.success(Unit)
+    }
+}
+
+interface Handler {
+    fun handle(event: String)
+}
+
+enum class Level { INFO, WARN }
+
+const val LIMIT = 24
+
+fun helper(items: List<String>): Int = items.size
+
+typealias Slug = String
+"#;
+
+    #[test]
+    fn kotlin_symbols_carry_kind_span_and_signature() {
+        let client = symbol("app/a.kt", SRC, "Client");
+        assert_eq!((client.kind, client.span), (SymbolKind::Class, (4, 9)));
+        assert_eq!(
+            client.signature.as_deref(),
+            Some("class Client<T>(val url: String) : Base()")
+        );
+        let send = symbol("app/a.kt", SRC, "send");
+        assert_eq!((send.kind, send.span), (SymbolKind::Method, (6, 8)));
+        assert_eq!(
+            send.signature.as_deref(),
+            Some("fun send(body: String, retries: Int = 3): Result<Unit>")
+        );
+        assert_eq!(
+            symbol("app/a.kt", SRC, "Handler").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(symbol("app/a.kt", SRC, "Level").kind, SymbolKind::Enum);
+        let limit = symbol("app/a.kt", SRC, "LIMIT");
+        assert_eq!((limit.kind, limit.span), (SymbolKind::Const, (17, 17)));
+        assert_eq!(limit.signature.as_deref(), Some("const val LIMIT"));
+        let helper = symbol("app/a.kt", SRC, "helper");
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert_eq!(
+            helper.signature.as_deref(),
+            Some("fun helper(items: List<String>): Int")
+        );
+        assert_eq!(symbol("app/a.kt", SRC, "Slug").kind, SymbolKind::Type);
+    }
+
+    #[test]
+    fn a_long_kotlin_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument{n}: Int")).collect();
+        let source = format!("fun long({}) {{}}\n", params.join(", "));
+        let signature = symbol("a.kt", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }

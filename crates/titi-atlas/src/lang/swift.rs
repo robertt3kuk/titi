@@ -16,10 +16,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, record, resolve_suffix};
+use super::support::{Placement, finish, inside, record, resolve_suffix, symbols_from_sites};
 
 use crate::symbols::{self, Grammar, push_field, push_site, text};
-use crate::{Candidate, UnresolvedImport};
+use crate::{Candidate, SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Swift, source) else {
@@ -41,13 +41,48 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(
+        tree.root_node(),
+        bytes,
+        &parsed.export_sites,
+        &|node: Node, _name: Node| swift_kind(node, bytes),
+    );
+    parsed
+}
+
+/// The kind of a Swift declaration node, for the symbols list.
+fn swift_kind(node: Node, source: &[u8]) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "class_declaration" => {
+            match node
+                .child_by_field_name("declaration_kind")
+                .and_then(|kind| text(kind, source))
+                .as_deref()
+            {
+                Some("struct") => SymbolKind::Struct,
+                Some("enum") => SymbolKind::Enum,
+                _ => SymbolKind::Class,
+            }
+        }
+        "protocol_declaration" => SymbolKind::Interface,
+        "function_declaration" => {
+            if inside(node, &["class_body", "enum_class_body", "protocol_body"]) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        "typealias_declaration" => SymbolKind::Type,
+        "property_declaration" => SymbolKind::Const,
+        _ => return None,
+    })
 }
 
 /// Declarations a caller can name: a `func`, a `class`/`struct`/`enum`/
@@ -192,5 +227,80 @@ public func send(completion: Int, _ other: Int, label inner: Int) {}
         for good in ["Own", "isBool", "flag", "more", "send"] {
             assert!(names.contains(&good.to_owned()), "{good}: {names:?}");
         }
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"
+/// Docs.
+public final class Session: NSObject {
+    public func send(body: Data, retries: Int = 3) throws -> Response {
+        return Response()
+    }
+}
+
+public struct Point { public var x: Int }
+
+public enum Level { case info, warn }
+
+public protocol Handler { func handle(event: String) }
+
+public typealias Slug = String
+
+public func helper(_ items: [String], completion: () -> Void) -> Int {
+    return 1
+}
+
+public let limit = 24
+"#;
+
+    #[test]
+    fn swift_symbols_carry_kind_span_and_signature() {
+        let session = symbol("Source/A.swift", SRC, "Session");
+        assert_eq!((session.kind, session.span), (SymbolKind::Class, (3, 7)));
+        assert_eq!(
+            session.signature.as_deref(),
+            Some("public final class Session: NSObject")
+        );
+        let send = symbol("Source/A.swift", SRC, "send");
+        assert_eq!((send.kind, send.span), (SymbolKind::Method, (4, 6)));
+        assert_eq!(
+            send.signature.as_deref(),
+            Some("public func send(body: Data, retries: Int = 3) throws -> Response")
+        );
+        assert_eq!(
+            symbol("Source/A.swift", SRC, "Point").kind,
+            SymbolKind::Struct
+        );
+        assert_eq!(
+            symbol("Source/A.swift", SRC, "Level").kind,
+            SymbolKind::Enum
+        );
+        assert_eq!(
+            symbol("Source/A.swift", SRC, "Handler").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(symbol("Source/A.swift", SRC, "Slug").kind, SymbolKind::Type);
+        let helper = symbol("Source/A.swift", SRC, "helper");
+        assert_eq!((helper.kind, helper.span), (SymbolKind::Function, (17, 19)));
+        assert_eq!(
+            helper.signature.as_deref(),
+            Some("public func helper(_ items: [String], completion: () -> Void) -> Int")
+        );
+        let limit = symbol("Source/A.swift", SRC, "limit");
+        assert_eq!(limit.kind, SymbolKind::Const);
+        assert_eq!(limit.signature.as_deref(), Some("public let limit"));
+    }
+
+    #[test]
+    fn a_long_swift_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument{n}: Int")).collect();
+        let source = format!("public func long({}) {{}}\n", params.join(", "));
+        let signature = symbol("a.swift", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }

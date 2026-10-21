@@ -431,10 +431,25 @@ fn signature_end(decl: Node) -> usize {
                 .find(|child| child.kind() == "=" && child.end_byte() <= value.start_byte());
             return Some(eq.map_or(value.start_byte(), |eq| eq.start_byte()));
         }
+        // Kotlin's `fun f() = expr` and `fun f() { … }` keep the body in a
+        // `function_body` child that has no field name.
+        {
+            let mut cursor = node.walk();
+            if let Some(body) = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "function_body")
+            {
+                return Some(body.start_byte());
+            }
+        }
         // An alias keeps its name and generics, not what it stands for.
         if matches!(
             node.kind(),
-            "type_item" | "type_alias_declaration" | "type_alias" | "typealias_declaration"
+            "type_item"
+                | "type_alias_declaration"
+                | "type_alias"
+                | "typealias_declaration"
+                | "property_declaration"
         ) {
             let mut cursor = node.walk();
             if let Some(eq) = node.children(&mut cursor).find(|child| child.kind() == "=") {
