@@ -2112,11 +2112,9 @@ impl EngineRuntime {
             .workspace_root
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
-        let agent_dir = self
-            .config
-            .agent_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
+        let agent_dir = self.config.agent_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("titi-mcp-{}", std::process::id()))
+        });
         self.mcp.set(
             servers,
             titi_mcp::ManagerConfig::from_process(&agent_dir, &workspace),

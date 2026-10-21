@@ -87,7 +87,13 @@ impl ToolHandler for McpTool {
     /// `fixture echo {"text":"hi"}`: the server and tool, then the arguments
     /// cut to a row.
     fn describe(&self, args: &Value) -> Option<String> {
-        let mut line = format!("{} {}", self.slot.name, self.remote_name);
+        // The tool's name is the server's to choose; the row is on a terminal.
+        let remote: String = self
+            .remote_name
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let mut line = format!("{} {remote}", self.slot.name);
         if !args.is_null() && args != &Value::Object(serde_json::Map::new()) {
             line.push(' ');
             line.push_str(&args.to_string());

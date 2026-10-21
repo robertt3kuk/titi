@@ -177,6 +177,26 @@ async fn tools_register_as_mcp_server_tool_with_the_servers_schema_and_exec_appr
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_action_row_names_the_server_the_tool_and_the_arguments() {
+    let rig = rig();
+    rig.manager.set_servers(vec![def("fixture", &[])]);
+    ready(&rig, "fixture").await;
+    let echo = tool(&rig, "mcp__fixture__echo");
+    assert_eq!(
+        echo.describe(&json!({ "text": "hi" })).as_deref(),
+        Some(r#"fixture echo {"text":"hi"}"#)
+    );
+    assert_eq!(
+        tool(&rig, "mcp__fixture__pid")
+            .describe(&json!({}))
+            .as_deref(),
+        Some("fixture pid")
+    );
+    let long = echo.describe(&json!({ "text": "x".repeat(500) })).unwrap();
+    assert!(long.chars().count() <= 80, "{long}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_a_set_approval_lowers_the_tier() {
     let rig = rig();
     let mut lowered = def("low", &[]);
