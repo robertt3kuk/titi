@@ -37,6 +37,7 @@ fn def(name: &str, env: &[(&str, &str)]) -> McpServerDef {
         approval: None,
         source: "test".to_owned(),
         project: false,
+        ..Default::default()
     }
 }
 

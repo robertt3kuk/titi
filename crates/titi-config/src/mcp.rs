@@ -1,13 +1,20 @@
 //! MCP server definitions, read from the files other agents read.
 //!
 //! A server is a program the engine starts and speaks to over its standard
-//! streams. The file shape is the ecosystem's `mcpServers` map, so the setup
+//! streams, or (`"type": "http"`) a URL it POSTs to. The file shape is the ecosystem's `mcpServers` map, so the setup
 //! instructions a server ships with work here without being converted:
 //!
 //! ```json
 //! {"mcpServers": {"files": {"command": "npx", "args": ["-y", "some-server"],
-//!   "env": {"ROOT": "."}, "cwd": "tools", "timeout": 30}}}
+//!   "env": {"ROOT": "."}, "cwd": "tools", "timeout": 30},
+//!   "docs": {"type": "http", "url": "https://mcp.example.invalid/mcp",
+//!   "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}}}
 //! ```
+//!
+//! `${VAR}` in an HTTP server's `url` and header values is read from the
+//! environment when the server connects, and only for a server of the user's
+//! own file ([`expand_env`]): a repository's entry is sent literally, so it
+//! cannot name a variable and have titi put its value on the wire.
 //!
 //! Like [`crate::hooks`], this module only *reads and describes*. Whether a
 //! definition may start is decided by the surface: the user's own file runs
@@ -66,11 +73,13 @@ impl McpApproval {
     }
 }
 
-/// One stdio server, as a file defined it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One server, as a file defined it: a stdio program (`command`) or, when
+/// `url` is set, a Streamable HTTP endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerDef {
     /// The key in `mcpServers`, made safe to be part of a tool name.
     pub name: String,
+    /// Empty for an HTTP server.
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -99,6 +108,13 @@ pub struct McpServerDef {
     /// Set by [`discover`], never read from a file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project: bool,
+    /// The endpoint of an HTTP server, as the file spelled it: `${VAR}` is
+    /// still in it (see [`expand_env`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Extra request headers of an HTTP server, as the file spelled them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 impl McpServerDef {
@@ -117,6 +133,22 @@ impl McpServerDef {
     /// by value as well as by key: `NODE_OPTIONS`, `PATH` and `LD_PRELOAD`
     /// are all one edit away from running something else.
     pub fn definition(&self) -> Value {
+        if let Some(url) = &self.url {
+            // Names and literal values, as written: never what `${VAR}`
+            // expands to, which is a secret the file does not hold.
+            let headers: BTreeMap<String, &String> = self
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value))
+                .collect();
+            return json!({
+                "name": self.name,
+                "type": "http",
+                "url": url,
+                "headers": headers,
+                "timeout": self.timeout(),
+            });
+        }
         json!({
             "name": self.name,
             "command": self.command,
@@ -140,6 +172,9 @@ impl McpServerDef {
     /// Every repository file this server's command line names: a launcher
     /// runs more than its first argument (`deno run -A tools/mcp.ts`).
     pub fn scripts(&self, workspace: &Path) -> Vec<crate::hooks::Script> {
+        if self.is_http() {
+            return Vec::new();
+        }
         let base = match self.cwd.as_deref() {
             Some(cwd) if !cwd.is_empty() => workspace.join(cwd),
             _ => workspace.to_owned(),
@@ -155,16 +190,174 @@ impl McpServerDef {
     /// file. What it pulls in is whatever its name resolves to, and the
     /// consent panel says so.
     pub fn runs_unhashed_code(&self, workspace: &Path) -> bool {
-        crate::hooks::is_launcher(&self.command) && self.scripts(workspace).is_empty()
+        !self.is_http()
+            && crate::hooks::is_launcher(&self.command)
+            && self.scripts(workspace).is_empty()
     }
 
-    /// The command line as a person would type it, for a panel.
+    /// Whether this is a Streamable HTTP server rather than a program.
+    pub fn is_http(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// `host` or `host:port` of an HTTP server, for a panel.
+    pub fn http_host(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let rest = url.split_once("://")?.1;
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        Some(rest[..end].to_owned())
+    }
+
+    /// The URL of an HTTP server without its query and fragment, which may
+    /// hold a key: what a transcript shows.
+    pub fn display_url(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let cut = url.find(['?', '#']);
+        Some(match cut {
+            Some(at) => format!("{}?…", &url[..at]),
+            None => url.to_owned(),
+        })
+    }
+
+    /// Why a repository may not name this HTTP server, if it may not: the
+    /// URL must be `https`, or `http` on the loopback interface, so a
+    /// repository cannot point titi at a plain-text remote or smuggle
+    /// credentials into the URL. `None` for a stdio server and for a URL
+    /// that passes.
+    pub fn project_url_problem(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let target = match parse_http_url(url) {
+            Ok(target) => target,
+            Err(reason) => return Some(reason),
+        };
+        if !target.https && !is_loopback_host(&target.host) {
+            return Some(
+                "a repository's server must use https (http is for localhost only)".to_owned(),
+            );
+        }
+        None
+    }
+
+    /// The command line as a person would type it, for a panel. For an HTTP
+    /// server, its URL.
     pub fn command_line(&self) -> String {
+        if let Some(url) = &self.url {
+            return url.clone();
+        }
         std::iter::once(self.command.as_str())
             .chain(self.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Where an HTTP server's URL points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTarget {
+    pub https: bool,
+    /// Host name or IP literal, without brackets or port.
+    pub host: String,
+}
+
+/// Reads the scheme and host of an `http://` or `https://` URL. Strict on
+/// purpose: it is what a repository's URL must pass, so it refuses user
+/// information (`http://127.0.0.1@evil.example/`), whitespace and control
+/// characters, a host with anything but letters, digits, `.` and `-` (or an
+/// IP literal), and a port that is not a number.
+pub fn parse_http_url(url: &str) -> Result<HttpTarget, String> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("the url holds whitespace or a control character".to_owned());
+    }
+    let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err("the url must start with https:// or http://".to_owned());
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.contains('@') {
+        return Err("the url holds user information (user:password@)".to_owned());
+    }
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        let Some((host, after)) = inner.split_once(']') else {
+            return Err("the url has an unterminated [ip6] host".to_owned());
+        };
+        (host, after.strip_prefix(':'))
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port
+        && (port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("the url's port is not a number".to_owned());
+    }
+    let is_ip = host.parse::<std::net::IpAddr>().is_ok();
+    let is_name = !host.is_empty()
+        && !authority.starts_with('[')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if !is_ip && !is_name {
+        return Err("the url's host is not a host name or IP address".to_owned());
+    }
+    Ok(HttpTarget {
+        https,
+        host: host.to_ascii_lowercase(),
+    })
+}
+
+/// `localhost` and the loopback addresses: where plain `http` is allowed for
+/// a repository's server.
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Replaces each `${NAME}` in `text` with what `lookup` gives for it. A name
+/// nothing defines, or a `${` that is never closed, is an `Err`: a header
+/// that silently lost its token would reach the server as a different
+/// request. Only a user's own server goes through this.
+pub fn expand_env(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = after.find('}') else {
+            return Err("a `${` is never closed".to_owned());
+        };
+        let name = &after[..end];
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(format!("`${{{name}}}` is not a variable name"));
+        }
+        match lookup(name) {
+            Some(value) => out.push_str(&value),
+            None => return Err(format!("the variable {name} is not set")),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Whether `name` may be an HTTP header name (an RFC 9110 token).
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// Everything the MCP files define, before anyone has decided what may run.
@@ -201,6 +394,13 @@ pub fn discover(agent_dir: &Path, workspace: &Path) -> Discovered {
     for mut def in project {
         def.project = true;
         if def.disabled {
+            continue;
+        }
+        if let Some(problem) = def.project_url_problem() {
+            found.notices.push(format!(
+                "mcp: {}: the server {:?} is skipped — {problem}",
+                def.source, def.name
+            ));
             continue;
         }
         if found.user.iter().any(|own| own.name == def.name) {
@@ -298,10 +498,18 @@ pub fn parse(text: &str, source: &str) -> Result<(Vec<McpServerDef>, Vec<String>
             continue;
         };
         let kind = entry.get("type").and_then(Value::as_str);
-        if !matches!(kind, None | Some("stdio")) || entry.contains_key("url") {
+        let http = matches!(kind, Some("http" | "streamable-http"));
+        if !http && (!matches!(kind, None | Some("stdio")) || entry.contains_key("url")) {
             skipped.push(skip(
-                "only stdio servers (`command`) run; http and sse are not supported",
+                "only stdio (`command`) and `\"type\": \"http\"` servers run; sse and ws are not supported",
             ));
+            continue;
+        }
+        if http {
+            match http_entry(entry, name, source) {
+                Ok(def) => defs.push(def),
+                Err(why) => skipped.push(skip(&why)),
+            }
             continue;
         }
         let Some(command) = entry
@@ -349,9 +557,64 @@ pub fn parse(text: &str, source: &str) -> Result<(Vec<McpServerDef>, Vec<String>
             approval: None,
             source: source.to_owned(),
             project: false,
+            url: None,
+            headers: BTreeMap::new(),
         });
     }
     Ok((defs, skipped))
+}
+
+/// One `"type": "http"` entry. The URL is checked only for its scheme here:
+/// a user's may hold `${VAR}`, and a repository's is held to the stricter rule
+/// by [`discover`].
+fn http_entry(
+    entry: &serde_json::Map<String, Value>,
+    name: String,
+    source: &str,
+) -> Result<McpServerDef, String> {
+    let url = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or("it has no `url`")?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("its `url` must start with https:// or http://".to_owned());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("its `url` holds whitespace or a control character".to_owned());
+    }
+    if entry.contains_key("command") {
+        return Err("it has both `url` and `command`".to_owned());
+    }
+    let headers = string_map(entry.get("headers"))
+        .map_err(|()| "`headers` is not an object of strings".to_owned())?;
+    for (header, value) in &headers {
+        if !is_header_name(header) {
+            return Err(format!("the header name {header:?} is not valid"));
+        }
+        if value.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(format!(
+                "the value of header {header:?} holds a control character"
+            ));
+        }
+    }
+    Ok(McpServerDef {
+        name,
+        url: Some(url.to_owned()),
+        headers,
+        disabled: entry
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        timeout_secs: entry
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .filter(|secs| *secs > 0)
+            .map(|secs| secs.min(MAX_TIMEOUT_SECS)),
+        source: source.to_owned(),
+        ..McpServerDef::default()
+    })
 }
 
 fn string_list(value: Option<&Value>) -> Result<Vec<String>, ()> {
@@ -404,7 +667,7 @@ mod tests {
         "files": {"command": "npx", "args": ["-y", "some-server"], "env": {"ROOT": "."},
                   "cwd": "tools", "timeout": 30},
         "off": {"command": "x", "disabled": true},
-        "web": {"type": "http", "url": "https://example.invalid/mcp"},
+        "web": {"type": "sse", "url": "https://example.invalid/sse"},
         "bad env": {"command": "x", "env": {"A": 1}},
         "no command": {"args": []},
         "a.b": {"command": "y"}
@@ -422,6 +685,7 @@ mod tests {
             approval: None,
             source: "t".to_owned(),
             project: false,
+            ..McpServerDef::default()
         }
     }
 
@@ -439,7 +703,10 @@ mod tests {
         assert!(defs[2].disabled);
         let skipped = skipped.join("\n");
         assert!(skipped.contains("\"web\""), "{skipped}");
-        assert!(skipped.contains("only stdio"), "{skipped}");
+        assert!(
+            skipped.contains("sse and ws are not supported"),
+            "{skipped}"
+        );
         assert!(skipped.contains("\"bad env\""), "{skipped}");
         assert!(skipped.contains("\"no command\""), "{skipped}");
     }
@@ -723,5 +990,182 @@ mod tests {
         );
         assert!(approval_setting(&settings, "odd").is_err());
         assert_eq!(approval_setting(&settings, "unset"), Ok(None));
+    }
+
+    fn lookup(name: &str) -> Option<String> {
+        (name == "TOKEN").then(|| "s3cret".to_owned())
+    }
+
+    fn http(url: &str, headers: &[(&str, &str)]) -> McpServerDef {
+        McpServerDef {
+            name: "h".to_owned(),
+            url: Some(url.to_owned()),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            source: "t".to_owned(),
+            ..McpServerDef::default()
+        }
+    }
+
+    #[test]
+    fn an_http_entry_reads_type_url_and_headers_and_accepts_both_spellings() {
+        let (defs, skipped) = parse(
+            r#"{"mcpServers": {
+                "a": {"type": "http", "url": "https://x.invalid/mcp", "headers": {"X-Key": "${TOKEN}"}, "timeout": 20},
+                "b": {"type": "streamable-http", "url": "http://127.0.0.1:9/mcp"},
+                "c": {"type": "http"},
+                "d": {"type": "http", "url": "ftp://x.invalid/"},
+                "e": {"type": "http", "url": "https://x.invalid/", "headers": {"X": 1}},
+                "f": {"type": "http", "url": "https://x.invalid/", "headers": {"bad name": "v"}},
+                "g": {"type": "http", "url": "https://x.invalid/", "command": "x"},
+                "h": {"url": "https://x.invalid/"}
+            }}"#,
+            "mcp.json",
+        )
+        .unwrap();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "{skipped:?}");
+        assert!(defs[0].is_http());
+        assert_eq!(defs[0].headers["X-Key"], "${TOKEN}", "kept as written");
+        assert_eq!(defs[0].timeout_secs, Some(20));
+        assert!(defs[0].command.is_empty());
+        assert_eq!(skipped.len(), 6, "{skipped:?}");
+    }
+
+    #[test]
+    fn env_is_expanded_only_where_asked_and_never_silently_empty() {
+        assert_eq!(
+            expand_env("Bearer ${TOKEN}!", &lookup).unwrap(),
+            "Bearer s3cret!"
+        );
+        assert_eq!(expand_env("no vars", &lookup).unwrap(), "no vars");
+        assert!(expand_env("${NOPE}", &lookup).unwrap_err().contains("NOPE"));
+        assert!(expand_env("${TOKEN", &lookup).is_err());
+        assert!(expand_env("${a b}", &lookup).is_err());
+        // The value is not scanned again: a secret that holds `${X}` stays text.
+        let nested = |name: &str| (name == "A").then(|| "${B}".to_owned());
+        assert_eq!(expand_env("${A}", &nested).unwrap(), "${B}");
+    }
+
+    #[test]
+    fn a_repository_url_is_https_or_http_on_loopback_and_holds_no_credentials() {
+        let problem = |url: &str| http(url, &[]).project_url_problem();
+        assert_eq!(problem("https://mcp.example.invalid/mcp"), None);
+        assert_eq!(problem("http://127.0.0.1:8080/mcp"), None);
+        assert_eq!(problem("http://localhost/mcp"), None);
+        assert_eq!(problem("http://[::1]:3000/mcp"), None);
+        assert!(
+            problem("http://example.invalid/mcp")
+                .unwrap()
+                .contains("https")
+        );
+        assert!(problem("http://127.0.0.1.evil.invalid/").is_some());
+        assert!(
+            problem("http://127.0.0.1@evil.invalid/")
+                .unwrap()
+                .contains("user information")
+        );
+        assert!(problem("https://user:pw@example.invalid/").is_some());
+        assert!(problem("https://${SECRET}.example.invalid/").is_some());
+        assert!(problem("https://example.invalid:80a/").is_some());
+        assert!(problem("https://exa mple.invalid/").is_some());
+        assert!(
+            problem("http://10.0.0.5/mcp").is_some(),
+            "private is not loopback"
+        );
+        // A path or query that names a variable is only text.
+        assert_eq!(
+            problem("https://example.invalid/${SECRET}?k=${SECRET}"),
+            None
+        );
+    }
+
+    #[test]
+    fn discover_skips_a_repository_url_that_breaks_the_rule_but_keeps_the_users_own() {
+        let agent = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            agent.path().join(USER_FILE),
+            r#"{"mcpServers": {"mine": {"type": "http", "url": "http://remote.invalid/mcp"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "bad": {"type": "http", "url": "http://remote.invalid/mcp"},
+                "good": {"type": "http", "url": "https://remote.invalid/mcp"},
+                "local": {"type": "http", "url": "http://127.0.0.1:1/mcp"}
+            }}"#,
+        )
+        .unwrap();
+        let found = discover(agent.path(), repo.path());
+        assert_eq!(
+            found.user.len(),
+            1,
+            "the user's own http url is theirs to choose"
+        );
+        let names: Vec<&str> = found.project.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["good", "local"]);
+        assert!(found.project.iter().all(|d| d.project));
+        let notes = found.notices.join("\n");
+        assert!(
+            notes.contains("\"bad\"") && notes.contains("https"),
+            "{notes}"
+        );
+    }
+
+    #[test]
+    fn the_http_hash_covers_type_url_and_header_text_and_not_what_a_variable_expands_to() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = http(
+            "https://x.invalid/mcp",
+            &[("Authorization", "Bearer ${TOKEN}")],
+        );
+        let hash = base.hash(repo.path());
+        // Header names are case-insensitive; the file it came from is not part of it.
+        let mut same = http(
+            "https://x.invalid/mcp",
+            &[("authorization", "Bearer ${TOKEN}")],
+        );
+        same.source = "elsewhere".to_owned();
+        assert_eq!(hash, same.hash(repo.path()));
+        for changed in [
+            http(
+                "https://y.invalid/mcp",
+                &[("Authorization", "Bearer ${TOKEN}")],
+            ),
+            http(
+                "https://x.invalid/mcp",
+                &[("Authorization", "Bearer ${OTHER}")],
+            ),
+            http("https://x.invalid/mcp", &[("X-Other", "Bearer ${TOKEN}")]),
+            http("https://x.invalid/mcp", &[]),
+            McpServerDef {
+                timeout_secs: Some(5),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(hash, changed.hash(repo.path()), "{changed:?}");
+        }
+        // A stdio server and an http one never collide.
+        assert_ne!(hash, def("x", &[]).hash(repo.path()));
+        // Whatever the variable holds is nowhere in what is hashed.
+        let text = base.definition().to_string();
+        assert!(text.contains("${TOKEN}") && !text.contains("s3cret"));
+        assert!(!base.runs_unhashed_code(repo.path()));
+        assert!(base.scripts(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn a_panel_shows_the_host_and_never_a_query() {
+        let d = http("https://mcp.example.invalid:8443/v1/mcp?key=abc", &[]);
+        assert_eq!(d.http_host().as_deref(), Some("mcp.example.invalid:8443"));
+        assert_eq!(
+            d.display_url().as_deref(),
+            Some("https://mcp.example.invalid:8443/v1/mcp?…")
+        );
+        assert_eq!(def("npx", &[]).http_host(), None);
     }
 }

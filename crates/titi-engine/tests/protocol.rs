@@ -300,6 +300,7 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 approval: Some(McpApproval::Read),
                 source: ".mcp.json".into(),
                 project: true,
+                ..Default::default()
             }],
         },
         r#"{"SetMcp":{"servers":[{"name":"files","command":"npx","args":["-y","srv"],"env":{"ROOT":"."},"cwd":"tools","disabled":false,"timeout_secs":30,"approval":"read","source":".mcp.json","project":true}]}}"#,
@@ -325,6 +326,7 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 approval: None,
                 source: String::new(),
                 project: false,
+                ..Default::default()
             }]
         }
     );
