@@ -41,7 +41,7 @@ session.autoResume in the agent config.yml or the project .titi/config.yml
 means off. Either way the session continued is the newest one the agent
 directory holds.
 
-  titi atlas [on|off|limit <n>|check|lsp]
+  titi atlas [on|off|limit <n>|check|dump|lsp]
                               manage the prompt map build: on, off, or a file cap
                               (default: on, cap is 24; setting wins over default,
                               TITI_NO_ATLAS=1 forces off for one run)

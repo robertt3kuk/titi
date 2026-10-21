@@ -57,6 +57,9 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         Some("check") => {
             check_cmd(workspace);
         }
+        Some("dump") => {
+            dump_cmd(workspace, &args[1..]);
+        }
         Some("capabilities") => {
             capabilities_cmd();
         }
@@ -72,7 +75,7 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         }
         Some(name) => {
             eprintln!("atlas: unknown command {name}");
-            eprintln!("usage: titi atlas [on|off|limit <n>|check|capabilities|lsp]");
+            eprintln!("usage: titi atlas [on|off|limit <n>|check|dump|capabilities|lsp]");
             std::process::exit(USAGE_EXIT);
         }
     }
@@ -210,4 +213,91 @@ fn save_setting(
             std::process::exit(1);
         }
     }
+}
+
+/// `titi atlas dump [--json] [--limit <n>]`: the whole index, read-only.
+///
+/// One entry per file in the order the prompt map lists it, with the facts the
+/// ranking rests on: role, rank, the map's sort score, dependents, exports and
+/// the edges (imports, re-exports, resolved uses). Plain output is one line per
+/// file; `--json` is one object with the files and the map text for `--limit`
+/// (default 24, the prompt's), which is what an evaluation replays.
+fn dump_cmd(workspace: &Path, args: &[String]) {
+    let mut json = false;
+    let mut limit = 24usize;
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--json" => json = true,
+            "--limit" => match words.next().and_then(|raw| raw.parse::<usize>().ok()) {
+                Some(n) if (1..=64).contains(&n) => limit = n,
+                _ => {
+                    eprintln!("atlas dump: --limit expects an integer from 1 to 64");
+                    std::process::exit(USAGE_EXIT);
+                }
+            },
+            other => {
+                eprintln!("atlas dump: unknown argument {other}");
+                eprintln!("usage: titi atlas dump [--json] [--limit <n>]");
+                std::process::exit(USAGE_EXIT);
+            }
+        }
+    }
+    let atlas = match titi_atlas::Atlas::index(workspace) {
+        Ok(atlas) => atlas,
+        Err(reason) => {
+            eprintln!("atlas: dump failed ({reason})");
+            std::process::exit(1);
+        }
+    };
+    let ranked = titi_atlas::ranking(&atlas, &std::collections::HashSet::new());
+    let dependents = |path: &str| atlas.dependents.get(path).copied().unwrap_or(0);
+    if !json {
+        for (order, entry) in ranked.iter().enumerate() {
+            let Some(file) = atlas.files.get(entry.path) else {
+                continue;
+            };
+            println!(
+                "{} {} {} rank={:.6} deps={} exports={} imports={}",
+                order + 1,
+                entry.path,
+                entry.role,
+                entry.rank,
+                dependents(entry.path),
+                file.exports.len(),
+                file.imports.len()
+            );
+        }
+        return;
+    }
+    let files: Vec<serde_json::Value> = ranked
+        .iter()
+        .enumerate()
+        .filter_map(|(order, entry)| {
+            let file = atlas.files.get(entry.path)?;
+            let uses: Vec<serde_json::Value> = file
+                .uses
+                .iter()
+                .map(|u| serde_json::json!([u.name, u.definer, format!("{:?}", u.basis)]))
+                .collect();
+            Some(serde_json::json!({
+                "path": entry.path,
+                "order": order + 1,
+                "role": entry.role,
+                "rank": entry.rank,
+                "score": entry.score,
+                "dependents": dependents(entry.path),
+                "exports": file.exports,
+                "imports": file.imports,
+                "reexports": file.reexports,
+                "inherits": file.inherits,
+                "uses": uses,
+            }))
+        })
+        .collect();
+    let out = serde_json::json!({
+        "files": files,
+        "map": { "limit": limit, "text": atlas.project(limit) },
+    });
+    println!("{out}");
 }

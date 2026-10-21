@@ -302,7 +302,7 @@ fn an_unknown_atlas_subcommand_is_named_and_shows_usage() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("atlas: unknown command wat\n"), "{stderr}");
     assert!(
-        stderr.contains("usage: titi atlas [on|off|limit <n>|check|capabilities|lsp]\n"),
+        stderr.contains("usage: titi atlas [on|off|limit <n>|check|dump|capabilities|lsp]\n"),
         "{stderr}"
     );
 }
@@ -389,4 +389,61 @@ fn check_stays_clean_and_never_lists_capability() {
     assert_eq!(code, 0, "{stdout}{stderr}");
     assert_eq!(stdout, "atlas: clean\n", "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// `dump --json` lists every file in the map's order with its role, rank and
+/// edges, and carries the same map text `project` renders; the plain form is
+/// one line per file; a bad flag is refused with exit 2.
+#[test]
+fn dump_lists_the_index_in_map_order_and_refuses_bad_flags() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(ws.join("src")).expect("dirs");
+    std::fs::create_dir_all(ws.join("tests")).expect("dirs");
+    std::fs::write(ws.join("src/lib.rs"), "mod hub;\npub use hub::Hub;\n").expect("write");
+    std::fs::write(ws.join("src/hub.rs"), "pub struct Hub;\n").expect("write");
+    std::fs::write(
+        ws.join("tests/use_hub.rs"),
+        "use crate::Hub;\nfn t(_: Hub) {}\n",
+    )
+    .expect("write");
+
+    let (stdout, _, code) = run(
+        dir.path(),
+        &ws,
+        &["atlas", "dump", "--json", "--limit", "2"],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    let files = value["files"].as_array().expect("files");
+    assert_eq!(files.len(), 3);
+    let order: Vec<u64> = files.iter().map(|f| f["order"].as_u64().unwrap()).collect();
+    assert_eq!(order, [1, 2, 3]);
+    let hub = files
+        .iter()
+        .find(|f| f["path"] == "src/hub.rs")
+        .expect("hub");
+    assert_eq!(hub["role"], "source");
+    assert_eq!(hub["exports"], serde_json::json!(["Hub"]));
+    let test = files
+        .iter()
+        .find(|f| f["path"] == "tests/use_hub.rs")
+        .expect("test");
+    assert_eq!(test["role"], "auxiliary");
+    let atlas = Atlas::index(&ws).expect("index");
+    assert_eq!(
+        value["map"]["text"],
+        atlas.project(2),
+        "the same projection"
+    );
+    assert_eq!(value["map"]["limit"], 2);
+
+    let (plain, _, code) = run(dir.path(), &ws, &["atlas", "dump"]);
+    assert_eq!(code, 0);
+    assert_eq!(plain.lines().count(), 3, "{plain}");
+    assert!(plain.lines().next().unwrap().starts_with("1 "), "{plain}");
+
+    let (_, stderr, code) = run(dir.path(), &ws, &["atlas", "dump", "--nope"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("unknown argument --nope"), "{stderr}");
 }

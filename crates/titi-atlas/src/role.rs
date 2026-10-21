@@ -21,6 +21,16 @@ pub(crate) enum Role {
     Auxiliary,
 }
 
+impl Role {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Entry => "entry",
+            Self::Auxiliary => "auxiliary",
+        }
+    }
+}
+
 /// Directory names that mark everything below them. Compared lowercased.
 const AUXILIARY_DIRS: &[&str] = &[
     "test",

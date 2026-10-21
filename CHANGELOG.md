@@ -10,6 +10,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `titi atlas dump [--json] [--limit <n>]` prints the whole index read-only, one entry per file in the order the prompt map lists it: role, graph rank, map score, dependents, exports, imports, re-exports and resolved uses; `--json` adds the projected map text. It is what the evaluation harness replays.
+
 - `.atlasignore`: a gitignore-syntax file the atlas reads at the workspace root and in nested directories, on top of `.gitignore`, to keep fixtures and samples out of the map without hiding them from git. titi's own repo ignores `evals/tasks/`, so `titi atlas check` is clean on it.
 
 - Cache-break diagnostics. When the provider reads under half of what the previous request left in its prompt cache, one line names what changed first, in the order the provider reads a request: `cache miss · model or effort switched`, `· tool list changed (+web −bash ~read)`, `· system prompt changed (block 3, +120 chars)`, `· message 12 edited`, `· history rewound (2 messages dropped)`, `· first request`, or — with nothing changed and a provider that has served from its cache before — `· prefix unchanged (the provider's cache expired or was evicted)`. Only names, counts and block numbers are ever printed, never prompt text; counts titi had to estimate because the provider reported none are never judged, and a change the provider's cache survived is not a line. `/cache [n]` (and Ctrl+K) lists the last requests with their cached share, size and the reason (`#14  turn 5   96% · 4.9k of 5.1k · ok   · prefix unchanged`). The engine sends each sized request as `CacheObserved` (prompt, cached, change, missed) for other surfaces, and the headless stream carries it too.

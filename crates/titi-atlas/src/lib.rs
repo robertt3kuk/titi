@@ -43,7 +43,7 @@ pub mod syntax_check;
 pub use lang::{Capability, Language, Level};
 pub use live::AtlasHandle;
 pub use lsp::serve_lsp;
-pub use project::render;
+pub use project::{RankedFile, ranking, render};
 pub use query::format_check_report;
 pub use scan::list_files;
 pub use shared::SharedAtlas;

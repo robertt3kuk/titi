@@ -19,6 +19,55 @@ const AUXILIARY_FACTOR: f64 = 0.25;
 /// imports it and so is nothing for a binary's `main`.
 const ENTRY_FACTOR: f64 = 2.0;
 
+/// One file in the order the prompt map lists it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RankedFile<'a> {
+    pub path: &'a str,
+    /// `source`, `entry` or `auxiliary`: what the path says the file is for.
+    pub role: &'static str,
+    /// The graph rank before the role and touch factors.
+    pub rank: f64,
+    /// What the map sorts by: the rank times the role or touch factor.
+    pub score: f64,
+}
+
+/// Every file the map may list, best first — exactly the order [`render`]
+/// truncates, so a reader of the full list sees what any limit would show.
+pub fn ranking<'a>(atlas: &'a Atlas, touched: &HashSet<String>) -> Vec<RankedFile<'a>> {
+    let mut ranked: Vec<RankedFile<'a>> = atlas
+        .files
+        .keys()
+        // Angle brackets would forge a closing tag and break the frame.
+        .filter(|path| !path.contains(['<', '>']))
+        .map(|path| {
+            let rank = atlas.ranks.get(path).copied().unwrap_or(0.0);
+            let role = classify(path);
+            let score = if touched.contains(path) {
+                rank * TOUCHED_BOOST
+            } else {
+                match role {
+                    Role::Auxiliary => rank * AUXILIARY_FACTOR,
+                    Role::Entry => rank * ENTRY_FACTOR,
+                    Role::Source => rank,
+                }
+            };
+            RankedFile {
+                path: path.as_str(),
+                role: role.as_str(),
+                rank,
+                score,
+            }
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(b.path))
+    });
+    ranked
+}
+
 /// Render the prompt map.
 ///
 /// `pending` is how much work the background indexer has accepted and not yet
@@ -28,30 +77,7 @@ const ENTRY_FACTOR: f64 = 2.0;
 /// a current one, and the cheap recovery (re-read the file) is only available
 /// to a model that knows.
 pub fn render(atlas: &Atlas, limit: usize, touched: &HashSet<String>, pending: usize) -> String {
-    let mut ranked: Vec<(&str, f64)> = atlas
-        .files
-        .keys()
-        // Angle brackets would forge a closing tag and break the frame.
-        .filter(|path| !path.contains(['<', '>']))
-        .map(|path| {
-            let base = atlas.ranks.get(path).copied().unwrap_or(0.0);
-            let score = if touched.contains(path) {
-                base * TOUCHED_BOOST
-            } else {
-                match classify(path) {
-                    Role::Auxiliary => base * AUXILIARY_FACTOR,
-                    Role::Entry => base * ENTRY_FACTOR,
-                    Role::Source => base,
-                }
-            };
-            (path.as_str(), score)
-        })
-        .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(b.0))
-    });
+    let mut ranked = ranking(atlas, touched);
     ranked.truncate(limit.max(1));
 
     let mut out = if pending == 0 {
@@ -59,8 +85,8 @@ pub fn render(atlas: &Atlas, limit: usize, touched: &HashSet<String>, pending: u
     } else {
         format!("<atlas pending=\"{pending}\">\n")
     };
-    for (path, _) in ranked {
-        let file = &atlas.files[path];
+    for entry in ranked {
+        let file = &atlas.files[entry.path];
         let dependents = atlas.dependents.get(&file.path).copied().unwrap_or(0);
         let recent = atlas.is_recent(&file.path, file.mtime);
         out.push_str(&file.path);

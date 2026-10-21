@@ -247,6 +247,7 @@ where work is happening — for the cost of one text block.
 cargo run -p titi-atlas --example map -- <path> <N>   # defaults: . and 24
 titi-map <path> <N>                                    # prebuilt, skill atlas-map
 titi atlas check                                      # index diagnostics, exit 1 on any
+titi atlas dump [--json] [--limit n]                  # the whole index in map order: role, rank, dependents, exports, edges
 titi atlas capabilities                               # level and extensions per language
 titi atlas lsp                                        # stdio LSP: documentSymbol, definition, references, diagnostic
 ```
