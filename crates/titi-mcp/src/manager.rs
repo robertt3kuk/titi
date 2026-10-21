@@ -95,6 +95,12 @@ pub struct ServerStatus {
     pub source: String,
 }
 
+/// The servers' state and tools at one instant: see [`McpManager::snapshot`].
+pub struct Snapshot {
+    pub status: Vec<ServerStatus>,
+    pub handlers: Vec<Arc<dyn ToolHandler>>,
+}
+
 /// Where the manager runs servers.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -228,7 +234,10 @@ impl Slot {
     }
 
     fn status(&self) -> ServerStatus {
-        let slot = locked(&self.inner);
+        self.status_of(&locked(&self.inner))
+    }
+
+    fn status_of(&self, slot: &SlotState) -> ServerStatus {
         ServerStatus {
             name: SmolStr::new(&self.name),
             state: slot.state,
@@ -356,7 +365,17 @@ impl McpManager {
     /// The tools of every ready server, as registry handlers. A server's
     /// approval tier is the one the user set for it, else `exec`.
     pub fn handlers(&self) -> Vec<Arc<dyn ToolHandler>> {
+        self.snapshot().handlers
+    }
+
+    /// Every server's status and the tools of the ready ones, read together:
+    /// a server is `Ready` in `status` exactly when its tools are among
+    /// `handlers`. Two separate reads can straddle the moment a server comes
+    /// up, and a surface told "ready" by one while the registry was built from
+    /// the other would run a turn without the tools.
+    pub fn snapshot(&self) -> Snapshot {
         let mut handlers: Vec<Arc<dyn ToolHandler>> = Vec::new();
+        let mut status = Vec::new();
         // Names are only unique within a server. Across servers the first, in
         // name order, keeps a name and the other is left out and reported, so
         // a call the model meant for one server never reaches another.
@@ -365,6 +384,7 @@ impl McpManager {
         for entry in servers.values() {
             let slot = &entry.slot;
             let state = locked(&slot.inner);
+            status.push(slot.status_of(&state));
             if state.state != ServerState::Ready {
                 continue;
             }
@@ -390,7 +410,7 @@ impl McpManager {
                 }));
             }
         }
-        handlers
+        Snapshot { status, handlers }
     }
 
     fn report_collision(&self, server: &str, tool: &str) {

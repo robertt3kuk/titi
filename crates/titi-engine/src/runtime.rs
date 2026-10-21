@@ -1702,7 +1702,7 @@ impl EngineRuntime {
                             self.verifier.set(command, on_edit);
                         }
                         EngineCommand::SetMcp { servers } => self.set_mcp(servers).await,
-                        EngineCommand::ListMcp => self.report_mcp().await,
+                        EngineCommand::ListMcp => self.sync_mcp().await,
                         EngineCommand::RestartMcp { name } => {
                             if !self.mcp.restart(&name) {
                                 let message = format!("mcp: no server named {name}");
@@ -2141,7 +2141,7 @@ impl EngineRuntime {
             servers,
             titi_mcp::ManagerConfig::from_process(&agent_dir, &workspace),
         );
-        self.report_mcp().await;
+        self.sync_mcp().await;
     }
 
     /// A server changed: swap its tools into the registry the next turn will
@@ -2158,15 +2158,7 @@ impl EngineRuntime {
                 .await;
         }
         if digest.changed {
-            for message in self.mcp.install(&mut self.tools) {
-                let _ = self
-                    .events
-                    .send(EngineEvent::Notice {
-                        message: message.into(),
-                    })
-                    .await;
-            }
-            self.report_mcp().await;
+            self.sync_mcp().await;
         }
     }
 
@@ -2190,12 +2182,23 @@ impl EngineRuntime {
         *active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
     }
 
-    async fn report_mcp(&self) {
+    /// Reads the MCP servers once, builds the registry's MCP tools from that
+    /// read and reports the same read to the surface, so no surface is told a
+    /// server is ready before the tools it brings are in the registry.
+    async fn sync_mcp(&mut self) {
+        let (mut servers, refused) = self.mcp.sync(&mut self.tools);
+        for message in refused {
+            let _ = self
+                .events
+                .send(EngineEvent::Notice {
+                    message: message.into(),
+                })
+                .await;
+        }
         // A key passed as an argument (`--api-key sk-…`), or one a failing
         // server printed to stderr, must not reach a transcript or a headless
         // client's JSONL: the command line and the reason are masked like
         // any other output.
-        let mut servers = self.mcp.status();
         for server in &mut servers {
             server.command = mask(&server.command, self.config.mask_ips);
             server.host = mask(&server.host, self.config.mask_ips);

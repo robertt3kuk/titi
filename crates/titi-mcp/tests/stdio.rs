@@ -965,3 +965,40 @@ async fn a_users_own_server_restarts_from_edited_files_because_that_is_what_rest
     assert!(rig.manager.restart("repo"));
     ready(&rig, "repo").await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_reads_status_and_tools_together() {
+    let rig = rig();
+    rig.manager.set_servers(vec![def("fixture", &[])]);
+    // However the read lands against the server coming up, the two halves
+    // agree: ready exactly when its tools are there.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = rig.manager.snapshot();
+        let ready = snapshot.status[0].state == ServerState::Ready;
+        assert_eq!(
+            ready,
+            !snapshot.handlers.is_empty(),
+            "{:?}",
+            snapshot.status
+        );
+        if ready {
+            let mut told: Vec<String> = snapshot.status[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect();
+            let mut held: Vec<String> = snapshot
+                .handlers
+                .iter()
+                .map(|handler| handler.definition().spec.name.to_string())
+                .collect();
+            told.sort();
+            held.sort();
+            assert_eq!(told, held);
+            return;
+        }
+        assert!(Instant::now() < deadline, "never ready");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}

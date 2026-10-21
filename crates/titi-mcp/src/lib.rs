@@ -19,7 +19,7 @@ pub use client::{
 pub use http::HttpLaunch;
 pub use manager::{
     EnvLookup, MAX_RESTARTS, ManagerConfig, McpEvent, McpManager, ServerState, ServerStatus,
-    ToolSummary, log_path,
+    Snapshot, ToolSummary, log_path,
 };
 pub use tool::{MAX_TOOL_NAME, tool_name};
 pub use vet::{MAX_DESCRIPTION, MAX_SCHEMA_BYTES, MAX_TOOLS};
