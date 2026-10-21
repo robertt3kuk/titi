@@ -212,7 +212,7 @@ impl MemoryIndex {
     /// FTS finds candidates; the embedding reranks them; a memory linked to a
     /// touched file is boosted, because that is the one the turn is about.
     pub fn recall(&self, query: &str, touched: &[String]) -> Result<Vec<Memory>, Error> {
-        let pool = self.candidates(query)?;
+        let pool = self.candidates(query, touched)?;
         self.ranked(pool, query, touched, RECALL_LIMIT)
     }
 
@@ -315,15 +315,43 @@ impl MemoryIndex {
         Ok(scored.into_iter().take(limit).map(|(m, _)| m).collect())
     }
 
-    /// The pool a recall ranks: the FTS hits, or everything when the query
-    /// says nothing the index can match.
-    fn candidates(&self, query: &str) -> Result<Vec<Memory>, Error> {
-        let matched = self.matching(query)?;
-        if matched.is_empty() {
-            self.all()
-        } else {
-            Ok(matched)
+    /// The pool a recall ranks: the FTS hits plus the notes linked to a
+    /// touched file, or everything when the query says nothing the index can
+    /// match.
+    ///
+    /// The linked notes ride along because they are boosted for being about
+    /// the files the turn is working on, and a prompt that shares no words
+    /// with them would otherwise drop them from the pool before the boost
+    /// could count.
+    fn candidates(&self, query: &str, touched: &[String]) -> Result<Vec<Memory>, Error> {
+        let mut pool = self.matching(query)?;
+        if pool.is_empty() {
+            return self.all();
         }
+        for memory in self.linked_memories(touched)? {
+            if pool.iter().all(|seen| seen.id != memory.id) {
+                pool.push(memory);
+            }
+        }
+        Ok(pool)
+    }
+
+    /// The notes linked to any of `touched`, most used first.
+    fn linked_memories(&self, touched: &[String]) -> Result<Vec<Memory>, Error> {
+        // Well under SQLite's bound-variable limit, so a long session's touched
+        // set cannot turn a recall into an error.
+        let touched = &touched[..touched.len().min(500)];
+        if touched.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; touched.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT m.id, m.category, m.summary, m.details, m.use_count
+             FROM memories m JOIN memory_files f ON f.memory_id = m.id
+             WHERE f.path IN ({marks}) ORDER BY m.use_count DESC LIMIT 50"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(touched), row_to_memory)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
     }
 
     /// The FTS hits for `query` and nothing else.
@@ -647,6 +675,68 @@ mod tests {
         assert!(matches!(second, Remembered::Duplicate(_)));
         assert_eq!(index.all().unwrap().len(), 1);
         assert_eq!(index.all().unwrap()[0].use_count, 1);
+    }
+
+    /// The prompt is the query: a note the user's words match outranks one
+    /// that merely has been used more, which is all an empty query can rank by.
+    #[test]
+    fn recall_ranks_by_the_prompt_it_is_given() {
+        let (_dir, index) = idx();
+        for _ in 0..3 {
+            index
+                .remember("context", "helm chart values live in deploy/", "", &[])
+                .unwrap();
+        }
+        index
+            .remember("gotcha", "sqlite wal checkpoint blocks readers", "", &[])
+            .unwrap();
+
+        let blind = index.recall("", &[]).unwrap();
+        assert!(blind[0].summary.starts_with("helm"), "{blind:?}");
+
+        let asked = index
+            .recall("tune the sqlite wal checkpoint settings", &[])
+            .unwrap();
+        assert!(asked[0].summary.starts_with("sqlite"), "{asked:?}");
+    }
+
+    /// Once the prompt matches something, the pool is the matches; a note
+    /// linked to a file this turn touched must not fall out of it for not
+    /// sharing words with the prompt.
+    #[test]
+    fn a_prompt_match_does_not_hide_a_note_about_a_touched_file() {
+        let (_dir, index) = idx();
+        index
+            .remember("gotcha", "sqlite wal checkpoint blocks readers", "", &[])
+            .unwrap();
+        index
+            .remember(
+                "gotcha",
+                "migrations run twice on a cold start",
+                "",
+                &["src/db.rs".into()],
+            )
+            .unwrap();
+        index
+            .remember("context", "unrelated note about the readme", "", &[])
+            .unwrap();
+
+        let recalled = index
+            .recall("sqlite wal checkpoint", &["src/db.rs".into()])
+            .unwrap();
+        let summaries: Vec<&str> = recalled.iter().map(|m| m.summary.as_str()).collect();
+        assert!(
+            summaries.iter().any(|s| s.starts_with("sqlite")),
+            "{summaries:?}"
+        );
+        assert!(
+            summaries.iter().any(|s| s.starts_with("migrations")),
+            "{summaries:?}"
+        );
+        assert!(
+            !summaries.iter().any(|s| s.starts_with("unrelated")),
+            "{summaries:?}"
+        );
     }
 
     #[test]

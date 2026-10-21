@@ -117,16 +117,28 @@ const PLAN_TIERS: &[ApprovalTier] = &[ApprovalTier::Read];
 /// no network tool registered still goes out with no tools at all.
 const DUCK_TIERS: &[ApprovalTier] = &[ApprovalTier::Network];
 
-/// The memories relevant to this turn, ranked against the files it has
-/// already touched. Off the runtime thread: the index is synchronous
-/// SQLite, and blocking the runtime thread panics.
-async fn recalled_memory(agent_dir: Option<PathBuf>, touched: &TouchedSink) -> Option<SmolStr> {
+/// Characters of the prompt a recall is asked with. A pasted log or file is
+/// not a question, and every token of it would join the match.
+const RECALL_QUERY_CHARS: usize = 500;
+
+/// The memories relevant to this turn, ranked against the prompt that opened
+/// it and the files it has already touched. Off the runtime thread: the
+/// index is synchronous SQLite, and blocking the runtime thread panics.
+///
+/// `prompt` is the user's text; an empty one (the context breakdown, which
+/// has no prompt) ranks by use and touched files alone.
+async fn recalled_memory(
+    agent_dir: Option<PathBuf>,
+    touched: &TouchedSink,
+    prompt: &str,
+) -> Option<SmolStr> {
     let agent_dir = agent_dir?;
     let touched = Arc::clone(touched);
+    let query: String = prompt.chars().take(RECALL_QUERY_CHARS).collect();
     run_off_thread(move || {
         let index = titi_memory::index::MemoryIndex::open(&agent_dir).ok()?;
         let touched = touched.blocking_lock().snapshot();
-        let recalled = index.recall("", &touched).ok()?;
+        let recalled = index.recall(&query, &touched).ok()?;
         let block = titi_memory::index::render_recall(&recalled);
         if block.is_empty() {
             None
@@ -2112,7 +2124,7 @@ impl EngineRuntime {
     /// The memories relevant to this turn. The turn itself builds the copy
     /// the model sees; this one only measures.
     async fn recalled_memory(&self) -> Option<SmolStr> {
-        recalled_memory(self.config.agent_dir.clone(), &self.touched).await
+        recalled_memory(self.config.agent_dir.clone(), &self.touched, "").await
     }
 
     /// Soul and personality. Memory is no longer pasted in whole: the index
@@ -2633,7 +2645,7 @@ async fn run_turn(
             edited.insert(path.clone());
         }
     }
-    let recalled = recalled_memory(config.agent_dir.clone(), &touched).await;
+    let recalled = recalled_memory(config.agent_dir.clone(), &touched, &prompt).await;
     let genome_text = genome_map(
         config.genome_root.clone(),
         config.genome_limit,
