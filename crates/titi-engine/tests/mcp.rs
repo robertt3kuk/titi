@@ -209,6 +209,45 @@ async fn set_mcp_returns_at_once_and_the_status_goes_from_starting_to_ready() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_sent_right_after_set_mcp_waits_for_the_servers_that_are_starting() {
+    // A headless one-shot submits its prompt the moment the engine is up; the
+    // first turn must still see the tools, not "unknown tool".
+    let transport = Arc::new(MockTransport::new(vec![
+        call("mcp__fixture__echo", r#"{"text":"early"}"#),
+        say("done"),
+    ]));
+    let mut engine = start(&transport, ApprovalMode::Yolo);
+    set_mcp(&engine, vec![server("fixture", &[])]).await;
+    submit(&engine, "go at once").await;
+    let events = until(&mut engine, turn_end).await;
+    assert_eq!(tool_answer(&events), ("early".to_owned(), false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_is_still_starting_after_the_wait_does_not_hold_the_turn_forever() {
+    let transport = Arc::new(MockTransport::new(vec![say("hello")]));
+    let mut engine = start(&transport, ApprovalMode::Yolo);
+    let mut hung = server("hung", &[("FIXTURE_NEVER_ANSWER", "1")]);
+    hung.timeout_secs = Some(120);
+    set_mcp(&engine, vec![hung]).await;
+    let started = Instant::now();
+    submit(&engine, "hello").await;
+    let events = until(&mut engine, turn_end).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Notice { message } if message.contains("hung") && message.contains("still starting")
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_model_is_offered_the_tool_and_a_call_round_trips_under_yolo() {
     let transport = Arc::new(MockTransport::new(vec![
         call("mcp__fixture__echo", r#"{"text":"hello from the model"}"#),

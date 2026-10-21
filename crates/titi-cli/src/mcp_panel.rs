@@ -297,8 +297,13 @@ fn detail_lines(chat: &Chat, selected: usize, room: usize) -> Option<Vec<String>
         }
     };
     if let Some(server) = chat.mcp.servers.get(selected) {
+        let reason = sanitize(&server.reason);
         wrapped(
-            format!("{} · {}", server.state.as_str(), sanitize(&server.reason)),
+            if reason.is_empty() {
+                server.state.as_str().to_owned()
+            } else {
+                format!("{} · {reason}", server.state.as_str())
+            },
             "  ",
             &mut lines,
         );

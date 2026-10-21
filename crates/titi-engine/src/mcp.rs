@@ -19,6 +19,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// Prefix of every tool an MCP server contributes.
 const PREFIX: &str = "mcp__";
 
+/// How long a prompt waits for servers that are still starting before the turn
+/// goes ahead without them. A person types for longer than a server takes to
+/// come up, but a one-shot (`--prompt`) submits at once and would otherwise
+/// have its first turn call tools that do not exist yet.
+pub(crate) const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) struct McpHost {
     manager: Option<McpManager>,
     tx: UnboundedSender<McpEvent>,
@@ -65,6 +71,15 @@ impl McpHost {
             .as_ref()
             .map(McpManager::status)
             .unwrap_or_default()
+    }
+
+    /// Names of the servers that have not yet come up or failed.
+    pub(crate) fn starting(&self) -> Vec<String> {
+        self.status()
+            .into_iter()
+            .filter(|server| server.state == titi_mcp::ServerState::Starting)
+            .map(|server| server.name.to_string())
+            .collect()
     }
 
     /// Takes `first` and everything queued behind it as one change, so a

@@ -1443,6 +1443,7 @@ impl EngineRuntime {
                             } else if active.is_some() {
                                 queued.push_back(text);
                             } else {
+                                self.await_mcp_startup().await;
                                 let text = self.expand_skills(text).await;
                                 let system = self.system_prompt().await;
                                 active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
@@ -2138,6 +2139,31 @@ impl EngineRuntime {
         if digest.changed {
             self.mcp.install(&mut self.tools);
             self.report_mcp().await;
+        }
+    }
+
+    /// Before a turn: gives servers that are still starting a moment, so the
+    /// turn's tools include theirs. Servers that miss the deadline join a
+    /// later turn, and the surface is told which.
+    async fn await_mcp_startup(&mut self) {
+        let deadline = tokio::time::Instant::now() + crate::mcp::STARTUP_WAIT;
+        while !self.mcp.starting().is_empty() {
+            match tokio::time::timeout_at(deadline, self.mcp.rx.recv()).await {
+                Ok(Some(event)) => self.mcp_changed(event).await,
+                Ok(None) => break,
+                Err(_) => {
+                    let names = self.mcp.starting().join(", ");
+                    let message =
+                        format!("mcp: {names} still starting; its tools are not in this turn");
+                    let _ = self
+                        .events
+                        .send(EngineEvent::Notice {
+                            message: message.into(),
+                        })
+                        .await;
+                    break;
+                }
+            }
         }
     }
 
