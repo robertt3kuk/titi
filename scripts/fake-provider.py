@@ -81,7 +81,11 @@ the real binary and the real HTTP stack:
   anything else   "Hello from the fake server. You said: <text>"
 
 Every answer ends with a usage chunk: 100 prompt tokens, 60 of them cached,
-and 10 completion tokens.
+and 10 completion tokens. With `FAKE_CACHE=1` in the environment the usage is
+instead a simulated prefix cache (see `simulated_cache`): a request that
+repeats the previous one's front reads it back as cached, one whose model,
+effort, tools or earlier messages differ loses everything from the first
+difference, so a cache-break diagnostic has something to find.
 
 Every request body is appended to `requests.jsonl` in the working
 directory, so a run can check what the model was actually sent.
@@ -105,6 +109,7 @@ Usage: scripts/fake-provider.py [port]   (default 18999, loopback only)
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -429,6 +434,36 @@ def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, f
     return words(f"Hello from the fake server. You said: {said}") + [(chunk({}, "stop"), 0)]
 
 
+_SIM_PREVIOUS: dict[str, str] = {}
+
+
+def simulated_cache(request: dict) -> tuple[int, int] | None:
+    """Prompt and cached tokens as a prefix cache would report them.
+
+    With `FAKE_CACHE=1` the usage chunk is computed from the request instead of
+    the fixed 100/60: the prompt is the request's model, reasoning effort,
+    tools and messages (in the order a provider reads them) at four characters
+    a token, and the cached part is the longest common prefix with the
+    previous request of the same conversation — the one that opens with the
+    same first message, so a title or review request does not stand in for the
+    chat's own.
+    """
+    if not os.environ.get("FAKE_CACHE"):
+        return None
+    messages = request.get("messages", [])
+    first = messages[0] if messages else {}
+    key = f"{first.get('role')}:{str(first.get('content'))[:40]}"
+    text = "\0".join([
+        str(request.get("model")),
+        str(request.get("reasoning_effort")),
+        json.dumps(request.get("tools", [])),
+        json.dumps(messages),
+    ])
+    shared = len(os.path.commonprefix([_SIM_PREVIOUS.get(key, ""), text]))
+    _SIM_PREVIOUS[key] = text
+    return max(1, len(text) // 4), shared // 4
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -472,9 +507,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
                 if pause:
                     time.sleep(pause)
+            counts = simulated_cache(request) or (100, 60)
             usage = {"id": "u", "object": "chat.completion.chunk", "model": "fake", "choices": [],
-                     "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
-                               "prompt_tokens_details": {"cached_tokens": 60}}}
+                     "usage": {"prompt_tokens": counts[0], "completion_tokens": 10,
+                               "total_tokens": counts[0] + 10,
+                               "prompt_tokens_details": {"cached_tokens": counts[1]}}}
             self.write_chunk(b"data: " + json.dumps(usage).encode() + b"\n\n")
             self.write_chunk(b"data: [DONE]\n\n")
             self.wfile.write(b"0\r\n\r\n")

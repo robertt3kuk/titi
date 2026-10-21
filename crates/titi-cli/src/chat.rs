@@ -905,6 +905,8 @@ pub struct Chat {
     pub(crate) hook_trust: Option<crate::hooks_trust::TrustPanel>,
     /// The MCP servers the engine reported, and the `/mcp` panel over them.
     pub(crate) mcp: crate::mcp_panel::McpState,
+    /// What the provider's cache did for the last requests (`/cache`).
+    pub(crate) cache_log: crate::cache_cmd::CacheLog,
     /// The session's usage by the model that ran each turn (`/usage`).
     pub(crate) usage_ledger: titi_tui::status::UsageLedger,
     /// Which transcript sections are drawn, and how: the `/details` state.
@@ -1044,6 +1046,7 @@ impl Chat {
             errors: crate::errors_panel::ErrorsState::default(),
             hook_trust: None,
             mcp: crate::mcp_panel::McpState::default(),
+            cache_log: crate::cache_cmd::CacheLog::default(),
             usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
@@ -1888,6 +1891,16 @@ impl Chat {
                 }
                 Applied::none()
             }
+            EngineEvent::CacheObserved {
+                turn_id,
+                prompt_tokens,
+                cached_tokens,
+                change,
+                missed,
+            } => {
+                self.record_cache(turn_id, prompt_tokens, cached_tokens, &change, missed);
+                Applied::none()
+            }
             EngineEvent::TurnUsage {
                 prompt_tokens,
                 completion_tokens,
@@ -2492,6 +2505,7 @@ impl Chat {
             "skills" => self.skills_command(args),
             "agents" => self.agents_command(args),
             "router" => self.router_command(args),
+            "cache" => self.cache_command(args),
             "verify" => self.verify_command(args),
             _ => {
                 // A known skill or file command is not a built-in: it goes to

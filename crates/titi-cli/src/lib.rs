@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod actions;
+pub(crate) mod cache_cmd;
 pub mod changelog;
 pub mod chat;
 pub mod composer;

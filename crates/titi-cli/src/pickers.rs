@@ -247,6 +247,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },
     Command {
+        name: "cache",
+        about: "what the provider's prompt cache did for the last requests, and why it missed",
+    },
+    Command {
         name: "changelog",
         about: "what changed in this build (bare: the last three releases, full, last [n])",
     },
