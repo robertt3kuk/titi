@@ -122,7 +122,7 @@ its extensions, its grammar when one is linked, and its parser. So
 `Language::from_path`, the extensions the scanner indexes, the grammar
 `ast_edit` needs and the dispatch in `lang::parse` all read the same table —
 adding a language is one module and one row, not four lists to keep in step.
-`refs.rs` holds the identifier work every language shares.
+`refs.rs` holds the identifier work every language shares. A name an import statement binds (`import { a as b } from`, `from x import a`, `use x::{a}` / `use x::a;`) is recorded as a use of `a` even when the file never calls it, because the import ties the name to a definition; a bare lowercase identifier elsewhere still is not.
 
 Every `Language` has a **level**, which is what a user sees when they ask:
 
@@ -268,6 +268,14 @@ src/runtime.rs (→3) [RECENT]
   tokens), the LSP's `references` (one location per mention instead of one
   per file) and `titi atlas`. An unknown name is an error that names the
   closest ones.
+- **Test pairing** (`pairing.rs`): a test is linked to its source by naming
+  (`tests/foo.rs`, `test_foo.py`, `foo_test.go`, `FooTest.java`, `foo.test.ts`,
+  `foo_spec.rb` are all about `foo`; `mod.rs`/`index.ts`/`__init__.py` answer to
+  their directory). Same language, and among several sources of one name the
+  one sharing the longest directory prefix; a tie pairs with nothing. The lens
+  reads a pair as an edge of weight 1 both ways (`tests a.rs` / `tested by
+  test_a.py`), and `outline` and `impact` list the paired tests next to the
+  tests that import the file.
 - **Co-change** (`cochange.rs`): `git log -n 500 --no-merges --name-only` is
   read once per `HEAD` (stamp = `.git/HEAD` plus the reflog's mtime, no
   process) on a thread of its own with a 2.5 s cap, started by the index

@@ -30,6 +30,7 @@ mod lang;
 mod lens;
 pub mod live;
 mod lsp;
+mod pairing;
 mod patterns;
 mod project;
 mod query;

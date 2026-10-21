@@ -174,7 +174,15 @@ pub(crate) enum EdgeKind {
     UsedBy,
     /// History edits them together.
     CoChange,
+    /// The file is the test of the neighbour, by naming.
+    Tests,
+    /// The neighbour is the test of the file, by naming.
+    TestedBy,
 }
+
+/// A test and its source by naming are as tied as a file and what it imports;
+/// the graph links the test to the code only one way, and often not at all.
+const TEST_PAIR: f64 = 1.0;
 
 /// What a co-change edge weighs against a dependency edge of one import: a
 /// pair that history edits together every time is as tied as a few uses.
@@ -236,6 +244,10 @@ impl LensIndex {
                     adj[from as usize].push((to, weight, EdgeKind::CoChange));
                 }
             }
+        }
+        for (test, source) in crate::pairing::pairs(&nodes) {
+            adj[test as usize].push((source, TEST_PAIR, EdgeKind::Tests));
+            adj[source as usize].push((test, TEST_PAIR, EdgeKind::TestedBy));
         }
         let out_sum: Vec<f64> = adj
             .iter()
@@ -682,6 +694,10 @@ impl Atlas {
             Some(&(to, _, EdgeKind::UsedBy)) => format!("used by {}", index.paths[to as usize]),
             Some(&(to, _, EdgeKind::CoChange)) => {
                 format!("changes with {}", index.paths[to as usize])
+            }
+            Some(&(to, _, EdgeKind::Tests)) => format!("tests {}", index.paths[to as usize]),
+            Some(&(to, _, EdgeKind::TestedBy)) => {
+                format!("tested by {}", index.paths[to as usize])
             }
             None => "near the seeds".to_owned(),
         }

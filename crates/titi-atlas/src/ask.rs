@@ -280,11 +280,14 @@ impl Atlas {
         let key = index.paths[at as usize].clone();
         let record = &self.files[&key];
         let dependents = self.dependents_of(index, at);
-        let tests = dependents
+        let mut tests: Vec<String> = dependents
             .iter()
             .filter(|path| tag(path) == Some("test"))
             .cloned()
             .collect();
+        tests.extend(self.paired_tests(index, &[at]));
+        tests.sort();
+        tests.dedup();
         Ok(Outline {
             path: key,
             language: record.language.name(),
@@ -433,6 +436,7 @@ impl Atlas {
                 }
             }
         }
+        let direct_at = direct.clone();
         let name_of = |at: &u32| index.paths[*at as usize].clone();
         let mut direct: Vec<String> = direct.iter().map(name_of).collect();
         let mut indirect: Vec<String> = indirect.iter().map(name_of).collect();
@@ -444,6 +448,10 @@ impl Atlas {
             .filter(|path| tag(path) == Some("test"))
             .cloned()
             .collect();
+        let touched: Vec<u32> = definers.iter().chain(&direct_at).copied().collect();
+        report.tests.extend(self.paired_tests(index, &touched));
+        report.tests.sort();
+        report.tests.dedup();
         report.direct = direct;
         report.indirect = indirect;
         for path in &report.definers {
@@ -526,6 +534,16 @@ impl Atlas {
             });
         }
         Ok(definers)
+    }
+
+    /// The tests that pair with any of `files` by naming.
+    fn paired_tests(&self, index: &LensIndex, files: &[u32]) -> Vec<String> {
+        files
+            .iter()
+            .flat_map(|&at| index.adj[at as usize].iter())
+            .filter(|(_, _, kind)| *kind == crate::lens::EdgeKind::TestedBy)
+            .map(|(test, _, _)| index.paths[*test as usize].clone())
+            .collect()
     }
 
     fn dependents_of(&self, index: &LensIndex, at: u32) -> Vec<String> {
