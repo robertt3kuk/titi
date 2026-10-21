@@ -2355,7 +2355,8 @@ impl EngineRuntime {
         )
         .with_approval_mode(ApprovalMode::Write)
         .with_max_rounds(crate::REVIEW_ROUNDS)
-        .with_mask_ips(self.config.mask_ips);
+        .with_mask_ips(self.config.mask_ips)
+        .with_hooks(&self.hooks);
         let reviewer = crate::AgentReviewer::new(Arc::new(runner), "reviewer");
         tokio::spawn(async move {
             let edited: Vec<String> = edited.iter().map(ToString::to_string).collect();

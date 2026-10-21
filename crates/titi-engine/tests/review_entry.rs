@@ -128,3 +128,76 @@ async fn nothing_changed_calls_no_model_and_names_no_verdict() {
     assert_eq!(report.reason, "nothing to review");
     assert_eq!(transport.call_count(), 0);
 }
+
+/// The reviewer's reads go to the provider like any other, so a policy a
+/// hook states — here: no reading `secret.txt` — holds for the reviewer too.
+#[tokio::test]
+async fn the_reviewer_passes_the_same_pre_tool_hooks_as_the_session() {
+    use titi_config::hooks::{HookDef, HookEvent};
+    use titi_providers::{Role, ToolCallRef};
+
+    let dir = repo();
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("secret.txt"), "launch codes\n").unwrap();
+    let read_secret = MockBody::Events(vec![
+        StreamEvent::ToolcallStart {
+            id: BlockId::new("t"),
+            call: ToolCallRef {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                ..Default::default()
+            },
+        },
+        StreamEvent::ToolcallDelta {
+            id: BlockId::new("t"),
+            json: r#"{"path":"secret.txt"}"#.into(),
+        },
+        StreamEvent::ToolcallEnd {
+            id: BlockId::new("t"),
+        },
+        StreamEvent::Done {
+            reason: StopReason::ToolUse,
+        },
+    ]);
+    let transport = Arc::new(MockTransport::new(vec![
+        read_secret,
+        reply("VERDICT: PASS — fine"),
+    ]));
+    let mut engine = start(dir.path(), &transport);
+    engine
+        .send(EngineCommand::SetHooks {
+            hooks: vec![HookDef {
+                event: HookEvent::PreToolUse,
+                matcher: Some("Read".into()),
+                command: "cat >/dev/null; echo 'secret.txt is off limits' >&2; exit 2".into(),
+                timeout_secs: None,
+                source: "test".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    engine
+        .send(EngineCommand::RunReview {
+            edited: vec!["a.txt".into()],
+        })
+        .await
+        .unwrap();
+    // The hook's own events come first; the report is what ends the review.
+    loop {
+        if let EngineEvent::ReviewFinished { .. } = engine.recv().await.expect("an event") {
+            break;
+        }
+    }
+    let requests = transport.requests();
+    let tool = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("the read was answered");
+    assert!(
+        tool.content.contains("secret.txt is off limits"),
+        "{}",
+        tool.content
+    );
+    assert!(!tool.content.contains("launch codes"), "{}", tool.content);
+}
