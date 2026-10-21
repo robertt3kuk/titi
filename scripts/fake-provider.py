@@ -19,6 +19,11 @@ the real binary and the real HTTP stack:
   "color shell"   a pty bash call printing colour and a `\r` progress bar
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
+  "spin cap"      (first user message) a `read` of README.md every round with a
+                  different `limit`, forever; once the request carries
+                  `tool_choice: "none"` it answers "Wrapped up: ..."
+  "spin repeat"   the same `read` of README.md every round until a tool result
+                  carries titi's `[titi:` nudge, then it answers and stops
   "run bash"      text, then a bash call: echo titi-smoke
   "load skill"    a `skill` call naming the first skill the system prompt lists
                   (`- name: description` under `# Skills`); `skill: none listed`
@@ -126,6 +131,37 @@ def first_listed_skill(messages: list[dict]) -> str | None:
             if line.startswith("- "):
                 return line[2:].split(":", 1)[0].strip()
     return None
+
+
+def spin(request: dict) -> list[tuple[dict, float]] | None:
+    """The multi-round keywords, which need the whole conversation.
+
+    `script` answers from the last message alone, and a tool result ends a
+    chain after one round; these two keep calling tools for as long as the
+    first user message says so, until the request forbids tool calls
+    (`tool_choice: "none"`, the turn's wrap-up) or, for `spin repeat`, a tool
+    result carries titi's `[titi:` nudge.
+    """
+    messages = request.get("messages", [])
+    first = next((m for m in messages if m.get("role") == "user"), {})
+    opening = str(first.get("content") or "")
+    if "spin cap" not in opening and "spin repeat" not in opening:
+        return None
+    if request.get("tool_choice") == "none":
+        return words("Wrapped up: read README.md over and over, nothing left to do.", 0) + [
+            (chunk({}, "stop"), 0)
+        ]
+    results = [m for m in messages if m.get("role") == "tool"]
+    if "spin repeat" in opening:
+        if results and "[titi:" in str(results[-1].get("content") or ""):
+            return words("Changing approach: I will stop repeating that read.", 0) + [
+                (chunk({}, "stop"), 0)
+            ]
+        args = {"path": "README.md"}
+    else:
+        # A different range each round, so no call ever repeats.
+        args = {"path": "README.md", "limit": len(results) + 1}
+    return [(c, 0) for c in call(f"call_spin_{len(results)}", "read", args)]
 
 
 def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, float]]:
@@ -340,7 +376,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
         try:
-            for event, pause in script(last, messages):
+            for event, pause in (spin(request) or script(last, messages)):
                 self.write_chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
                 if pause:
                     time.sleep(pause)
