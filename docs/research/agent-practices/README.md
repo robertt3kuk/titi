@@ -44,6 +44,7 @@ Method and limits:
 - **Practice:** Run until done, with step and cost budgets and a graceful stop.
 - **Evidence:** mini-swe-agent runs a linear loop to submission and scores >74% on SWE-bench Verified with bash only ([docs](https://mini-swe-agent.com/latest/)). Anthropic's agent samples "until the model decides it is finished or exceeds 200k context". Anthropic's harness post found agents fail by stopping early or declaring victory early, not by running too long.
 - **titi:** partial, and harmful. `max_tool_rounds: 8` (`runtime.rs:737`) is never overridden outside tests, and exceeding it emits `Failed "tool round cap reached"` and ends the turn (`runtime.rs:2775-2785`). Subagents get 6 (`tool_agent.rs:39`).
+- **titi, 2026-10-21:** a subagent at its cap (`agent.subagentMaxToolRounds`, default 40; `maxTurns` in a definition lowers it) now gets the same wrap-up request as the main turn and returns its summary marked `(stopped at the tool budget)` instead of an error.
 - **Do:**
   - Raise the main default to about 100 and expose it as a setting.
   - At the cap, ask the model for a wrap-up message and keep the work, rather than failing the turn.
@@ -146,6 +147,7 @@ Method and limits:
   - Anthropic's multi-agent system used Opus lead plus Sonnet subagents (+90.2% over single-agent Opus on its research eval).
   - Haiku 5.5 lists at $0.10/$0.50 per MTok and Sonnet 5.5 at $2/$10 ([pricing](https://platform.claude.com/docs/en/build-with-claude/prompt-caching.md)).
 - **titi:** partial. One `agent_model` for all subagents (`titi-cli/src/engine.rs:922`); aliases via `modelRoles` (STATE.md); `judgment.rs` uses a small model for closed questions; advisor and council take their own models. There is no per-role slot for explore, compact or namer, and no effort per role.
+- **titi, 2026-10-21:** a subagent definition (`.claude/agents/*.md`, `docs/research/extensibility-marketplace/design-2026-10.md` L5) can set `model` (a `modelRoles` alias or a catalog id) and `effort` per named specialist, so a cheap model for a reviewer or a scout is a file, not a code change; the model is chosen only from the user's own catalog. `taskRouter.*` is still not built.
 - **Do:** Add a `taskRouter.{explore,compact,review,namer}` settings layer defaulting to the chat model. Ship an A/B (#10) before recommending a cheaper default.
 
 ### 10. Evals: measure titi's own harness
