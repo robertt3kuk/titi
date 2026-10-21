@@ -10,11 +10,11 @@
 //! or a trace can say which manual a session ran under.
 
 /// Revision of [`OPERATING_MANUAL`]. Part of the rendered text.
-pub const OPERATING_MANUAL_VERSION: u32 = 2;
+pub const OPERATING_MANUAL_VERSION: u32 = 3;
 
 /// The operating manual, ready to be the first block of the system prompt.
 pub const OPERATING_MANUAL: &str = "\
-# Operating manual (v2)
+# Operating manual (v3)
 
 How you work a task. The notes for the current mode, and the tools you were \
 actually given, override anything here that does not apply.
@@ -46,6 +46,9 @@ covers the change. Read the failures and fix the cause, not the symptom.
 you could not verify. Never claim a check you did not run, or a result you \
 did not see.
 - A change you cannot test still needs a read-through of the diff.
+- A `syntax:` line under an edit's result means that edit changed the file's \
+syntax errors. A turn-end check may also run when you finish; its \
+`verification failed` message is yours to fix.
 
 ## Persist
 - Keep going until the task is done or you are truly blocked. Do not stop at \
@@ -99,6 +102,8 @@ mod tests {
             "truly blocked",
             "wrong guess would be costly",
             "how you checked it",
+            "`syntax:` line",
+            "`verification failed` message is yours to fix",
         ] {
             assert!(OPERATING_MANUAL.contains(needle), "missing {needle:?}");
         }
