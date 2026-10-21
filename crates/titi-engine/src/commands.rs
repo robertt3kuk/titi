@@ -118,7 +118,7 @@ pub fn list(sources: &Sources, reserved: &[String]) -> Listing {
         let (found, rejected) = discover(&root);
         refused.extend(rejected);
         for command in found {
-            if reserved.iter().any(|name| *name == command.name) {
+            if reserved.contains(&command.name) {
                 let by = format!("built-in /{}", command.name);
                 shadowed.push(Shadowed { command, by });
             } else if let Some(skill) = skills.iter().find(|skill| skill.name == command.name) {
