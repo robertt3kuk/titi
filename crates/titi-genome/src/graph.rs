@@ -63,6 +63,7 @@ pub(crate) fn rank(
         })
         .collect();
     let share_total: f64 = shares.iter().sum();
+    let implementations = implementations(&nodes);
     let mut dependents = vec![0usize; n];
     let mut inbound: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     let mut outbound = vec![0.0f64; n];
@@ -113,6 +114,16 @@ pub(crate) fn rank(
             inbound[to_at].push((from_at, weight));
             dependents[to_at] += 1;
         }
+        // A header's rank is its implementation's too: nothing includes the
+        // `.c`, and by include edges alone it would be the module's least
+        // important file. Not a dependent, so `(→N)` is unchanged.
+        if let Some(companions) = implementation_key(from).and_then(|key| implementations.get(&key))
+        {
+            for &to_at in companions.iter().filter(|to_at| **to_at != from_at) {
+                outbound[from_at] += from_edge;
+                inbound[to_at].push((from_at, from_edge));
+            }
+        }
         // The floor is what keeps a file whose only edge is a guess from
         // handing all its rank to it: it passes on what its edges weigh, and
         // never more than one import's worth would carry.
@@ -146,6 +157,35 @@ pub(crate) fn rank(
         .map(|(path, value)| ((*path).clone(), value))
         .collect();
     (ranks, dependents)
+}
+
+const HEADERS: &[&str] = &["h", "hh", "hpp", "hxx"];
+const IMPLEMENTATIONS: &[&str] = &["c", "cc", "cpp", "cxx", "m", "mm"];
+
+/// `(directory, stem)` of a C-family header: where its implementation sits.
+fn implementation_key(path: &str) -> Option<(String, String)> {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let (stem, ext) = name.rsplit_once('.')?;
+    HEADERS
+        .contains(&ext)
+        .then(|| (dir.to_owned(), stem.to_owned()))
+}
+
+/// The C-family implementation files by `(directory, stem)`, as node indices.
+fn implementations(nodes: &[&String]) -> HashMap<(String, String), Vec<usize>> {
+    let mut found: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (at, path) in nodes.iter().enumerate() {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if let Some((stem, ext)) = name.rsplit_once('.')
+            && IMPLEMENTATIONS.contains(&ext)
+        {
+            found
+                .entry((dir.to_owned(), stem.to_owned()))
+                .or_default()
+                .push(at);
+        }
+    }
+    found
 }
 
 /// The weight of an edge backed by `evidence` units of imports and uses.
