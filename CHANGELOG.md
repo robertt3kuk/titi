@@ -83,6 +83,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed
 
+- Two `agent` calls of one round stay one `2 actions ▾` block: the subagents' own lines that arrive between them no longer cut it in two, and the `subagents` header stands after the block.
+
 - `/help` no longer dumps about 48 note lines into the transcript: it opens the command palette on the commands (`help · 48 commands`), `/help <text>` opens it pre-filtered, and `/help all` prints the old text listing with its `keys …` line.
 
 - Reading a directory says `4 entries` instead of `4 lines`, and the listing the model gets no longer starts with `.git/` (`.hg/` and `.svn/` are left out too; `.github/` and `.gitignore` stay).

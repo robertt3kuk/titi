@@ -623,13 +623,14 @@ pub(crate) fn transcript(
                 turn_headed = true;
             }
             let mode = modes[section_index(Section::Tools)];
-            texts.extend(actions::group_rows(
-                &owned[index..end],
-                mode,
-                now,
-                theme,
-                inner,
-            ));
+            // The subagents' own lines inside the range are drawn on their
+            // own turn, after the block.
+            let calls: Vec<TranscriptLine> = owned[index..end]
+                .iter()
+                .filter(|line| line.kind != LineKind::Agent)
+                .cloned()
+                .collect();
+            texts.extend(actions::group_rows(&calls, mode, now, theme, inner));
             (texts, Vec::new())
         } else if line.kind == LineKind::Assistant {
             {
@@ -1304,6 +1305,10 @@ enum LineRole {
 /// reported under them is one block, and anything else — the model's text, a
 /// note, the user — ends it. A `Diff` that no call precedes stays a line of its
 /// own.
+///
+/// A subagent's own lines (`LineKind::Agent`) arrive between the calls that
+/// started them, and must not cut the round in two: they sit inside the block's
+/// range but stay lines of their own, drawn after the block.
 fn line_roles(lines: &[TranscriptLine]) -> Vec<LineRole> {
     let mut roles = vec![LineRole::Plain; lines.len()];
     let mut at = 0;
@@ -1313,13 +1318,23 @@ fn line_roles(lines: &[TranscriptLine]) -> Vec<LineRole> {
             continue;
         }
         let mut end = at + 1;
-        while end < lines.len() && (lines[end].call.is_some() || lines[end].kind == LineKind::Diff)
-        {
-            end += 1;
+        let mut scan = end;
+        while scan < lines.len() {
+            let line = &lines[scan];
+            if line.call.is_some() || line.kind == LineKind::Diff {
+                end = scan + 1;
+                scan = end;
+            } else if line.kind == LineKind::Agent {
+                scan += 1;
+            } else {
+                break;
+            }
         }
         roles[at] = LineRole::Start(end);
-        for role in &mut roles[at + 1..end] {
-            *role = LineRole::Member;
+        for (role, line) in roles[at + 1..end].iter_mut().zip(&lines[at + 1..end]) {
+            if line.kind != LineKind::Agent {
+                *role = LineRole::Member;
+            }
         }
         at = end;
     }

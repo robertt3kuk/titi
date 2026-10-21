@@ -11694,6 +11694,48 @@ fn agent_finished(name: &str, success: bool) -> EngineEvent {
     }
 }
 
+/// Two `agent` calls of one round are one action block. The subagents'
+/// own lines, which arrive between them, do not split it: the section's
+/// header stands after the block.
+#[test]
+fn agent_chatter_does_not_split_the_round_it_belongs_to() {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(1),
+        model: "openai/gpt-4.1".into(),
+    });
+    for (call_id, who) in [("c1", "alpha"), ("c2", "beta")] {
+        chat.on_event(EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: call_id.into(),
+            name: "agent".into(),
+            detail: Some(format!("agent {who}: slow {who}").into()),
+        });
+        chat.on_event(agent_started(who));
+        chat.on_event(agent_finished(who, true));
+        chat.on_event(EngineEvent::ToolFinished {
+            turn_id: TurnId(1),
+            call_id: call_id.into(),
+            output: format!("agent {who} completed: done").into(),
+            is_error: false,
+            detail: None,
+        });
+    }
+    let rows = frame_rows(&mut chat, 100, 30).join("\n");
+    assert!(rows.contains("2 actions"), "{rows}");
+    assert_eq!(
+        rows.matches("actions ▾").count() + rows.matches("action ▾").count(),
+        1,
+        "{rows}"
+    );
+    let beta = rows.find("Delegated beta").unwrap_or(0);
+    let header = rows.find("subagents (4)").unwrap_or(0);
+    assert!(
+        rows.find("Delegated alpha").unwrap_or(usize::MAX) < beta && beta < header,
+        "both calls, then the section:\n{rows}"
+    );
+}
+
 /// The strip lists the live agents — several at once, finishing out of
 /// order — and an agent that ends leaves it. `off` draws nothing, `full`
 /// draws all of them, and `collapsed` counts the overflow.
