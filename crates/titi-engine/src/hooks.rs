@@ -543,8 +543,16 @@ impl Hooks {
     }
 }
 
-/// Both spellings of a tool's name, Claude's first.
+/// Every name a matcher may use for a tool: Claude's first, then titi's own.
+/// The tools that run commands without being `bash` — `project` runs the
+/// repository's test, lint and build commands, `git_commit` runs git and so
+/// the repository's git hooks — also answer to `Bash`, so a Claude-style
+/// `Bash` policy (`rm -rf`, no network) is not one tool name away from being
+/// skipped. Their `tool_name` on stdin stays their own.
 fn tool_names(tool: &str) -> Vec<&str> {
+    if matches!(tool, "project" | "git_commit") {
+        return vec![tool, "Bash"];
+    }
     let claude = claude_tool_name(tool);
     if claude == tool {
         vec![tool]
@@ -802,6 +810,12 @@ mod tests {
         assert!(hooks.watches_tool("grep"), "a native name matches too");
         assert!(!hooks.watches_tool("read"));
         assert!(!hooks.watches_tool("glob"));
+        // Tools that run commands answer to `Bash` too.
+        assert!(hooks.watches_tool("project"));
+        assert!(hooks.watches_tool("git_commit"));
+        // `git` and `diagnose` read; they are not shell commands.
+        assert!(!hooks.watches_tool("git"));
+        assert!(!hooks.watches_tool("diagnose"));
     }
 
     #[test]
