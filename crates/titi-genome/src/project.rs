@@ -60,7 +60,7 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>, pending:
             .ok()
             .is_some_and(|elapsed| elapsed <= NEW_WINDOW);
         out.push_str(&file.path);
-        out.push_str(":(→");
+        out.push_str(" (→");
         out.push_str(&dependents.to_string());
         out.push(')');
         if recent {

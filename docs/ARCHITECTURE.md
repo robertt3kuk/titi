@@ -154,10 +154,10 @@ Before each turn the index is refreshed and rendered with
 
 ```
 <genome>
-src/lib.rs:(→12)
+src/lib.rs (→12)
   +Genome (9)
   +render (4)
-src/runtime.rs:(→3) [RECENT]
+src/runtime.rs (→3) [RECENT]
   +EngineRuntime (7)
 </genome>
 ```

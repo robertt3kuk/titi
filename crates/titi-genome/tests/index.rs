@@ -107,7 +107,7 @@ pub fn hash() {}
 
     let projected = genome.project(8);
     assert!(projected.contains("<genome>"));
-    assert!(projected.contains("src/util.rs:(→2)"));
+    assert!(projected.contains("src/util.rs (→2)"));
     assert!(projected.contains("+hash") || projected.contains("+Session"));
 }
 
@@ -463,16 +463,16 @@ fn a_recently_modified_file_is_marked_recent_not_new() {
     let genome = Genome::index(root).unwrap();
     let projected = genome.project(4);
     assert!(
-        projected.contains("src/live.rs:(→0) [RECENT]"),
+        projected.contains("src/live.rs (→0) [RECENT]"),
         "{projected}"
     );
-    assert!(projected.contains("src/stale.rs:(→0)\n"), "{projected}");
+    assert!(projected.contains("src/stale.rs (→0)\n"), "{projected}");
     assert!(
         !projected.contains("[NEW]"),
         "the marker means recently modified, not newly created: {projected}"
     );
     assert!(
-        !projected.contains("src/stale.rs:(→0) [RECENT]"),
+        !projected.contains("src/stale.rs (→0) [RECENT]"),
         "a file older than 48h is not recent: {projected}"
     );
 }
