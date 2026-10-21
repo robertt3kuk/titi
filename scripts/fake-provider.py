@@ -10,6 +10,8 @@ the real binary and the real HTTP stack:
                   words below) a reviewer reply: `VERDICT: FAIL — missing test` and
                   one finding, `README.md:1 — no test covers the new title`
   "sleepy shell"  a bash call that runs for 3 s (the live tool phase)
+  "danger shell"  a bash call on `rm -rf ./victim` (what a PreToolUse hook that
+                  refuses `rm -rf` is for)
   "forever"       a bash call that never exits (Ctrl+C must stop it)
   "dev server"    a bash call on `npm run dev` (refused before it runs)
   "make todo"     a todo write: three items, the second in progress
@@ -144,6 +146,8 @@ def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, f
         return [(c, 0) for c in call("call_skill", "skill", {"name": name})]
     if "sleepy shell" in content:
         return [(c, 0) for c in call("call_sleepy", "bash", {"command": "sleep 3; echo slept"})]
+    if "danger shell" in content:
+        return [(c, 0) for c in call("call_danger", "bash", {"command": "rm -rf ./victim"})]
     if "forever" in content:
         return [(c, 0) for c in call("call_forever", "bash", {"command": "echo started; sleep 600"})]
     if "dev server" in content:
