@@ -1100,6 +1100,9 @@ pub struct EngineRuntime {
     /// Bumped by every `RestoreHistory`. A turn that started before the
     /// rewind must not write its stale history back over the replacement.
     history_epoch: u64,
+    /// The provider's count for the last request, which the next turn's
+    /// first round is judged by. See `compaction::PromptMemory`.
+    prompt_memory: crate::compaction::PromptMemory,
     /// The background jobs the engine is holding: loops it repeats, and
     /// `bash` commands a turn handed over. Shared with the sink the tools
     /// report through, so `/jobs` sees a command the moment it is handed over.
@@ -1381,6 +1384,7 @@ impl EngineRuntime {
             claims: claims.clone(),
             steering: Steering::default(),
             history_epoch: 0,
+            prompt_memory: crate::compaction::PromptMemory::default(),
             jobs,
             next_job,
             self_commands: command_tx.clone(),
@@ -1452,6 +1456,7 @@ impl EngineRuntime {
                         EngineCommand::RestoreHistory { messages } => {
                             self.config.restored_messages = messages;
                             self.history_epoch += 1;
+                            self.prompt_memory.forget();
                         }
                         EngineCommand::Steer { text } => {
                             // Queued, not applied here: the running turn drains it at
@@ -1783,6 +1788,7 @@ impl EngineRuntime {
                             let turn_id = TurnId(self.next_turn.load(Ordering::SeqCst));
                             let running = active.is_some();
                             let event = compact_history(&mut self.config, focus.as_deref(), running, turn_id);
+                            self.prompt_memory.forget();
                             let _ = self.events.send(event).await;
                         }
                     }
@@ -2338,6 +2344,7 @@ impl EngineRuntime {
         let money_bounded = self.money_budget.is_some();
         let hooks = self.hooks.clone();
         let verifier = self.verifier.clone();
+        let prompt_memory = self.prompt_memory.clone();
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -2361,6 +2368,7 @@ impl EngineRuntime {
                 money_bounded,
                 hooks,
                 verifier,
+                prompt_memory,
             )
             .await;
             let _ = done
@@ -2647,8 +2655,7 @@ fn compact_history(
     let before = focus.map(|_| config.restored_messages.clone());
     let Some(done) = crate::compaction::compact(
         &mut config.restored_messages,
-        &forced,
-        config.context_window.max(1),
+        &crate::compaction::Fold::new(&forced, config.context_window.max(1)),
     ) else {
         return EngineEvent::Notice {
             message: "compact: nothing to fold yet".into(),
@@ -2712,6 +2719,7 @@ async fn run_turn(
     money_bounded: bool,
     hooks: Hooks,
     verifier: crate::verify::Verifier,
+    prompt_memory: crate::compaction::PromptMemory,
 ) -> Option<Vec<ChatMessage>> {
     // The turn's own span opens here and closes at the tail — the one place
     // every path below reaches, because the early returns all belong to the
@@ -2921,6 +2929,12 @@ async fn run_turn(
                 tool_calls: Vec::new(),
                 ..Default::default()
             });
+            // The provider's count for the last request, once there is one: the
+            // fold trigger is judged by it rather than by the estimate.
+            let mut reported = prompt_memory.recall(
+                config.restored_messages.len(),
+                usize::from(system.is_some()),
+            );
             let mut tool_rounds = 0;
             let mut stop_continued = false;
             let mut verify = verifier.for_turn(touched.lock().await.edits());
@@ -2945,9 +2959,11 @@ async fn run_turn(
                 // away before the provider refuses the request.
                 if let Some(folded) = crate::compaction::compact(
                     &mut messages,
-                    &config.compaction,
-                    config.context_window,
+                    &crate::compaction::Fold::new(&config.compaction, config.context_window)
+                        .reported(reported),
                 ) {
+                    // The count described a request that no longer exists.
+                    reported = None;
                     if let Some(recorder) = trajectory.lock().await.as_mut() {
                         let _ = recorder.record(titi_core::trajectory::EventKind::Compaction {
                             folded: folded.folded as u64,
@@ -2985,7 +3001,7 @@ async fn run_turn(
                 let _ = events
                     .send(EngineEvent::ContextUsage {
                         turn_id,
-                        tokens: crate::compaction::estimate_request(&messages),
+                        tokens: crate::compaction::context_used(&messages, reported),
                         window: config.context_window,
                     })
                     .await;
@@ -3040,6 +3056,7 @@ async fn run_turn(
                             return None;
                         }
                     }
+                    let request_len = messages.len();
                     match stream_attempt(
                         turn_id,
                         &messages,
@@ -3057,6 +3074,7 @@ async fn run_turn(
                     .await
                     {
                         Ok((text, calls, thinking, report)) if calls.is_empty() => {
+                            reported = crate::compaction::Reported::new(report.prompt, request_len);
                             round_report = Some(report);
                             if !text.is_empty() {
                                 messages.push(ChatMessage {
@@ -3071,6 +3089,7 @@ async fn run_turn(
                             break;
                         }
                         Ok((text, calls, thinking, report)) => {
+                            reported = crate::compaction::Reported::new(report.prompt, request_len);
                             round_report = Some(report);
                             let issued = crate::tool_budget::IssuedCall::of(&calls);
                             tool_rounds += 1;
@@ -3126,9 +3145,12 @@ async fn run_turn(
                                 };
                                 let _ = crate::compaction::compact(
                                     &mut messages,
-                                    &forced,
-                                    config.context_window.max(1),
+                                    &crate::compaction::Fold::new(
+                                        &forced,
+                                        config.context_window.max(1),
+                                    ),
                                 );
+                                reported = None;
                                 OpenSpan::open(
                                     &spans,
                                     turn_span_id.clone(),
@@ -3250,7 +3272,14 @@ async fn run_turn(
                     if wrap_up {
                         crate::tool_budget::strip_wrap_up(&mut messages);
                     }
-                    return Some(visible_history(messages, system.as_ref()));
+                    let request_messages = messages.len();
+                    let history = visible_history(messages, system.as_ref());
+                    prompt_memory.remember(
+                        reported,
+                        request_messages - history.len(),
+                        history.len(),
+                    );
+                    return Some(history);
                 }
                 if let Some(error) = last_error {
                     last_failure = Some(format!("{model}: {error}"));

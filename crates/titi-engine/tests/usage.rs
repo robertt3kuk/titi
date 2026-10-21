@@ -193,14 +193,22 @@ async fn rounds_with_and_without_a_report_each_add_their_own_figure() {
     ]));
     let mut engine = EngineRuntime::start_with_tools(
         EngineConfig::new("primary"),
-        resolver(vec![("primary", transport)]),
+        resolver(vec![("primary", Arc::clone(&transport) as _)]),
         echo_registry(),
     );
     let events = run_turn(&mut engine).await;
 
+    // The unreported round is charged the estimate of the request it sent.
+    let requests = transport.requests();
+    let estimated_prompt = titi_engine::compaction::estimate_request(&requests[1].messages);
+    // The gauge is the provider's count for the round it did measure plus the
+    // estimate of what was appended after that request.
     let rounds = context_usage(&events);
     assert_eq!(rounds.len(), 2, "{events:?}");
-    let estimated_prompt = rounds[1];
+    let appended = titi_engine::compaction::estimate_request(
+        &requests[1].messages[requests[0].messages.len()..],
+    );
+    assert_eq!(rounds[1], 1000 + appended, "{events:?}");
     let estimated_completion = titi_core::compaction::estimate_tokens("done");
     let usage = turn_usage(&events);
     assert_eq!(

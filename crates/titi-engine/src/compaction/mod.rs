@@ -8,6 +8,7 @@
 //! Spec: `docs/research/compaction-context`.
 
 mod mask;
+mod reported;
 
 use smol_str::SmolStr;
 use titi_core::compaction::{CompactionPolicy, StructuredSummarizer, Summarizer, estimate_tokens};
@@ -15,6 +16,31 @@ use titi_core::session::{Entry, Role as EntryRole};
 use titi_providers::{ChatMessage, Role};
 
 use mask::mask_tool_results;
+pub use reported::{PromptMemory, Reported, context_used};
+
+/// What a compaction needs to know about the request it may shrink.
+#[derive(Debug, Clone, Copy)]
+pub struct Fold<'a> {
+    pub policy: &'a CompactionPolicy,
+    pub context_window: u64,
+    /// The provider's count for the request, when there is one.
+    pub reported: Option<Reported>,
+}
+
+impl<'a> Fold<'a> {
+    pub fn new(policy: &'a CompactionPolicy, context_window: u64) -> Self {
+        Self {
+            policy,
+            context_window,
+            reported: None,
+        }
+    }
+
+    pub fn reported(mut self, reported: Option<Reported>) -> Self {
+        self.reported = reported;
+        self
+    }
+}
 
 /// What one compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +98,13 @@ fn digest_message(summary: &str, folded: usize) -> ChatMessage {
 /// that brings the request under the threshold it stops there, otherwise the
 /// oldest messages are folded into one digest. `None` when nothing was done:
 /// below the threshold, or no prefix left to shrink.
-pub fn compact(
-    messages: &mut Vec<ChatMessage>,
-    policy: &CompactionPolicy,
-    context_window: u64,
-) -> Option<Compacted> {
-    let used = estimate_request(messages);
+pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compacted> {
+    let Fold {
+        policy,
+        context_window,
+        reported,
+    } = *fold;
+    let used = context_used(messages, reported);
     if !policy.should_compact(used, context_window) {
         return None;
     }
@@ -148,6 +175,14 @@ fn to_entry(message: &ChatMessage) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact(
+        messages: &mut Vec<ChatMessage>,
+        policy: &CompactionPolicy,
+        context_window: u64,
+    ) -> Option<Compacted> {
+        super::compact(messages, &Fold::new(policy, context_window))
+    }
 
     fn user(text: &str) -> ChatMessage {
         ChatMessage {
@@ -400,5 +435,69 @@ mod tests {
         let mut messages = vec![system("you are titi"), user("hi")];
         assert_eq!(compact(&mut messages, &eager(), 100), None);
         assert_eq!(messages.len(), 2);
+    }
+
+    /// A request the estimate sees as small but the provider counted as
+    /// nearly full: the count wins, because the estimate ignores the tool
+    /// declarations and runs low for code.
+    #[test]
+    fn the_providers_count_arms_the_trigger_the_estimate_misses() {
+        let policy = CompactionPolicy {
+            threshold_percent: 80.0,
+            keep_recent_tokens: 4,
+            method_order: vec![titi_core::compaction::Strategy::SnapCompact],
+        };
+        let history = || {
+            vec![
+                user("first question, long enough to fold"),
+                assistant("first answer"),
+                user("newest"),
+            ]
+        };
+        let mut by_estimate = history();
+        assert_eq!(
+            super::compact(&mut by_estimate, &Fold::new(&policy, 1_000)),
+            None,
+            "a dozen tokens of a thousand-token window is nowhere near"
+        );
+
+        let mut by_count = history();
+        let seen = Reported {
+            prompt_tokens: 900,
+            messages: 3,
+        };
+        let done = super::compact(
+            &mut by_count,
+            &Fold::new(&policy, 1_000).reported(Some(seen)),
+        )
+        .expect("the provider says 90% full");
+        assert_eq!(
+            done.tokens_before, 900,
+            "the figure it reports is the real one"
+        );
+        assert!(done.folded >= 1);
+    }
+
+    /// The reverse: a long-looking request the provider counted as small is
+    /// not worth a fold.
+    #[test]
+    fn a_small_provider_count_overrides_a_large_estimate() {
+        let policy = CompactionPolicy {
+            threshold_percent: 80.0,
+            keep_recent_tokens: 4,
+            ..CompactionPolicy::default()
+        };
+        let mut messages = vec![user(&"x".repeat(4_000)), assistant("ok"), user("go")];
+        let seen = Reported {
+            prompt_tokens: 100,
+            messages: 3,
+        };
+        assert_eq!(
+            super::compact(
+                &mut messages,
+                &Fold::new(&policy, 1_200).reported(Some(seen))
+            ),
+            None
+        );
     }
 }
