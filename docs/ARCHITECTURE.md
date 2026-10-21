@@ -246,8 +246,10 @@ src/runtime.rs (→3) [RECENT]
   within 48 hours touched the file, so a fresh clone or checkout of old
   history marks nothing. Read once per index build by `recency.rs` (three git
   calls, 1.5 s budget, run beside the parse) and extended with every file the
-  session re-parses. Outside git, or when `git status` does not answer in
-  time: mtime within 48 hours.
+  session re-parses. In a shallow clone only the uncommitted changes count:
+  its oldest commit is a boundary that touches every file, so the log is not
+  read. Outside git, or when `git status` does not answer in time: mtime
+  within 48 hours.
 - `+Name (users)` — up to 4 exports per file, sorted by user count, and an
   export nobody uses is omitted: the symbol-level blast radius next to the
   file-level `(→N)`.

@@ -189,3 +189,49 @@ fn outside_git_the_modification_time_decides() {
     let atlas = Atlas::index(root).unwrap();
     assert_eq!(recent_paths(&atlas), vec!["src/live.rs".to_owned()]);
 }
+
+/// A shallow clone's only commit is the boundary: git shows every file as
+/// added in it, so a recent boundary would mark the whole tree. History is
+/// not there to ask, and only uncommitted changes are known to be recent.
+#[test]
+fn a_shallow_clone_marks_only_uncommitted_changes() {
+    let origin = tempfile::tempdir().unwrap();
+    let root = origin.path();
+    init(root);
+    write(root, "src/a.rs", "pub fn alpha() {}\n");
+    write(root, "src/b.rs", "pub fn bravo() {}\n");
+    commit_all(root, LONG_AGO);
+    write(
+        root,
+        "src/a.rs",
+        "pub fn alpha() {}\npub fn alpha_two() {}\n",
+    );
+    git(root, &["add", "-A"], None);
+    git(root, &["commit", "-q", "-m", "recent"], None);
+
+    let parent = tempfile::tempdir().unwrap();
+    let clone = parent.path().join("clone");
+    let status = Command::new("git")
+        .args(["clone", "-q", "--depth", "1"])
+        .arg(format!("file://{}", root.display()))
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let atlas = Atlas::index(&clone).unwrap();
+    assert_eq!(
+        recent_paths(&atlas),
+        Vec::<String>::new(),
+        "the boundary commit is not evidence:\n{}",
+        atlas.project(8)
+    );
+
+    write(
+        &clone,
+        "src/b.rs",
+        "pub fn bravo() {}\npub fn bravo_two() {}\n",
+    );
+    let atlas = Atlas::index(&clone).unwrap();
+    assert_eq!(recent_paths(&atlas), vec!["src/b.rs".to_owned()]);
+}

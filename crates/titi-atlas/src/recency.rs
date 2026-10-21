@@ -4,8 +4,10 @@
 //! which for a clone, a branch switch or a cherry-pick is the minute the
 //! command ran, for every file at once. Inside a git repository the question
 //! worth asking is "did someone work on this": the file has uncommitted
-//! changes, or a commit made within [`WINDOW`] changed it. Outside git there
-//! is no history, and the clock is the only evidence there is.
+//! changes, or a commit made within [`WINDOW`] changed it. In a shallow clone
+//! only the uncommitted changes count: its oldest commit is a boundary that
+//! touches every file. Outside git there is no history, and the clock is the
+//! only evidence there is.
 //!
 //! The answer is a set of index paths read once when an index is built, off
 //! the parse threads' critical path (see [`Probe`]), and extended with every
@@ -123,6 +125,17 @@ fn read_git(root: &Path) -> Option<HashSet<String>> {
         if let Some(inside) = path.strip_prefix(prefix) {
             files.insert(inside.to_owned());
         }
+    }
+
+    // A shallow clone's oldest commit is its boundary: git reports every file
+    // as added in it, so a boundary inside the window would mark the whole
+    // tree. The history that says what was worked on is not there to ask, and
+    // only what the status found is known to be recent. (`git` older than 2.15
+    // does not know the flag; its answer is not `true`, which keeps the log.)
+    let shallow = run_git(root, &["rev-parse", "--is-shallow-repository"], deadline)
+        .is_some_and(|answer| answer.trim_ascii() == b"true");
+    if shallow {
+        return Some(files);
     }
 
     // `--relative` limits the log to `root` and strips the prefix itself.
