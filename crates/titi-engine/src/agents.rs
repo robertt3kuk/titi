@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use futures::StreamExt;
 use titi_providers::{ChatMessage, RequestCtx, Role, StreamEvent, WireRequest};
 
+use crate::agent_defs::AgentProfile;
 use crate::claims::Claims;
 use crate::findings::Findings;
 use crate::protocol::{AgentKind, AgentStatus, EngineEvent};
@@ -21,6 +22,8 @@ pub struct AgentRequest {
     pub task: SmolStr,
     pub kind: AgentKind,
     pub parent_id: Option<SmolStr>,
+    /// The definition file this agent runs from, if it has one.
+    pub profile: Option<Arc<AgentProfile>>,
 }
 
 /// How a run ended, for a caller that waited on it.
@@ -170,6 +173,18 @@ impl AgentSupervisor {
     }
 
     pub async fn spawn(&self, name: SmolStr, task: SmolStr, kind: AgentKind) -> SmolStr {
+        self.spawn_with(name, task, kind, None).await
+    }
+
+    /// [`spawn`](Self::spawn) for a subagent run from a definition file: the
+    /// profile narrows its tools and sets its prompt, model, cap and effort.
+    pub async fn spawn_with(
+        &self,
+        name: SmolStr,
+        task: SmolStr,
+        kind: AgentKind,
+        profile: Option<Arc<AgentProfile>>,
+    ) -> SmolStr {
         let id: SmolStr = format!("agent-{}", self.next_id.fetch_add(1, Ordering::SeqCst)).into();
         let request = AgentRequest {
             id: id.clone(),
@@ -177,9 +192,21 @@ impl AgentSupervisor {
             task,
             kind,
             parent_id: Some("Main".into()),
+            profile,
         };
         self.launch(request).await;
         id
+    }
+
+    /// Says something to the person at the surface, outside any agent's
+    /// transcript.
+    pub async fn notice(&self, message: impl Into<SmolStr>) {
+        let _ = self
+            .events
+            .send(EngineEvent::Notice {
+                message: message.into(),
+            })
+            .await;
     }
 
     /// Moves the view to `agent_id`.

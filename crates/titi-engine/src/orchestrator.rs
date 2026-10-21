@@ -119,6 +119,7 @@ impl Job {
                     task: task.clone(),
                     kind: AgentKind::Subagent,
                     parent_id: None,
+                    profile: None,
                 };
                 match runner.run(request, AgentContext::detached()).await {
                     Err(error) => JobResult::failed(error),

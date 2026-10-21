@@ -847,18 +847,18 @@ async fn the_agent_schema_keeps_every_parameter_and_its_description() {
             .as_str()
             .is_some_and(|text| !text.trim().is_empty())
     };
-    for name in ["task", "name", "kind", "tasks", "context"] {
+    for name in ["task", "name", "kind", "agent", "tasks", "context"] {
         let property = properties
             .get(name)
             .unwrap_or_else(|| panic!("`{name}` is no longer a parameter"));
         assert!(described(property), "`{name}` lost its description");
     }
-    assert_eq!(properties.len(), 5, "{:?}", properties.keys());
+    assert_eq!(properties.len(), 6, "{:?}", properties.keys());
     let entry = &properties["tasks"]["items"];
     assert_eq!(entry["required"], serde_json::json!(["task"]));
     let entry_properties = entry["properties"].as_object().unwrap();
-    for name in ["task", "name", "kind"] {
+    for name in ["task", "name", "kind", "agent"] {
         assert!(entry_properties.contains_key(name), "batch entry `{name}`");
     }
-    assert_eq!(entry_properties.len(), 3);
+    assert_eq!(entry_properties.len(), 4);
 }

@@ -860,6 +860,7 @@ impl Coder for RunnerCoder {
                     task: task.into(),
                     kind: crate::AgentKind::Subagent,
                     parent_id: None,
+                    profile: None,
                 },
                 crate::AgentContext::detached(),
             )

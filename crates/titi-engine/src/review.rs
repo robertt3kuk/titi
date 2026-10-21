@@ -141,6 +141,7 @@ impl Reviewer for AgentReviewer {
             task: request.prompt(),
             kind: AgentKind::Advisor,
             parent_id: None,
+            profile: None,
         };
         let notes = self
             .runner

@@ -738,6 +738,9 @@ pub struct EngineConfig {
     /// nothing, so the provider's own default applies. `SetEffort` changes it
     /// for the rest of the session.
     pub effort: Option<titi_providers::Effort>,
+    /// The user's `modelRoles`, role name to model id: what a subagent
+    /// definition's `model` may name besides a full model id.
+    pub model_roles: std::collections::BTreeMap<String, String>,
 }
 
 impl EngineConfig {
@@ -775,6 +778,7 @@ impl EngineConfig {
             interrupt: titi_tools::Interrupt::new(),
             background_after: None,
             effort: None,
+            model_roles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1064,6 +1068,8 @@ pub struct EngineRuntime {
     events: mpsc::Sender<EngineEvent>,
     next_turn: Arc<AtomicU64>,
     agents: Option<crate::agents::AgentSupervisor>,
+    /// Where the `agent` tool's definitions are read; set with `agents`.
+    agent_catalog: Option<Arc<crate::agent_defs::AgentCatalog>>,
     tools: ToolRegistry,
     approval_waiters: ApprovalWaiters,
     /// The questions the model has asked and nobody has answered yet. See
@@ -1346,10 +1352,18 @@ impl EngineRuntime {
         // tool rather than one that refuses every call. The subagent's own
         // registry is built below without this tool, which is what bounds
         // nesting: a subagent cannot spawn a subagent, at any depth.
-        if let Some(agents) = &agents {
+        let agent_catalog = agents.as_ref().map(|_| {
+            Arc::new(crate::agent_defs::AgentCatalog::new(
+                extension_sources(&config),
+                config.model_roles.clone(),
+            ))
+        });
+        if let (Some(agents), Some(catalog)) = (&agents, &agent_catalog) {
             tools.register(Arc::new(crate::agent_tool::AgentTool::new(
                 agents.clone(),
                 config.agent_writes,
+                Arc::clone(catalog),
+                Arc::clone(&resolver),
             )));
         }
         let runtime = Self {
@@ -1363,6 +1377,7 @@ impl EngineRuntime {
             events: event_tx,
             next_turn: Arc::new(AtomicU64::new(1)),
             agents,
+            agent_catalog,
             tools,
             approval_waiters: ApprovalWaiters::default(),
             ask_waiters,
@@ -2244,16 +2259,7 @@ impl EngineRuntime {
 
     /// Where skills and commands are looked for, from this session's config.
     fn extension_sources(&self) -> crate::sources::Sources {
-        crate::sources::Sources {
-            cwd: self
-                .config
-                .workspace_root
-                .clone()
-                .or_else(|| self.config.genome_root.clone()),
-            agent_dir: self.config.agent_dir.clone(),
-            home: process_home(),
-            foreign_user_dirs: self.config.foreign_user_dirs,
-        }
+        extension_sources(&self.config)
     }
 
     /// Name and description of discovered skills. Bodies stay on disk.
@@ -2339,6 +2345,12 @@ impl EngineRuntime {
         // A cancel is spent once a new turn starts. The command it was raised
         // for still sees it: the interrupt counts raises, not just the flag.
         self.config.interrupt.clear();
+        // The agent definitions the model is offered stay as they are for the
+        // whole turn: read here, once, so editing a file mid-turn does not
+        // change the tool description the provider has cached.
+        if let Some(catalog) = &self.agent_catalog {
+            catalog.refresh();
+        }
         let aborted = Arc::new(AtomicBool::new(false));
         let task_abort = Arc::clone(&aborted);
         let mut config = self.config.clone();
@@ -2728,6 +2740,20 @@ fn process_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+/// Where skills, commands and agent definitions are looked for, from a
+/// session's config.
+fn extension_sources(config: &EngineConfig) -> crate::sources::Sources {
+    crate::sources::Sources {
+        cwd: config
+            .workspace_root
+            .clone()
+            .or_else(|| config.genome_root.clone()),
+        agent_dir: config.agent_dir.clone(),
+        home: process_home(),
+        foreign_user_dirs: config.foreign_user_dirs,
+    }
 }
 
 fn context_part(label: &str, text: Option<&str>) -> ContextPart {

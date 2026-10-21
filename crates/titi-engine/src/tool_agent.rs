@@ -195,18 +195,50 @@ impl ToolAgentRunner {
         context: &AgentContext,
         agent_span_id: Option<String>,
     ) -> Result<SmolStr, SmolStr> {
+        let profile = request.profile.as_deref();
+        let model = profile
+            .and_then(|profile| profile.model.as_deref())
+            .unwrap_or(&self.model);
         let resolved = self
             .resolver
-            .resolve(&self.model)
+            .resolve(model)
             .map_err(|error| SmolStr::from(error.to_string()))?;
         let credential = resolved.credential;
-
-        let mut messages = vec![ChatMessage {
+        let reasoning = profile
+            .and_then(|profile| profile.effort)
+            .and_then(|effort| {
+                titi_providers::resolve_reasoning(
+                    resolved.transport.api(),
+                    resolved.reasoning.as_ref(),
+                    &titi_providers::RequestOpts {
+                        effort: Some(effort),
+                    },
+                )
+            });
+        // A definition narrows what this runner was built with: its tools can
+        // only be a subset, and its cap only lower, so a file in a repository
+        // never makes a subagent more than the session's settings allow.
+        let mut tools = self.tools.clone();
+        let mut max_rounds = self.max_rounds;
+        let mut messages = Vec::new();
+        if let Some(profile) = profile {
+            profile.narrow(&mut tools);
+            if let Some(turns) = profile.max_rounds {
+                max_rounds = max_rounds.min(turns);
+            }
+            messages.push(ChatMessage {
+                role: Role::System,
+                content: profile.system_prompt().into(),
+                tool_calls: Vec::new(),
+                ..Default::default()
+            });
+        }
+        messages.push(ChatMessage {
             role: Role::User,
             content: request.task.clone(),
             tool_calls: Vec::new(),
             ..Default::default()
-        }];
+        });
         let mut summary = String::new();
 
         // The subagent's own cancellation flag, chained to the caller's.
@@ -233,7 +265,7 @@ impl ToolAgentRunner {
             // request, with tool calls forbidden, to say what is done and
             // what is left — the main turn's wrap-up, so the parent gets an
             // answer to read instead of an error.
-            let wrap_up = rounds >= self.max_rounds;
+            let wrap_up = rounds >= max_rounds;
             if wrap_up {
                 stopped = true;
                 messages.push(crate::tool_budget::wrap_up_message());
@@ -266,8 +298,9 @@ impl ToolAgentRunner {
 
             let mut wire = WireRequest::new(resolved.wire_model.clone());
             wire.messages = messages.clone();
-            wire.tools = self.tools.specs();
+            wire.tools = tools.specs();
             wire.forbid_tool_calls = wrap_up;
+            wire.reasoning = reasoning.clone();
             let mut stream = match resolved
                 .transport
                 .stream(
@@ -368,7 +401,7 @@ impl ToolAgentRunner {
                 calls,
                 text.into(),
                 collector.thinking().to_vec(),
-                &self.tools,
+                &tools,
                 self.approval_mode,
                 &waiters,
                 &sink,
@@ -523,6 +556,7 @@ mod tests {
                     task: "write the file".into(),
                     kind: AgentKind::Subagent,
                     parent_id: None,
+                    profile: None,
                 },
                 AgentContext::detached(),
             )

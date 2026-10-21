@@ -32,14 +32,18 @@
 //! engine refuses the call rather than parking a turn nobody can answer. The
 //! same reasoning sets this tool's tier — see [`AgentTool::new`].
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use smol_str::SmolStr;
 use titi_providers::ToolSpec;
 use titi_tools::{ApprovalTier, ToolDefinition, ToolHandler, ToolResult};
 
+use crate::agent_defs::{AgentCatalog, AgentProfile, Choice};
 use crate::agents::{AgentOutcome, AgentSupervisor};
 use crate::protocol::{AgentKind, AgentStatus};
+use crate::runtime::TransportResolver;
 
 /// Characters of a subagent's answer the parent model is given.
 ///
@@ -82,14 +86,49 @@ pub struct AgentTool {
     /// asked about what a subagent will do. This tool's tier says so: `Exec`
     /// when the child may execute, `Read` when it cannot do more than read.
     child_may_exec: bool,
+    /// The definition files, as of the turn's start.
+    catalog: Arc<AgentCatalog>,
+    /// What `model` in a definition is checked against.
+    resolver: Arc<dyn TransportResolver>,
 }
 
 impl AgentTool {
-    pub fn new(agents: AgentSupervisor, child_may_exec: bool) -> Self {
+    pub fn new(
+        agents: AgentSupervisor,
+        child_may_exec: bool,
+        catalog: Arc<AgentCatalog>,
+        resolver: Arc<dyn TransportResolver>,
+    ) -> Self {
         Self {
             agents,
             child_may_exec,
+            catalog,
+            resolver,
         }
+    }
+
+    /// The tool's description, then the definitions a call may name. The list
+    /// is the catalog's as of the turn's start and in name order, so it does
+    /// not move under the provider's prompt cache within a turn.
+    fn description(&self) -> String {
+        let mut text = String::from(
+            "Hand a task to a subagent and wait for its answer; `tasks` hands over several at \
+             once. A subagent has its own context and tool loop; it cannot ask you or spawn \
+             subagents. Use it for work that would flood this context (searching a tree, \
+             reading many files, a self-contained edit), not for what one tool call answers. \
+             Separate `agent` calls in one response run in turn; a `tasks` batch runs together \
+             (at most four in flight), one answer section per child, so use it for independent \
+             pieces.",
+        );
+        let listing = self.catalog.current();
+        if !listing.agents.is_empty() {
+            text.push_str(
+                "\n\nAgent definitions you can pass as `agent` (each has its own prompt and \
+                 may have fewer tools):",
+            );
+            text.push_str(&listing.render());
+        }
+        text
     }
 }
 
@@ -128,15 +167,7 @@ impl ToolHandler for AgentTool {
         ToolDefinition {
             spec: ToolSpec {
                 name: "agent".into(),
-                description: "Hand a task to a subagent and wait for its answer; `tasks` hands \
-                              over several at once. A subagent has its own context and tool \
-                              loop; it cannot ask you or spawn subagents. Use it for work that \
-                              would flood this context (searching a tree, reading many files, \
-                              a self-contained edit), not for what one tool call answers. \
-                              Separate `agent` calls in one response run in turn; a `tasks` \
-                              batch runs together (at most four in flight), one answer section \
-                              per child, so use it for independent pieces."
-                    .into(),
+                description: self.description().into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -156,17 +187,24 @@ impl ToolHandler for AgentTool {
                             "description": "`subagent` (default) does the work; `advisor` \
                                             gives a second opinion on a plan."
                         },
+                        "agent": {
+                            "type": "string",
+                            "description": "Run the task as this agent definition (see the \
+                                            list in this tool's description): its prompt, \
+                                            tools and model. Omit for a general subagent."
+                        },
                         "tasks": {
                             "type": "array",
                             "description": "A batch instead of `task`: each entry is `{task, \
-                                            name?, kind?}`. Exactly one of `task` and `tasks` \
+                                            name?, kind?, agent?}`. Exactly one of `task` and `tasks` \
                                             is required.",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "task": { "type": "string" },
                                     "name": { "type": "string" },
-                                    "kind": { "type": "string", "enum": ["subagent", "advisor"] }
+                                    "kind": { "type": "string", "enum": ["subagent", "advisor"] },
+                                    "agent": { "type": "string" }
                                 },
                                 "required": ["task"],
                                 "additionalProperties": false
@@ -207,7 +245,22 @@ impl ToolHandler for AgentTool {
     }
 
     fn refusal(&self, args: &Value) -> Option<String> {
-        shape_of(args).err()
+        let shape = match shape_of(args) {
+            Ok(shape) => shape,
+            Err(why) => return Some(why),
+        };
+        let listing = self.catalog.current();
+        let items = match &shape {
+            Shape::Single(item) => std::slice::from_ref(item),
+            Shape::Batch { items, .. } => items.as_slice(),
+        };
+        items.iter().find_map(|item| {
+            let name = item.agent.as_ref()?;
+            listing
+                .find(name)
+                .is_none()
+                .then(|| format!("agent: no definition named `{name}`; {}", listing.names()))
+        })
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -221,20 +274,36 @@ impl ToolHandler for AgentTool {
                 };
             }
         };
+        let refused = |why: String| ToolResult {
+            output: why.into(),
+            is_error: true,
+            detail: None,
+        };
         match shape {
-            Shape::Single(item) => self.run_single(item).await,
-            Shape::Batch { context, items } => self.run_batch(context, items).await,
+            Shape::Single(item) => {
+                let items = [item];
+                let mut profiles = match self.profiles(&items).await {
+                    Ok(profiles) => profiles,
+                    Err(why) => return refused(why),
+                };
+                let [item] = items;
+                self.run_single(item, profiles.pop().flatten()).await
+            }
+            Shape::Batch { context, items } => match self.profiles(&items).await {
+                Ok(profiles) => self.run_batch(context, items, profiles).await,
+                Err(why) => refused(why),
+            },
         }
     }
 }
 
 impl AgentTool {
     /// One child, waited on to the end.
-    async fn run_single(&self, item: Item) -> ToolResult {
+    async fn run_single(&self, item: Item, profile: Option<Arc<AgentProfile>>) -> ToolResult {
         // The one spawn path: the supervisor the surface's command uses too.
         let agent_id = self
             .agents
-            .spawn(item.name.clone(), item.prompt(None), item.kind)
+            .spawn_with(item.name.clone(), item.prompt(None), item.kind, profile)
             .await;
         let mut guard = StopChildren {
             agents: self.agents.clone(),
@@ -274,22 +343,31 @@ impl AgentTool {
     /// A child that fails does not stop its siblings — see the module docs;
     /// the wave's waits all resolve before the next wave is spawned, so a
     /// failure is a section in the answer, not an abort.
-    async fn run_batch(&self, context: Option<String>, items: Vec<Item>) -> ToolResult {
+    async fn run_batch(
+        &self,
+        context: Option<String>,
+        items: Vec<Item>,
+        profiles: Vec<Option<Arc<AgentProfile>>>,
+    ) -> ToolResult {
         let mut guard = StopChildren {
             agents: self.agents.clone(),
             ids: Vec::new(),
             armed: true,
         };
         let mut outcomes: Vec<Option<AgentOutcome>> = Vec::with_capacity(items.len());
-        for wave in items.chunks(BATCH_CONCURRENCY) {
+        for (wave, wave_profiles) in items
+            .chunks(BATCH_CONCURRENCY)
+            .zip(profiles.chunks(BATCH_CONCURRENCY))
+        {
             let mut ids: Vec<SmolStr> = Vec::with_capacity(wave.len());
-            for item in wave {
+            for (item, profile) in wave.iter().zip(wave_profiles) {
                 let id = self
                     .agents
-                    .spawn(
+                    .spawn_with(
                         item.name.clone(),
                         item.prompt(context.as_deref()),
                         item.kind,
+                        profile.clone(),
                     )
                     .await;
                 guard.ids.push(id.clone());
@@ -309,6 +387,46 @@ impl AgentTool {
             detail: None,
         }
     }
+
+    /// The definitions a call names, as the profiles its children run with.
+    ///
+    /// A name nobody defined refuses the whole call before any child starts,
+    /// with the names that do exist. A `model` the user's catalog cannot
+    /// serve is not an error: the child runs on the subagents' own model and
+    /// the surface is told why.
+    async fn profiles(&self, items: &[Item]) -> Result<Vec<Option<Arc<AgentProfile>>>, String> {
+        let listing = self.catalog.current();
+        let mut profiles = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(name) = &item.agent else {
+                profiles.push(None);
+                continue;
+            };
+            let Some(definition) = listing.find(name) else {
+                return Err(format!(
+                    "agent: no definition named `{name}`; {}",
+                    listing.names()
+                ));
+            };
+            let model = match self
+                .catalog
+                .choose_model(definition.model.as_deref(), &*self.resolver)
+            {
+                Choice::Inherit => None,
+                Choice::Use(model) => Some(model),
+                Choice::Fallback(why) => {
+                    self.agents
+                        .notice(format!(
+                            "agent {name}: model {why}; running on the subagents' own model"
+                        ))
+                        .await;
+                    None
+                }
+            };
+            profiles.push(Some(Arc::new(definition.profile(model))));
+        }
+        Ok(profiles)
+    }
 }
 
 /// What a call asked for, once its arguments have been read.
@@ -325,6 +443,8 @@ struct Item {
     task: String,
     name: SmolStr,
     kind: AgentKind,
+    /// The definition to run as, by name.
+    agent: Option<String>,
 }
 
 impl Item {
@@ -352,6 +472,11 @@ fn shape_of(args: &Value) -> Result<Shape, String> {
         (false, false) => Err("agent needs a `task`, or a `tasks` list to run as a batch".into()),
         (true, false) => Ok(Shape::Single(item_of(args, None)?)),
         (false, true) => {
+            if args.get("agent").is_some() {
+                return Err(
+                    "agent: name the definition inside each entry of `tasks`, not beside it".into(),
+                );
+            }
             let list = args
                 .get("tasks")
                 .and_then(Value::as_array)
@@ -390,6 +515,19 @@ fn item_of(args: &Value, index: Option<usize>) -> Result<Item, String> {
         .map(str::trim)
         .filter(|task| !task.is_empty())
         .ok_or_else(|| format!("agent: {which} needs a `task`: what the subagent is to do"))?;
+    let agent = match args.get("agent") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    format!("agent: {which}'s `agent` must be the name of a definition")
+                })?
+                .to_owned(),
+        ),
+    };
     let name: SmolStr = match args
         .get("name")
         .and_then(Value::as_str)
@@ -397,9 +535,10 @@ fn item_of(args: &Value, index: Option<usize>) -> Result<Item, String> {
         .filter(|name| !name.is_empty())
     {
         Some(name) => name.into(),
-        None => match index {
-            Some(index) => format!("Subagent {}", index + 1).into(),
-            None => "Subagent".into(),
+        None => match (&agent, index) {
+            (Some(agent), _) => agent.as_str().into(),
+            (None, Some(index)) => format!("Subagent {}", index + 1).into(),
+            (None, None) => "Subagent".into(),
         },
     };
     let kind = match args.get("kind").and_then(Value::as_str) {
@@ -410,6 +549,7 @@ fn item_of(args: &Value, index: Option<usize>) -> Result<Item, String> {
         task: task.to_owned(),
         name,
         kind,
+        agent,
     })
 }
 

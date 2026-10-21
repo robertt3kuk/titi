@@ -784,6 +784,25 @@ pub fn apply_tool_round_limits(
     Ok(())
 }
 
+/// The `modelRoles` map as role name to model id, for the engine to resolve a
+/// subagent definition's `model` against. An entry that is not text is not a
+/// role.
+pub fn model_roles_from(
+    settings: &titi_config::settings::Settings,
+) -> std::collections::BTreeMap<String, String> {
+    settings
+        .get("modelRoles")
+        .and_then(|value| value.as_object().cloned())
+        .map(|roles| {
+            roles
+                .into_iter()
+                .filter_map(|(name, model)| Some((name, model.as_str()?.trim().to_owned())))
+                .filter(|(_, model)| !model.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether the genome prompt map is enabled from settings; `genome.enabled` as a boolean.
 ///
 /// Missing key → true (default on). JSON bool true/false → that. String `on`/`true`/`yes` →
@@ -1051,6 +1070,7 @@ pub fn start_engine_with(
             .map_err(|error| error.to_string())?;
         engine_config.background_after = Some(titi_tools::background_after_with(threshold));
         apply_tool_round_limits(&mut engine_config, settings)?;
+        engine_config.model_roles = model_roles_from(settings);
     }
     let mut tools = ToolRegistry::new();
     // One cache for the main turn and every subagent it spawns.
@@ -1160,6 +1180,29 @@ pub fn start_engine_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `modelRoles` reaches the engine as a plain role-to-model map, so a
+    /// subagent definition's `model: fast` can mean what `/switch @fast` does.
+    #[test]
+    fn model_roles_reach_the_engine_as_a_map() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).expect("agent dir");
+        std::fs::write(
+            agent.join("config.yml"),
+            "modelRoles:\n  fast: local/small\n  default: openai/gpt-4.1\n  odd: 7\n",
+        )
+        .expect("config");
+        let settings =
+            titi_config::settings::Settings::load(&agent, tmp.path(), &[]).expect("settings load");
+        let roles = model_roles_from(&settings);
+        assert_eq!(roles.get("fast").map(String::as_str), Some("local/small"));
+        assert_eq!(
+            roles.get("default").map(String::as_str),
+            Some("openai/gpt-4.1")
+        );
+        assert_eq!(roles.get("odd"), None);
+    }
 
     /// The two round limits reach the engine config; unset keeps the engine's
     /// defaults and a bad value is refused by name.

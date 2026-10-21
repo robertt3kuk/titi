@@ -145,6 +145,7 @@ impl CouncilMember {
                     task: self.prompt(question),
                     kind: AgentKind::Subagent,
                     parent_id: None,
+                    profile: None,
                 },
                 AgentContext::detached(),
             )
@@ -271,6 +272,7 @@ impl Council {
                     task: fold_prompt(question, answers, dropped).into(),
                     kind: AgentKind::Subagent,
                     parent_id: None,
+                    profile: None,
                 },
                 AgentContext::detached(),
             )
