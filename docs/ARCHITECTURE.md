@@ -13,6 +13,7 @@ source files are listed at the end. If the code changes, the code wins.
 | titi-engine | Protocol, turn loop, provider registry, subagents |
 | titi-providers | Transport and stream parsing |
 | titi-tools | Tools and the read / write / exec tiers |
+| titi-mcp | MCP client over stdio: servers, their tools as `mcp__<server>__<tool>` |
 | titi-genome | Repo walk, PageRank, projection into the system message |
 | titi-core | JSONL sessions, search, trajectory |
 | titi-memory | Memory index: full text and local embeddings |
@@ -252,6 +253,25 @@ Code: `crates/titi-tools/src/{lib,fs,cache}.rs`; the approval gate is
 `glob`, `grep`, `bash`. The CLI registers them via
 `workspace_tools_with_cache(&workspace, read_cache)` plus `MemoryTool` from
 `titi-memory`, in a `ToolRegistry` of `ToolHandler` / `ToolDefinition`.
+
+### MCP servers
+
+Code: `crates/titi-mcp/src/{client,manager,tool}.rs` (client, supervisor,
+registry handlers), `crates/titi-config/src/mcp.rs` (files, hash),
+`crates/titi-engine/src/mcp.rs` (the engine's side),
+`crates/titi-cli/src/{mcp_setup,mcp_panel,hooks_trust}.rs`.
+
+The surface reads `<agent_dir>/mcp.json` (runs unconditionally) and
+`.titi/mcp.json` / `.mcp.json` (only with the user's recorded consent, hashed
+like hooks) and sends the approved list as `EngineCommand::SetMcp`; the
+engine reads no MCP file. Each server is a child process (own process group,
+allow-listed environment plus its `env`, stderr in `<agent_dir>/mcp/<server>.log`)
+spoken to over newline-delimited JSON-RPC, protocol 2025-11-25. Servers start
+in the background; a prompt waits up to 10 s for servers still starting. The
+engine swaps a server's tools into its registry when the manager reports a
+change (a running turn keeps the registry it started with), and reports
+`EngineEvent::McpStatus`. Every `mcp__` tool is exec tier unless the user's own
+`mcp.<server>.approval` lowers it for the user's own server.
 
 ### Tiers and modes
 
