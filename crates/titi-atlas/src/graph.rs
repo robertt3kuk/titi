@@ -208,6 +208,7 @@ mod tests {
             language: Language::Rust,
             exports: Vec::new(),
             export_sites: Vec::new(),
+            symbols: Vec::new(),
             imports: imports.iter().map(|s| (*s).to_owned()).collect(),
             unresolved_imports: Vec::new(),
             unresolved_candidates: Vec::new(),

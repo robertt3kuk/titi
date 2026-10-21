@@ -39,6 +39,14 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   external_uses, uses, raw_refs, size, mtime, … }`. `uses` is the resolved
   half of `raw_refs`: each entry names the one file it is a use of and why
   (`Basis::Scope` or `Basis::Unique`).
+- `FileRecord::symbols: Vec<SymbolSite>` (`symbol.rs`) is the per-symbol
+  contract: `SymbolSite { name, kind: SymbolKind, span: (start_line,
+  end_line), signature: Option<String> /* one line, ≤ 120 chars, built with
+  one_line_signature */, exported: bool }`, one entry per export in export
+  order (plus private items a module chooses to describe). A language module
+  fills `ParsedFile::symbols`; one that has not yet leaves it empty and the
+  index derives one entry per export from `export_sites` (kind `Other`, a
+  one-line span, no signature).
 - `SymbolRecord { files, users }`: who defines a name and, summed over the
   definers, how many distinct files use it. `used_by` is the per-definer
   view the prompt map prints: definer path → `(export, distinct files whose

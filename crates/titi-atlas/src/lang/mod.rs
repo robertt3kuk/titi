@@ -37,6 +37,9 @@ pub struct ParsedFile {
     pub exports: Vec<String>,
     /// One site per export, source order. Names match [`Self::exports`].
     pub export_sites: Vec<crate::ExportSite>,
+    /// Symbols with extent and signature; empty until a module fills it, in
+    /// which case the index derives one per export. See [`crate::SymbolSite`].
+    pub symbols: Vec<crate::SymbolSite>,
     /// Files this one depends on.
     pub imports: Vec<String>,
     /// Import specifiers of this workspace's own shape that named no file.

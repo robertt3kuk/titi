@@ -37,6 +37,7 @@ mod role;
 mod scan;
 mod scope;
 mod shared;
+mod symbol;
 mod symbols;
 pub mod syntax_check;
 
@@ -47,6 +48,7 @@ pub use project::{RankedFile, ranking, render};
 pub use query::format_check_report;
 pub use scan::list_files;
 pub use shared::SharedAtlas;
+pub use symbol::{MAX_SIGNATURE, SymbolKind, SymbolSite, one_line_signature};
 
 /// Crate version, mirrors the workspace release.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -132,6 +134,11 @@ pub struct FileRecord {
     pub exports: Vec<String>,
     /// One site per export, same names as [`Self::exports`], source order.
     pub export_sites: Vec<ExportSite>,
+    /// Every symbol the file defines, with its extent and, where its language
+    /// module extracts one, its one-line signature. One entry per name in
+    /// [`Self::exports`] and in the same order, so the two never disagree; see
+    /// [`SymbolSite`].
+    pub symbols: Vec<SymbolSite>,
     pub imports: Vec<String>,
     /// Specifiers that did not resolve to a known file. Not graph edges.
     pub unresolved_imports: Vec<String>,
@@ -1309,11 +1316,17 @@ fn parse_one(
         .nth(file.path.split('/').count())
         .unwrap_or(Path::new(""));
     reresolve::retry(root, &file.path, language, source, &mut result, known);
+    let symbols = symbol::sites_for(
+        std::mem::take(&mut result.symbols),
+        &result.exports,
+        &result.export_sites,
+    );
     (
         FileRecord {
             language,
             path: file.path.clone(),
             exports: result.exports,
+            symbols,
             export_sites: result.export_sites,
             imports: result.imports,
             unresolved_imports: result.unresolved_imports,

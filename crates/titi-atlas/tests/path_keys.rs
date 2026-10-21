@@ -117,7 +117,8 @@ fn an_lsp_uri_through_a_symlinked_root_still_finds_the_file() {
 
     let uri = format!("file://{}", link.join("src/a.rs").display());
     let body = |text: String| format!("Content-Length: {}\r\n\r\n{text}", text.len());
-    let mut input = body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_owned());
+    let mut input =
+        body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_owned());
     input.push_str(&body(format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#
     )));
