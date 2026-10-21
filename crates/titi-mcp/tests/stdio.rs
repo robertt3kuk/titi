@@ -197,6 +197,43 @@ async fn the_action_row_names_the_server_the_tool_and_the_arguments() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_tool_list_is_bounded_screened_and_reported() {
+    let mut rig = rig();
+    rig.manager
+        .set_servers(vec![def("fixture", &[("FIXTURE_HOSTILE", "1")])]);
+    ready(&rig, "fixture").await;
+    let status = rig.manager.status();
+    let names: Vec<&str> = status[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names.len(), titi_mcp::MAX_TOOLS, "{}", names.len());
+    assert!(
+        !names.contains(&"mcp__fixture__injected"),
+        "an injection was registered"
+    );
+    assert!(!names.contains(&"mcp__fixture__badschema"));
+    let long = status[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "mcp__fixture__longdesc")
+        .unwrap();
+    assert_eq!(long.description.chars().count(), titi_mcp::MAX_DESCRIPTION);
+    let mut notice = String::new();
+    while let Ok(event) = rig.events.try_recv() {
+        if let McpEvent::Notice(text) = event {
+            notice.push_str(&text);
+        }
+    }
+    assert!(
+        notice.contains("injected (reads like a prompt injection)"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("badschema (its input schema is not an object)"),
+        "{notice}"
+    );
+    assert!(notice.contains("more than 128 tools"), "{notice}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_a_set_approval_lowers_the_tier() {
     let rig = rig();
     let mut lowered = def("low", &[]);

@@ -9,6 +9,7 @@
 pub mod client;
 pub mod manager;
 mod tool;
+mod vet;
 
 pub use client::{CallOutput, Client, ClientEvent, Launch, McpError, ToolInfo, render_content};
 pub use manager::{
@@ -16,3 +17,4 @@ pub use manager::{
     log_path,
 };
 pub use tool::{MAX_TOOL_NAME, tool_name};
+pub use vet::{MAX_DESCRIPTION, MAX_SCHEMA_BYTES, MAX_TOOLS};

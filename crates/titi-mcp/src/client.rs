@@ -200,12 +200,17 @@ impl Client {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
-                    input_schema: tool
-                        .get("inputSchema")
-                        .filter(|schema| schema.is_object())
-                        .cloned()
-                        .unwrap_or_else(|| json!({ "type": "object" })),
+                    // As the server sent it: `vet` decides whether it may be
+                    // offered. A tool with no schema at all takes no arguments.
+                    input_schema: match tool.get("inputSchema") {
+                        None | Some(Value::Null) => json!({ "type": "object" }),
+                        Some(schema) => schema.clone(),
+                    },
                 });
+            }
+            // More than the list may keep (`vet`) is not worth collecting.
+            if tools.len() > crate::vet::MAX_TOOLS * 4 {
+                break;
             }
             cursor = page
                 .get("nextCursor")

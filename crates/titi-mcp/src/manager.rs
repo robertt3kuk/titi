@@ -491,7 +491,8 @@ async fn supervise(slot: Arc<Slot>, config: ManagerConfig, events: UnboundedSend
 /// Records a connection and its tool list as the slot's ready state, and
 /// returns what was left out of the list and why.
 fn publish(slot: &Slot, client: &Arc<Client>, tools: Vec<ToolInfo>) -> Vec<String> {
-    let mut notes = Vec::new();
+    let (tools, vetted) = crate::vet::vet(&slot.name, tools);
+    let mut notes: Vec<String> = vetted.into_iter().collect();
     let mut seen = HashSet::new();
     let mut listing = Vec::with_capacity(tools.len());
     for tool in tools {
