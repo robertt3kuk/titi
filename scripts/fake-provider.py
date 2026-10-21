@@ -9,6 +9,10 @@ the real binary and the real HTTP stack:
   "[titi-review]" (the marker every /review request carries; matched before the
                   words below) a reviewer reply: `VERDICT: FAIL — missing test` and
                   one finding, `README.md:1 — no test covers the new title`
+  "[titi-compact]" (the marker in the system prompt of a compaction summary
+                  request; matched before every other word, because the
+                  transcript it carries repeats the words of the whole
+                  conversation) a structured summary, `## Goal` … `## Next step`
   "sleepy shell"  a bash call that runs for 3 s (the live tool phase)
   "danger shell"  a bash call on `rm -rf ./victim` (what a PreToolUse hook that
                   refuses `rm -rf` is for)
@@ -216,12 +220,27 @@ def chain(request: dict) -> list[tuple[dict, float]] | None:
         return words("Fixed: ok.txt written." if fixed else "Done: a.txt written.", 0) + done
     return None
 
+COMPACT_SUMMARY = (
+    "## Goal\nFake summary: carry on the scripted conversation.\n"
+    "## Decisions made\nnone\n"
+    "## Files and symbols touched\nnone\n"
+    "## Commands run and outcomes\nnone\n"
+    "## Unresolved errors and failing checks\nnone\n"
+    "## User preferences and constraints\nnone\n"
+    "## Next step\nanswer the next question"
+)
+
 
 def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, float]]:
     """The chunks to stream for this request, each with the pause after it."""
     content = last.get("content") or ""
     if isinstance(content, list):
         content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    if any(
+        m.get("role") == "system" and "[titi-compact]" in str(m.get("content") or "")
+        for m in messages or []
+    ):
+        return words(COMPACT_SUMMARY, 0) + [(chunk({}, "stop"), 0)]
     if last.get("role") == "tool":
         first = content.strip().splitlines()[0] if content.strip() else "(empty)"
         return words(f"tool said: {first}", 0) + [(chunk({}, "stop"), 0)]
