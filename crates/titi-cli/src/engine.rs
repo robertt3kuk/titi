@@ -997,6 +997,11 @@ pub fn start_engine_with(
     // is opt-in (`trace.thinking: true`); the size and the time are recorded
     // either way. Read through the same helper the editor switch uses: unset is
     // off, and a typo leaves it off rather than quietly turning it on.
+    // The surface's own command names win over a file's, and the user alone
+    // decides whether `~/.claude` and `~/.agents` are read.
+    engine_config.reserved_commands = crate::extensions::reserved_commands();
+    let skill_sources = crate::extensions::sources(&agent_dir, &workspace, settings.as_ref());
+    engine_config.foreign_user_dirs = skill_sources.foreign_user_dirs;
     engine_config.trace_thinking = settings.as_ref().is_some_and(|settings| {
         titi_config::settings::switch_on(settings, titi_config::settings::TRACE_THINKING_KEY)
     });
@@ -1030,6 +1035,9 @@ pub fn start_engine_with(
         titi_memory::tool::MemoryTool::with_providers(agent_dir.clone(), provider_ids),
     ));
     tools.register(Arc::new(titi_tools::TodoTool::new()));
+    tools.register(Arc::new(titi_engine::skill_tool::SkillTool::new(
+        skill_sources,
+    )));
     struct CliSettingsBackend {
         agent_dir: std::path::PathBuf,
         workspace: std::path::PathBuf,

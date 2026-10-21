@@ -5888,7 +5888,8 @@ fn guard_every_listed_command_dispatches_and_does_something() {
             || chat.palette.list.is_some()
             || chat.model_picker.is_some()
             || chat.login_picker.is_some()
-            || chat.theme_picker.is_some();
+            || chat.theme_picker.is_some()
+            || chat.extensions.is_some();
         assert!(
             did_something,
             "/{} does nothing (no effect, no log, no output)",

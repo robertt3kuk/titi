@@ -757,6 +757,10 @@ pub struct Chat {
     pub(crate) emoji_picker: titi_tui::emoji::EmojiPicker,
     /// Skills the engine discovered, offered by the same picker.
     pub(crate) skills: Vec<SkillRow>,
+    /// File commands the engine discovered, offered by the same picker.
+    pub(crate) commands: Vec<crate::extensions::CommandRow>,
+    /// The `/skills` panel, while it is open.
+    pub(crate) extensions: Option<crate::extensions::ExtensionsPicker>,
     /// Kitty or Ghostty unicode placeholders are available.
     pub(crate) kitty: bool,
     pub(crate) tmux: bool,
@@ -984,6 +988,8 @@ impl Chat {
             model_picker: None,
             emoji_picker: titi_tui::emoji::EmojiPicker::default(),
             skills: Vec::new(),
+            commands: Vec::new(),
+            extensions: None,
             kitty: false,
             tmux: false,
             photos: Vec::new(),
@@ -2435,10 +2441,13 @@ impl Chat {
             "diagnose" => self.diagnose(args),
             "copy" => self.copy_command(args),
             "errors" => self.errors_command(args),
+            "skills" => self.skills_command(args),
             _ => {
-                // A known skill is not a command: it goes to the model as a
-                // prompt, and the engine expands it there.
-                if self.skills.iter().any(|skill| skill.name == name) {
+                // A known skill or file command is not a built-in: it goes to
+                // the model as a prompt, and the engine expands it there.
+                if self.skills.iter().any(|skill| skill.name == name)
+                    || self.commands.iter().any(|command| command.name == name)
+                {
                     return None;
                 }
                 self.push(LineKind::Error, format!("unknown command /{name}"));
@@ -4517,7 +4526,7 @@ pub fn run(
         chat.push(LineKind::Note, note);
     }
     chat.catalog = catalog;
-    chat.skills = discovered_skills(&chat.agent_dir);
+    chat.refresh_extensions();
     let detect = titi_tui::image::PlaceholderDetect::from_env();
     if detect.supported() {
         chat.kitty = true;
@@ -4657,21 +4666,6 @@ pub(crate) struct SkillRow {
     pub(crate) about: String,
 }
 
-/// Discovery lives in the engine, so the picker offers exactly the names a
-/// `/name` reference can expand.
-fn discovered_skills(agent_dir: &Path) -> Vec<SkillRow> {
-    titi_engine::skills::catalog(
-        Some(&crate::session_fs::current_workspace()),
-        Some(agent_dir),
-    )
-    .into_iter()
-    .map(|skill| SkillRow {
-        name: skill.name,
-        about: skill.description,
-    })
-    .collect()
-}
-
 /// A way to sign in to a subscription provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginMethod {
@@ -4755,7 +4749,7 @@ pub(crate) fn slash_token(input: &str, caret: usize) -> Option<SlashToken<'_>> {
     let name = &input[start + 1..end];
     if !name
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
     {
         return None;
     }

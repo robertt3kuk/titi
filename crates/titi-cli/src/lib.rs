@@ -12,6 +12,9 @@ pub mod engine;
 pub(crate) mod errors_panel;
 #[cfg(test)]
 mod errors_tests;
+pub(crate) mod extensions;
+#[cfg(test)]
+mod extensions_tests;
 pub mod first_frame;
 pub(crate) mod footer_actions;
 #[cfg(test)]

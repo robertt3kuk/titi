@@ -276,6 +276,12 @@ pub const TREE_FILTER_MODE_KEY: &str = "treeFilterMode";
 /// way, so `/trace` and `titi trace` show the metrics with the setting off.
 pub const TRACE_THINKING_KEY: &str = "trace.thinking";
 
+/// Whether skills and commands are also read from `~/.agents` and `~/.claude`.
+///
+/// Off by default: those are other tools' directories. User layers only; see
+/// [`foreign_user_dirs`].
+pub const SKILLS_FOREIGN_USER_DIRS_KEY: &str = "skills.foreignUserDirs";
+
 /// Whether a finished turn's footer names its wall time.
 ///
 /// Unset means on. The footer is the dim row under the answer; this is the
@@ -790,6 +796,22 @@ pub fn switch_on(settings: &Settings, key: &str) -> bool {
     }
 }
 
+/// Whether skills and commands are also read from `~/.agents` and `~/.claude`.
+///
+/// Off unless the user turns it on (`skills.foreignUserDirs: true`): those
+/// directories hold another tool's state, so reading them is the user's
+/// call, and it is read from the user's layers only so a repository cannot
+/// make it for them.
+pub fn foreign_user_dirs(settings: &Settings) -> bool {
+    match settings.get_user(SKILLS_FOREIGN_USER_DIRS_KEY) {
+        Some(Value::Bool(on)) => on,
+        Some(Value::String(text)) => {
+            matches!(text.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+        }
+        _ => false,
+    }
+}
+
 /// One dotted segment into a value: an object key, or a decimal position in
 /// an array — the shape [`Settings::flatten`] gives array elements, so a
 /// flattened key resolves back to the layer that set it.
@@ -1022,6 +1044,30 @@ mod tests {
             Some(Value::Bool(true))
         );
         assert_eq!(settings.get_user("privacy.allow"), None);
+    }
+
+    /// `~/.claude` and `~/.agents` belong to other tools: only the user's own
+    /// layers may open them, so a cloned repo cannot make titi read them.
+    #[test]
+    fn foreign_user_dirs_are_opened_by_the_user_layers_alone() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(
+            &project.path().join(PROJECT_SUBPATH),
+            "skills:\n  foreignUserDirs: true\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert!(
+            !foreign_user_dirs(&settings),
+            "the project file opened them"
+        );
+
+        write(
+            &agent.path().join("config.yml"),
+            "skills:\n  foreignUserDirs: true\n",
+        );
+        let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        assert!(foreign_user_dirs(&settings));
     }
 
     #[test]

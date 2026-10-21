@@ -59,6 +59,13 @@ pub struct Command {
     bound: PathBuf,
 }
 
+impl Command {
+    /// The Markdown file the command comes from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A command another definition of the name beat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadowed {

@@ -223,6 +223,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "every error this session showed, newest first",
     },
     Command {
+        name: "skills",
+        about: "skills and file commands found, where, and what was left out",
+    },
+    Command {
         name: "statusline",
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },
@@ -248,6 +252,8 @@ pub(crate) const COMMANDS: &[Command] = &[
 pub(crate) enum PickRow {
     Command(&'static Command),
     Skill(usize),
+    /// A file command: an index into [`Chat::commands`].
+    File(usize),
 }
 
 /// One row of the bare-`/login` picker: a subscription provider and how to
@@ -587,6 +593,17 @@ pub(crate) fn picker_rows(chat: &Chat) -> Vec<PickRow> {
         .into_iter()
         .map(PickRow::Skill),
     );
+    // A file command is something typed first, like a built-in one.
+    if chat.input[..token.start].trim().is_empty() {
+        rows.extend(
+            rank_names(
+                token.prefix,
+                chat.commands.iter().map(|command| command.name.as_str()),
+            )
+            .into_iter()
+            .map(PickRow::File),
+        );
+    }
     rows
 }
 
@@ -1712,6 +1729,9 @@ pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<Pane
     if chat.errors.picker.is_some() {
         return Some(crate::errors_panel::errors_panel(chat, total, width));
     }
+    if chat.extensions.is_some() {
+        return Some(crate::extensions::extensions_panel(chat, total, width));
+    }
     if chat.history_picker.is_some() {
         return Some(history_panel(chat, total));
     }
@@ -2338,6 +2358,21 @@ fn command_panel(chat: &Chat, total: u16) -> PanelView {
                     .unwrap_or_default(),
                 accent: true,
             },
+            PickRow::File(at) => PanelLine::Row {
+                text: chat
+                    .commands
+                    .get(*at)
+                    .map(|command| {
+                        let name = if command.hint.is_empty() {
+                            command.name.clone()
+                        } else {
+                            format!("{} {}", command.name, command.hint)
+                        };
+                        format!("/{name:<12} ·command {}", command.about)
+                    })
+                    .unwrap_or_default(),
+                accent: true,
+            },
         })
         .collect();
     panel_view(None, lines, Some(selected), panel_body(total))
@@ -2572,6 +2607,7 @@ impl Chat {
             || self.login_picker.is_some()
             || self.model_picker.is_some()
             || self.errors.picker.is_some()
+            || self.extensions.is_some()
             || self.emoji_picker.is_visible()
             || self.arg_rows().is_some()
             || self.compose.mention.is_visible()
@@ -2713,6 +2749,11 @@ impl Chat {
                 .skills
                 .get(*index)
                 .map(|skill| skill.name.as_str())
+                .unwrap_or_default(),
+            PickRow::File(index) => self
+                .commands
+                .get(*index)
+                .map(|command| command.name.as_str())
                 .unwrap_or_default(),
         }
     }

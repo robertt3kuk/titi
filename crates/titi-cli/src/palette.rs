@@ -239,6 +239,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Bool,
     ),
     setting(
+        cfg::SKILLS_FOREIGN_USER_DIRS_KEY,
+        "also read skills and commands from ~/.agents and ~/.claude",
+        Values::Bool,
+    ),
+    setting(
         cfg::DISPLAY_TURN_FOOTER_TIME_KEY,
         "wall time in the turn footer",
         Values::Bool,
@@ -274,6 +279,9 @@ pub(crate) const SETTINGS: &[Setting] = &[
 pub(crate) enum Action {
     /// Run `/name` as if it had been typed and sent.
     Command(&'static str),
+    /// A skill or file command (`"skill"`, `"command"`): Enter leaves
+    /// `/name ` in the composer for its arguments.
+    Slash(&'static str),
     Panel(Panel),
     Setting(&'static Setting),
 }
@@ -294,6 +302,7 @@ impl Entry {
     fn row(&self) -> String {
         let kind = match self.action {
             Action::Command(_) => "",
+            Action::Slash(kind) => return format!("{:<24} {kind} · {}", self.label, self.about),
             Action::Panel(_) => "panel · ",
             Action::Setting(_) => "setting · ",
         };
@@ -325,6 +334,12 @@ const PANELS: [(&str, &str, Panel); 6] = [
 
 /// Every command, panel and setting, in the order a bare palette shows them.
 pub(crate) fn entries() -> Vec<Entry> {
+    entries_with(Vec::new())
+}
+
+/// [`entries`] with the skills and file commands of this session listed
+/// after the built-in commands.
+pub(crate) fn entries_with(extra: Vec<Entry>) -> Vec<Entry> {
     let commands = COMMANDS.iter().map(|command| Entry {
         label: format!("/{}", command.name),
         about: command.about.to_owned(),
@@ -347,6 +362,7 @@ pub(crate) fn entries() -> Vec<Entry> {
         action: Action::Command("statusline"),
     };
     commands
+        .chain(extra)
         .chain(panels)
         .chain(std::iter::once(preset))
         .chain(settings)
@@ -494,9 +510,9 @@ pub(crate) struct Palette {
 }
 
 impl Palette {
-    fn open() -> Self {
+    fn open(extra: Vec<Entry>) -> Self {
         Self {
-            entries: entries(),
+            entries: entries_with(extra),
             query: String::new(),
             selected: 0,
             help: false,
@@ -719,7 +735,7 @@ impl Chat {
     pub(crate) fn ctrl_k(&mut self) -> Applied {
         self.disarm();
         if self.input.is_empty() {
-            self.palette.list = Some(Palette::open());
+            self.palette.list = Some(Palette::open(self.extension_entries()));
             return Applied::none();
         }
         let (start, end) = self.whole_markers(self.caret(), self.input.len());
@@ -731,6 +747,25 @@ impl Chat {
         self.picker_hidden = false;
         self.scroll_offset = 0;
         Applied::none()
+    }
+
+    /// The skills a person may type and the file commands, as palette rows.
+    fn extension_entries(&self) -> Vec<Entry> {
+        let skills = self.skills.iter().map(|skill| Entry {
+            label: format!("/{}", skill.name),
+            about: skill.about.clone(),
+            action: Action::Slash("skill"),
+        });
+        let commands = self.commands.iter().map(|command| Entry {
+            label: format!("/{}", command.name),
+            about: if command.hint.is_empty() {
+                command.about.clone()
+            } else {
+                format!("{} {}", command.hint, command.about)
+            },
+            action: Action::Slash("command"),
+        });
+        skills.chain(commands).collect()
     }
 
     /// `/help`: the palette on the commands alone, `query` typed in.
@@ -810,6 +845,12 @@ impl Chat {
             Action::Command(name) if NEEDS_TEXT.contains(&name) => {
                 self.palette.list = None;
                 self.input = format!("/{name} ");
+                self.caret_to_end();
+                Applied::none()
+            }
+            Action::Slash(_) => {
+                self.palette.list = None;
+                self.input = format!("{} ", entry.label);
                 self.caret_to_end();
                 Applied::none()
             }
