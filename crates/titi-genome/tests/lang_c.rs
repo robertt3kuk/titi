@@ -269,3 +269,46 @@ fn c_quoted_includes_resolve_and_system_ones_stay_quiet() {
         );
     }
 }
+
+/// `foo.h` declares what `foo.c` defines: the pair is one module. The header
+/// is what an includer sees; the implementation is credited as the header's
+/// implementation (edge `foo.h` -> `foo.c`) so it ranks under its header, and
+/// the `.c` depends on its header even when it never writes the include.
+#[test]
+fn c_header_and_same_stem_source_are_a_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "net.h", "int net_connect(const char *host);\n");
+    write(
+        root,
+        "net.c",
+        "int net_connect(const char *host) { return host != 0; }\n",
+    );
+    write(
+        root,
+        "main.c",
+        "#include \"net.h\"\nint main(void) { return net_connect(\"x\"); }\n",
+    );
+    write(root, "lone.c", "int lone(void) { return 1; }\n");
+    write(root, "sub/util.h", "int util(void);\n");
+    write(
+        root,
+        "sub/util.c",
+        "#include \"util.h\"\nint util(void) { return 2; }\n",
+    );
+
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(genome.files["net.c"].imports, vec!["net.h".to_owned()]);
+    assert_eq!(genome.files["net.h"].imports, vec!["net.c".to_owned()]);
+    assert!(genome.files["lone.c"].imports.is_empty());
+    // An explicit include and the pair are one edge, not two.
+    assert_eq!(
+        genome.files["sub/util.c"].imports,
+        vec!["sub/util.h".to_owned()]
+    );
+    assert_eq!(
+        genome.files["sub/util.h"].imports,
+        vec!["sub/util.c".to_owned()]
+    );
+    assert_eq!(genome.dependents.get("net.c"), Some(&1));
+}

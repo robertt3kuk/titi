@@ -316,7 +316,10 @@ def lsp_probes(repo, entries):
         out["probes"].append({"probe": "documentSymbol", "file": top, "ok": len(syms) > 0,
                               "n": len(syms), "exports_in_map": [e[0] for e in entries[0]["exports"]],
                               "names": [s["name"] for s in syms][:12]})
-        for entry in entries[:3]:
+        # Files with at least one export line are the probe targets: a file the
+        # map shows with no export (an implementation .c, a barrel) has nothing to
+        # ask about, and counting it would score the map's shape, not the LSP.
+        for entry in [e for e in entries if e["exports"]][:3]:
             rel = entry["path"]
             if not entry["exports"]:
                 for kind in ("definition", "references", "ref-site definition"):
