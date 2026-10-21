@@ -689,7 +689,7 @@ impl Atlas {
         if let Some(source) = self.overlay.get(path) {
             return Some(source.clone());
         }
-        fs::read_to_string(self.root.join(path)).ok()
+        fs::read(self.root.join(path)).ok().map(content::decode)
     }
 
     /// Give the index the co-change partners history found. The lens reads
@@ -1428,7 +1428,7 @@ fn parse_one(
     let source: &str = match overlay.get(&file.path) {
         Some(source) => source,
         None => {
-            disk = fs::read_to_string(&file.abs).unwrap_or_default();
+            disk = content::read_source(&file.abs);
             &disk
         }
     };

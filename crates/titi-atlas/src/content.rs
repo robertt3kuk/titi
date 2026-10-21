@@ -60,3 +60,23 @@ mod tests {
         assert_eq!(fingerprint(b""), fingerprint(b""));
     }
 }
+
+/// A source file's text, whatever its encoding.
+///
+/// Parsers and the use-site scan read `&str`. A file with bytes that are not
+/// UTF-8 (a Latin-1 comment, a Windows-1252 quote, a Shift-JIS header) used to
+/// read as an error and index as empty, which drops every symbol it defines
+/// and every edge it carries. Decoding it lossily replaces each bad byte with
+/// U+FFFD and costs nothing else: an identifier is ASCII or valid UTF-8 in
+/// every language the atlas reads, so what the replacement can touch is
+/// comments and string contents, which the parsers do not need exact. Valid
+/// UTF-8, nearly every file, is taken without a copy.
+pub(crate) fn decode(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
+}
+
+/// [`decode`] of the file at `path`; a file that cannot be read is empty text.
+pub(crate) fn read_source(path: &std::path::Path) -> String {
+    std::fs::read(path).map(decode).unwrap_or_default()
+}
