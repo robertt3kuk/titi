@@ -139,11 +139,15 @@ struct SlotState {
 pub(crate) struct Slot {
     pub(crate) name: String,
     def: McpServerDef,
+    /// For a repository's server: the hash of what was approved to run, taken
+    /// when the server was first handed over. Every start after that must
+    /// still hash to it.
+    approved_hash: Option<String>,
     inner: Mutex<SlotState>,
 }
 
 impl Slot {
-    fn new(def: McpServerDef) -> Arc<Self> {
+    fn new(def: McpServerDef, approved_hash: Option<String>) -> Arc<Self> {
         let state = if def.disabled {
             ServerState::Disabled
         } else {
@@ -152,6 +156,7 @@ impl Slot {
         Arc::new(Self {
             name: def.name.clone(),
             def,
+            approved_hash,
             inner: Mutex::new(SlotState {
                 state,
                 reason: String::new(),
@@ -261,7 +266,8 @@ impl McpManager {
             {
                 continue;
             }
-            let entry = self.start(def.clone());
+            let hash = def.project.then(|| def.hash(&self.config.workspace));
+            let entry = self.start(def.clone(), hash);
             servers.insert(def.name, entry);
         }
         drop(servers);
@@ -272,19 +278,24 @@ impl McpManager {
     /// restart allowance renewed. `false` for a name nobody knows.
     pub fn restart(&self, name: &str) -> bool {
         let mut servers = locked(&self.servers);
-        let Some(def) = servers.get(name).map(|entry| entry.slot.def.clone()) else {
+        let Some((def, hash)) = servers
+            .get(name)
+            .map(|entry| (entry.slot.def.clone(), entry.slot.approved_hash.clone()))
+        else {
             return false;
         };
         servers.remove(name);
-        let entry = self.start(def);
+        // The hash that was approved, not one taken now: restarting is not
+        // a way to approve what a `git pull` changed.
+        let entry = self.start(def, hash);
         servers.insert(name.to_owned(), entry);
         drop(servers);
         let _ = self.events.send(McpEvent::Changed);
         true
     }
 
-    fn start(&self, def: McpServerDef) -> Entry {
-        let slot = Slot::new(def);
+    fn start(&self, def: McpServerDef, approved_hash: Option<String>) -> Entry {
+        let slot = Slot::new(def, approved_hash);
         let task = (!slot.def.disabled).then(|| {
             tokio::spawn(supervise(
                 Arc::clone(&slot),
@@ -439,6 +450,18 @@ async fn supervise(slot: Arc<Slot>, config: ManagerConfig, events: UnboundedSend
     let log = log_path(&config.agent_dir, &slot.name);
     let mut restarts = 0;
     loop {
+        if let Some(approved) = &slot.approved_hash
+            && slot.def.hash(&config.workspace) != *approved
+        {
+            let reason = "its definition, or a repository file it runs, changed since it was approved; restart titi here to review it";
+            slot.set(ServerState::Failed, reason);
+            let _ = events.send(McpEvent::Notice(format!(
+                "mcp: {} not started: {reason}",
+                slot.name
+            )));
+            let _ = events.send(McpEvent::Changed);
+            return;
+        }
         let (client_events, mut from_client) = unbounded_channel();
         let launch = launch_for(&slot.def, &config);
         let started = async {

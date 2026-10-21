@@ -93,6 +93,12 @@ pub struct McpServerDef {
     /// definition.
     #[serde(default)]
     pub source: String,
+    /// Read from the repository, not from the user's own file. The manager
+    /// holds such a server to the definition (and the repository files it
+    /// runs) that was approved: a restart from changed files is refused.
+    /// Set by [`discover`], never read from a file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project: bool,
 }
 
 impl McpServerDef {
@@ -192,7 +198,8 @@ pub fn discover(agent_dir: &Path, workspace: &Path) -> Discovered {
             &mut found.notices,
         );
     }
-    for def in project {
+    for mut def in project {
+        def.project = true;
         if def.disabled {
             continue;
         }
@@ -341,6 +348,7 @@ pub fn parse(text: &str, source: &str) -> Result<(Vec<McpServerDef>, Vec<String>
                 .map(|secs| secs.min(MAX_TIMEOUT_SECS)),
             approval: None,
             source: source.to_owned(),
+            project: false,
         });
     }
     Ok((defs, skipped))
@@ -413,6 +421,7 @@ mod tests {
             timeout_secs: None,
             approval: None,
             source: "t".to_owned(),
+            project: false,
         }
     }
 
@@ -664,6 +673,8 @@ mod tests {
         assert_eq!(user, ["clash", "mine"]);
         let project: Vec<&str> = found.project.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(project, ["dup", "theirs", "other"], "{:?}", found.notices);
+        assert!(found.project.iter().all(|def| def.project));
+        assert!(found.user.iter().all(|def| !def.project));
         assert!(
             found
                 .notices

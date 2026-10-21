@@ -86,6 +86,7 @@ fn server(name: &str, env: &[(&str, &str)]) -> McpServerDef {
         timeout_secs: Some(10),
         approval: None,
         source: "test".to_owned(),
+        project: false,
     }
 }
 
@@ -596,5 +597,33 @@ fn the_clients_result_cap_leaves_the_engines_own_cut_to_do_its_work() {
     assert_eq!(
         titi_mcp::MAX_RESULT_CHARS,
         2 * titi_engine::tool_loop::MAX_TOOL_OUTPUT
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_in_a_servers_arguments_or_stderr_is_masked_in_what_the_surface_sees() {
+    let key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    let transport = Arc::new(MockTransport::new(vec![]));
+    let mut engine = start(&transport, ApprovalMode::Yolo);
+    let mut leaky = server(
+        "leaky",
+        &[("FIXTURE_EXIT_AT_START", "1"), ("FIXTURE_STDERR_KEY", key)],
+    );
+    leaky.args.extend(["--api-key".to_owned(), key.to_owned()]);
+    set_mcp(&engine, vec![leaky]).await;
+    let events = until(&mut engine, |event| {
+        servers_of(event)
+            .is_some_and(|servers| servers.iter().any(|s| s.state == ServerState::Failed))
+    })
+    .await;
+    let seen = format!("{events:?}");
+    assert!(seen.contains("--api-key"), "{seen}");
+    assert!(
+        seen.contains("stderr:"),
+        "the reason still carries the stderr tail: {seen}"
+    );
+    assert!(
+        !seen.contains("abcdefghijklmnopqrstuvwxyz0123456789"),
+        "the key reached a surface: {seen}"
     );
 }

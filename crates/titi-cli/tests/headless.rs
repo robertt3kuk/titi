@@ -155,3 +155,72 @@ fn a_lone_switch_model_answers_and_the_runner_exits() {
     assert!(line.contains(r#""from":"#), "{line}");
     assert!(line.contains(r#""to":"openai-codex/gpt-5.5""#), "{line}");
 }
+
+/// A one-shot run ends the process as soon as its turn is over. The MCP
+/// servers it started must not outlive it: closing the pipe is not enough for
+/// what a server spawned, so the run has to stop the engine, which stops the
+/// process groups, before it exits.
+#[test]
+fn a_one_shot_run_leaves_no_mcp_server_or_helper_behind() {
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    let dir = tempfile::tempdir().expect("temp");
+    let work = tempfile::tempdir().expect("temp");
+    let pids = work.path().join("helper.pid");
+    std::fs::write(
+        dir.path().join("config.yml"),
+        "providers:\n  - id: fake\n    api: openai-completions\n    base_url: http://127.0.0.1:9/v1\n    credential_required: false\nmodels:\n  - id: fake/scripted\n    provider: fake\n    wire_model: fake\n    context_window: 32000\nmodelRoles:\n  default: fake/scripted\n",
+    )
+    .expect("write the config");
+    let server = format!(
+        "{}/../titi-mcp/tests/fixtures/mcp_server.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::write(
+        dir.path().join("mcp.json"),
+        serde_json::json!({"mcpServers": {"fixture": {
+            "command": "python3", "args": [server],
+            "env": {"FIXTURE_SPAWN_CHILD": pids.to_str().unwrap()}}}})
+        .to_string(),
+    )
+    .expect("write mcp.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_titi"))
+        .args(["--headless", "--prompt", "hello"])
+        .current_dir(work.path())
+        .env("TITI_AGENT_DIR", dir.path())
+        .env("TITI_NO_GENOME", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the one-shot run did not end");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = status;
+    let helper =
+        std::fs::read_to_string(&pids).expect("the server started and left its helper's pid");
+    let server_pid =
+        std::fs::read_to_string(work.path().join("helper.pid.server")).expect("server pid");
+    let gone = Instant::now() + Duration::from_secs(3);
+    while alive(&helper) || alive(&server_pid) {
+        assert!(
+            Instant::now() < gone,
+            "server {server_pid} or its helper {helper} outlived the run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

@@ -22,6 +22,7 @@ chosen by environment variables so a test can ask for the awkward cases:
   FIXTURE_ESCAPES      put terminal escape sequences in the protocolVersion it
                        answers, in the stderr line it dies with and in the error
                        text of the `rpc_error` tool
+  FIXTURE_STDERR_KEY   with FIXTURE_EXIT_AT_START: the value is the last stderr line
   FIXTURE_NO_NEWLINE   write 9 MiB of one unterminated line right away
   FIXTURE_PING_FLOOD   after answering initialize: send N ping requests, then stop
                        reading stdin for a while, then send list_changed
@@ -156,6 +157,8 @@ sys.stderr.write("fixture: started\n")
 sys.stderr.flush()
 if os.environ.get("FIXTURE_EXIT_AT_START"):
     sys.stderr.write("fixture: refusing to start\n")
+    if os.environ.get("FIXTURE_STDERR_KEY"):
+        sys.stderr.write("bad key " + os.environ["FIXTURE_STDERR_KEY"] + "\n")
     if os.environ.get("FIXTURE_ESCAPES"):
         sys.stderr.write("\x1b]52;c;ZXZpbA==\x07\x1b[2Kdied badly\n")
     sys.stderr.flush()
@@ -164,6 +167,8 @@ if os.environ.get("FIXTURE_EXIT_AT_START"):
 child_path = os.environ.get("FIXTURE_SPAWN_CHILD")
 if child_path:
     child = subprocess.Popen(["sleep", "300"])
+    with open(child_path + ".server", "w") as handle:
+        handle.write(str(os.getpid()))
     with open(child_path, "w") as handle:
         handle.write(str(child.pid))
 

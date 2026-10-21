@@ -36,6 +36,7 @@ fn def(name: &str, env: &[(&str, &str)]) -> McpServerDef {
         timeout_secs: Some(10),
         approval: None,
         source: "test".to_owned(),
+        project: false,
     }
 }
 
@@ -891,4 +892,74 @@ async fn nothing_a_server_says_reaches_a_reason_or_notice_with_a_control_charact
     );
     assert!(text.contains("9999"), "{text}");
     assert!(!text.chars().any(char::is_control), "{text:?}");
+}
+
+/// A repository's server whose script lives in the workspace.
+fn project_server(rig: &Rig, env: &[(&str, &str)]) -> McpServerDef {
+    std::fs::copy(fixture(), rig.work.path().join("srv.py")).unwrap();
+    let mut server = def("repo", env);
+    server.args = vec!["srv.py".to_owned()];
+    server.project = true;
+    server
+}
+
+fn edit_script(rig: &Rig) {
+    let path = rig.work.path().join("srv.py");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n# edited after approval\n");
+    std::fs::write(path, text).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_server_whose_script_changed_is_not_restarted_by_slash_mcp_restart() {
+    let rig = rig();
+    rig.manager.set_servers(vec![project_server(&rig, &[])]);
+    ready(&rig, "repo").await;
+    edit_script(&rig);
+    assert!(rig.manager.restart("repo"));
+    let status = until(&rig, "refused", |status| {
+        state_of(status, "repo") == ServerState::Failed
+    })
+    .await;
+    assert!(
+        status[0].reason.contains("changed since it was approved"),
+        "{}",
+        status[0].reason
+    );
+    // And it stays refused: the approval is for what was approved.
+    assert!(rig.manager.restart("repo"));
+    until(&rig, "refused again", |status| {
+        state_of(status, "repo") == ServerState::Failed
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_server_that_crashes_is_not_respawned_from_changed_files() {
+    let rig = rig();
+    rig.manager.set_servers(vec![project_server(&rig, &[])]);
+    ready(&rig, "repo").await;
+    edit_script(&rig);
+    let _ = tool(&rig, "mcp__repo__crash").invoke(json!({})).await;
+    let status = until(&rig, "refused", |status| {
+        state_of(status, "repo") == ServerState::Failed
+    })
+    .await;
+    assert!(
+        status[0].reason.contains("changed since it was approved"),
+        "{}",
+        status[0].reason
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_own_server_restarts_from_edited_files_because_that_is_what_restart_is_for() {
+    let rig = rig();
+    let mut mine = project_server(&rig, &[]);
+    mine.project = false;
+    rig.manager.set_servers(vec![mine]);
+    ready(&rig, "repo").await;
+    edit_script(&rig);
+    assert!(rig.manager.restart("repo"));
+    ready(&rig, "repo").await;
 }

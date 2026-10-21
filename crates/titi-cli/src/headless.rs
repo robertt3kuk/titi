@@ -138,6 +138,18 @@ fn ends_a_turn(event: &EngineEvent) -> bool {
     )
 }
 
+/// Ends the engine and waits for it to be gone. The process exits right after
+/// a headless run, so an engine that was only dropped never got to stop the MCP
+/// servers it started: their process groups (and whatever they spawned) would
+/// outlive the run. Bounded, so a wedged engine cannot hold the exit.
+async fn finish(mut engine: Engine) {
+    let _ = engine.send(EngineCommand::Shutdown).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while engine.recv().await.is_some() {}
+    })
+    .await;
+}
+
 /// Runs the JSONL surface. `log` receives the same transcript the TUI would
 /// write, so a headless run is resumable too.
 ///
@@ -148,6 +160,15 @@ fn ends_a_turn(event: &EngineEvent) -> bool {
 /// as long as the engine runs.
 pub async fn run(
     mut engine: Engine,
+    log: Option<crate::session_log::SessionLog>,
+) -> io::Result<i32> {
+    let code = run_inner(&mut engine, log).await;
+    finish(engine).await;
+    code
+}
+
+async fn run_inner(
+    engine: &mut Engine,
     log: Option<crate::session_log::SessionLog>,
 ) -> io::Result<i32> {
     let mut stdout = io::stdout();
@@ -295,6 +316,16 @@ pub async fn run_prompt(
     log: Option<crate::session_log::SessionLog>,
     prompt: &str,
 ) -> io::Result<i32> {
+    let code = run_prompt_inner(&mut engine, log, prompt).await;
+    finish(engine).await;
+    code
+}
+
+async fn run_prompt_inner(
+    engine: &mut Engine,
+    log: Option<crate::session_log::SessionLog>,
+    prompt: &str,
+) -> io::Result<i32> {
     if let Some(log) = &log {
         let _ = log.user(prompt);
     }
@@ -392,6 +423,16 @@ pub async fn run_goal(
     log: Option<crate::session_log::SessionLog>,
     goal: &str,
 ) -> io::Result<i32> {
+    let code = run_goal_inner(&mut engine, log, goal).await;
+    finish(engine).await;
+    code
+}
+
+async fn run_goal_inner(
+    engine: &mut Engine,
+    log: Option<crate::session_log::SessionLog>,
+    goal: &str,
+) -> io::Result<i32> {
     if let Some(log) = &log {
         let _ = log.user(&format!("/goal {goal}"));
     }
@@ -451,6 +492,15 @@ fn goal_exit_code(event: &EngineEvent) -> Option<i32> {
 /// findings go to stderr for a person reading the job log.
 pub async fn run_review(
     mut engine: Engine,
+    log: Option<crate::session_log::SessionLog>,
+) -> io::Result<i32> {
+    let code = run_review_inner(&mut engine, log).await;
+    finish(engine).await;
+    code
+}
+
+async fn run_review_inner(
+    engine: &mut Engine,
     log: Option<crate::session_log::SessionLog>,
 ) -> io::Result<i32> {
     if engine

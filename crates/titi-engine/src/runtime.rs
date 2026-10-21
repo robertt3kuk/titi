@@ -2155,6 +2155,7 @@ impl EngineRuntime {
     async fn mcp_changed(&mut self, first: titi_mcp::McpEvent) {
         let digest = self.mcp.digest(first);
         for message in digest.notices {
+            let message = mask(&message, self.config.mask_ips);
             let _ = self
                 .events
                 .send(EngineEvent::Notice {
@@ -2196,7 +2197,15 @@ impl EngineRuntime {
     }
 
     async fn report_mcp(&self) {
-        let servers = self.mcp.status();
+        // A key passed as an argument (`--api-key sk-…`), or one a failing
+        // server printed to stderr, must not reach a transcript or a headless
+        // client's JSONL: the command line and the reason are masked like
+        // any other output.
+        let mut servers = self.mcp.status();
+        for server in &mut servers {
+            server.command = mask(&server.command, self.config.mask_ips);
+            server.reason = mask(&server.reason, self.config.mask_ips);
+        }
         let _ = self.events.send(EngineEvent::McpStatus { servers }).await;
     }
 

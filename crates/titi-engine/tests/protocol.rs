@@ -299,9 +299,10 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 timeout_secs: Some(30),
                 approval: Some(McpApproval::Read),
                 source: ".mcp.json".into(),
+                project: true,
             }],
         },
-        r#"{"SetMcp":{"servers":[{"name":"files","command":"npx","args":["-y","srv"],"env":{"ROOT":"."},"cwd":"tools","disabled":false,"timeout_secs":30,"approval":"read","source":".mcp.json"}]}}"#,
+        r#"{"SetMcp":{"servers":[{"name":"files","command":"npx","args":["-y","srv"],"env":{"ROOT":"."},"cwd":"tools","disabled":false,"timeout_secs":30,"approval":"read","source":".mcp.json","project":true}]}}"#,
     );
     // A client that sends nothing clears the servers; a bare definition gets
     // the defaults, which are the highest approval tier and no timeout.
@@ -323,6 +324,7 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 timeout_secs: None,
                 approval: None,
                 source: String::new(),
+                project: false,
             }]
         }
     );
