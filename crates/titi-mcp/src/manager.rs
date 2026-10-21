@@ -417,7 +417,12 @@ fn stderr_tail(path: &Path) -> Option<String> {
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    Some(line.trim().chars().take(160).collect())
+    Some(
+        crate::client::plain(line.trim())
+            .chars()
+            .take(160)
+            .collect(),
+    )
 }
 
 fn failure_reason(error: &McpError, log: &Path) -> String {

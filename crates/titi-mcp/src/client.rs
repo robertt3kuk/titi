@@ -303,16 +303,17 @@ impl Handshake {
             .ok_or_else(|| McpError::Protocol("initialize has no protocolVersion".to_owned()))?;
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(McpError::UnsupportedVersion {
-                server: version.to_owned(),
+                server: plain(version),
             });
         }
         inner.notify("notifications/initialized", json!({}))?;
         Ok(Self {
-            server_name: result
-                .pointer("/serverInfo/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            server_name: plain(
+                result
+                    .pointer("/serverInfo/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
             version: version.to_owned(),
             has_tools: result.pointer("/capabilities/tools").is_some(),
         })
@@ -710,11 +711,12 @@ impl Reader {
         let answer = match (message.get("result"), message.get("error")) {
             (_, Some(error)) => Err(McpError::Rpc {
                 code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
-                message: error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("no message")
-                    .to_owned(),
+                message: plain(
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no message"),
+                ),
             }),
             (Some(result), None) => Ok(result.clone()),
             (None, None) => Err(McpError::Protocol(
@@ -754,6 +756,21 @@ fn signal_group(pid: u32, signal: &str) {
 
 #[cfg(not(unix))]
 fn signal_group(_pid: u32, _signal: &str) {}
+
+/// Text from a server that is about to be shown to a person: control
+/// characters (escape sequences, carriage returns) and the invisible ones that
+/// reorder or hide text are dropped, and it is cut to a line's worth. Every
+/// reason and notice a server can influence goes through this, because a
+/// headless run prints them to a terminal as they are.
+pub(crate) fn plain(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        })
+        .take(500)
+        .collect()
+}
 
 /// The text of a `tools/call` result. Text blocks are kept; what a model
 /// cannot be handed as text is named: `[image]`, `[audio]`, `[resource

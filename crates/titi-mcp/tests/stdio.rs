@@ -848,3 +848,47 @@ async fn two_servers_whose_tools_get_one_name_never_shadow_each_other() {
         "{said:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_a_server_says_reaches_a_reason_or_notice_with_a_control_character() {
+    let mut rig = rig();
+    rig.manager.set_servers(vec![
+        def(
+            "vers",
+            &[("FIXTURE_ESCAPES", "1"), ("FIXTURE_VERSION", "x")],
+        ),
+        def(
+            "dies",
+            &[("FIXTURE_ESCAPES", "1"), ("FIXTURE_EXIT_AT_START", "1")],
+        ),
+        def("rpc", &[("FIXTURE_ESCAPES", "1")]),
+    ]);
+    until(&rig, "failures", |status| {
+        state_of(status, "vers") == ServerState::Failed
+            && state_of(status, "dies") == ServerState::Failed
+            && state_of(status, "rpc") == ServerState::Ready
+    })
+    .await;
+    let refused = tool(&rig, "mcp__rpc__rpc_error").invoke(json!({})).await;
+    assert!(
+        refused.output.contains("bad arguments"),
+        "{}",
+        refused.output
+    );
+    let mut text = refused.output.to_string();
+    for server in rig.manager.status() {
+        text.push_str(&server.reason);
+        text.push_str(&server.command);
+    }
+    while let Ok(event) = rig.events.try_recv() {
+        if let McpEvent::Notice(note) = event {
+            text.push_str(&note);
+        }
+    }
+    assert!(
+        text.contains("died badly"),
+        "the stderr tail is kept: {text}"
+    );
+    assert!(text.contains("9999"), "{text}");
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+}

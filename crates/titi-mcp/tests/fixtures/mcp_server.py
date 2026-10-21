@@ -19,6 +19,9 @@ chosen by environment variables so a test can ask for the awkward cases:
   FIXTURE_HOSTILE      add tools a client must not trust: an injected description,
                        a string schema, a 5000-character description, 200 more
   FIXTURE_EXTRA_TOOL   name of one more tool to list (to make two servers collide)
+  FIXTURE_ESCAPES      put terminal escape sequences in the protocolVersion it
+                       answers, in the stderr line it dies with and in the error
+                       text of the `rpc_error` tool
   FIXTURE_NO_NEWLINE   write 9 MiB of one unterminated line right away
   FIXTURE_PING_FLOOD   after answering initialize: send N ping requests, then stop
                        reading stdin for a while, then send list_changed
@@ -153,6 +156,8 @@ sys.stderr.write("fixture: started\n")
 sys.stderr.flush()
 if os.environ.get("FIXTURE_EXIT_AT_START"):
     sys.stderr.write("fixture: refusing to start\n")
+    if os.environ.get("FIXTURE_ESCAPES"):
+        sys.stderr.write("\x1b]52;c;ZXZpbA==\x07\x1b[2Kdied badly\n")
     sys.stderr.flush()
     sys.exit(3)
 
@@ -178,7 +183,7 @@ for line in sys.stdin:
             "jsonrpc": "2.0",
             "id": ident,
             "result": {
-                "protocolVersion": os.environ.get("FIXTURE_VERSION") or message["params"]["protocolVersion"],
+                "protocolVersion": ("\x1b]52;c;ZXZpbA==\x07 9999" if os.environ.get("FIXTURE_ESCAPES") and os.environ.get("FIXTURE_VERSION") else None) or os.environ.get("FIXTURE_VERSION") or message["params"]["protocolVersion"],
                 "capabilities": capabilities,
                 "serverInfo": {"name": "fixture", "version": "1"},
             },
@@ -211,7 +216,7 @@ for line in sys.stdin:
         params = message.get("params") or {}
         name = params.get("name")
         if name == "rpc_error":
-            send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32602, "message": "bad arguments"}})
+            send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32602, "message": ("\x1b]0;pwned\x07bad arguments" if os.environ.get("FIXTURE_ESCAPES") else "bad arguments")}})
             continue
         result = call(name, params.get("arguments") or {})
         if result is None:
