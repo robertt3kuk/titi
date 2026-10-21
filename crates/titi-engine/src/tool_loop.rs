@@ -765,6 +765,12 @@ async fn invoke_one(
     }
     let tier = tools.approval_tier(&call.name);
     if force_approval || !approval_mode.auto_approves(tier) {
+        // Registered before the call is announced: a surface answers the
+        // moment it sees the prompt, the command loop that takes the answer
+        // runs beside this turn, and an answer that beat the registration
+        // would find no waiter and leave this call waiting for good.
+        let (tx, rx) = oneshot::channel();
+        waiters.lock().await.insert(call.call_id.clone(), tx);
         let _ = events
             .send(EngineEvent::ToolApprovalNeeded {
                 turn_id,
@@ -772,12 +778,13 @@ async fn invoke_one(
                 name: call.name.clone(),
             })
             .await;
-        let (tx, rx) = oneshot::channel();
-        waiters.lock().await.insert(call.call_id.clone(), tx);
         let approved = tokio::select! {
             result = rx => result.unwrap_or(false),
             _ = wait_aborted(aborted) => false,
         };
+        // An answer takes its entry; an abort leaves it, and nothing else
+        // would ever remove it.
+        waiters.lock().await.remove(&call.call_id);
         if !approved {
             return Executed {
                 call_id: call.call_id.clone(),
@@ -996,5 +1003,93 @@ mod tests {
         let stats = live.last_stats().expect("the write was folded in");
         assert_eq!(stats.parsed, 1, "one file, read and parsed");
         assert!(!stats.walked, "and no tree was listed to find it");
+    }
+
+    struct WriteStub;
+
+    #[async_trait::async_trait]
+    impl ToolHandler for WriteStub {
+        fn definition(&self) -> titi_tools::ToolDefinition {
+            titi_tools::ToolDefinition {
+                spec: titi_providers::ToolSpec {
+                    name: "w".into(),
+                    description: "a tool that needs approval".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                approval: ApprovalTier::Write,
+            }
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+            ToolResult {
+                output: "ran".into(),
+                is_error: false,
+                detail: None,
+            }
+        }
+    }
+
+    /// A surface answers a prompt the moment it sees it, and the command loop
+    /// that takes the answer runs beside the turn. If the call were announced
+    /// before its waiter is registered, an answer that beat the registration
+    /// would find nobody to wake and the turn would wait for it forever.
+    ///
+    /// The registration is held up here by keeping the waiters' lock: while it
+    /// is held, the call must not have been announced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_is_announced_only_once_its_answer_can_be_received() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(WriteStub));
+        let waiters = ApprovalWaiters::default();
+        let (events, mut seen) = mpsc::channel(8);
+        let guard = waiters.lock().await;
+        let task = {
+            let waiters = Arc::clone(&waiters);
+            tokio::spawn(async move {
+                let prepared = Prepared {
+                    call: PendingToolCall {
+                        call_id: "c1".into(),
+                        name: "w".into(),
+                        arguments: "{}".into(),
+                        thought_signature: SmolStr::default(),
+                    },
+                    args: serde_json::json!({}),
+                    write_path: None,
+                    claimed: None,
+                    started: std::time::Instant::now(),
+                };
+                invoke_one(
+                    TurnId(1),
+                    &prepared,
+                    &tools,
+                    ApprovalMode::Write,
+                    &waiters,
+                    &AtomicBool::new(false),
+                    &events,
+                    &Hooks::default(),
+                    false,
+                )
+                .await
+            })
+        };
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), seen.recv()).await;
+        assert!(
+            early.is_err(),
+            "announced before it could be answered: {early:?}"
+        );
+        drop(guard);
+        let Some(EngineEvent::ToolApprovalNeeded { call_id, .. }) = seen.recv().await else {
+            panic!("the call was never announced");
+        };
+        let waiter = waiters.lock().await.remove(&call_id);
+        waiter
+            .expect("the waiter is registered when the call is announced")
+            .send(true)
+            .ok();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the answer woke the call")
+            .expect("the task finished");
+        assert_eq!(done.output.as_str(), "ran");
     }
 }
