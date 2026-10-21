@@ -196,27 +196,55 @@ def run_time(cmd, cwd):
 
 
 def parse_map(text):
-    """-> list of {path, deps, recent, exports:[(name, users)]} in print order."""
+    """-> list of {path, deps, tags, recent, exports:[[name, users]], signatures:{name: sig}} in print order.
+
+    A file line is `path (→N)` followed by any number of ` [TAG]` suffixes (`[RECENT]`, `[entry]`,
+    `[test]`, ...); an export line is `  +Name (users)`, optionally followed by two spaces and a
+    one-line signature. Name and users are read from the prefix only.
+    """
     entries = []
     for line in text.splitlines():
         if line.startswith("<") or not line.strip():
             continue
-        m = re.match(r"^(\S.*?) \(→(\d+)\)( \[RECENT\])?\s*$", line)
+        m = re.match(r"^(\S.*?) \(→(\d+)\)((?: \[[A-Za-z]+\])*)\s*$", line)
         if m:
-            entries.append({"path": m[1], "deps": int(m[2]), "recent": bool(m[3]), "exports": [],
-                            "raw": line})
+            tags = re.findall(r"\[([A-Za-z]+)\]", m[3])
+            entries.append({"path": m[1], "deps": int(m[2]), "tags": tags, "recent": "RECENT" in tags,
+                            "exports": [], "signatures": {}, "raw": line})
             continue
-        m = re.match(r"^\s+\+(.+?) \((\d+)\)\s*$", line)
+        m = re.match(r"^\s+\+(.+?) \((\d+)\)(?:  (.*?))?\s*$", line)
         if m and entries:
             entries[-1]["exports"].append([m[1], int(m[2])])
+            if m[3]:
+                entries[-1]["signatures"][m[1]] = m[3]
             entries[-1].setdefault("raw_exports", []).append(line)
             continue
         if line.startswith(("  ", "\t")) and entries:
             entries[-1].setdefault("other", []).append(line)
         elif entries or not line.startswith("<"):
-            entries.append({"path": line.strip(), "deps": None, "recent": "[RECENT]" in line,
-                            "exports": [], "raw": line, "unparsed": True})
+            entries.append({"path": line.strip(), "deps": None, "tags": [], "recent": "[RECENT]" in line,
+                            "exports": [], "signatures": {}, "raw": line, "unparsed": True})
     return entries
+
+
+def self_test_parse_map():
+    old = "<atlas>\nsrc/a.rs (→3) [RECENT]\n  +Engine (4)\n  +run (2)\nsrc/b.rs (→0)\n</atlas>"
+    new = ("<atlas>\nsrc/main.rs (→0) [entry]\n  +run (7)  pub fn run(&self) -> Out\n"
+           "tests/t.rs (→2) [test] [RECENT]\n  +Name With Space (1)  fn x()  (and parens) \nsrc/c.rs (→5)\n</atlas>")
+    a = parse_map(old)
+    assert [e["path"] for e in a] == ["src/a.rs", "src/b.rs"], a
+    assert a[0]["recent"] and a[0]["tags"] == ["RECENT"] and a[0]["deps"] == 3
+    assert a[0]["exports"] == [["Engine", 4], ["run", 2]] and a[0]["signatures"] == {}
+    assert not a[1]["recent"] and a[1]["tags"] == [] and a[1]["deps"] == 0
+    b = parse_map(new)
+    assert [e["path"] for e in b] == ["src/main.rs", "tests/t.rs", "src/c.rs"], b
+    assert b[0]["tags"] == ["entry"] and not b[0]["recent"]
+    assert b[0]["exports"] == [["run", 7]] and b[0]["signatures"] == {"run": "pub fn run(&self) -> Out"}
+    assert b[1]["tags"] == ["test", "RECENT"] and b[1]["recent"]
+    assert b[1]["exports"] == [["Name With Space", 1]]
+    assert b[1]["signatures"] == {"Name With Space": "fn x()  (and parens)"}
+    assert not any(e.get("unparsed") for e in a + b)
+    print("parse_map self-test: ok")
 
 
 def map_text(repo):
@@ -734,7 +762,10 @@ def main():
     ap.add_argument("--max-changed", type=int, default=12, help="commits mode: skip commits touching more files")
     ap.add_argument("--scan", type=int, default=400, help="commits mode: recent non-merge commits to look through")
     ap.add_argument("--conditions", default="static,tool", help="commits mode: rankings to score (tool needs ATLAS_TOOL_CMD)")
+    ap.add_argument("--self-test", action="store_true", help="check the map parser on old and new map text, then exit")
     a = ap.parse_args()
+    if a.self_test:
+        return self_test_parse_map()
     if a.mode == "commits":
         if not TITI_BIN.exists():
             sys.exit(f"missing {TITI_BIN}: cargo build --release -p titi-cli --locked")
