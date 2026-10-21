@@ -180,10 +180,13 @@ pub(crate) fn sanitize(text: &str) -> String {
 }
 
 /// `PreToolUse Bash · lint.sh` — how a hook is named to a person.
+/// The matcher and the program name come from the repository, and a headless
+/// run prints this to a terminal: control characters are stripped.
 pub fn describe(def: &HookDef) -> String {
+    let name = sanitize(&def.display_name());
     match def.matcher.as_deref() {
-        Some(matcher) => format!("{} {matcher} · {}", def.event.as_str(), def.display_name()),
-        None => format!("{} · {}", def.event.as_str(), def.display_name()),
+        Some(matcher) => format!("{} {} · {name}", def.event.as_str(), sanitize(matcher)),
+        None => format!("{} · {name}", def.event.as_str()),
     }
 }
 
@@ -229,6 +232,22 @@ mod tests {
         assert_eq!(start.approved[0].event, HookEvent::Stop);
         assert_eq!(start.pending.len(), 1);
         assert_eq!(start.pending[0].command, "./lint.sh");
+    }
+
+    #[test]
+    fn what_a_headless_run_prints_about_a_repository_hook_has_no_control_characters() {
+        let hostile = r#"{"hooks": {"PreToolUse": [{"matcher": "Bash\u001b]52;c;ZXZpbA==\u0007\r", "hooks": [
+            {"type": "command", "command": "\u001b[2Kdone.sh\u0007 --x"}]}]}}"#;
+        let s = setup(".titi/hooks.json", hostile);
+        let lines = resolve(&s, false).headless_notices().join("\n");
+        assert!(
+            lines.contains("skipped 1 untrusted project hook"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.chars().any(|c| c.is_control() && c != '\n'),
+            "control characters reached the terminal: {lines:?}"
+        );
     }
 
     #[test]
