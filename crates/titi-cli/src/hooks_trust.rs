@@ -203,6 +203,7 @@ fn hook_lines(
     index: usize,
     count: usize,
     def: &titi_config::hooks::HookDef,
+    workspace: &std::path::Path,
     room: usize,
 ) -> Vec<String> {
     let mut lines = vec![format!("{}/{count}  {}", index + 1, describe_event(def))];
@@ -213,7 +214,7 @@ fn hook_lines(
     lines.push(format!(
         "     {} · #{}{timeout}",
         sanitize(&def.source),
-        &def.hash()[..8]
+        &def.hash(workspace)[..8]
     ));
     let command = sanitize_keep_newlines(&def.command);
     for (row, text) in wrap_plain(&command, room.saturating_sub(7).max(8))
@@ -225,6 +226,17 @@ fn hook_lines(
         } else {
             format!("       {text}")
         });
+    }
+    if let Some(script) = def.script(workspace) {
+        let state = if script.sha256.is_some() {
+            "its content is part of the hash"
+        } else {
+            "not there yet"
+        };
+        lines.push(format!(
+            "     runs repository files: {} ({state})",
+            sanitize(&script.path.to_string_lossy())
+        ));
     }
     lines
 }
@@ -257,7 +269,13 @@ pub(crate) fn trust_panel(chat: &Chat, total: u16, width: u16) -> PanelView {
     let mut lines: Vec<String> = vec!["read every hook below (↓), then choose".to_owned()];
     let mut ends = Vec::with_capacity(pending.len());
     for (index, def) in pending.iter().enumerate() {
-        lines.extend(hook_lines(index, pending.len(), def, room));
+        lines.extend(hook_lines(
+            index,
+            pending.len(),
+            def,
+            &panel.start.workspace,
+            room,
+        ));
         ends.push(lines.len() - 1);
     }
     let first_answer = lines.len();
@@ -448,6 +466,27 @@ mod tests {
         assert!(all.contains(" · #"), "a short hash: {all}");
         assert!(!all.contains('\u{1b}'), "control characters are stripped");
         assert!(all.contains("[2Jhidden"), "the rest of the text stays");
+    }
+
+    #[test]
+    fn the_panel_says_when_a_hook_runs_repository_files() {
+        let mut screen = screen_with(&eight_hooks(), 8);
+        std::fs::create_dir_all(screen.repo.path().join("hooks")).unwrap();
+        for n in 1..=7 {
+            std::fs::write(screen.repo.path().join(format!("hooks/h{n}.sh")), "true\n").unwrap();
+        }
+        // Resolve again: the panel reads the files as they are now.
+        let start = HookStartup::resolve(screen.agent.path(), screen.repo.path(), None, false);
+        screen.chat.hook_trust = Some(TrustPanel::new(start));
+        let all = scroll_to_the_end(&mut screen);
+        assert!(all.contains("runs repository files: hooks/h1.sh"), "{all}");
+        assert!(all.contains("its content is part of the hash"), "{all}");
+        // `prettier …` runs a program from PATH, which is not a repository file.
+        let distinct: std::collections::BTreeSet<&str> = all
+            .lines()
+            .filter(|line| line.contains("runs repository files"))
+            .collect();
+        assert_eq!(distinct.len(), 7, "{all}");
     }
 
     #[test]

@@ -239,6 +239,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// The sha-256 of `bytes`, as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The sha-256 of a definition's canonical JSON, as lowercase hex.
 ///
 /// Canonical means object keys sorted at every depth and no whitespace, so the
