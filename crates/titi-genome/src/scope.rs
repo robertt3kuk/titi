@@ -37,11 +37,11 @@ const DISTINCTIVE_LEN: usize = 5;
 /// defines one of these is not made the definition of every mention of it.
 const COMMON: &[&str] = &[
     "apply", "build", "check", "clear", "close", "color", "config", "context", "create", "data",
-    "default", "delete", "empty", "error", "event", "files", "first", "from", "handle", "index",
-    "input", "insert", "items", "label", "model", "name", "number", "output", "page", "parse",
-    "path", "print", "range", "raw", "remove", "render", "reset", "result", "route", "row",
-    "select", "start", "state", "status", "string", "style", "sync", "table", "title", "update",
-    "value", "write",
+    "default", "delete", "empty", "error", "event", "failed", "files", "finished", "first", "from",
+    "handle", "index", "input", "insert", "items", "label", "model", "name", "number", "output",
+    "page", "parse", "path", "print", "range", "raw", "remove", "render", "reset", "result",
+    "route", "row", "select", "start", "state", "status", "string", "style", "sync", "table",
+    "title", "update", "value", "write",
 ];
 
 /// Whether a name defined once may be linked without evidence.
