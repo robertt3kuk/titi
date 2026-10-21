@@ -14,7 +14,6 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use crate::symbol::{SymbolKind, SymbolSite, one_line_signature};
-use crate::symbols::text;
 
 /// The first candidate `files` can satisfy, in the order it was emitted.
 ///
@@ -483,10 +482,10 @@ pub(crate) fn signature_of(outer: Node, decl: Node, source: &[u8]) -> Option<Str
     let mut raw = std::str::from_utf8(source.get(start..end)?).ok()?;
     // No body or initialiser field (a Go `type T struct { … }`): the first
     // brace opens the body.
-    if end == decl.end_byte() {
-        if let Some(brace) = raw.find('{') {
-            raw = &raw[..brace];
-        }
+    if end == decl.end_byte()
+        && let Some(brace) = raw.find('{')
+    {
+        raw = &raw[..brace];
     }
     let raw = raw
         .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ';' | '=' | ':' | ',' | '{'));
