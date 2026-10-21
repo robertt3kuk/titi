@@ -147,6 +147,18 @@ fn foreign_user_config_on(settings: &Settings) -> bool {
     }
 }
 
+/// Text from a repository, made safe to print: control characters (escape
+/// sequences, carriage returns) and the invisible characters that reorder or
+/// hide text are dropped.
+pub(crate) fn sanitize(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        })
+        .collect()
+}
+
 /// `PreToolUse Bash · lint.sh` — how a hook is named to a person.
 pub fn describe(def: &HookDef) -> String {
     match def.matcher.as_deref() {
