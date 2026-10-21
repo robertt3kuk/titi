@@ -45,6 +45,14 @@ the real binary and the real HTTP stack:
                   a server named `fixture` offers; see crates/titi-mcp/tests/fixtures)
   "run project"   a `project` call: {action: list} (detects the workspace's
                   ecosystem and prints the commands; runs nothing)
+  "delegate reviewer"  an `agent` call naming the definition `reviewer`, with a
+                  plain task, so the child's request shows the definition's
+                  prompt and tools (needs `.claude/agents/reviewer.md`)
+  "delegate capped"  an `agent` call naming the definition `capped`, whose task
+                  holds `spin cap`: the child reads README.md every round until
+                  its request forbids tool calls (give the definition a small
+                  `maxTurns`)
+  "delegate nobody"  an `agent` call naming a definition that does not exist
   "pin agents"    two `agent` calls in one round, each with a small task: the
                   tool loop runs them one after another, so the strip shows one
                   live agent at a time
@@ -252,6 +260,15 @@ def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, f
         if name is None:
             return words("skill: none listed", 0) + [(chunk({}, "stop"), 0)]
         return [(c, 0) for c in call("call_skill", "skill", {"name": name})]
+    if "delegate reviewer" in content:
+        args = {"agent": "reviewer", "task": "review the top of the readme and say what you find"}
+        return [(c, 0) for c in call("call_delegate", "agent", args)]
+    if "delegate capped" in content:
+        args = {"agent": "capped", "task": "spin cap: keep reading the readme"}
+        return [(c, 0) for c in call("call_delegate_capped", "agent", args)]
+    if "delegate nobody" in content:
+        args = {"agent": "nobody", "task": "do a thing"}
+        return [(c, 0) for c in call("call_delegate_nobody", "agent", args)]
     if "sleepy shell" in content:
         return [(c, 0) for c in call("call_sleepy", "bash", {"command": "sleep 3; echo slept"})]
     if "danger shell" in content:
