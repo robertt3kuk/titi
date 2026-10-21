@@ -8,7 +8,8 @@ fresh copy of an agent dir, then runs the task's `check.sh` in that dir. Exit
 
   scripts/eval.py --bin target/debug/titi --tasks evals/tasks \
       [--only NAME]... [--runs N] [--agent-dir DIR] [--out report.json] \
-      [--timeout S] [--smoke] [--keep]
+      [--timeout S] [--smoke] [--keep] \
+      [--conditions atlas-off,atlas-map,atlas-full] [--condition-env NAME=KEY=VALUE]...
 
 Task layout (`evals/tasks/<name>/`): `task.md` (the prompt), `repo/` (the
 starting project), `check.sh` (offline; runs the project's own test),
@@ -23,6 +24,16 @@ The numbers come from titi's stdout JSONL (`EngineEvent` in
 crates/titi-engine/src/protocol.rs): `TurnUsage` (prompt / completion / cached
 tokens, `cost_micro_usd`), `ToolStarted`, `ToolFinished` (`is_error`), `Failed`.
 Python 3 standard library only.
+
+Conditions (`--conditions a,b,...`) run every task x run once per condition
+with that condition's environment, for an A/B in one command: `atlas-off`
+(`TITI_NO_ATLAS=1`: no map, no lens), `atlas-full` (the default: map, lens and,
+once it exists, the atlas tool) and `atlas-map` (the map only). Titi has no
+switch yet that turns the per-prompt lens or the atlas tool off while keeping
+the map, so `atlas-map` is skipped with a note until one exists; give it with
+`--condition-env atlas-map=KEY=VALUE` (repeatable, also defines new conditions)
+and it runs. The report adds, per condition, the pass rate, tokens, cost, wall
+time, tool calls and how often the model called the `atlas` tool.
 """
 
 import argparse
@@ -39,6 +50,14 @@ import time
 # (`--prompt` resumes the newest one), traces, and state that belongs to a
 # person's own use. Keys (`auth.db`) and `config.yml` stay.
 AGENT_DIR_SKIP = ("sessions", "traces", "trajectories", "state.db*", "memory.db*")
+# Environment each named condition adds. `None` means: the knob that would make
+# the condition differ from `atlas-full` does not exist in titi yet.
+ATLAS_VARS = ("TITI_NO_ATLAS",)
+CONDITIONS = {
+    "atlas-off": {"TITI_NO_ATLAS": "1"},
+    "atlas-map": None,
+    "atlas-full": {},
+}
 DEFAULT_TIMEOUT_S = 600
 CHECK_TIMEOUT_S = 300
 
@@ -77,8 +96,13 @@ def git(cwd, *args):
     )
 
 
-def run_titi(binary, prompt, cwd, agent_dir, timeout_s):
+def run_titi(binary, prompt, cwd, agent_dir, timeout_s, condition_env=None):
     env = dict(os.environ)
+    if condition_env is not None:
+        # A condition decides the atlas switches itself; none leaks in from the shell.
+        for name in ATLAS_VARS:
+            env.pop(name, None)
+        env.update(condition_env)
     env["TITI_AGENT_DIR"] = agent_dir
     proc = subprocess.Popen(
         [binary, "--prompt", prompt, "--approval", "yolo"],
@@ -100,7 +124,7 @@ def parse_events(stdout):
     stats = {
         "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0,
         "cost_micro_usd": 0, "unpriced_turns": 0, "turns": 0,
-        "tool_calls": 0, "tool_errors": 0, "failed": None,
+        "tool_calls": 0, "tool_errors": 0, "atlas_calls": 0, "failed": None,
     }
     for line in stdout.splitlines():
         line = line.strip()
@@ -127,6 +151,8 @@ def parse_events(stdout):
                 stats["cost_micro_usd"] += cost
         elif kind == "ToolStarted":
             stats["tool_calls"] += 1
+            if body.get("name") == "atlas":
+                stats["atlas_calls"] += 1
         elif kind == "ToolFinished":
             if body.get("is_error"):
                 stats["tool_errors"] += 1
@@ -201,7 +227,7 @@ def run_check(task, workdir):
     return done.returncode == 0, done.stdout[-2000:]
 
 
-def run_one(args, task, index, agent_src):
+def run_one(args, task, index, agent_src, condition=None, condition_env=None):
     scratch = tempfile.mkdtemp(prefix="titi-eval-")
     workdir = os.path.join(scratch, "repo")
     agent_dir = os.path.join(scratch, "agent")
@@ -213,14 +239,14 @@ def run_one(args, task, index, agent_src):
                     ignore=shutil.ignore_patterns(*AGENT_DIR_SKIP))
     timeout_s = args.timeout or task["meta"].get("timeout_s", DEFAULT_TIMEOUT_S)
     started = time.monotonic()
-    code, out, err, timed_out = run_titi(args.bin, task["prompt"], workdir, agent_dir, timeout_s)
+    code, out, err, timed_out = run_titi(args.bin, task["prompt"], workdir, agent_dir, timeout_s, condition_env)
     wall = time.monotonic() - started
     # Judged before the grading files go back, so what the model did to them shows.
     touched = tests_touched(workdir, hidden_paths(task))
     restore_hidden(task, workdir)
     solved, check_tail = run_check(task, workdir)
     row = {
-        "task": task["name"], "run": index, "solved": solved,
+        "task": task["name"], "condition": condition, "run": index, "solved": solved,
         "wall_s": round(wall, 2), "timed_out": timed_out, "exit_code": code,
         "tests_touched": touched,
         **parse_events(out),
@@ -266,6 +292,9 @@ def summarize(rows):
         "mean_cost_usd": mean(costs),
         "priced_runs": len(costs),
         "tool_calls": calls,
+        "atlas_calls": sum(r["atlas_calls"] for r in rows),
+        "runs_calling_atlas": sum(1 for r in rows if r["atlas_calls"]),
+        "mean_tool_calls": mean([r["tool_calls"] for r in rows]),
         "tool_errors": errors,
         "tool_error_rate": (errors / calls) if calls else None,
     }
@@ -278,11 +307,11 @@ def print_report(tasks, rows, skipped):
         if not task_rows:
             continue
         print(f"### {task['name']}\n")
-        print("| run | solved | wall s | timeout | tests touched | prompt | completion | cached | cost $ | tools | tool errors |")
-        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        print("| condition | run | solved | wall s | timeout | tests touched | prompt | completion | cached | cost $ | tools | tool errors |")
+        print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for r in task_rows:
             print(
-                f"| {r['run']} | {'yes' if r['solved'] else 'no'} | {r['wall_s']:.1f} "
+                f"| {r.get('condition') or '-'} | {r['run']} | {'yes' if r['solved'] else 'no'} | {r['wall_s']:.1f} "
                 f"| {'yes' if r['timed_out'] else 'no'} | {'yes' if r['tests_touched'] else 'no'} | {r['prompt_tokens']} "
                 f"| {r['completion_tokens']} | {r['cached_tokens']} "
                 f"| {fmt(r['cost_usd'], 4)} | {r['tool_calls']} | {r['tool_errors']} |"
@@ -308,6 +337,48 @@ def print_report(tasks, rows, skipped):
     print()
 
 
+def print_conditions(conditions, rows, unavailable):
+    print("## Conditions\n")
+    print("| condition | solved | pass rate | mean tokens | mean cost $ | mean wall s | mean tool calls | atlas tool calls | runs using atlas |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for name in conditions:
+        group = [r for r in rows if r["condition"] == name]
+        if not group:
+            continue
+        s = summarize(group)
+        print(
+            f"| {name} | {s['solved']}/{s['runs']} | {s['pass_rate'] * 100:.0f}% | {fmt(s['mean_tokens'])} "
+            f"| {fmt(s['mean_cost_usd'], 4)} | {s['mean_wall_s']:.1f} | {fmt(s['mean_tool_calls'], 1)} "
+            f"| {s['atlas_calls']} | {s['runs_calling_atlas']}/{s['runs']} |"
+        )
+    for name, why in unavailable:
+        print(f"| {name} | not run: {why} | - | - | - | - | - | - | - |")
+    print()
+
+
+def resolve_conditions(names, overrides):
+    """-> (runnable [(name, env)], unavailable [(name, why)]). No names: one unnamed default run."""
+    table = {name: (dict(env) if env is not None else None) for name, env in CONDITIONS.items()}
+    for spec in overrides or []:
+        name, _, pair = spec.partition("=")
+        key, eq, value = pair.partition("=")
+        if not name or not eq or not key:
+            sys.exit(f"eval: --condition-env wants NAME=KEY=VALUE, got {spec!r}")
+        table[name] = (table.get(name) or {}) | {key: value}
+    if not names:
+        return [(None, None)], []
+    runnable, unavailable = [], []
+    for name in names:
+        if name not in table:
+            sys.exit(f"eval: unknown condition {name!r} (known: {', '.join(sorted(table))})")
+        if table[name] is None:
+            unavailable.append((name, "titi has no switch that turns off the lens and the atlas tool but keeps the map; "
+                                      "pass --condition-env %s=KEY=VALUE once one exists" % name))
+        else:
+            runnable.append((name, table[name]))
+    return runnable, unavailable
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run titi on small tasks and grade the result.")
     parser.add_argument("--bin", required=True, help="path to the titi binary")
@@ -319,6 +390,9 @@ def main():
     parser.add_argument("--timeout", type=int, help="seconds per titi run; overrides meta.json")
     parser.add_argument("--smoke", action="store_true", help="also run tasks whose name starts with _")
     parser.add_argument("--keep", action="store_true", help="keep each run's workdir, stdout and stderr")
+    parser.add_argument("--conditions", help="comma-separated: atlas-off, atlas-map, atlas-full (or any --condition-env name)")
+    parser.add_argument("--condition-env", action="append", metavar="NAME=KEY=VALUE",
+                        help="add an environment variable to a condition (defines it if new); repeatable")
     args = parser.parse_args()
     if args.runs < 1:
         sys.exit("eval: --runs must be at least 1")
@@ -337,20 +411,29 @@ def main():
             skipped.append((task["name"], "missing " + ", ".join(absent)))
         else:
             runnable.append(task)
+    names = [n for n in (args.conditions or "").split(",") if n]
+    cond_runs, unavailable = resolve_conditions(names, args.condition_env)
     rows = []
-    for task in runnable:
-        for index in range(1, args.runs + 1):
-            print(f"eval: {task['name']} run {index}/{args.runs} ...", file=sys.stderr, flush=True)
-            row = run_one(args, task, index, agent_src)
-            print(f"eval:   {'solved' if row['solved'] else 'unsolved'} in {row['wall_s']}s", file=sys.stderr, flush=True)
-            rows.append(row)
+    for condition, condition_env in cond_runs:
+        for task in runnable:
+            for index in range(1, args.runs + 1):
+                label = f" [{condition}]" if condition else ""
+                print(f"eval: {task['name']}{label} run {index}/{args.runs} ...", file=sys.stderr, flush=True)
+                row = run_one(args, task, index, agent_src, condition, condition_env)
+                print(f"eval:   {'solved' if row['solved'] else 'unsolved'} in {row['wall_s']}s", file=sys.stderr, flush=True)
+                rows.append(row)
 
     print_report(runnable, rows, skipped)
+    if names:
+        print_conditions(names, rows, unavailable)
     if args.out:
         report = {
             "bin": args.bin, "runs_per_task": args.runs,
             "tasks": {t["name"]: summarize([r for r in rows if r["task"] == t["name"]]) for t in runnable},
             "skipped": [{"task": name, "reason": why} for name, why in skipped],
+            "conditions": {n: summarize([r for r in rows if r["condition"] == n])
+                           for n, _ in cond_runs if n},
+            "conditions_not_run": [{"condition": n, "reason": why} for n, why in unavailable],
             "totals": summarize(rows) if rows else None,
             "runs": rows,
         }

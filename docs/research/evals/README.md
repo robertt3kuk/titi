@@ -63,6 +63,44 @@ only the scripted provider (`scripts/fake-provider.py`) answers with an edit
 that satisfies its check. Against that provider it must come out solved and
 the other tasks unsolved — that is the proof the grading is not vacuous.
 
+## Conditions: an A/B in one command
+
+`--conditions atlas-off,atlas-map,atlas-full` runs every task × run once per
+condition, each with its own environment, and adds a per-condition table
+(pass rate, mean tokens, mean cost, mean wall time, mean tool calls, how many
+`atlas` tool calls the model made and in how many runs, counted from
+`ToolStarted` names):
+
+```bash
+scripts/eval.py --bin target/release/titi --tasks evals/tasks \
+    --agent-dir ~/.titi/eval-agent --runs 3 \
+    --conditions atlas-off,atlas-map,atlas-full --out /tmp/eval-ab.json
+```
+
+| condition | environment | what the model sees |
+| --- | --- | --- |
+| `atlas-off` | `TITI_NO_ATLAS=1` | no `<atlas>` map, no lens |
+| `atlas-full` | (default) | map, per-prompt lens and, once it exists, the atlas tool |
+| `atlas-map` | **missing knob** | the map only |
+
+`atlas-map` is not run today: titi has no setting or environment variable
+that turns off the lens (and, later, the atlas tool) while keeping the map,
+so the harness reports it as "not run" instead of silently running it as
+`atlas-full`. When such a knob exists, add it without touching the script:
+`--condition-env atlas-map=TITI_ATLAS_NO_LENS=1` (name and value are whatever
+the knob is; repeat the flag for several variables, and any other name defines
+a new condition). Atlas variables inherited from the shell are cleared for a
+named condition. Without `--conditions` the run is as before, one unnamed
+condition, and the report has no conditions table.
+
+Smoke (proves the plumbing with the scripted provider, no key): point an agent
+dir at `scripts/fake-provider.py` as in its docstring, start it, and run
+`scripts/eval.py --bin target/release/titi --tasks evals/tasks --only _smoke
+--smoke --runs 2 --agent-dir <dir> --conditions atlas-off,atlas-map,atlas-full`.
+`_smoke` is solved in both runnable conditions, `atlas-map` is listed as not
+run, and the provider's `requests.jsonl` shows `<atlas>` in the `atlas-full`
+requests only.
+
 ## What the numbers mean
 
 From titi's stdout JSONL (`EngineEvent`, `crates/titi-engine/src/protocol.rs`):
