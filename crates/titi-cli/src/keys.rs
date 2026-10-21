@@ -552,6 +552,11 @@ impl Chat {
         // The next key takes a standing selection away, the way every terminal
         // does: the highlight is about the copy that just happened, not a mode.
         self.clear_selection();
+        // The question about a repository's hooks comes first: it is asked
+        // before anything can be typed, and only its own keys answer it.
+        if self.hook_trust.is_some() {
+            return self.hook_trust_key(key, now);
+        }
         if self.approval.is_some() {
             return self.approval_key(key);
         }

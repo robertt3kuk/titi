@@ -128,6 +128,9 @@ fn ends_a_turn(event: &EngineEvent) -> bool {
         EngineEvent::TurnFinished { .. }
             | EngineEvent::Failed { .. }
             | EngineEvent::Cancelled { .. }
+            // A prompt a hook (or the budget) refused starts no turn, so this
+            // is the only reply it gets.
+            | EngineEvent::PromptReturned { .. }
             | EngineEvent::AgentFinished { .. }
             | EngineEvent::GoalFinished { .. }
             | EngineEvent::ReviewFinished { .. }
@@ -318,7 +321,27 @@ pub async fn run_prompt(
             reply.push_str(text);
             eprint!("{text}");
         }
-        if matches!(event, EngineEvent::Failed { .. }) {
+        // The JSONL stream has all of it; a person watching stderr gets the
+        // lines that explain why a prompt or a call did not go as asked.
+        match &event {
+            EngineEvent::Notice { message } => eprintln!("{message}"),
+            EngineEvent::HookRan {
+                event,
+                hook,
+                outcome,
+                detail,
+                ..
+            } => {
+                if let Some(row) = crate::hooks_trust::hook_row(event, hook, *outcome, detail) {
+                    eprintln!("{row}");
+                }
+            }
+            _ => {}
+        }
+        if matches!(
+            event,
+            EngineEvent::Failed { .. } | EngineEvent::PromptReturned { .. }
+        ) {
             failed = true;
         }
         if matches!(
@@ -326,6 +349,7 @@ pub async fn run_prompt(
             EngineEvent::TurnFinished { .. }
                 | EngineEvent::Failed { .. }
                 | EngineEvent::Cancelled { .. }
+                | EngineEvent::PromptReturned { .. }
         ) {
             break;
         }

@@ -27,6 +27,8 @@ usage: titi [options]
   --continue, -c              resume the newest session in this agent
                               directory instead of starting blank; with
                               nothing to resume, start fresh and say so
+  --trust-project             run the hooks this repository defines without asking; a
+                              headless run skips untrusted ones (and says so) without it
   --mouse <preset>            accepted, ignored (off | on | wheel | buttons | all)
   --set-key <provider> <key>  store an API key in the agent directory
   --list-keys                 list stored providers, kind and lifetime (never the keys)
@@ -108,6 +110,9 @@ fn main() -> io::Result<()> {
     let mut replay_fast = false;
     // `--continue` is a Rust keyword, so the flag's own name is not.
     let mut continue_session = false;
+    // `--trust-project`: this repository's hooks run without the panel, and
+    // nothing is recorded in the trust store.
+    let mut trust_project = false;
     let mut approval = titi_tools::ApprovalMode::Write;
     let mut mode = titi_engine::protocol::SessionMode::Agent;
     let mut theme: Option<String> = None;
@@ -130,6 +135,8 @@ fn main() -> io::Result<()> {
             }
         } else if arg == "--headless" || arg == "-p" {
             headless = true;
+        } else if arg == "--trust-project" {
+            trust_project = true;
         } else if arg == "--continue" || arg == "-c" {
             continue_session = true;
         } else if arg == "--prompt" {
@@ -353,6 +360,25 @@ fn main() -> io::Result<()> {
     let (engine, models, session_id, pin_note) =
         titi_cli::engine::start_engine_with(approval, mode, continue_session)
             .map_err(io::Error::other)?;
+    // The engine runs only the hooks it is handed: the user's own, and the
+    // repository's that the trust store already holds. The rest wait for the
+    // panel (screen) or are skipped (headless).
+    let hooks_startup = {
+        let agent_dir = titi_config::agent_dir();
+        let workspace = titi_cli::session_fs::current_workspace();
+        let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
+        titi_cli::hooks_setup::HookStartup::resolve(
+            &agent_dir,
+            &workspace,
+            settings.as_ref(),
+            trust_project,
+        )
+    };
+    if !hooks_startup.approved.is_empty() {
+        let _ = engine.try_send(titi_engine::EngineCommand::SetHooks {
+            hooks: hooks_startup.approved.clone(),
+        });
+    }
     let session_log =
         titi_cli::session_log::SessionLog::open(&titi_config::agent_dir(), &session_id);
     if session_log.is_none() {
@@ -370,6 +396,9 @@ fn main() -> io::Result<()> {
         // honoured is said here, on stderr, beside the other startup lines.
         // The screen carries the same note itself (`chat::run`).
         for note in [&pin_note, &continue_note].into_iter().flatten() {
+            eprintln!("{note}");
+        }
+        for note in hooks_startup.headless_notices() {
             eprintln!("{note}");
         }
         let code = match (review, goal, prompt) {
@@ -412,6 +441,7 @@ fn main() -> io::Result<()> {
         // Two notes can be owed at once (`--continue` with nothing to resume,
         // and a pinned model that is not available): each is its own line.
         [pin_note, continue_note].into_iter().flatten().collect(),
+        hooks_startup,
     )
 }
 

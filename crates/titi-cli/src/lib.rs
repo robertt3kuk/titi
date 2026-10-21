@@ -24,6 +24,8 @@ pub mod git_checkpoint;
 pub mod headless;
 pub mod herdr;
 pub(crate) mod history_nav;
+pub mod hooks_setup;
+pub(crate) mod hooks_trust;
 pub mod hub;
 pub mod keys;
 pub mod login;

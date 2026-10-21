@@ -901,6 +901,8 @@ pub struct Chat {
     /// Every error the transcript showed this session, and the `/errors`
     /// panel over them.
     pub(crate) errors: crate::errors_panel::ErrorsState,
+    /// The question about a repository's untrusted hooks, while it is up.
+    pub(crate) hook_trust: Option<crate::hooks_trust::TrustPanel>,
     /// The session's usage by the model that ran each turn (`/usage`).
     pub(crate) usage_ledger: titi_tui::status::UsageLedger,
     /// Which transcript sections are drawn, and how: the `/details` state.
@@ -1038,6 +1040,7 @@ impl Chat {
             history_picker: None,
             footer_hits: Vec::new(),
             errors: crate::errors_panel::ErrorsState::default(),
+            hook_trust: None,
             usage_ledger: titi_tui::status::UsageLedger::default(),
             details: Details::new(),
             compose: crate::composer_state::ComposerState::default(),
@@ -1804,6 +1807,18 @@ impl Chat {
             }
             EngineEvent::GoalFinished { report } => {
                 self.push(LineKind::Note, report.to_string());
+                Applied::none()
+            }
+            EngineEvent::HookRan {
+                event,
+                hook,
+                outcome,
+                detail,
+                ..
+            } => {
+                if let Some(row) = crate::hooks_trust::hook_row(&event, &hook, outcome, &detail) {
+                    self.push(LineKind::Note, one_line(&row, TOOL_PREVIEW));
+                }
                 Applied::none()
             }
             EngineEvent::ReviewFinished { report } => {
@@ -4387,6 +4402,7 @@ pub fn run(
     mut cast: Option<crate::ompcast::CastWriter>,
     theme_name: Option<String>,
     startup_notes: Vec<String>,
+    hooks: crate::hooks_setup::HookStartup,
 ) -> io::Result<()> {
     let models = catalog.ids();
     let model = models
@@ -4524,6 +4540,14 @@ pub fn run(
     }
     for note in startup_notes {
         chat.push(LineKind::Note, note);
+    }
+    // A repository's untrusted hooks wait on the user before the first
+    // prompt can be typed: the panel takes every key until it is answered.
+    for note in &hooks.notices {
+        chat.push(LineKind::Note, note.clone());
+    }
+    if !hooks.pending.is_empty() {
+        chat.hook_trust = Some(crate::hooks_trust::TrustPanel::new(hooks));
     }
     chat.catalog = catalog;
     chat.refresh_extensions();

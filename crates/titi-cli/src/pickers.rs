@@ -1690,6 +1690,9 @@ fn trace_panel(chat: &Chat, total: u16) -> PanelView {
 /// The picker above the composer for the state on screen: the login picker,
 /// the model browser, or the slash/skill list.
 pub(crate) fn panel_view_for(chat: &Chat, total: u16, width: u16) -> Option<PanelView> {
+    if chat.hook_trust.is_some() {
+        return Some(crate::hooks_trust::trust_panel(chat, total, width));
+    }
     if chat.pending_ask.is_some() {
         return Some(ask_panel(chat, total));
     }
@@ -2595,7 +2598,8 @@ impl Chat {
     /// Whether a panel holds the bottom of the screen: the same set
     /// [`Chat::on_key`] routes to before the composer sees a key.
     pub(crate) fn panel_open(&self) -> bool {
-        self.approval.is_some()
+        self.hook_trust.is_some()
+            || self.approval.is_some()
             || self.login_for.is_some()
             || self.theme_picker.is_some()
             || self.session_picker.is_some()
