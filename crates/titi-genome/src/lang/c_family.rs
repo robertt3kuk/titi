@@ -106,7 +106,12 @@ fn c_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
             }
             _ => {}
         }
-        c_items(child, source, out);
+        // A function body holds statements and locals, not declarations a
+        // caller can name: `SECTION("x") { … }` inside a test case parses as a
+        // function and is not one.
+        if !matches!(child.kind(), "compound_statement" | "lambda_expression") {
+            c_items(child, source, out);
+        }
     }
 }
 
@@ -124,10 +129,51 @@ fn c_function(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
         if !calls_something(declarator) {
             continue;
         }
-        if let Some(name) = declarator_name(declarator) {
+        if let Some(name) = declarator_name(declarator)
+            && !is_macro_call(node, name, source)
+            && !KEYWORDS.contains(&text(name, source).unwrap_or_default().as_str())
+        {
             push_site(name, source, out);
         }
     }
+}
+
+/// Words the grammar can mistake for a declarator name.
+const KEYWORDS: &[&str] = &[
+    "noexcept", "throw", "decltype", "sizeof", "alignas", "typeof",
+];
+
+/// `JSON_CATCH(...) { }` and `TEST_CASE(x) { }`: a SCREAMING_CASE name, or, outside a class, a function
+/// with no return type and a bare, unqualified name. Real C++ spells such a
+/// thing only as a constructor or destructor, and those live in a class body
+/// or carry a `Class::` qualifier, so a bare one at file or namespace scope
+/// is a macro invocation the grammar read as a definition.
+fn is_macro_call(node: Node, name: Node, source: &[u8]) -> bool {
+    // A name in SCREAMING_CASE is a macro by convention. Preprocessor
+    // conditionals can derail the grammar so far that `SECTION("x") { … }`
+    // inside a test body is read as a typed function at file scope.
+    if matches!(name.kind(), "identifier" | "field_identifier")
+        && text(name, source).is_some_and(|name| {
+            name.len() >= 2
+                && name.bytes().any(|byte| byte.is_ascii_uppercase())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return true;
+    }
+    if node.child_by_field_name("type").is_some() || name.kind() != "identifier" {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "field_declaration_list" {
+            return false;
+        }
+        ancestor = parent.parent();
+    }
+    text(name, source).is_some()
 }
 
 /// Whether a declarator chain goes through a function declarator — the whole
@@ -210,5 +256,70 @@ fn c_includes(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         c_includes(child, source, from_dir, files, imports, unresolved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::lang::test_support::exports;
+
+    fn names(path: &str, source: &str) -> Vec<String> {
+        exports(path, source).unwrap_or_else(|| panic!("{path} parses"))
+    }
+
+    #[test]
+    fn test_macro_invocations_are_not_exported_functions() {
+        let names = names(
+            "tests/unit-x.cpp",
+            r#"
+#include "doctest.h"
+TEST_CASE("serialization")
+{
+    SECTION("person") { CHECK(1 == 1); }
+    CHECK_THROWS_AS(parse(), std::exception&);
+    json j = json::array();
+    JSON_CATCH(...) {}
+}
+TEST_CASE_TEMPLATE("t", T, int, long) { }
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Person, name)
+JSON_CATCH(...) { }
+void SECTION_AFTER_BROKEN_IF(int x) { }
+namespace ns { TEST_CASE("inner") { } int real(int x) { return x; } }
+"#,
+        );
+        assert_eq!(names, vec!["real".to_owned()], "{names:?}");
+    }
+
+    #[test]
+    fn keywords_and_local_declarations_are_not_exports() {
+        let names = names(
+            "include/a.hpp",
+            r#"
+template <class T>
+auto convert(T&& v) noexcept(noexcept(from(v))) -> int;
+struct from_json_fn {
+    template<typename B, typename T>
+    auto operator()(const B& j, T&& val) const
+    noexcept(noexcept(from_json(j, std::forward<T>(val))))
+    -> decltype(from_json(j, std::forward<T>(val)))
+    {
+        return from_json(j, std::forward<T>(val));
+    }
+};
+struct Engine {
+    Engine() {}
+    ~Engine() {}
+    void start() noexcept {}
+};
+int run() { int local(3); return local; }
+Engine::Engine(int) {}
+"#,
+        );
+        for bad in ["noexcept", "local"] {
+            assert!(!names.contains(&bad.to_owned()), "{bad}: {names:?}");
+        }
+        for good in ["convert", "Engine", "start", "run"] {
+            assert!(names.contains(&good.to_owned()), "{good}: {names:?}");
+        }
     }
 }
