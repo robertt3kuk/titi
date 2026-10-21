@@ -651,7 +651,48 @@ def condition_tool(worktree, task, dump):
     return list(json.loads(p.stdout))
 
 
-CONDITIONS = {"static": condition_static, "tool": condition_tool}
+def _atlas_json(worktree, *args):
+    """`titi atlas <args>` in the worktree; the parsed JSON, or None when it answers with an error
+    (`lens` exits non-zero for a task with no seeds)."""
+    p = subprocess.run([str(TITI_BIN), "atlas", *args], cwd=worktree, capture_output=True, text=True)
+    if p.returncode:
+        return None
+    return json.loads(p.stdout)
+
+
+def condition_lens(worktree, task, dump):
+    """The per-prompt lens as the turn builds it (default budget): what the model is shown beside the map."""
+    data = _atlas_json(worktree, "lens", "--task", task, "--json")
+    return [e["path"] for e in (data or {}).get("entries", [])]
+
+
+def condition_find(worktree, task, dump):
+    """`titi atlas find "<task>"`: the query the atlas tool answers (it caps its list)."""
+    data = _atlas_json(worktree, "find", task, "--json")
+    return list((data or {}).get("paths", []))
+
+
+def _union(*lists):
+    seen, out = set(), []
+    for items in lists:
+        for path in items:
+            if path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
+def condition_lens_find(worktree, task, dump):
+    return _union(condition_lens(worktree, task, dump), condition_find(worktree, task, dump))
+
+
+def condition_map_lens(worktree, task, dump):
+    """What the prompt carries before the model acts: the lens first, then the map's files."""
+    return _union(condition_lens(worktree, task, dump), condition_static(worktree, task, dump))
+
+
+CONDITIONS = {"static": condition_static, "lens": condition_lens, "find": condition_find,
+              "lens+find": condition_lens_find, "map+lens": condition_map_lens, "tool": condition_tool}
 SRC_EXT = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".java", ".kt", ".kts", ".c",
            ".h", ".cpp", ".cc", ".hpp", ".cs", ".swift", ".php", ".rb"}
 
@@ -734,7 +775,10 @@ def render_replay(tasks, conditions):
 
     head = "| repo | tasks | files | " + " | ".join(f"{c} r@10 | {c} r@24" for c in names) + " | map tokens | leaky |"
     out = [head, "|" + "---|" * (head.count("|") - 1)]
-    for repo, rows in list(by.items()) + [("**ALL**", tasks)]:
+    clean = [t for t in tasks if not t["leaky"]]
+    for repo, rows in list(by.items()) + [("**ALL**", tasks), ("**ALL, message names no truth file**", clean)]:
+        if not rows:
+            continue
         cells = " | ".join(
             f"{mean([r for r in rows if c in r['conditions']], lambda r, c=c, k=k: r['conditions'][c][k]):.2f}"
             for c in names for k in ("r10", "r24"))
@@ -822,7 +866,8 @@ def main():
     ap.add_argument("--min-msg", type=int, default=20, help="commits mode: message length, at least")
     ap.add_argument("--max-changed", type=int, default=12, help="commits mode: skip commits touching more files")
     ap.add_argument("--scan", type=int, default=400, help="commits mode: recent non-merge commits to look through")
-    ap.add_argument("--conditions", default="static,tool", help="commits mode: rankings to score (tool needs ATLAS_TOOL_CMD)")
+    ap.add_argument("--conditions", default="static,lens,find,lens+find,map+lens",
+                    help="commits mode: rankings to score: static, lens, find, lens+find, map+lens, tool (needs ATLAS_TOOL_CMD)")
     ap.add_argument("--self-test", action="store_true", help="check the map parser on old and new map text, then exit")
     a = ap.parse_args()
     if a.self_test:
