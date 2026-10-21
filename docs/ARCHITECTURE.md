@@ -68,7 +68,9 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   root of the evidence behind it — one unit per import and per scoped use, a
   quarter per guess — so a file that leans on four names of another is more
   tied to it than one that mentions a single name, and a file spreads its rank
-  over its edges in proportion to their weights.
+  over its edges in proportion to their weights. A file's edges weigh at least
+  1 together (`MIN_OUTBOUND`): a file whose only edge is a guess passes half
+  its rank to it, not all of it.
 - **`(→N)` counts distinct files with an edge to this one**, and `+Name (n)`
   counts distinct files whose uses of `Name` resolve to *this* file. Two files
   defining `Shared` are counted separately.

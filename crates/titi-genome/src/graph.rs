@@ -15,6 +15,9 @@ const EVIDENCE: f64 = 1.0;
 /// is worth. Four guesses weigh as much as one real dependency.
 const GUESS: f64 = 0.25;
 
+/// What a file's edges weigh at least, however light they are.
+const MIN_OUTBOUND: f64 = 1.0;
+
 /// PageRank over the file graph, and each file's dependent count.
 ///
 /// An edge runs from a file to each file it imports and each file one of its
@@ -73,6 +76,10 @@ pub fn rank(files: &HashMap<String, FileRecord>) -> (HashMap<String, f64>, HashM
             inbound[to_at].push((from_at, weight));
             dependents[to_at] += 1;
         }
+        // The floor is what keeps a file whose only edge is a guess from
+        // handing all its rank to it: it passes on what its edges weigh, and
+        // never more than one import's worth would carry.
+        outbound[from_at] = outbound[from_at].max(MIN_OUTBOUND);
     }
 
     let dependents: HashMap<String, usize> = nodes
@@ -183,7 +190,7 @@ mod tests {
                     .push((from.clone(), weight));
                 *dependents.entry(to.clone()).or_default() += 1;
             }
-            outbound.insert(from.clone(), total);
+            outbound.insert(from.clone(), f64::max(total, super::MIN_OUTBOUND));
         }
         if n == 0 {
             return (HashMap::new(), dependents);
@@ -303,6 +310,29 @@ mod tests {
         );
         let (ranks, _) = rank(&files);
         assert!((ranks["hub.rs"] - ranks["guess.rs"]).abs() < 1e-12);
+    }
+
+    /// A file whose only edge is a guess passes on half of what a file with
+    /// one import does, not all of it.
+    #[test]
+    fn a_lone_guess_does_not_carry_the_whole_rank() {
+        let mut files = HashMap::new();
+        for path in ["by_import.rs", "by_guess.rs"] {
+            files.insert(path.to_owned(), record(path, &[], &[]));
+        }
+        files.insert(
+            "importer.rs".to_owned(),
+            record("importer.rs", &["by_import.rs"], &[]),
+        );
+        files.insert(
+            "guesser.rs".to_owned(),
+            record("guesser.rs", &[], &[("by_guess.rs", Basis::Unique)]),
+        );
+        let (ranks, _) = rank(&files);
+        let teleport = (1.0 - DAMPING) / 4.0;
+        let share = |score: f64| (score - teleport) / DAMPING;
+        let ratio = share(ranks["by_import.rs"]) / share(ranks["by_guess.rs"]);
+        assert!((ratio - 2.0).abs() < 1e-9, "{ratio}");
     }
 
     #[test]
