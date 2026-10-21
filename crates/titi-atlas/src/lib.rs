@@ -473,17 +473,18 @@ impl Atlas {
             .chain(self.overlay.keys().cloned())
             .collect();
 
-        let absorbed = self.absorb(listed, &known, urgent, max_workers);
-        match probe {
-            Some(probe) => self.recency = Some(probe.finish()),
-            None => self.note_changed(&absorbed.dirty),
-        }
         let gone: Vec<String> = self
             .files
             .keys()
             .filter(|path| !known.contains(*path))
             .cloned()
             .collect();
+        let reread = self.importers_of(&gone);
+        let absorbed = self.absorb(listed, &known, urgent, &reread, max_workers);
+        match probe {
+            Some(probe) => self.recency = Some(probe.finish()),
+            None => self.note_changed(&absorbed.dirty),
+        }
         for path in &gone {
             self.drop_record(path);
         }
@@ -549,6 +550,7 @@ impl Atlas {
         }
         let mut listed = Vec::new();
         let mut removed = 0;
+        let mut dropped: Vec<String> = Vec::new();
         let keys: Vec<String> = paths.iter().filter_map(|path| self.key(path)).collect();
         let paths = keys.as_slice();
         let mut seen: HashSet<&str> = HashSet::new();
@@ -562,7 +564,23 @@ impl Atlas {
                 // Gone from disk, or never a file this index would carry. The
                 // first is a removal; the second is nothing to do, and
                 // `drop_record` answers both without a second question.
-                None => removed += usize::from(self.drop_record(path)),
+                None => {
+                    if self.drop_record(path) {
+                        removed += 1;
+                        dropped.push(path.clone());
+                    }
+                }
+            }
+        }
+        // Files that imported what was just dropped: their records still name
+        // it, and only a read against the smaller file set says what the
+        // specifier does now. They were not named, so they are listed here.
+        let reread = self.importers_of(&dropped);
+        for path in &reread {
+            if !seen.contains(path.as_str())
+                && let Some(file) = scan::stat(&self.root, path)
+            {
+                listed.push(file);
             }
         }
         let known: HashSet<String> = self
@@ -572,7 +590,7 @@ impl Atlas {
             .chain(listed.iter().map(|file| file.path.clone()))
             .collect();
 
-        let absorbed = self.absorb(&listed, &known, paths, usize::MAX);
+        let absorbed = self.absorb(&listed, &known, paths, &reread, usize::MAX);
         self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
         let reresolved = self.finish(
@@ -623,7 +641,13 @@ impl Atlas {
             .chain(std::iter::once(path.to_owned()))
             .collect();
         self.overlay.insert(path.to_owned(), source.to_owned());
-        let absorbed = self.absorb(&[listed], &known, &[path.to_owned()], usize::MAX);
+        let absorbed = self.absorb(
+            &[listed],
+            &known,
+            &[path.to_owned()],
+            &HashSet::new(),
+            usize::MAX,
+        );
         self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved;
         let reresolved = self.finish(graph_recomputed, &absorbed.dirty, absorbed.scope_moved);
@@ -655,6 +679,11 @@ impl Atlas {
     /// it — `definition` and `references` — and both would locate the wrong
     /// identifier if they read disk while the client is looking at an edited
     /// buffer.
+    /// The root the last refresh walked; empty before the first.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn source_of(&self, path: &str) -> Option<String> {
         if let Some(source) = self.overlay.get(path) {
             return Some(source.clone());
@@ -788,6 +817,7 @@ impl Atlas {
         listed: &[scan::ListedFile],
         known: &HashSet<String>,
         urgent: &[String],
+        reread: &HashSet<String>,
         max_workers: usize,
     ) -> Absorption {
         // Every path this update adds. It is the only way a specifier that
@@ -798,10 +828,19 @@ impl Atlas {
             .filter(|file| !self.files.contains_key(&file.path))
             .map(|file| file.path.clone())
             .collect();
-        let stale: Vec<&scan::ListedFile> =
-            listed.iter().filter(|file| self.is_stale(file)).collect();
+        let stale: Vec<&scan::ListedFile> = listed
+            .iter()
+            .filter(|file| reread.contains(&file.path) || self.is_stale(file))
+            .collect();
         let stale = prioritize(stale, urgent);
-        let records = parse_batch(&stale, known, &self.files, &self.overlay, max_workers);
+        let records = parse_batch(
+            &stale,
+            known,
+            &self.files,
+            &self.overlay,
+            reread,
+            max_workers,
+        );
 
         // A parse can only move the graph by changing the tuple the graph is
         // built from. `exports` and the scope (`imports`, re-exports, crate
@@ -897,6 +936,35 @@ impl Atlas {
         }
     }
 
+    /// The files whose records name any of `gone` as an import, a re-export
+    /// or a scope they inherit.
+    ///
+    /// A resolved specifier keeps no candidates, so the way to learn what it
+    /// names once its target is gone is to read the importer again against the
+    /// file set that is left: it comes back with the specifier unresolved and
+    /// the `unresolved-import` diagnostic restored, instead of an edge to
+    /// nothing. Importers of one file are few; the walk that found it gone
+    /// parsed far more.
+    fn importers_of(&self, gone: &[String]) -> HashSet<String> {
+        if gone.is_empty() {
+            return HashSet::new();
+        }
+        let gone: HashSet<&str> = gone.iter().map(String::as_str).collect();
+        self.files
+            .values()
+            .filter(|record| !gone.contains(record.path.as_str()))
+            .filter(|record| {
+                record
+                    .imports
+                    .iter()
+                    .chain(&record.reexports)
+                    .chain(&record.inherits)
+                    .any(|path| gone.contains(path.as_str()))
+            })
+            .map(|record| record.path.clone())
+            .collect()
+    }
+
     /// Drop a path from the index and from the mention index.
     ///
     /// The two move together: a stale mention entry would have this file
@@ -944,11 +1012,8 @@ impl Atlas {
     /// diagnostic goes away. Returns whether any file moved, which the caller
     /// needs because a changed `imports` list is a changed graph input.
     ///
-    /// One case this does not reach: an import that *resolved* when it was
-    /// parsed and whose target was later deleted keeps the edge in `imports`
-    /// (the ranker drops it, since the path is no longer a node) and keeps no
-    /// specifier to restore the diagnostic from. Only re-parsing that file
-    /// fixes its record; the graph is right either way.
+    /// The opposite case, an import that resolved and whose target is deleted,
+    /// is answered by [`Self::importers_of`]: those files are read again.
     fn resolve_new_imports(&mut self, appeared: &HashSet<String>, known: &HashSet<String>) -> bool {
         if appeared.is_empty() {
             return false;
@@ -1266,6 +1331,7 @@ fn parse_batch(
     known: &HashSet<String>,
     previous: &HashMap<String, FileRecord>,
     overlay: &HashMap<String, String>,
+    reread: &HashSet<String>,
     max_workers: usize,
 ) -> Vec<(FileRecord, bool)> {
     let workers = std::thread::available_parallelism()
@@ -1276,7 +1342,7 @@ fn parse_batch(
     if workers <= 1 {
         return stale
             .iter()
-            .map(|file| parse_one(file, known, previous.get(&file.path), overlay))
+            .map(|file| parse_one(file, known, previous_of(previous, reread, file), overlay))
             .collect();
     }
     // Files are claimed one at a time from a shared counter, in list order,
@@ -1297,7 +1363,7 @@ fn parse_batch(
                         };
                         done.push((
                             at,
-                            parse_one(file, known, previous.get(&file.path), overlay),
+                            parse_one(file, known, previous_of(previous, reread, file), overlay),
                         ));
                     }
                 })
@@ -1318,6 +1384,20 @@ fn parse_batch(
         }
         slots.into_iter().flatten().collect()
     })
+}
+
+/// The record a parse may keep when the bytes agree with it: none for a file
+/// that is being read again because of what *other* files did, since its
+/// bytes agreeing with its record is exactly the case that proves nothing.
+fn previous_of<'a>(
+    previous: &'a HashMap<String, FileRecord>,
+    reread: &HashSet<String>,
+    file: &scan::ListedFile,
+) -> Option<&'a FileRecord> {
+    if reread.contains(&file.path) {
+        return None;
+    }
+    previous.get(&file.path)
 }
 
 /// The [`scan::ListedFile`] shape of an editor buffer: the text is the file.
@@ -1493,7 +1573,14 @@ mod tests {
         let stale: Vec<&scan::ListedFile> = files.iter().collect();
         let known: HashSet<String> = files.iter().map(|file| file.path.clone()).collect();
 
-        let records = parse_batch(&stale, &known, &HashMap::new(), &HashMap::new(), usize::MAX);
+        let records = parse_batch(
+            &stale,
+            &known,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            usize::MAX,
+        );
 
         assert_eq!(records.len(), 64);
         for ((record, parsed), file) in records.iter().zip(&files) {
@@ -1551,6 +1638,7 @@ mod tests {
                 &known,
                 &HashMap::new(),
                 &HashMap::new(),
+                &HashSet::new(),
                 max_workers,
             )
             .into_iter()

@@ -610,6 +610,16 @@ pub(crate) async fn execute_tools(
         {
             let _ = tokio::task::spawn_blocking(move || atlas.apply_changes(&[path])).await;
         }
+        // A command can change any file: a formatter, a generator, `rm`, `git
+        // checkout`. The next read of the index in this turn has to see it, and
+        // the per-turn walk comes too late for that, so one walk runs here. It
+        // runs whether or not the command succeeded: a failed one may have
+        // got halfway.
+        if tools.approval_tier(&prepared.call.name) == ApprovalTier::Exec
+            && let Some(atlas) = atlas.cloned()
+        {
+            let _ = tokio::task::spawn_blocking(move || atlas.resync()).await;
+        }
         finish(
             turn_id,
             prepared,

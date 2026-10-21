@@ -157,6 +157,27 @@ impl SharedAtlas {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
+    /// Walk the root this index was last built over and fold in whatever
+    /// moved, on the calling thread.
+    ///
+    /// For the caller that has just run something it cannot name the effects
+    /// of — a shell command, a formatter, a test run — and is about to read:
+    /// one walk is 3–12 ms on a repository of thousands of files, and nothing
+    /// is published when it finds nothing. An index that was never built over
+    /// a root has nothing to walk and answers with its empty stats.
+    pub fn resync(&self) -> std::io::Result<RefreshStats> {
+        let root = self.snapshot().root().to_path_buf();
+        if root.as_os_str().is_empty() {
+            return Ok(RefreshStats::default());
+        }
+        self.refresh_capped(&root, &[], usize::MAX)
+    }
+
+    /// Run a targeted update — see [`Atlas::apply_changes`] — and publish it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::refresh`].
     pub fn apply_changes(&self, paths: &[String]) -> std::io::Result<RefreshStats> {
         self.update(|atlas| atlas.apply_changes(paths))
     }

@@ -112,7 +112,16 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   characters (they would break the line-based projection).
 - **Refresh is incremental.** `refresh()` re-parses only files whose `size`
   or `mtime` changed, drops deleted ones, and recomputes ranks every time
-  (cheap next to parsing).
+  (cheap next to parsing). A file that imported a dropped one is read again
+  (`importers_of`), so its import becomes the `unresolved-import` diagnostic
+  instead of an edge to nothing. A move is a deletion and an arrival; a record
+  is not carried across paths, because what a file's relative imports resolve
+  to depends on where it is.
+- **A command's effects are in the index before the next read.** After any
+  Exec-tier tool call (`bash`, `project`, an MCP tool) the tool loop runs one
+  `SharedAtlas::resync` — a walk on the calling thread, nothing published when
+  it finds nothing — so the model's next `atlas` call or the next turn's map
+  cannot be older than what the command did.
 
 ### Languages
 

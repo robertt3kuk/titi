@@ -214,3 +214,97 @@ async fn the_lens_can_be_switched_off_while_the_map_stays() {
     assert!(without.contains("<atlas>"), "{without}");
     assert!(!without.contains("<atlas-lens>"), "{without}");
 }
+
+/// An exec-tier tool that deletes a source file, standing in for `rm`.
+struct Remover(std::path::PathBuf);
+
+#[async_trait::async_trait]
+impl titi_tools::ToolHandler for Remover {
+    fn definition(&self) -> titi_tools::ToolDefinition {
+        titi_tools::ToolDefinition {
+            spec: titi_providers::ToolSpec {
+                name: "remover".into(),
+                description: "removes src/service.rs".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            approval: titi_tools::ApprovalTier::Exec,
+        }
+    }
+
+    async fn invoke(&self, _args: serde_json::Value) -> titi_tools::ToolResult {
+        std::fs::remove_file(self.0.join("src/service.rs")).unwrap();
+        titi_tools::ToolResult {
+            output: "removed".into(),
+            is_error: false,
+            detail: None,
+        }
+    }
+}
+
+fn call(id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolcallStart {
+            id: BlockId::new(id),
+            call: ToolCallRef {
+                call_id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            },
+        },
+        StreamEvent::ToolcallDelta {
+            id: BlockId::new(id),
+            json: args.into(),
+        },
+        StreamEvent::ToolcallEnd {
+            id: BlockId::new(id),
+        },
+        StreamEvent::Done {
+            reason: StopReason::ToolUse,
+        },
+    ]
+}
+
+/// A command that deletes a file is seen by the very next `atlas` call in the
+/// same turn, not at the next turn's walk.
+#[tokio::test]
+async fn a_shell_commands_effects_are_in_the_index_before_the_next_call() {
+    let dir = workspace();
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(call("rm", "remover", "{}")),
+        MockBody::Events(call(
+            "ask",
+            "atlas",
+            r#"{"op":"uses","target":"SessionStore"}"#,
+        )),
+        MockBody::Events(vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+        }]),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(Remover(dir.path().to_path_buf())));
+    let mut config = EngineConfig::new("primary");
+    config.atlas_root = Some(dir.path().to_path_buf());
+    config.approval_mode = ApprovalMode::Yolo;
+    let mut engine =
+        EngineRuntime::start_with_tools(config, resolver(Arc::clone(&transport) as _), tools);
+    engine
+        .send(EngineCommand::SubmitPrompt {
+            text: "clean up".into(),
+        })
+        .await
+        .unwrap();
+    until_terminal(&mut engine).await;
+
+    let requests = transport.requests();
+    let answer = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .rev()
+        .find(|message| message.role == Role::Tool && message.content.starts_with("atlas gen="))
+        .expect("the atlas answer reached the model");
+    assert!(
+        !answer.content.contains("src/service.rs"),
+        "the deleted file is still listed as a user:\n{}",
+        answer.content
+    );
+}
