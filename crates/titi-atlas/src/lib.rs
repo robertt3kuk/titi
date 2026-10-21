@@ -22,6 +22,7 @@ use std::time::SystemTime;
 
 pub mod ast_edit;
 
+mod cochange;
 mod content;
 mod graph;
 mod lang;
@@ -42,6 +43,7 @@ mod symbol;
 mod symbols;
 pub mod syntax_check;
 
+pub use cochange::{CoChange, head_stamp as cochange_head_stamp, probe as probe_cochange};
 pub use lang::{Capability, Language, Level};
 pub use lens::{Lens, LensBudget, LensEntry, MAX_LENS_FILES, SeedInput, SeedKind, Seeds};
 pub use live::AtlasHandle;
@@ -369,6 +371,9 @@ pub struct Atlas {
     layout: scope::Layout,
     /// What the lens walks, built on first use; see [`lens`].
     lens: lens::LensCache,
+    /// Files that change together, from history; see [`cochange`]. Empty until
+    /// a probe has answered.
+    cochange: std::sync::Arc<CoChange>,
 }
 
 /// One refresh's file-level outcome, before the graph decision is folded in.
@@ -649,6 +654,18 @@ impl Atlas {
             return Some(source.clone());
         }
         fs::read_to_string(self.root.join(path)).ok()
+    }
+
+    /// Give the index the co-change partners history found. The lens reads
+    /// them as edges from the next call on.
+    pub fn set_cochange(&mut self, found: CoChange) {
+        self.cochange = std::sync::Arc::new(found);
+        self.lens = lens::LensCache::default();
+    }
+
+    /// The co-change partners the index holds.
+    pub fn cochange(&self) -> &CoChange {
+        &self.cochange
     }
 
     /// The index key of `path`: relative to the root, `/`-separated, without

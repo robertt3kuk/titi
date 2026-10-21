@@ -165,14 +165,31 @@ pub struct Lens {
     pub unmapped: Vec<String>,
 }
 
+/// How a file is linked to a neighbour in the lens's walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeKind {
+    /// The file itself depends on the neighbour.
+    Uses,
+    /// The neighbour depends on the file.
+    UsedBy,
+    /// History edits them together.
+    CoChange,
+}
+
+/// What a co-change edge weighs against a dependency edge of one import: a
+/// pair that history edits together every time is as tied as a few uses.
+const COCHANGE: f64 = 1.5;
+/// A pair's history weight is capped here before it is scaled; a pair edited
+/// together in every recent commit saturates, it does not dominate.
+const COCHANGE_CAP: f64 = 2.0;
+
 /// What the lens needs from the records, built once per graph.
 #[derive(Debug, Default)]
 pub(crate) struct LensIndex {
     paths: Vec<String>,
     at: HashMap<String, u32>,
-    /// `(neighbour, weight, toward)` — `toward` is true for an edge the file
-    /// itself draws (it depends on the neighbour), false for the reverse.
-    adj: Vec<Vec<(u32, f64, bool)>>,
+    /// `(neighbour, weight, kind)`; see [`EdgeKind`].
+    adj: Vec<Vec<(u32, f64, EdgeKind)>>,
     out_sum: Vec<f64>,
     exact: HashMap<String, Vec<u32>>,
     lower: HashMap<String, Vec<u32>>,
@@ -202,11 +219,22 @@ impl LensIndex {
             .enumerate()
             .map(|(i, path)| (path.clone(), i as u32))
             .collect();
-        let mut adj: Vec<Vec<(u32, f64, bool)>> = vec![Vec::new(); n];
+        let mut adj: Vec<Vec<(u32, f64, EdgeKind)>> = vec![Vec::new(); n];
         for (from, edges) in out.iter().enumerate() {
             for &(to, weight) in edges {
-                adj[from].push((to, weight, true));
-                adj[to as usize].push((from as u32, weight * REVERSE, false));
+                adj[from].push((to, weight, EdgeKind::Uses));
+                adj[to as usize].push((from as u32, weight * REVERSE, EdgeKind::UsedBy));
+            }
+        }
+        for (path, partners) in atlas.cochange.iter() {
+            let Some(&from) = at.get(path) else {
+                continue;
+            };
+            for (other, weight) in partners {
+                if let Some(&to) = at.get(other) {
+                    let weight = COCHANGE * f64::from(*weight).min(COCHANGE_CAP);
+                    adj[from as usize].push((to, weight, EdgeKind::CoChange));
+                }
             }
         }
         let out_sum: Vec<f64> = adj
@@ -641,8 +669,11 @@ impl Atlas {
                     .then_with(|| index.paths[b.0 as usize].cmp(&index.paths[a.0 as usize]))
             });
         match best {
-            Some(&(to, _, true)) => format!("uses {}", index.paths[to as usize]),
-            Some(&(to, _, false)) => format!("used by {}", index.paths[to as usize]),
+            Some(&(to, _, EdgeKind::Uses)) => format!("uses {}", index.paths[to as usize]),
+            Some(&(to, _, EdgeKind::UsedBy)) => format!("used by {}", index.paths[to as usize]),
+            Some(&(to, _, EdgeKind::CoChange)) => {
+                format!("changes with {}", index.paths[to as usize])
+            }
             None => "near the seeds".to_owned(),
         }
     }

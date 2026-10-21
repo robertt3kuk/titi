@@ -285,13 +285,17 @@ fn lens_cmd(workspace: &Path, args: &[String]) {
         eprintln!("{usage}");
         std::process::exit(USAGE_EXIT);
     };
-    let atlas = match titi_atlas::Atlas::index(workspace) {
+    let mut atlas = match titi_atlas::Atlas::index(workspace) {
         Ok(atlas) => atlas,
         Err(reason) => {
             eprintln!("atlas: lens failed ({reason})");
             std::process::exit(1);
         }
     };
+    // A one-shot has no background worker to read history, so it reads it here.
+    if let Some(found) = titi_atlas::probe_cochange(workspace) {
+        atlas.set_cochange(found);
+    }
     let seeds = atlas.seeds(&titi_atlas::SeedInput {
         prompt: &task,
         touched: &touched,

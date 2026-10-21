@@ -239,6 +239,14 @@ src/runtime.rs (→3) [RECENT]
 - File limit: `EngineConfig::atlas_limit`, default 24, overridden by the
   `atlas.limit` setting (1..=64, the project `.titi/config.yml` winning);
   `TITI_NO_ATLAS=1` drops the map.
+- **Co-change** (`cochange.rs`): `git log -n 500 --no-merges --name-only` is
+  read once per `HEAD` (stamp = `.git/HEAD` plus the reflog's mtime, no
+  process) on a thread of its own with a 2.5 s cap, started by the index
+  worker and republished when a walk finds `HEAD` moved; the first frame and a
+  turn never wait for it. A commit touching 2–12 source files adds
+  `0.5^(age/50)/sqrt(files)` to each pair; each file keeps its 8 strongest
+  partners. The lens reads them as extra edges (`changes with a.rs`, weight
+  `1.5 × min(w, 2)`); the static ranking does not use them.
 - **The lens** (`lens.rs`, `<atlas-lens>`) is the part of the repository *this*
   prompt is about, built per turn from seeds and a personalised PageRank, no
   model involved. Seeds: files the prompt names (`src/a.rs`, `a.rs:42`, a

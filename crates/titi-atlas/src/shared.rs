@@ -147,6 +147,16 @@ impl SharedAtlas {
     /// # Panics
     ///
     /// As [`Self::refresh`].
+    /// Publish the co-change partners history found. A publish of its own,
+    /// with no refresh stats to report: no file moved.
+    pub fn set_cochange(&self, found: crate::CoChange) {
+        let _sole_writer = self.writer.lock().expect("atlas writer lock poisoned");
+        let mut next = (*self.snapshot()).clone();
+        next.set_cochange(found);
+        *self.state.write().expect("atlas lock poisoned") = Arc::new(next);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     pub fn apply_changes(&self, paths: &[String]) -> std::io::Result<RefreshStats> {
         self.update(|atlas| atlas.apply_changes(paths))
     }

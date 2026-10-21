@@ -483,6 +483,11 @@ fn run(
     options: Options,
 ) {
     let mut queue = Queue::default();
+    // History is read once per `HEAD` on a thread of its own and published
+    // when it answers; the first poll starts it, and a window that walked the
+    // tree looks again, which is when a checkout or a commit shows.
+    let mut history = crate::cochange::Follower::default();
+    history.poll(&root, &atlas);
     // Requests this worker has taken out of the channel. It is the worker's
     // own count, so it is exact at the moment it is read: nothing else bumps
     // it, and the worker is single-threaded.
@@ -534,7 +539,11 @@ fn run(
         // A window with nothing in it can only be reached when nothing is
         // outstanding, because a failed window keeps its queue; it clears the
         // count because there is genuinely nothing left to clear.
+        let walked = queue.walk;
         let folded = queue.is_empty() || apply(&atlas, &root, &queue).is_ok();
+        if folded && walked {
+            history.poll(&root, &atlas);
+        }
         if folded {
             progress.applied.store(received, Ordering::Release);
             progress.items.store(0, Ordering::Release);
