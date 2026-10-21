@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config_file;
+pub mod hooks;
 pub mod roles;
 pub mod settings;
 pub mod trust;
