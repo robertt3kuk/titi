@@ -293,17 +293,7 @@ fn hook_lines(
             format!("       {text}")
         });
     }
-    if let Some(script) = def.script(workspace) {
-        let state = if script.sha256.is_some() {
-            "its content is part of the hash"
-        } else {
-            "not there yet"
-        };
-        lines.push(format!(
-            "     runs repository files: {} ({state})",
-            sanitize(&script.path.to_string_lossy())
-        ));
-    }
+    lines.extend(script_lines(&def.scripts(workspace)));
     lines
 }
 
@@ -353,18 +343,33 @@ fn server_lines(
     if let Some(cwd) = def.cwd.as_deref() {
         lines.push(format!("     cwd  {}", sanitize(cwd)));
     }
-    if let Some(script) = def.script(workspace) {
-        let state = if script.sha256.is_some() {
-            "its content is part of the hash"
-        } else {
-            "not there yet"
-        };
-        lines.push(format!(
-            "     runs repository files: {} ({state})",
-            sanitize(&script.path.to_string_lossy())
-        ));
+    lines.extend(script_lines(&def.scripts(workspace)));
+    if def.runs_unhashed_code(workspace) {
+        lines.push(
+            "     repository code is not hashed: it is a launcher and no argument is a repository file"
+                .to_owned(),
+        );
     }
     lines
+}
+
+/// One line per repository file a command runs, with whether its content is
+/// part of the hash.
+fn script_lines(scripts: &[titi_config::hooks::Script]) -> Vec<String> {
+    scripts
+        .iter()
+        .map(|script| {
+            let state = if script.sha256.is_some() {
+                "its content is part of the hash"
+            } else {
+                "not there yet"
+            };
+            format!(
+                "     runs repository files: {} ({state})",
+                sanitize(&script.path.to_string_lossy())
+            )
+        })
+        .collect()
 }
 
 /// `PreToolUse Bash|Edit`: the event and its matcher, without the program
@@ -785,6 +790,30 @@ mod tests {
         assert!(!all.contains('\u{1b}'), "control characters are stripped");
         assert!(all.contains("cwd  tools"), "{all}");
         assert!(all.contains(".mcp.json") && all.contains(" · #"), "{all}");
+    }
+
+    #[test]
+    fn the_panel_lists_every_file_a_launcher_runs_and_says_when_none_is_hashed() {
+        let servers = r#"{"mcpServers": {
+            "a": {"command": "deno", "args": ["run", "-A", "tools/mcp.ts", "--config", "tools/c.json"]},
+            "b": {"command": "npx", "args": ["-y", "some-server"]}}}"#;
+        let mut screen = screen_with_servers(servers, false);
+        std::fs::create_dir_all(screen.repo.path().join("tools")).unwrap();
+        std::fs::write(screen.repo.path().join("tools/mcp.ts"), "x").unwrap();
+        std::fs::write(screen.repo.path().join("tools/c.json"), "{}").unwrap();
+        let start = HookStartup::resolve(screen.agent.path(), screen.repo.path(), None, false);
+        let mcp = McpStartup::resolve(screen.agent.path(), screen.repo.path(), None, false);
+        screen.chat.hook_trust = Some(TrustPanel::new(start).with_mcp(mcp));
+        let all = scroll_to_the_end(&mut screen);
+        assert!(all.contains("runs repository files: tools/mcp.ts"), "{all}");
+        assert!(all.contains("runs repository files: tools/c.json"), "{all}");
+        assert!(all.contains("repository code is not hashed"), "{all}");
+        let (a_part, b_part) = all.split_once("2/2").expect("both servers");
+        assert!(
+            !a_part.contains("repository code is not hashed"),
+            "{a_part}"
+        );
+        assert!(b_part.contains("repository code is not hashed"), "{b_part}");
     }
 
     #[test]

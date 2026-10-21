@@ -112,29 +112,29 @@ impl McpServerDef {
     /// as it is for a hook.
     pub fn hash(&self, workspace: &Path) -> String {
         let mut definition = self.definition();
-        if let (Some(script), Some(object)) = (self.script(workspace), definition.as_object_mut()) {
-            object.insert(
-                "script".to_owned(),
-                json!({
-                    "path": script.path.to_string_lossy(),
-                    "sha256": script.sha256,
-                }),
-            );
-        }
+        crate::hooks::add_scripts(&mut definition, &self.scripts(workspace));
         crate::trust::hash_definition(&definition)
     }
 
-    /// The repository file this server runs, if its command line names one.
-    pub fn script(&self, workspace: &Path) -> Option<crate::hooks::Script> {
+    /// Every repository file this server's command line names: a launcher
+    /// runs more than its first argument (`deno run -A tools/mcp.ts`).
+    pub fn scripts(&self, workspace: &Path) -> Vec<crate::hooks::Script> {
         let base = match self.cwd.as_deref() {
             Some(cwd) if !cwd.is_empty() => workspace.join(cwd),
             _ => workspace.to_owned(),
         };
-        crate::hooks::script_of(
-            std::iter::once(self.command.clone()).chain(self.args.iter().cloned()),
-            workspace,
-            &base,
-        )
+        let words: Vec<String> = std::iter::once(self.command.clone())
+            .chain(self.args.iter().cloned())
+            .collect();
+        crate::hooks::scripts_of(&words, workspace, &base)
+    }
+
+    /// Whether the server starts code the hash cannot see: a launcher
+    /// (`npx`, `uv`, an interpreter) none of whose arguments is a repository
+    /// file. What it pulls in is whatever its name resolves to, and the
+    /// consent panel says so.
+    pub fn runs_unhashed_code(&self, workspace: &Path) -> bool {
+        crate::hooks::is_launcher(&self.command) && self.scripts(workspace).is_empty()
     }
 
     /// The command line as a person would type it, for a panel.
@@ -484,16 +484,96 @@ mod tests {
                 ..def("node", &["./server.js"])
             },
         ] {
-            let script = server.script(repo.path()).unwrap_or_else(|| {
-                panic!("{}", server.command_line());
-            });
+            let script = server
+                .scripts(repo.path())
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| {
+                    panic!("{}", server.command_line());
+                });
             assert!(script.sha256.is_some());
             let before = server.hash(repo.path());
             std::fs::write(repo.path().join("tools/server.js"), "evil()\n").unwrap();
             assert_ne!(before, server.hash(repo.path()), "an edited script is new");
             std::fs::write(repo.path().join("tools/server.js"), "console.log(1)\n").unwrap();
         }
-        assert_eq!(def("npx", &["-y", "x"]).script(repo.path()), None);
+        assert!(def("npx", &["-y", "x"]).scripts(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn every_repository_file_a_launcher_runs_is_hashed_not_only_the_first_word() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+        for file in [
+            "tools/mcp.ts",
+            "tools/helper.ts",
+            "s.py",
+            "server.py",
+            "preload.js",
+            "s.js",
+        ] {
+            std::fs::write(repo.path().join(file), "v1\n").unwrap();
+        }
+        for (command, args) in [
+            ("deno", vec!["run", "-A", "tools/mcp.ts"]),
+            ("bun", vec!["run", "tools/mcp.ts"]),
+            ("python3", vec!["-X", "dev", "s.py"]),
+            ("node", vec!["--import", "./preload.js", "s.js"]),
+            ("node", vec!["--require=./preload.js", "s.js"]),
+            ("uv", vec!["run", "server.py"]),
+            ("npx", vec!["tsx", "tools/mcp.ts"]),
+            (
+                "deno",
+                vec!["run", "tools/mcp.ts", "--config", "tools/helper.ts"],
+            ),
+        ] {
+            let server = def(command, &args);
+            let scripts = server.scripts(repo.path());
+            assert!(!scripts.is_empty(), "{command} {args:?}: nothing hashed");
+            assert!(
+                scripts.iter().all(|script| script.sha256.is_some()),
+                "{command} {args:?}: `run` or a flag was taken for a missing script: {scripts:?}"
+            );
+            let before = server.hash(repo.path());
+            for script in &scripts {
+                std::fs::write(repo.path().join(&script.path), "evil\n").unwrap();
+                assert_ne!(
+                    before,
+                    server.hash(repo.path()),
+                    "{command} {args:?}: {:?}",
+                    script.path
+                );
+                std::fs::write(repo.path().join(&script.path), "v1\n").unwrap();
+            }
+            assert_eq!(before, server.hash(repo.path()));
+        }
+        // Two files, both hashed.
+        let two = def(
+            "deno",
+            &["run", "tools/mcp.ts", "--config", "tools/helper.ts"],
+        );
+        assert_eq!(two.scripts(repo.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_launcher_that_names_no_repository_file_is_flagged_as_unhashed() {
+        let repo = tempfile::tempdir().unwrap();
+        for server in [
+            def("npx", &["-y", "some-server"]),
+            def("uvx", &["tool"]),
+            def("deno", &["run", "https://example.invalid/x.ts"]),
+            def("python3", &["-m", "server"]),
+        ] {
+            assert!(
+                server.runs_unhashed_code(repo.path()),
+                "{}",
+                server.command_line()
+            );
+        }
+        std::fs::write(repo.path().join("s.py"), "x").unwrap();
+        assert!(!def("python3", &["s.py"]).runs_unhashed_code(repo.path()));
+        // A plain program on PATH is not a launcher of repository code.
+        assert!(!def("my-server", &["--stdio"]).runs_unhashed_code(repo.path()));
     }
 
     #[test]

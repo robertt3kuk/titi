@@ -108,15 +108,7 @@ impl HookDef {
     /// nothing of the repository's hashes exactly as its definition does.
     pub fn hash(&self, workspace: &Path) -> String {
         let mut definition = self.definition();
-        if let (Some(script), Some(object)) = (self.script(workspace), definition.as_object_mut()) {
-            object.insert(
-                "script".to_owned(),
-                json!({
-                    "path": script.path.to_string_lossy(),
-                    "sha256": script.sha256,
-                }),
-            );
-        }
+        add_scripts(&mut definition, &self.scripts(workspace));
         crate::trust::hash_definition(&definition)
     }
 
@@ -128,11 +120,14 @@ impl HookDef {
     /// or a linter's own config pulls in is out of reach: both stay as
     /// residual risk (docs/research/extensibility-marketplace/design-2026-10.md).
     pub fn script(&self, workspace: &Path) -> Option<Script> {
-        script_of(
-            self.command.split_whitespace().map(unquote),
-            workspace,
-            workspace,
-        )
+        self.scripts(workspace).into_iter().next()
+    }
+
+    /// Every repository file the command names, not only the first
+    /// (see [`scripts_of`]).
+    pub fn scripts(&self, workspace: &Path) -> Vec<Script> {
+        let words: Vec<String> = self.command.split_whitespace().map(unquote).collect();
+        scripts_of(&words, workspace, workspace)
     }
 
     /// The short name a transcript row calls the hook by: the program the
@@ -152,9 +147,8 @@ impl HookDef {
 /// The repository file a command line runs, from its words (see
 /// [`HookDef::script`] for what counts). Relative paths resolve against
 /// `base`, the directory the command runs in; a file only counts when it lies
-/// inside `workspace`. An MCP server's `command` and `args` go through the
-/// same lookup, so a server that runs `node ./server.js` is hashed with that
-/// file.
+/// inside `workspace`. A file that is not there yet still counts, so one
+/// written after approval cannot ride on the old consent.
 pub fn script_of(
     words: impl IntoIterator<Item = String>,
     workspace: &Path,
@@ -166,21 +160,98 @@ pub fn script_of(
         first
     } else if INTERPRETERS.contains(&first.rsplit('/').next().unwrap_or(&first)) {
         let mut found = None;
-        for word in words {
-            if !word.starts_with('-') {
-                found = Some(word);
-                break;
+        while let Some(word) = words.next() {
+            // `deno run x.ts`, `bun x x.ts`: a subcommand, not the script.
+            if SUBCOMMANDS.contains(&word.as_str()) {
+                continue;
             }
             // `bash -c '…'`, `node -e '…'`, `python -m mod`: what follows
             // is code or a module name, not a file of the repository.
             if INLINE_FLAGS.contains(&word.as_str()) {
                 return None;
             }
+            // `python3 -X dev s.py`: the flag's value is not the script.
+            if VALUE_FLAGS.contains(&word.as_str()) {
+                words.next();
+                continue;
+            }
+            if !word.starts_with('-') {
+                found = Some(word);
+                break;
+            }
         }
         found?
     } else {
         return None;
     };
+    resolve(&candidate, workspace, base, true)
+}
+
+/// Every repository file a command line names: [`script_of`]'s pick first
+/// (which may not exist yet), then each other word, or `--flag=value` value,
+/// that is an existing file inside `workspace`. A launcher runs more than its
+/// first argument — `deno run -A tools/mcp.ts`, `uv run server.py`,
+/// `node --import ./preload.js s.js` — and each of those is code the approval
+/// covers only if it is hashed.
+pub fn scripts_of(words: &[String], workspace: &Path, base: &Path) -> Vec<Script> {
+    let mut found: Vec<Script> = Vec::new();
+    found.extend(script_of(words.iter().cloned(), workspace, base));
+    for (index, word) in words.iter().enumerate() {
+        // The program itself is a lookup on `PATH` unless it names a path.
+        if index == 0 && !is_pathlike(word) {
+            continue;
+        }
+        let candidate = match word.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => value,
+            _ => word.as_str(),
+        };
+        if candidate.is_empty() || candidate.starts_with('-') {
+            continue;
+        }
+        if let Some(script) = resolve(candidate, workspace, base, false)
+            && !found.iter().any(|known| known.path == script.path)
+        {
+            found.push(script);
+        }
+    }
+    found
+}
+
+/// Programs that start other code: an interpreter, a package runner, a build
+/// tool. A command like this that names no repository file has code behind it
+/// that nothing here can hash.
+pub fn is_launcher(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    INTERPRETERS.contains(&name) || RUNNERS.contains(&name)
+}
+
+/// What a hash adds for the scripts a command runs. One script keeps the form
+/// it always had, so an approval made before `scripts_of` existed still holds.
+pub(crate) fn add_scripts(definition: &mut Value, scripts: &[Script]) {
+    let entry =
+        |script: &Script| json!({ "path": script.path.to_string_lossy(), "sha256": script.sha256 });
+    let Some(object) = definition.as_object_mut() else {
+        return;
+    };
+    match scripts {
+        [] => {}
+        [one] => {
+            object.insert("script".to_owned(), entry(one));
+        }
+        many => {
+            object.insert(
+                "scripts".to_owned(),
+                Value::Array(many.iter().map(entry).collect()),
+            );
+        }
+    }
+}
+
+fn resolve(candidate: &str, workspace: &Path, base: &Path, allow_missing: bool) -> Option<Script> {
+    // `deno run https://host/x.ts` is a download, not a file of the repository.
+    if candidate.contains("://") {
+        return None;
+    }
     let candidate = candidate
         .replace("${CLAUDE_PROJECT_DIR}", &workspace.to_string_lossy())
         .replace("$CLAUDE_PROJECT_DIR", &workspace.to_string_lossy());
@@ -206,12 +277,12 @@ pub fn script_of(
             })
         }
         // Resolves outside the repository (a system binary, a symlink
-        // out): not the repository's file.
+        // out) or is a directory: not the repository's file.
         Ok(_) => None,
         // Not there yet. If it is written later the hash changes, so a
         // script that does not exist at approval time cannot be added
         // under the same consent.
-        Err(_) => {
+        Err(_) if allow_missing => {
             let lexical = joined.strip_prefix(workspace).ok()?;
             if lexical
                 .components()
@@ -224,6 +295,7 @@ pub fn script_of(
                 sha256: None,
             })
         }
+        Err(_) => None,
     }
 }
 
@@ -239,6 +311,30 @@ pub struct Script {
 /// Programs that take a script as their first non-flag argument.
 const INTERPRETERS: [&str; 12] = [
     "sh", "bash", "zsh", "dash", "python", "python3", "node", "deno", "bun", "ruby", "perl", "php",
+];
+
+/// Package and task runners: they start code that is not on their command
+/// line, so a repository file may or may not be among their arguments.
+const RUNNERS: [&str; 17] = [
+    "npx", "npm", "pnpm", "yarn", "tsx", "ts-node", "uv", "uvx", "poetry", "pdm", "pipx", "cargo",
+    "make", "go", "java", "dotnet", "rye",
+];
+
+/// Subcommands of the interpreters that run a script (`deno run`, `bun x`).
+const SUBCOMMANDS: [&str; 4] = ["run", "x", "dlx", "exec"];
+
+/// Interpreter flags whose next word is their value, not the script.
+const VALUE_FLAGS: [&str; 10] = [
+    "-X",
+    "-W",
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--env-file",
+    "--config",
+    "--preload",
+    "--inspect-port",
 ];
 
 /// Interpreter flags after which the next word is not a script file.
@@ -531,6 +627,32 @@ mod tests {
                 "{command}: an edited script is new"
             );
             std::fs::write(repo.path().join(&script.path), "echo restored\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_hook_run_through_deno_or_with_value_flags_hashes_the_script_not_the_subcommand() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("tools")).unwrap();
+        std::fs::write(repo.path().join("tools/h.ts"), "v1\n").unwrap();
+        std::fs::write(repo.path().join("h.py"), "v1\n").unwrap();
+        for (command, file) in [
+            ("deno run -A tools/h.ts", "tools/h.ts"),
+            ("python3 -X dev h.py", "h.py"),
+            ("uv run h.py", "h.py"),
+        ] {
+            let hook = def(command);
+            let scripts = hook.scripts(repo.path());
+            assert!(
+                scripts
+                    .iter()
+                    .any(|s| s.path == Path::new(file) && s.sha256.is_some()),
+                "{command}: {scripts:?}"
+            );
+            let before = hook.hash(repo.path());
+            std::fs::write(repo.path().join(file), "evil\n").unwrap();
+            assert_ne!(before, hook.hash(repo.path()), "{command}");
+            std::fs::write(repo.path().join(file), "v1\n").unwrap();
         }
     }
 
