@@ -46,6 +46,7 @@ pub struct Origin {
 pub(crate) enum Kind {
     Skills,
     Commands,
+    Agents,
 }
 
 impl Kind {
@@ -53,6 +54,7 @@ impl Kind {
         match self {
             Kind::Skills => "skills",
             Kind::Commands => "commands",
+            Kind::Agents => "agents",
         }
     }
 }
@@ -101,7 +103,7 @@ impl Sources {
         {
             let foreign: &[&str] = match kind {
                 Kind::Skills => &[".agents", ".claude"],
-                Kind::Commands => &[".claude"],
+                Kind::Commands | Kind::Agents => &[".claude"],
             };
             for parent in foreign {
                 roots.push(Root {
@@ -226,6 +228,33 @@ mod tests {
         assert_eq!(
             labels(&sources, Kind::Commands),
             ["~/.titi/agent/commands", "~/.claude/commands"]
+        );
+    }
+
+    #[test]
+    fn agents_follow_the_commands_layout() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let mut sources = Sources {
+            cwd: Some(repo),
+            agent_dir: Some(home.path().join(".titi/agent")),
+            home: Some(home.path().to_path_buf()),
+            ..Sources::default()
+        };
+        assert_eq!(
+            labels(&sources, Kind::Agents),
+            [
+                ".titi/agents",
+                ".agents/agents",
+                ".claude/agents",
+                "~/.titi/agent/agents"
+            ]
+        );
+        sources.foreign_user_dirs = true;
+        assert_eq!(
+            labels(&sources, Kind::Agents).last().map(String::as_str),
+            Some("~/.claude/agents")
         );
     }
 }

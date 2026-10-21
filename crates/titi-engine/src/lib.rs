@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod advisor;
+pub mod agent_defs;
 pub mod agent_tool;
 pub mod agents;
 pub mod change_review;
