@@ -67,6 +67,9 @@ the real binary and the real HTTP stack:
   "big output"    a bash call that prints 20,000 lines (the output cap)
   "edit readme"   an edit call on README.md (`# smoke ws` -> `# smoke workspace`)
   "read readme"   a read call on README.md
+  "atlas probe X" an `atlas` tool call {op: find, query: X}: X is the word right after the
+                  keyword, so a prompt that names an identifier from the code makes the
+                  model ask the index about it
   "read long"     a read call on long.txt, no range (make it with `seq 1 5000`)
   "read dir"      a read call on the workspace root (a directory)
   "write file"    a write call creating smoke.txt
@@ -109,6 +112,7 @@ Usage: scripts/fake-provider.py [port]   (default 18999, loopback only)
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import time
@@ -388,6 +392,10 @@ def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, f
         return [(c, 0) for c in call("call_long", "read", {"path": "long.txt"})]
     if "read dir" in content:
         return [(c, 0) for c in call("call_dir", "read", {"path": "."})]
+    probe = re.search(r"atlas probe\s+(\w+)", content)
+    if probe:
+        args = {"op": "find", "query": probe.group(1)}
+        return [(c, 0) for c in call("call_atlas", "atlas", args)]
     if "read readme" in content:
         return [(c, 0) for c in call("call_read", "read", {"path": "README.md"})]
     if "write file" in content:
