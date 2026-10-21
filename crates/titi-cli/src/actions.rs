@@ -126,7 +126,7 @@ impl ActionCall {
         let elapsed = self.elapsed(now);
         self.outcome = Some(Outcome {
             ok,
-            result: result_summary(&self.tool, ok, output, diff),
+            result: result_summary(&self.tool, &self.target, ok, output, diff),
             elapsed,
         });
     }
@@ -178,7 +178,13 @@ fn target_of(tool: &str, detail: Option<&str>) -> String {
 /// One dim line about what a finished call brought back: a count for the tools
 /// whose answer is a listing, `exit N` for a command, the diff's size for a
 /// change, and the answer's own first line for anything else.
-pub(crate) fn result_summary(tool: &str, ok: bool, output: &str, diff: Option<&str>) -> String {
+pub(crate) fn result_summary(
+    tool: &str,
+    target: &str,
+    ok: bool,
+    output: &str,
+    diff: Option<&str>,
+) -> String {
     let first = || {
         output
             .lines()
@@ -204,6 +210,17 @@ pub(crate) fn result_summary(tool: &str, ok: bool, output: &str, diff: Option<&s
             count => counted(count, "match", "matches"),
         },
         "bash" => "exit 0".to_owned(),
+        // The target carries `done/total`, so the answer's own `done/total
+        // done` is only worth a word when it adds something.
+        "todo" => {
+            let summary = first();
+            let count = target.split_whitespace().next().unwrap_or_default();
+            match summary.strip_prefix(&format!("{count} done")) {
+                Some(rest) if !count.is_empty() => rest.trim_start_matches(", ").to_owned(),
+                _ if target == "empty" && summary == "todo list is empty" => String::new(),
+                _ => summary,
+            }
+        }
         "edit" | "hashline_edit" | "write" => match diff.map(diff_size) {
             Some((added, removed)) if added + removed > 0 => format!("+{added} \u{2212}{removed}"),
             _ => first(),
@@ -782,7 +799,7 @@ mod tests {
     #[test]
     fn the_result_summary_counts_what_came_back() {
         let sum = |tool: &str, ok: bool, out: &str, diff: Option<&str>| {
-            result_summary(tool, ok, out, diff)
+            result_summary(tool, "", ok, out, diff)
         };
         assert_eq!(sum("read", true, "a\nb\nc\n", None), "3 lines");
         assert_eq!(sum("read", true, "a\n", None), "1 line");
@@ -819,6 +836,25 @@ mod tests {
         assert_eq!(
             sum("read", false, "src/x.rs is outside the workspace", None),
             "src/x.rs is outside the workspace"
+        );
+    }
+
+    /// The row's target already says `1/3`, so the result repeats nothing:
+    /// it is empty, and says only what the target does not (cancelled items).
+    #[test]
+    fn a_todo_result_does_not_repeat_the_targets_count() {
+        let sum = |target: &str, out: &str| result_summary("todo", target, true, out, None);
+        assert_eq!(sum("1/3 · Fix the parser", "1/3 done\n[x] 1. a"), "");
+        assert_eq!(sum("3/3", "3/3 done\n[x] 1. a"), "");
+        assert_eq!(
+            sum("1/3 · Fix", "1/3 done, 1 cancelled\n[x] 1. a"),
+            "1 cancelled"
+        );
+        assert_eq!(sum("empty", "todo list is empty"), "");
+        assert_eq!(
+            sum("2/3 · Fix", "1/3 done\n[x] 1. a"),
+            "1/3 done",
+            "a count that differs from the target's is shown"
         );
     }
 

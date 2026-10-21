@@ -83,6 +83,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed
 
+- The `todo` row no longer repeats itself: `✓ Planned 1/3 · Fix the parser  1/3 done` is `✓ Planned 1/3 · Fix the parser`, and the result column only says what the target does not (`1 cancelled`).
+
 - An `ask` question is said once: the `✓ Asked …` row and its detail carry the question and the answer, and the three `· ask · …` notes that repeated them are gone. A question with no action row of its own keeps the notes.
 
 - A turn's reasoning no longer vanishes when the answer or a tool call starts: it stays above it as `▾ thought · 4 words · 0.2s` with the text dim underneath (12 rows, then `… N more lines`), as `▸ thought · …` alone under `/details thinking collapsed`, and not at all when thinking is hidden. Nothing new is written to the session file.
