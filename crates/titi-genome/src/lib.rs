@@ -918,7 +918,7 @@ impl Genome {
             return 0;
         }
         let reresolved = self.index_symbols(dirty, scope_moved);
-        let (ranks, dependents) = graph::rank(&self.files);
+        let (ranks, dependents) = graph::rank(&self.files, &self.layout);
         self.ranks = ranks;
         self.dependents = dependents;
         reresolved
@@ -964,7 +964,7 @@ impl Genome {
             }
         }
         if scope_moved {
-            self.layout = scope::Layout::build(&self.files);
+            self.layout = scope::Layout::build(&self.files, &self.root);
         }
 
         let symbols: HashMap<String, SymbolRecord> = definers

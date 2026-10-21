@@ -27,6 +27,7 @@
 //! nothing: guessing between them would invent a dependency.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::{Basis, FileRecord, Language, SymbolRecord, SymbolUse};
 
@@ -93,12 +94,17 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    pub(crate) fn build(files: &HashMap<String, FileRecord>) -> Self {
+    /// `root` is where the index's paths are relative to. A crate is named by
+    /// its manifest, not by its directory — `crates/core` is `foo-core`, and
+    /// `use foo_core::X` is how everything else spells it — so the manifest
+    /// next to a `src/lib.rs` is read when there is one, and the directory
+    /// name stands in when there is not.
+    pub(crate) fn build(files: &HashMap<String, FileRecord>, root: &Path) -> Self {
         let mut crates: HashMap<String, Option<String>> = HashMap::new();
         let mut packages: HashMap<(Language, String), Vec<String>> = HashMap::new();
         for (path, record) in files {
             if let Some(dir) = path.strip_suffix("/src/lib.rs") {
-                let name = dir.rsplit('/').next().unwrap_or(dir).replace('-', "_");
+                let name = crate_name(root, dir);
                 crates
                     .entry(name)
                     .and_modify(|slot| *slot = None)
@@ -120,11 +126,55 @@ impl Layout {
         }
     }
 
+    /// The `lib.rs` of each workspace crate `record` names.
+    pub(crate) fn facades<'a>(&'a self, record: &'a FileRecord) -> impl Iterator<Item = &'a str> {
+        record
+            .external_uses
+            .iter()
+            .filter_map(|name| self.crates.get(name))
+            .map(String::as_str)
+    }
+
     fn package_of(&self, record: &FileRecord) -> &[String] {
         self.packages
             .get(&(record.language, directory(&record.path).to_owned()))
             .map_or(&[], Vec::as_slice)
     }
+}
+
+/// The name other crates write for the crate whose `src/lib.rs` is under
+/// `dir`: `[lib] name`, else `[package] name`, else the directory's name, with
+/// `-` as `_` the way a path spells it.
+fn crate_name(root: &Path, dir: &str) -> String {
+    let from_manifest = std::fs::read_to_string(root.join(dir).join("Cargo.toml"))
+        .ok()
+        .and_then(|manifest| manifest_name(&manifest));
+    from_manifest
+        .unwrap_or_else(|| dir.rsplit('/').next().unwrap_or(dir).to_owned())
+        .replace('-', "_")
+}
+
+/// The `name = "…"` of `[lib]` if it has one, otherwise of `[package]`.
+fn manifest_name(manifest: &str) -> Option<String> {
+    let mut table = "";
+    let (mut package, mut lib) = (None, None);
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix('[') {
+            table = header.trim_end_matches(']').trim();
+            continue;
+        }
+        let Some(("name", value)) = line.split_once('=').map(|(key, value)| (key.trim(), value)) else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']).to_owned();
+        match table {
+            "package" => package = Some(value),
+            "lib" => lib = Some(value),
+            _ => {}
+        }
+    }
+    lib.or(package)
 }
 
 /// Resolves a file's mentions against the workspace's definers.

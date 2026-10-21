@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::scope::Layout;
 use crate::{Basis, FileRecord};
 
 const DAMPING: f64 = 0.85;
@@ -30,7 +31,10 @@ const MIN_OUTBOUND: f64 = 1.0;
 /// large tree. Files are visited in the map's iteration order and each file's
 /// inbound sources are kept in that order, so the sums are added in the order
 /// the keyed version added them.
-pub fn rank(files: &HashMap<String, FileRecord>) -> (HashMap<String, f64>, HashMap<String, usize>) {
+pub(crate) fn rank(
+    files: &HashMap<String, FileRecord>,
+    layout: &Layout,
+) -> (HashMap<String, f64>, HashMap<String, usize>) {
     let nodes: Vec<&String> = files.keys().collect();
     let n = nodes.len();
     let index: HashMap<&str, usize> = nodes
@@ -59,6 +63,13 @@ pub fn rank(files: &HashMap<String, FileRecord>) -> (HashMap<String, f64>, HashM
                     Basis::Unique => GUESS,
                 };
                 evidence.push((to_at, worth));
+            }
+        }
+        // A file that names a workspace crate leans on that crate's `lib.rs`
+        // as much as on a file it imports: the facade is the dependency.
+        for facade in layout.facades(record) {
+            if let Some(&to_at) = index.get(facade) {
+                evidence.push((to_at, EVIDENCE));
             }
         }
         evidence.retain(|(to_at, _)| *to_at != from_at);
@@ -123,6 +134,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::{DAMPING, EVIDENCE, GUESS, ITERATIONS, rank};
+    use crate::scope::Layout;
     use crate::{Basis, FileRecord, Language, SymbolUse};
 
     fn record(path: &str, imports: &[&str], uses: &[(&str, Basis)]) -> FileRecord {
@@ -242,7 +254,7 @@ mod tests {
             ];
             files.insert(path.clone(), record(&path, &imports, &uses));
         }
-        let (ranks, dependents) = rank(&files);
+        let (ranks, dependents) = rank(&files, &Layout::default());
         let (want_ranks, want_dependents) = keyed_rank(&files);
         assert_eq!(dependents, want_dependents);
         assert_eq!(ranks.len(), want_ranks.len());
@@ -277,7 +289,7 @@ mod tests {
         ] {
             files.insert(path.to_owned(), record(path, &[], &uses));
         }
-        let (ranks, dependents) = rank(&files);
+        let (ranks, dependents) = rank(&files, &Layout::default());
         assert_eq!(dependents["deep.rs"], 1);
         assert_eq!(dependents["thin.rs"], 1);
         // user.rs spreads its rank 2 : 1 over the two hubs.
@@ -308,7 +320,7 @@ mod tests {
                 ],
             ),
         );
-        let (ranks, _) = rank(&files);
+        let (ranks, _) = rank(&files, &Layout::default());
         assert!((ranks["hub.rs"] - ranks["guess.rs"]).abs() < 1e-12);
     }
 
@@ -328,7 +340,7 @@ mod tests {
             "guesser.rs".to_owned(),
             record("guesser.rs", &[], &[("by_guess.rs", Basis::Unique)]),
         );
-        let (ranks, _) = rank(&files);
+        let (ranks, _) = rank(&files, &Layout::default());
         let teleport = (1.0 - DAMPING) / 4.0;
         let share = |score: f64| (score - teleport) / DAMPING;
         let ratio = share(ranks["by_import.rs"]) / share(ranks["by_guess.rs"]);
@@ -337,7 +349,7 @@ mod tests {
 
     #[test]
     fn an_empty_graph_ranks_to_nothing() {
-        let (ranks, dependents) = rank(&HashMap::new());
+        let (ranks, dependents) = rank(&HashMap::new(), &Layout::default());
         assert!(ranks.is_empty() && dependents.is_empty());
     }
 }
