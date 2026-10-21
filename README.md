@@ -79,6 +79,7 @@ titi --mode plan
 | `/switch` | Fuzzy search over the same list: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` resolves a model role from the settings |
 | `/usage` | Tokens for this turn and for the session, prompt and completion apart — as the provider counted them, estimated only when it reports none, with the part served from the prompt cache named |
 | `/budget` | Caps what the session may spend: `/budget 200k`, `/budget 1.5m`, `/budget $2`, `/budget off`. Tokens or money (exact micro-dollars, charged at each round's model price by the engine's own ledger; a model with no price says so rather than pretending) |
+| `/effort` | How hard the model is asked to think: `/effort high` (also `minimal`, `low`, `medium`, `xhigh`, `max`), `/effort off` (send nothing; the provider's default). Reaches only a model whose catalogue entry declares `reasoning` (`reasoning: {efforts: [low, medium, high]}` under `models:`); a level it lacks is moved to the nearest it has, and a model with none is sent none. `model.effort` sets where a session starts. Changing it after the first request says the next one misses the prompt cache |
 | `/settings` | Every resolved setting with the layer it came from |
 | `/theme` | Chooses a palette; bare `/theme` opens the picker and remembers the choice |
 | `/keys` · `/whoami` | Which providers have a key: env, stored, or none. The key itself is never shown |
@@ -322,6 +323,7 @@ titi --mode plan
 | `/switch` | Нечёткий поиск по тому же списку: `/switch opus`, `/switch anthropic/claude-sonnet-4-5`. `/switch @review:high` разворачивает роль модели из настроек |
 | `/usage` | Токены за ход и за сессию, prompt и completion отдельно — как их посчитал провайдер; оценка, только если он не сообщает; часть из кэша промпта названа отдельно |
 | `/budget` | Ограничивает трату сессии: `/budget 200k`, `/budget 1.5m`, `/budget $2`, `/budget off`. Токены или деньги (точные микро-доллары, по цене модели каждого раунда из леджера самого движка; модель без цены говорит об этом, а не делает вид) |
+| `/effort` | Насколько усердно модель думает: `/effort high` (также `minimal`, `low`, `medium`, `xhigh`, `max`), `/effort off` (ничего не отправлять; умолчание провайдера). Доходит только до модели, у которой в каталоге объявлено `reasoning` (`reasoning: {efforts: [low, medium, high]}` в `models:`); недоступный ей уровень заменяется ближайшим, а модели без объявления не отправляется ничего. `model.effort` задаёт начальное значение сессии. Смена после первого запроса предупреждает, что следующий запрос не попадёт в кэш промпта |
 | `/settings` | Все разрешённые настройки и слой, из которого пришла каждая |
 | `/theme` | Выбирает палитру; голый `/theme` открывает выбор и запоминает его |
 | `/keys` · `/whoami` | У кого есть ключ: env, сохранён или нет. Сам ключ не показывается |

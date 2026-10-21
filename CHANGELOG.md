@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Added
 
+- `/effort [off|minimal|low|medium|high|xhigh|max]` sets how hard the model is asked to think, and the choice now reaches the provider: Chat Completions `reasoning_effort`, Responses `reasoning.effort`, Anthropic `output_config.effort` (with adaptive thinking), Gemini `thinkingConfig`. Only a model whose catalogue entry declares reasoning is sent anything — built in, the Codex models and `anthropic/claude-sonnet-5-5`; others declare it under `models:` as `reasoning: {efforts: [low, high]}` (a Gemini 2.5 model adds `thinking_format: google-budget`) — and a level it lacks is moved to the nearest it has, and said so. `off`, and every session that never sets one, sends nothing, so each provider keeps its own default. `model.effort` in the config is where a session starts. The status line shows the level sent beside the model (`claude-sonnet-5-5 (high)`), and changing it after the first request says `effort high · next request misses the prompt cache`, because the effort is part of what the provider caches. Subagents, the advisor and the namer keep the provider default.
+
 - `titi` paints its first frame sooner in a repo with a code map on a busy machine (median 115 ms instead of 77 ms in a 10-core test, against 34 ms without the map): the map's first index leaves two cores (one on a small machine) to the thread that is drawing, and takes no longer to finish.
 
 - The tool descriptions the model is sent every turn are 11% shorter (10.9 KB instead of 12.2 KB, about 340 tokens per request). Only wording that repeated itself or another field went; every parameter and the guidance on when to use each tool stayed, and a test now fails if one is lost.

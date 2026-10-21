@@ -163,6 +163,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "switch model with fuzzy search or role",
     },
     Command {
+        name: "effort",
+        about: "how hard the model thinks (usage: /effort off|low|medium|high|xhigh)",
+    },
+    Command {
         name: "budget",
         about: "cap the tokens this session may spend (usage: /budget 200k|off)",
     },

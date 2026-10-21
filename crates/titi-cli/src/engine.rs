@@ -7,7 +7,7 @@ use titi_engine::{
     ModelDescriptor, ModelPrice, ProviderDescriptor, ProviderRegistry, ProviderRegistryConfig,
     TrajectorySink,
 };
-use titi_providers::ApiKind;
+use titi_providers::{ApiKind, Effort, ModelCompat};
 use titi_tools::{ApprovalMode, SensitivePolicy, ToolRegistry, workspace_tools_with_interrupt};
 
 pub fn default_registry_config() -> ProviderRegistryConfig {
@@ -107,6 +107,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "gpt-4.1".into(),
                 context_window: Some(1_000_000),
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "openrouter/gpt-4.1".into(),
@@ -114,6 +115,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "openai/gpt-4.1".into(),
                 context_window: Some(1_000_000),
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "opencode-go/glm-5.3-flash".into(),
@@ -121,6 +123,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "glm-5.3-flash".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "opencode-go/deepseek-v4-flash".into(),
@@ -128,6 +131,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "deepseek-v4-flash".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "anthropic/claude-sonnet-4-5".into(),
@@ -135,6 +139,27 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "claude-sonnet-4-5".into(),
                 context_window: Some(200_000),
                 price: None,
+                reasoning: None,
+            },
+            // Takes effort and adaptive thinking:
+            // platform.claude.com/docs/en/build-with-claude/effort. Sonnet
+            // 4.5 above is not on that page's list, so it is sent none.
+            ModelDescriptor {
+                id: "anthropic/claude-sonnet-5-5".into(),
+                provider: "anthropic".into(),
+                wire_model: "claude-sonnet-5-5".into(),
+                context_window: None,
+                price: None,
+                reasoning: Some(ModelCompat {
+                    efforts: vec![
+                        Effort::Low,
+                        Effort::Medium,
+                        Effort::High,
+                        Effort::Xhigh,
+                        Effort::Max,
+                    ],
+                    ..ModelCompat::default()
+                }),
             },
             ModelDescriptor {
                 id: "clinepass/glm-5.3".into(),
@@ -142,6 +167,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "glm-5.3".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "clinepass/deepseek-v4-flash".into(),
@@ -149,6 +175,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "deepseek-v4-flash".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "clinepass/deepseek-v4-pro".into(),
@@ -156,6 +183,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "deepseek-v4-pro".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "bai/glm-5.3-flash".into(),
@@ -163,6 +191,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "glm-5.3-flash".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "bai/qwen3.8-flash".into(),
@@ -170,6 +199,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "qwen3.8-flash".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
             ModelDescriptor {
                 id: "bai/qwen3.8-max".into(),
@@ -177,6 +207,7 @@ pub fn default_registry_config() -> ProviderRegistryConfig {
                 wire_model: "qwen3.8-max".into(),
                 context_window: None,
                 price: None,
+                reasoning: None,
             },
         ],
     };
@@ -217,6 +248,13 @@ fn codex_models() -> Vec<ModelDescriptor> {
             wire_model: (*wire).into(),
             context_window: *window,
             price: None,
+            // Responses' `reasoning.effort`. `none` and `minimal` are left
+            // off the ladder: the newest of these models reject both
+            // (developers.openai.com/api/docs/guides/reasoning).
+            reasoning: Some(ModelCompat {
+                efforts: vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh],
+                ..ModelCompat::default()
+            }),
         })
         .collect()
 }
@@ -248,6 +286,7 @@ pub const NO_PRICE_MODELS: &[&str] = &[
     "openai/gpt-4.1",
     "openrouter/gpt-4.1",
     "anthropic/claude-sonnet-4-5",
+    "anthropic/claude-sonnet-5-5",
     // Subscription and gateway backends: flat-rate plans, so no per-token
     // price exists for this repo to write down.
     "opencode-go/glm-5.3-flash",
@@ -814,6 +853,27 @@ pub fn parse_approval(raw: &str) -> Result<ApprovalMode, String> {
     }
 }
 
+/// The effort `model.effort` starts a session with. Unset, `off` and `none`
+/// are no effort; a level is that level; anything else is an error naming the
+/// key and the words it takes, and the session starts with no effort.
+pub(crate) fn effort_from_settings(
+    settings: &titi_config::settings::Settings,
+) -> Result<Option<Effort>, String> {
+    let key = titi_config::settings::MODEL_EFFORT_KEY;
+    let Some(value) = settings.get(key) else {
+        return Ok(None);
+    };
+    let word = value.as_str().map(str::trim).unwrap_or_default();
+    if word.eq_ignore_ascii_case("off") || word.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    Effort::from_name(word).map(Some).ok_or_else(|| {
+        format!(
+            "{key}: {value} is not off, minimal, low, medium, high, xhigh or max; no effort is set"
+        )
+    })
+}
+
 /// Starts the engine with the default approval policy, in agent mode.
 pub fn start_engine() -> Result<(Engine, ModelCatalog, String, Option<String>), String> {
     start_engine_with(ApprovalMode::Write, SessionMode::Agent, false)
@@ -1009,6 +1069,20 @@ pub fn start_engine_with(
             .and_then(|v| v.as_str().map(str::to_owned))
             .filter(|s| !s.is_empty() && s != "local");
     }
+    // `model.effort` is where the session's effort starts. A value that is not
+    // one of the levels leaves it unset and says so, once, beside the model
+    // pin's notice: a typo must not quietly mean something else.
+    let mut effort_note = None;
+    if let Some(settings) = &settings {
+        match effort_from_settings(settings) {
+            Ok(effort) => engine_config.effort = effort,
+            Err(note) => effort_note = Some(note),
+        }
+    }
+    let pin_note = match (pin_note, effort_note) {
+        (Some(pin), Some(effort)) => Some(format!("{pin}; {effort}")),
+        (pin, effort) => pin.or(effort),
+    };
     // The flag is the user's word for this run; the key is standing consent.
     // Either one asks for the same thing, and `launch_session` decides which
     // session that is; with neither, a launch starts blank.
@@ -1077,5 +1151,61 @@ mod tests {
         let (primary, note) = start_model(&[], Some("local/llama"), |_| false);
         assert_eq!(primary, "");
         assert!(note.expect("a notice").contains("local/llama"));
+    }
+
+    fn effort_in(config: &str) -> Result<Option<Effort>, String> {
+        let tmp = tempfile::tempdir().expect("temp");
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).expect("agent dir");
+        std::fs::write(agent.join("config.yml"), config).expect("config");
+        let settings =
+            titi_config::settings::Settings::load(&agent, tmp.path(), &[]).expect("settings load");
+        effort_from_settings(&settings)
+    }
+
+    /// `model.effort` is where a session's effort starts: unset and `off`
+    /// send nothing, a level is that level, and a word that is neither is
+    /// refused by name rather than read as something else.
+    #[test]
+    fn model_effort_starts_the_session_or_names_the_mistake() {
+        assert_eq!(effort_in("theme: x\n"), Ok(None));
+        assert_eq!(effort_in("model:\n  effort: off\n"), Ok(None));
+        assert_eq!(
+            effort_in("model:\n  effort: High\n"),
+            Ok(Some(Effort::High))
+        );
+        assert_eq!(
+            effort_in("model:\n  effort: xhigh\n"),
+            Ok(Some(Effort::Xhigh))
+        );
+        let note = effort_in("model:\n  effort: turbo\n").expect_err("not a level");
+        assert!(note.starts_with("model.effort:"), "{note}");
+        assert!(note.contains("turbo"), "{note}");
+        assert!(effort_in("model:\n  effort: 3\n").is_err());
+    }
+
+    /// Only a model whose descriptor declares a reasoning ladder is ever sent
+    /// an effort; the built-in catalogue declares it for exactly the models
+    /// that take one.
+    #[test]
+    fn only_models_that_take_effort_declare_it() {
+        let config = default_registry_config();
+        let declared: Vec<&str> = config
+            .models
+            .iter()
+            .filter(|model| model.reasoning.is_some())
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(declared.contains(&"anthropic/claude-sonnet-5-5"));
+        assert!(declared.contains(&"openai-codex/gpt-5.5"));
+        for model in [
+            "anthropic/claude-sonnet-4-5",
+            "openai/gpt-4.1",
+            "openrouter/gpt-4.1",
+            "clinepass/glm-5.3",
+            "bai/qwen3.8-max",
+        ] {
+            assert!(!declared.contains(&model), "{model} must be sent none");
+        }
     }
 }

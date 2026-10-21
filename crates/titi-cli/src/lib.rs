@@ -6,6 +6,8 @@ pub mod chat;
 pub mod composer;
 pub(crate) mod composer_state;
 pub(crate) mod draft_stash;
+#[cfg(test)]
+mod effort_tests;
 pub mod engine;
 pub(crate) mod errors_panel;
 #[cfg(test)]

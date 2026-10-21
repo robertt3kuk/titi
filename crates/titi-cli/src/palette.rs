@@ -31,7 +31,19 @@ const NEEDS_TEXT: [&str; 5] = ["btw", "loop", "goal", "council", "graph"];
 
 /// Commands whose argument is one of a short list: [`command_values`] knows
 /// the list for each.
-pub(crate) const VALUE_COMMANDS: [&str; 5] = ["theme", "statusline", "mouse", "genome", "details"];
+pub(crate) const VALUE_COMMANDS: [&str; 6] = [
+    "theme",
+    "statusline",
+    "mouse",
+    "genome",
+    "details",
+    "effort",
+];
+
+/// What `/effort` and `model.effort` take: `off` sends nothing, and each
+/// other word is a level of [`titi_providers::Effort`].
+pub(crate) const EFFORT_WORDS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The sections `/details` names, and the three modes each can be in.
 const DETAIL_SECTIONS: [&str; 5] = ["thinking", "tools", "subagents", "activity", "folded"];
@@ -147,6 +159,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         cfg::MODEL_DEFAULT_ROLE_KEY,
         "the model a session starts on",
         Values::Free,
+    ),
+    setting(
+        cfg::MODEL_EFFORT_KEY,
+        "how hard the model is asked to think",
+        Values::OneOf(&EFFORT_WORDS),
     ),
     setting(
         cfg::DISPLAY_SMOOTH_STREAMING_KEY,
@@ -568,6 +585,10 @@ pub(crate) fn command_values(chat: &Chat, name: &str) -> Option<Vec<ArgValue>> {
             items.push(ArgValue::new("cycle", false));
             items
         }
+        "effort" => EFFORT_WORDS
+            .iter()
+            .map(|word| ArgValue::new(*word, chat.effort_word() == *word))
+            .collect(),
         _ => return None,
     };
     Some(values)

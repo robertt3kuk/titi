@@ -161,6 +161,17 @@ pub const TUI_AUTOGRAPH_KEY: &str = "tui.autoGraph";
 /// did before this key existed.
 pub const MODEL_DEFAULT_ROLE_KEY: &str = "modelRoles.default";
 
+/// How hard the model is asked to think when a session starts: `off`,
+/// `minimal`, `low`, `medium`, `high`, `xhigh` or `max`.
+///
+/// Unset means **off**, which sends nothing and leaves each provider on its
+/// own default, so a config that never mentions it changes no request.
+/// `/effort` changes it for the rest of a session; this key is where a
+/// session starts. A model that takes no effort setting is sent none whatever
+/// the key says, and a level its ladder lacks is moved to the nearest one it
+/// has.
+pub const MODEL_EFFORT_KEY: &str = "model.effort";
+
 /// Whether a streamed answer is revealed at a readable rate instead of in
 /// whatever bursts the provider sends.
 ///

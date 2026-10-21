@@ -29,6 +29,7 @@ use ratatui::widgets::{Block, Paragraph};
 use titi_core::session::Role;
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{ContextPart, Engine, EngineCommand, EngineEvent};
+use titi_providers::Effort;
 use titi_tui::caps::MousePreset;
 use titi_tui::selection::Selection;
 use titi_tui::status_bar::{
@@ -779,6 +780,13 @@ pub struct Chat {
     money_budget_micro: Option<u64>,
     /// The mode the engine confirmed it is in.
     pub(crate) mode: SessionMode,
+    /// The reasoning effort the engine confirmed, and the level the primary
+    /// model is really sent for it (`None` when it takes no effort at all).
+    effort: Option<Effort>,
+    effort_applied: Option<Effort>,
+    /// A `/effort` was sent and its answer has not come back: that answer is
+    /// said even when it changes nothing, because the person asked.
+    effort_asked: bool,
     /// Membership in the local hub, when `/join` connected.
     hub: HubSession,
     /// Whether the roster panel is shown (`/hub`).
@@ -988,6 +996,9 @@ impl Chat {
             money_spent_micro: 0,
             money_budget_micro: None,
             mode: SessionMode::Agent,
+            effort: None,
+            effort_applied: None,
+            effort_asked: false,
             hub: HubSession::default(),
             hub_open: false,
             scroll_offset: 0,
@@ -1972,6 +1983,14 @@ impl Chat {
                 self.push(LineKind::Note, format!("mode: {}", mode.label()));
                 Applied::none()
             }
+            EngineEvent::EffortChanged {
+                effort,
+                applied,
+                cache_miss,
+            } => {
+                self.on_effort_changed(effort, applied, cache_miss);
+                Applied::none()
+            }
             EngineEvent::SessionNamed { title, .. } => {
                 self.session_label = title.to_string();
                 Applied::none()
@@ -2390,6 +2409,7 @@ impl Chat {
             "jobs" => self.jobs(args),
             "advisor" => self.advisor(args),
             "budget" => self.budget(args),
+            "effort" => self.effort_command(args),
             "plan" => self.plan(args),
             "done" => self.done(args),
             "goal" => self.goal(args),
@@ -3911,6 +3931,63 @@ impl Chat {
         }))
     }
 
+    /// The word `/effort` shows and the value list marks as current.
+    pub(crate) fn effort_word(&self) -> &'static str {
+        self.effort.map_or("off", Effort::name)
+    }
+
+    /// `/effort [off|minimal|low|medium|high|xhigh|max]` sets how hard the
+    /// model is asked to think; with no word it says what is in force.
+    ///
+    /// The engine's `EffortChanged` is the confirmation, as `ModelSwitched` is
+    /// for a switch: it says what the model will really be sent, which this
+    /// side cannot know, and whether the change costs the prompt cache.
+    fn effort_command(&mut self, args: &str) -> Applied {
+        let word = args.trim();
+        if word.is_empty() {
+            let line = effort_line(self.effort, self.effort_applied, false, &self.model);
+            self.push(LineKind::Note, line);
+            return Applied::none();
+        }
+        let effort = match word.to_ascii_lowercase().as_str() {
+            "off" | "none" | "default" | "clear" => None,
+            other => match Effort::from_name(other) {
+                Some(effort) => Some(effort),
+                None => {
+                    self.push(
+                        LineKind::Error,
+                        format!(
+                            "usage: /effort off|minimal|low|medium|high|xhigh|max (got {word})"
+                        ),
+                    );
+                    return Applied::none();
+                }
+            },
+        };
+        self.effort_asked = true;
+        Applied::send(EngineCommand::SetEffort { effort }, None)
+    }
+
+    /// What the engine reported: the setting, what the model is sent for it,
+    /// and whether the change loses the cache. A re-report that changes
+    /// nothing (the engine repeats it after a model switch) stays silent
+    /// unless a `/effort` is waiting for its answer.
+    fn on_effort_changed(
+        &mut self,
+        effort: Option<Effort>,
+        applied: Option<Effort>,
+        cache_miss: bool,
+    ) {
+        let changed = (self.effort, self.effort_applied) != (effort, applied);
+        self.effort = effort;
+        self.effort_applied = applied;
+        if changed || cache_miss || self.effort_asked {
+            self.effort_asked = false;
+            let line = effort_line(effort, applied, cache_miss, &self.model);
+            self.push(LineKind::Note, line);
+        }
+    }
+
     /// `/budget [amount|off]` caps what this session may spend: tokens
     /// (`/budget 200k`) or money (`/budget $2`).
     ///
@@ -4780,6 +4857,36 @@ fn parse_interval(word: &str) -> Option<u64> {
     digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
+/// The line that says what the session's effort is, and what comes of it.
+fn effort_line(
+    effort: Option<Effort>,
+    applied: Option<Effort>,
+    cache_miss: bool,
+    model: &str,
+) -> String {
+    let Some(effort) = effort else {
+        let mut line = "effort off · the provider's default".to_owned();
+        if cache_miss {
+            line.push_str(" · next request misses the prompt cache");
+        }
+        return line;
+    };
+    let mut line = format!("effort {effort}");
+    match applied {
+        None => line.push_str(&format!(
+            " · {model} takes no effort setting, so nothing is sent"
+        )),
+        Some(sent) if sent != effort => {
+            line.push_str(&format!(" · {model} is sent {sent}, the nearest it takes"));
+        }
+        Some(_) => {}
+    }
+    if cache_miss {
+        line.push_str(" · next request misses the prompt cache");
+    }
+    line
+}
+
 /// Why `/budget` could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BudgetArgError {
@@ -5527,6 +5634,9 @@ pub(crate) fn masthead_snapshot(chat: &Chat) -> StatusSnapshot {
         SessionMode::Agent => None,
         other => Some(other.label().to_owned()),
     };
+    // What the model is really sent, not what was asked: a model that takes
+    // no effort setting shows none.
+    snapshot.effort = chat.effort_applied.map(|effort| effort.name().to_owned());
     // A loop running unseen is the whole problem, which is why this sits beside
     // the state word; `None` hides the segment when there is nothing running.
     snapshot.loops = (!chat.jobs.is_empty()).then_some(chat.jobs.len());
