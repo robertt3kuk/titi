@@ -10,6 +10,7 @@
 
 pub mod config_file;
 pub mod hooks;
+pub mod mcp;
 pub mod roles;
 pub mod settings;
 pub mod trust;

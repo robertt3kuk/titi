@@ -1,8 +1,8 @@
 //! The workspace trust store: which code-bearing project definitions the user
 //! has approved.
 //!
-//! A repository can ship things that run on the user's machine — hooks today,
-//! MCP servers later — and a clone must not get to run them just by existing.
+//! A repository can ship things that run on the user's machine — hooks and
+//! MCP servers — and a clone must not get to run them just by existing.
 //! The consent lives in `<agent_dir>/trust.json`, outside every repository, as
 //! one entry per *definition*: `{workspaces: {<canonical path>: {trusted_at,
 //! items: {<kind>: {<sha256 of the canonical definition>: {trusted_at,
@@ -28,12 +28,15 @@ use sha2::{Digest, Sha256};
 /// Name of the store inside the agent directory.
 pub const TRUST_FILE: &str = "trust.json";
 
-/// `kind` of a command hook, the one code-bearing definition there is today.
+/// `kind` of a command hook.
 pub const KIND_HOOK: &str = "hook";
 
 /// `kind` of a repository's `verify.command`: a shell command the engine runs
 /// when a turn that edited files ends.
 pub const KIND_VERIFY: &str = "verify";
+
+/// `kind` of an MCP server definition: a program the engine starts.
+pub const KIND_MCP: &str = "mcp";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
