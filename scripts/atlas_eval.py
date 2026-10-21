@@ -15,6 +15,7 @@ For each repo under the corpus dir (default /tmp/titi-qa/genome-corpus) it:
   6. scores the map against hand-written ground truth (TRUTH below) and flags
      suspicious lines.
 
+`--mode determinism --runs N` indexes each repo N times and fails if the dump or the map text varies.
 `--mode commits` replays real commits instead (task = commit message, index built at the parent,
 truth = modified indexed files; recall@10/@24 and map tokens from the real `titi atlas dump`).
 
@@ -742,6 +743,49 @@ def render_replay(tasks, conditions):
     return "\n".join(out) + "\n"
 
 
+def determinism_main(a):
+    """Index every repo --runs times (one `titi atlas dump --json` process each) and count the distinct
+    full dumps and distinct map texts. The same tree must give one of each: the map is a prompt prefix."""
+    import hashlib
+    corpus = Path(a.corpus)
+    only = set(filter(None, a.only.split(",")))
+    repos = sorted(d for d in corpus.iterdir() if (d / ".git").exists() and (not only or d.name in only))
+    rows = []
+    for repo in repos:
+        dumps, maps, differing = set(), set(), Counter()
+        base = None
+        for _ in range(a.runs):
+            dump = atlas_dump(repo)
+            dumps.add(hashlib.md5(json.dumps(dump, sort_keys=True).encode()).hexdigest())
+            maps.add(dump["map"]["text"])
+            files = {f["path"]: f for f in dump["files"]}
+            if base is None:
+                base = files
+                continue
+            for path, f in files.items():
+                for key, value in f.items():
+                    if base.get(path, {}).get(key) != value:
+                        differing[key] += 1
+        rows.append({"repo": repo.name, "files": len(base or {}), "runs": a.runs, "distinct_dumps": len(dumps),
+                     "distinct_maps": len(maps), "fields_that_differ": dict(differing)})
+        print(f"== {repo.name}: {len(dumps)} dumps, {len(maps)} maps", file=sys.stderr, flush=True)
+    out = ["| repo | files | runs | distinct dumps | distinct map texts | fields that differ |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        out.append(f"| {r['repo']} | {r['files']} | {r['runs']} | {r['distinct_dumps']} | {r['distinct_maps']} | "
+                   f"{', '.join(f'{k} ({v})' for k, v in r['fields_that_differ'].items()) or '-'} |")
+    table = "\n".join(out) + "\n"
+    print(table)
+    target = Path(a.out) if a.out else corpus / "determinism.json"
+    target.write_text(json.dumps(rows, indent=1))
+    if a.md:
+        Path(a.md).write_text(table)
+    bad = [r["repo"] for r in rows if r["distinct_dumps"] > 1 or r["distinct_maps"] > 1]
+    if bad:
+        print(f"NOT DETERMINISTIC: {', '.join(bad)}", file=sys.stderr)
+        sys.exit(1)
+    print("deterministic: every repo gave one dump and one map", file=sys.stderr)
+
+
 def replay_main(a):
     corpus = Path(a.corpus)
     only = set(filter(None, a.only.split(",")))
@@ -770,8 +814,9 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default=None)
     ap.add_argument("--md", default=None, help="also write the markdown tables here")
-    ap.add_argument("--mode", choices=("survey", "commits"), default="survey",
-                    help="survey: map/check/LSP over each repo; commits: replay real commits as tasks")
+    ap.add_argument("--mode", choices=("survey", "commits", "determinism"), default="survey",
+                    help="survey: map/check/LSP over each repo; commits: replay real commits as tasks; determinism: index each repo --runs times and compare")
+    ap.add_argument("--runs", type=int, default=5, help="determinism mode: indexings per repo")
     ap.add_argument("--commits", type=int, default=10, help="commits mode: tasks per repo")
     ap.add_argument("--max-files", type=int, default=8, help="commits mode: modified indexed source files, at most")
     ap.add_argument("--min-msg", type=int, default=20, help="commits mode: message length, at least")
@@ -782,10 +827,10 @@ def main():
     a = ap.parse_args()
     if a.self_test:
         return self_test_parse_map()
-    if a.mode == "commits":
+    if a.mode in ("commits", "determinism"):
         if not TITI_BIN.exists():
             sys.exit(f"missing {TITI_BIN}: cargo build --release -p titi-cli --locked")
-        return replay_main(a)
+        return determinism_main(a) if a.mode == "determinism" else replay_main(a)
     for b in (MAP_BIN, TITI_BIN):
         if not b.exists():
             sys.exit(f"missing {b}: cargo build --release -p titi-cli -p titi-atlas --examples --locked")
