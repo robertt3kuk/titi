@@ -58,6 +58,7 @@ fn swift_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
+            "class_declaration" if is_extension(child) => {}
             "function_declaration"
             | "class_declaration"
             | "protocol_declaration"
@@ -71,6 +72,17 @@ fn swift_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
         }
         swift_items(child, source, out);
     }
+}
+
+/// `extension Type { … }` is a `class_declaration` whose name is the type it
+/// extends. That type belongs to whoever declared it — often the standard
+/// library or a framework — so the extension does not export it; the members
+/// inside are exports on their own.
+fn is_extension(node: Node) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .take_while(|child| child.kind() != "class_body" && child.kind() != "enum_class_body")
+        .any(|child| child.kind() == "extension")
 }
 
 /// Whether a declaration carries `public` or `open`. The keyword is a
@@ -151,4 +163,34 @@ fn module_candidates(module: &str) -> Vec<Candidate> {
             }
         })
         .collect()
+}
+#[cfg(test)]
+mod tests {
+    use crate::lang::test_support::exports;
+
+    fn names(source: &str) -> Vec<String> {
+        exports("Source/A.swift", source).unwrap_or_else(|| panic!("swift parses"))
+    }
+
+    #[test]
+    fn an_extension_exports_its_members_not_the_type_it_extends() {
+        let names = names(
+            r#"
+public struct Own {}
+extension NSNumber {
+    func isBool() -> Bool { true }
+    public var flag: Bool { true }
+}
+extension Array: Extended {}
+extension Own { public func more() {} }
+public func send(completion: Int, _ other: Int, label inner: Int) {}
+"#,
+        );
+        for bad in ["NSNumber", "Array", "completion", "other", "inner", "label"] {
+            assert!(!names.contains(&bad.to_owned()), "{bad}: {names:?}");
+        }
+        for good in ["Own", "isBool", "flag", "more", "send"] {
+            assert!(names.contains(&good.to_owned()), "{good}: {names:?}");
+        }
+    }
 }
