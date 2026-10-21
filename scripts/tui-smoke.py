@@ -263,10 +263,11 @@ def smoke(args) -> None:
             )
             print(f"tui-smoke: `/` listed the commands after {waited:.1f}s")
 
-            # 3. `/help` opens the command palette on the commands.
+            # 3. `/help` opens the command palette on the commands; its title
+            # (`help · N commands`) appears nowhere before the palette opens.
             session.send(b"help\r")
             waited = session.expect(
-                ["browse these commands", "switch model"],
+                ["help · ", " commands"],
                 args.step_timeout,
                 "/help output",
                 deadline,
