@@ -56,7 +56,6 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         &mut imports,
         &mut unresolved,
     );
-    imports.extend(pair_of(path, files));
     finish(
         source,
         sites,
@@ -64,29 +63,6 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         unresolved,
         symbols::error_count(tree.root_node()),
     )
-}
-
-const HEADER_EXTS: &[&str] = &["h", "hpp", "hh", "hxx"];
-const SOURCE_EXTS: &[&str] = &["c", "cc", "cpp", "cxx"];
-
-/// The other half of a header/implementation pair: `foo.c` and `foo.h` in one
-/// directory are one module. A source file depends on its header whether or
-/// not it writes the include, and a header points at the file that implements
-/// it, so the implementation is ranked under its header instead of being a
-/// leaf nothing reaches.
-fn pair_of(path: &str, files: &HashSet<String>) -> Option<String> {
-    let (stem, ext) = path.rsplit_once('.')?;
-    let others = if SOURCE_EXTS.contains(&ext) {
-        HEADER_EXTS
-    } else if HEADER_EXTS.contains(&ext) {
-        SOURCE_EXTS
-    } else {
-        return None;
-    };
-    others
-        .iter()
-        .map(|other| format!("{stem}.{other}"))
-        .find(|candidate| files.contains(candidate))
 }
 
 /// The tree to read the file from. A `.h` is claimed by C, but the C grammar

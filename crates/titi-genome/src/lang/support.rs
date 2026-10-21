@@ -202,11 +202,6 @@ pub(crate) fn resolve_relative(from: &str, spec: &str, exts: &[&str]) -> Vec<Can
     };
     let mut candidates = Vec::new();
     for ext in exts {
-        // `..` out to the workspace root names the root's own index file.
-        if joined.is_empty() {
-            candidates.push(Candidate::Exact(format!("index.{ext}")));
-            continue;
-        }
         candidates.push(Candidate::Exact(format!("{joined}.{ext}")));
         candidates.push(Candidate::Exact(format!("{joined}/index.{ext}")));
     }
