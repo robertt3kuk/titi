@@ -60,12 +60,17 @@ pub fn ranking<'a>(atlas: &'a Atlas, touched: &HashSet<String>) -> Vec<RankedFil
             }
         })
         .collect();
-    ranked.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.path.cmp(b.path))
-    });
+    // Scores are compared to nine decimal places of the best one: two files
+    // that are equal in exact arithmetic and differ in the last bits of a sum
+    // are a tie, and the path decides it, the same way on every run and under
+    // any future change of summation order.
+    let top = ranked
+        .iter()
+        .map(|entry| entry.score)
+        .fold(0.0, f64::max)
+        .max(f64::MIN_POSITIVE);
+    let key = |entry: &RankedFile<'_>| (entry.score / top * 1e9).round() as i64;
+    ranked.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.path.cmp(b.path)));
     ranked
 }
 

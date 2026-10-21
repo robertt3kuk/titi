@@ -106,8 +106,12 @@ impl CoChange {
         self.partners.is_empty()
     }
 
+    /// Every file with its partners, in path order: whatever builds on them
+    /// (the lens's edge lists) must not inherit the hasher's order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Vec<(String, f32)>)> {
-        self.partners.iter()
+        let mut all: Vec<(&String, &Vec<(String, f32)>)> = self.partners.iter().collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all.into_iter()
     }
 }
 

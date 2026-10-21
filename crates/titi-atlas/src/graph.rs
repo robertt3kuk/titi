@@ -40,14 +40,18 @@ const ENTRY_SHARE: f64 = 4.0;
 /// The power iteration runs over `Vec`s indexed by file, so a pass is plain
 /// arithmetic: keyed by path it hashed and cloned a `String` per file per
 /// iteration, and that was most of what an edit that moved the graph cost on a
-/// large tree. Files are visited in the map's iteration order and each file's
-/// inbound sources are kept in that order, so the sums are added in the order
-/// the keyed version added them.
+/// large tree. Files are visited in path order and each file's inbound sources
+/// are kept in that order, so the sums are added in the same order every run.
 pub(crate) fn rank(
     files: &HashMap<String, FileRecord>,
     layout: &Layout,
 ) -> (HashMap<String, f64>, HashMap<String, usize>) {
-    let nodes: Vec<&String> = files.keys().collect();
+    // Sorted, so the order floating-point sums are added in is a function of
+    // the paths and not of the hasher: f64 addition is not associative, and
+    // a rank that differs in its last digits between two runs over one tree
+    // reorders files that tie and changes bytes the prompt cache is keyed on.
+    let mut nodes: Vec<&String> = files.keys().collect();
+    nodes.sort();
     let n = nodes.len();
     let index: HashMap<&str, usize> = nodes
         .iter()
