@@ -192,6 +192,14 @@ impl ToolRegistry {
         self.tools.insert(name, handler);
     }
 
+    /// Takes out every tool whose name starts with `prefix`, for a family of
+    /// tools that is replaced as a whole (an MCP server's tools when its list
+    /// changes). Not a withholding: the names were never refused, they are gone.
+    pub fn unregister_prefix(&mut self, prefix: &str) {
+        self.tools.retain(|name, _| !name.starts_with(prefix));
+        self.withheld.retain(|name| !name.starts_with(prefix));
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn ToolHandler>> {
         self.tools.get(name).cloned()
     }
@@ -395,6 +403,16 @@ mod tests {
                 detail: None,
             }
         }
+    }
+
+    #[test]
+    fn a_family_of_tools_can_be_taken_out_by_prefix() {
+        let mut registry = ToolRegistry::new();
+        for name in ["mcp__a__x", "mcp__a__y", "mcp__b__x", "read"] {
+            registry.register(Arc::new(NamedTool(name)));
+        }
+        registry.unregister_prefix("mcp__a__");
+        assert_eq!(registry.names(), ["mcp__b__x", "read"]);
     }
 
     /// The tool array is the first thing a provider hashes for its prompt
