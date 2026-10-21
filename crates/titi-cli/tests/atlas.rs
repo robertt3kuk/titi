@@ -425,6 +425,12 @@ fn dump_lists_the_index_in_map_order_and_refuses_bad_flags() {
         .expect("hub");
     assert_eq!(hub["role"], "source");
     assert_eq!(hub["exports"], serde_json::json!(["Hub"]));
+    let symbol = &hub["symbols"][0];
+    assert_eq!(symbol["name"], "Hub");
+    assert_eq!(symbol["kind"], "struct");
+    assert_eq!(symbol["span"], serde_json::json!([1, 1]));
+    assert_eq!(symbol["signature"], "pub struct Hub");
+    assert_eq!(symbol["exported"], true);
     let test = files
         .iter()
         .find(|f| f["path"] == "tests/use_hub.rs")

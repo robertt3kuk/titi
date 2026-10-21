@@ -413,6 +413,19 @@ fn dump_cmd(workspace: &Path, args: &[String]) {
                 .iter()
                 .map(|u| serde_json::json!([u.name, u.definer, format!("{:?}", u.basis)]))
                 .collect();
+            let symbols: Vec<serde_json::Value> = file
+                .symbols
+                .iter()
+                .map(|symbol| {
+                    serde_json::json!({
+                        "name": symbol.name,
+                        "kind": symbol.kind.word(),
+                        "span": [symbol.span.0, symbol.span.1],
+                        "signature": symbol.signature,
+                        "exported": symbol.exported,
+                    })
+                })
+                .collect();
             Some(serde_json::json!({
                 "path": entry.path,
                 "order": order + 1,
@@ -425,6 +438,7 @@ fn dump_cmd(workspace: &Path, args: &[String]) {
                 "reexports": file.reexports,
                 "inherits": file.inherits,
                 "uses": uses,
+                "symbols": symbols,
             }))
         })
         .collect();

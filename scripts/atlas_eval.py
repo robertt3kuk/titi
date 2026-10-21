@@ -522,6 +522,18 @@ def git(repo, *args):
     return r.stdout.strip()
 
 
+def symbol_coverage(repo):
+    """Exported symbols of the index and how many carry a signature / a kind (`titi atlas dump --json`)."""
+    try:
+        files = atlas_dump(repo)["files"]
+    except (RuntimeError, ValueError, KeyError) as exc:
+        return {"error": str(exc)}
+    exported = [s for f in files for s in f.get("symbols", []) if s["exported"]]
+    return {"exported": len(exported),
+            "with_signature": sum(1 for s in exported if s["signature"]),
+            "with_kind": sum(1 for s in exported if s["kind"])}
+
+
 def eval_repo(repo):
     repo = Path(repo)
     name = repo.name
@@ -559,6 +571,7 @@ def eval_repo(repo):
     r["lsp"] = lsp_probes(repo, entries)
     r["incremental"] = incremental(repo, entries)
     r["score"] = score(name, entries)
+    r["symbols"] = symbol_coverage(repo)
     for f in TRUTH.get(name, {}).get("files", []):
         if not (repo / f).exists():
             print(f"warning: {name}: ground-truth file missing: {f}", file=sys.stderr)
@@ -568,8 +581,8 @@ def eval_repo(repo):
 
 def render_markdown(results):
     """Corpus table + per-repo top-10 and flags, verbatim from the map."""
-    out = ["| repo | lang | SHA | tracked / indexed files | index ms | RSS MB | check exit | diagnostics (capped at 32) | p@10 | recall@24 | LSP ok/total | incremental |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = ["| repo | lang | SHA | tracked / indexed files | index ms | RSS MB | check exit | diagnostics (capped at 32) | p@10 | recall@24 | LSP ok/total | symbols with signature | incremental |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         pr = r["lsp"]["probes"]
         ok = sum(1 for x in pr if x["ok"])
@@ -579,12 +592,15 @@ def render_markdown(results):
                 + f" ({inc.get('didOpen_ms', 0):.0f} ms); cold reindex "
                 + ("sees" if inc.get("disk_sees_new_export") else "MISSES")
                 + f" ({inc.get('cold_reindex_ms', 0):.0f} ms)") if "error" not in inc else "error: " + inc["error"]
+        sym = r.get("symbols", {})
+        cov = (f"{sym['with_signature']}/{sym['exported']} "
+               f"({100 * sym['with_signature'] / max(sym['exported'], 1):.0f}%)") if "exported" in sym else "?"
         lang = "/".join(r["languages"]) or "?"
         codes = ", ".join(f"{k} {v}" for k, v in r["check"]["by_code"].items()) or "none"
         out.append(f"| {r['name']} | {lang} | `{r['sha'][:12]}` | {r['tracked_files']} / {r['indexed_files']} "
                    f"| {r['index_ms_min']:.0f} | {r['rss_mb']:.0f} | {r['check']['exit']} | {codes} "
                    f"| {sc['p_at_10']:.1f} | {sc['recall_at_24']:.2f} ({len(sc['hits24'])}/{len(sc['truth'])}) "
-                   f"| {ok}/{len(pr)} | {incs} |")
+                   f"| {ok}/{len(pr)} | {cov} | {incs} |")
     for r in results:
         out += ["", f"### {r['name']}", "",
                 f"Last commit {r['commit_date']}; {r['indexed_files']} files, {r['edges']} edges. "
