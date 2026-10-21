@@ -8401,6 +8401,122 @@ fn the_reasoning_row_is_the_thinking_section() {
     assert!(!frame.contains("weighing the options"), "{frame}");
 }
 
+/// One turn's reasoning, then the answer: the helper the settle tests share.
+fn reasoned(reasoning: &str, then: EngineEvent) -> Chat {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(1),
+        model: "openai/gpt-4.1".into(),
+    });
+    chat.on_event(EngineEvent::ThinkingDelta {
+        turn_id: TurnId(1),
+        text: reasoning.into(),
+    });
+    chat.on_event(then);
+    chat
+}
+
+fn answer(text: &str) -> EngineEvent {
+    EngineEvent::StreamDelta {
+        turn_id: TurnId(1),
+        text: text.into(),
+    }
+}
+
+/// The reasoning does not vanish when the answer starts: it stays where it
+/// was as one settled line, the text under a `thought` summary while
+/// thinking is expanded (the default).
+#[test]
+fn reasoning_settles_into_a_thought_line_when_the_answer_starts() {
+    let mut chat = reasoned("let me consider this", answer("The answer."));
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(rows.contains("▾ thought · 4 words · "), "{rows}");
+    assert!(rows.contains("let me consider this"), "{rows}");
+    assert!(!rows.contains("thinking  "), "{rows}");
+    let thought = rows.find("▾ thought").unwrap_or(usize::MAX);
+    let reply = rows.find("The answer.").unwrap_or(0);
+    assert!(
+        thought < reply,
+        "the thought stays above the answer:\n{rows}"
+    );
+}
+
+/// The time on the line is the span from the first reasoning delta to the
+/// last, not the turn's clock.
+#[test]
+fn a_thought_reports_the_span_of_its_reasoning() {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::ThinkingDelta {
+        turn_id: TurnId(1),
+        text: "let me consider this".into(),
+    });
+    // The first and the last delta 230ms apart.
+    let first = Instant::now();
+    chat.thinking_first = Some(first);
+    chat.thinking_last = Some(first + Duration::from_millis(230));
+    chat.on_event(answer("The answer."));
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(rows.contains("▾ thought · 4 words · 0.2s"), "{rows}");
+}
+
+/// Collapsed reads as the summary alone; hidden reads as nothing.
+#[test]
+fn a_settled_thought_follows_the_thinking_mode() {
+    let mut chat = reasoned("let me consider this", answer("The answer."));
+    command(&mut chat, "/details thinking collapsed");
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(rows.contains("▸ thought · 4 words · "), "{rows}");
+    assert!(!rows.contains("let me consider this"), "{rows}");
+    command(&mut chat, "/details thinking hidden");
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(!rows.contains("thought"), "{rows}");
+    assert!(rows.contains("The answer."), "{rows}");
+}
+
+/// A turn that reasoned nothing shows no thought line.
+#[test]
+fn a_turn_without_reasoning_shows_no_thought() {
+    let mut chat = chat();
+    chat.on_event(EngineEvent::TurnStarted {
+        turn_id: TurnId(1),
+        model: "openai/gpt-4.1".into(),
+    });
+    chat.on_event(answer("Just the answer."));
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(!rows.contains("thought"), "{rows}");
+}
+
+/// A tool call settles the reasoning just as the answer does.
+#[test]
+fn a_tool_call_settles_the_reasoning_too() {
+    let mut chat = reasoned(
+        "need to look at the file",
+        EngineEvent::ToolStarted {
+            turn_id: TurnId(1),
+            call_id: "c1".into(),
+            name: "read".into(),
+            detail: Some("read README.md".into()),
+        },
+    );
+    let rows = frame_rows(&mut chat, 80, 24).join("\n");
+    assert!(rows.contains("▾ thought · 6 words · "), "{rows}");
+    assert!(rows.contains("need to look at the file"), "{rows}");
+}
+
+/// A long reasoning is capped at twelve rows and says how many it left out.
+#[test]
+fn a_long_thought_is_capped_and_counted() {
+    let reasoning = (1..=30)
+        .map(|n| format!("step{n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut chat = reasoned(&reasoning, answer("Done."));
+    let rows = frame_rows(&mut chat, 80, 40).join("\n");
+    assert!(rows.contains("step12"), "{rows}");
+    assert!(!rows.contains("step13"), "{rows}");
+    assert!(rows.contains("… 18 more lines"), "{rows}");
+}
+
 /// A compaction leaves a divider and takes the history it folded off the
 /// screen: the point of the fold is a short transcript, not a note.
 #[test]

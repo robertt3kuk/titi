@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroU16;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::CellDiffOption;
 use ratatui::style::{Color, Modifier, Style};
@@ -233,6 +233,10 @@ pub struct TranscriptLine {
     /// Set on a tool call's line: what the call was and how it is going. The
     /// line's text is then what a surface without rows reads.
     pub call: Option<ActionCall>,
+    /// Set on a settled reasoning line: how long the reasoning ran, from its
+    /// first delta to its last. The line's text is then the whole reasoning,
+    /// not the streaming row's `thinking  …` tail.
+    pub thought_for: Option<Duration>,
 }
 
 impl TranscriptLine {
@@ -243,6 +247,7 @@ impl TranscriptLine {
             at: None,
             model: None,
             call: None,
+            thought_for: None,
         }
     }
 
@@ -573,7 +578,9 @@ pub(crate) fn transcript(
                 // An action block stands collapsed as its own summary row; a
                 // line that is not part of one folds into the section's
                 // counted header.
-                SectionMode::Collapsed if matches!(roles[index], LineRole::Start(_)) => {}
+                SectionMode::Collapsed
+                    if matches!(roles[index], LineRole::Start(_)) || line.thought_for.is_some() => {
+                }
                 SectionMode::Collapsed => {
                     if headers_drawn.insert(section) {
                         let count = owned
@@ -581,6 +588,7 @@ pub(crate) fn transcript(
                             .enumerate()
                             .filter(|(at, line)| {
                                 roles[*at] == LineRole::Plain
+                                    && line.thought_for.is_none()
                                     && line.kind.section() == Some(section)
                             })
                             .count();
@@ -647,6 +655,17 @@ pub(crate) fn transcript(
                 footers.push((base, index, actions));
             }
             (texts, Vec::new())
+        } else if let Some(took) = line.thought_for {
+            (
+                thought_rows(
+                    &line.text,
+                    took,
+                    modes[section_index(Section::Thinking)],
+                    theme,
+                    inner,
+                ),
+                Vec::new(),
+            )
         } else if line.kind == LineKind::Fold {
             // The divider carries the fold's own chevron, which the state
             // above — not the line — decides.
@@ -989,6 +1008,59 @@ fn section_header(section: Section, count: usize, theme: &Theme, width: usize) -
         .unwrap_or_default()
 }
 
+/// Rows of a settled thought the screen draws before it says how many it left.
+const THOUGHT_MAX_ROWS: usize = 12;
+
+/// A settled reasoning line: `▸ thought · 4 words · 0.2s` while collapsed,
+/// and under `▾` the reasoning itself, wrapped and dim, while expanded —
+/// capped at [`THOUGHT_MAX_ROWS`] rows with the rest counted.
+fn thought_rows(
+    text: &str,
+    took: Duration,
+    mode: SectionMode,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let words = text.split_whitespace().count();
+    let noun = if words == 1 { "word" } else { "words" };
+    let summary = format!(
+        "thought · {words} {noun} · {}",
+        actions::duration_label(took)
+    );
+    let mark = if mode == SectionMode::Expanded {
+        "▾"
+    } else {
+        "▸"
+    };
+    let mut rows = chip(
+        (mark, ThemeColor::Dim, summary, ThemeColor::Dim),
+        theme,
+        width,
+    );
+    if mode != SectionMode::Expanded {
+        return rows;
+    }
+    let room = body_width(width, MARK_INDENT).max(4);
+    let gutter = " ".repeat(MARK_INDENT);
+    let mut body: Vec<String> = text
+        .lines()
+        .flat_map(|line| wrap_plain(line, room))
+        .collect();
+    let hidden = body.len().saturating_sub(THOUGHT_MAX_ROWS);
+    body.truncate(THOUGHT_MAX_ROWS);
+    if hidden > 0 {
+        let noun = if hidden == 1 { "line" } else { "lines" };
+        body.push(format!("… {hidden} more {noun}"));
+    }
+    rows.extend(body.into_iter().map(|piece| {
+        Line::from(vec![
+            Span::styled(gutter.clone(), page(theme)),
+            Span::styled(piece, fg(theme, ThemeColor::Dim)),
+        ])
+    }));
+    rows
+}
+
 /// The rows of one transcript line, plus every row that carries a URL.
 pub(crate) fn message_rows(
     line: &TranscriptLine,
@@ -1039,8 +1111,17 @@ pub(crate) fn message_rows(
             width,
         ),
         LineKind::Usage => usage_rows(&line.text, theme, width).0,
-        // Reasoning reads exactly as a note does — the section it belongs to
-        // is a `/details` axis, not a look.
+        // A settled thought read without the section's mode (a cast replay)
+        // reads expanded.
+        LineKind::Thinking if line.thought_for.is_some() => thought_rows(
+            &line.text,
+            line.thought_for.unwrap_or_default(),
+            SectionMode::Expanded,
+            theme,
+            width,
+        ),
+        // The streaming row reads exactly as a note does — the section it
+        // belongs to is a `/details` axis, not a look.
         LineKind::Thinking => chip(
             ("·", ThemeColor::Dim, line.text.clone(), ThemeColor::Dim),
             theme,

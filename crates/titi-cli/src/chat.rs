@@ -632,6 +632,10 @@ pub struct Chat {
     /// result instead of being appended above them.
     shown_from: usize,
     thinking: String,
+    /// When the first and the latest reasoning delta of the round arrived:
+    /// the span the settled `thought` line reports.
+    thinking_first: Option<Instant>,
+    thinking_last: Option<Instant>,
     assistant_at: Option<usize>,
     thinking_at: Option<usize>,
     pub(crate) approval: Option<PendingApproval>,
@@ -921,6 +925,8 @@ impl Chat {
             recorded_reply: 0,
             shown_from: 0,
             thinking: String::new(),
+            thinking_first: None,
+            thinking_last: None,
             assistant_at: None,
             thinking_at: None,
             approval: None,
@@ -1504,11 +1510,11 @@ impl Chat {
                 self.recorded_reply = 0;
                 self.shown_from = 0;
                 self.assistant_at = None;
-                self.drop_thinking();
+                self.settle_thinking();
                 Applied::none()
             }
             EngineEvent::StreamDelta { text, .. } => {
-                self.drop_thinking();
+                self.settle_thinking();
                 self.reply.push_str(&text);
                 self.show_reply();
                 // A tool cannot stream and run at once, so text is always
@@ -1517,6 +1523,9 @@ impl Chat {
                 Applied::none()
             }
             EngineEvent::ThinkingDelta { text, .. } if self.reply.is_empty() => {
+                let now = Instant::now();
+                self.thinking_first.get_or_insert(now);
+                self.thinking_last = Some(now);
                 self.thinking.push_str(&text);
                 self.show_thinking();
                 self.phase = WorkPhase::Thinking;
@@ -1528,6 +1537,7 @@ impl Chat {
                 detail,
                 ..
             } => {
+                self.settle_thinking();
                 self.agent_edits
                     .started(&call_id, &name, detail.as_deref(), |path| {
                         Path::new(path).exists()
@@ -4083,7 +4093,7 @@ impl Chat {
         self.approval = None;
         self.pending_ask = None;
         self.assistant_at = None;
-        self.drop_thinking();
+        self.settle_thinking();
         // The turn's usage footer, under the last line of the turn. Only a
         // turn that reported usage has one: a turn cancelled before its first
         // round has nothing to say, and a row of zeros would say it wrong.
@@ -4147,18 +4157,33 @@ impl Chat {
         self.thinking_at = Some(self.lines.len() - 1);
     }
 
-    fn drop_thinking(&mut self) {
-        if let Some(index) = self.thinking_at.take()
-            && index < self.lines.len()
-        {
+    /// The reasoning stops being the newest thing on screen — the answer or
+    /// a tool call began, or the turn ended — so its streaming row becomes a
+    /// settled `thought` line where it stands. A round that reasoned nothing
+    /// leaves no line.
+    fn settle_thinking(&mut self) {
+        let text = std::mem::take(&mut self.thinking);
+        let took = match (self.thinking_first.take(), self.thinking_last.take()) {
+            (Some(first), Some(last)) => last.saturating_duration_since(first),
+            _ => Duration::ZERO,
+        };
+        let Some(index) = self.thinking_at.take() else {
+            return;
+        };
+        if index >= self.lines.len() {
+            return;
+        }
+        if text.trim().is_empty() {
             self.lines.remove(index);
             if let Some(at) = self.assistant_at.as_mut()
                 && *at > index
             {
                 *at -= 1;
             }
+            return;
         }
-        self.thinking.clear();
+        self.lines[index].text = text.trim().to_owned();
+        self.lines[index].thought_for = Some(took);
     }
 
     pub(crate) fn push(&mut self, kind: LineKind, text: String) {
