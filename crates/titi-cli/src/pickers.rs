@@ -235,6 +235,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "skills and file commands found, where, and what was left out",
     },
     Command {
+        name: "agents",
+        about: "subagent definitions found, where, and what was left out",
+    },
+    Command {
         name: "statusline",
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },

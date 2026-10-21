@@ -10,12 +10,14 @@ use std::cell::Cell;
 use std::path::Path;
 use std::time::Instant;
 
+use titi_engine::agent_defs::{self, AgentDef};
 use titi_engine::commands::{self, Command};
 use titi_engine::skills::{self, Skill};
 use titi_engine::sources::Sources;
 
 use crate::chat::{Applied, Chat, Key, SkillRow};
 use crate::composer::{one_line, wrap_plain};
+use crate::hooks_setup::sanitize;
 use crate::pickers::{COMMANDS, PanelLine, PanelView, panel_body, panel_label_room, panel_view};
 use crate::transcript::LineKind;
 
@@ -236,6 +238,114 @@ fn detail_notes(detail: &mut Vec<String>, notes: &[String], ignored: &[String]) 
     }
 }
 
+/// Most lines of a definition's file the detail view shows.
+const FILE_VIEW_LINES: usize = 120;
+
+/// Every subagent definition discovery saw, with its status: the ones in use
+/// first, then the shadowed, then the invalid.
+pub(crate) fn agent_rows(sources: &Sources) -> Vec<ExtensionRow> {
+    let listing = agent_defs::list(sources);
+    let mut rows = Vec::new();
+    for agent in &listing.agents {
+        let mut parts = vec!["active".to_owned()];
+        flags(&mut parts, &agent.ignored, &agent.notes);
+        rows.push(agent_row(agent, parts.join(" · ")));
+    }
+    for shadowed in &listing.shadowed {
+        rows.push(agent_row(
+            &shadowed.agent,
+            format!("shadowed by {}", shadowed.by),
+        ));
+    }
+    for invalid in &listing.invalid {
+        let status = format!("invalid: {}", invalid.reason);
+        let mut detail = vec![
+            format!("{} · agent", invalid.name),
+            format!("file: {}", invalid.path().display()),
+            format!("source: {}", invalid.origin.label),
+            format!("status: {status}"),
+        ];
+        file_view(&mut detail, invalid.source_text());
+        rows.push(ExtensionRow {
+            name: invalid.name.clone(),
+            kind: "agent",
+            source: invalid.origin.label.clone(),
+            status,
+            detail,
+        });
+    }
+    rows
+}
+
+fn agent_row(agent: &AgentDef, status: String) -> ExtensionRow {
+    let mut detail = vec![
+        format!("{} · agent", agent.name),
+        format!("file: {}", agent.path().display()),
+        format!("source: {}", agent.origin.label),
+        format!("status: {status}"),
+        format!("description: {}", agent.description),
+    ];
+    detail.push(match &agent.tools {
+        Some(tools) if tools.is_empty() => "tools: none".to_owned(),
+        Some(tools) => format!(
+            "tools: {}",
+            tools
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "tools: all a subagent has".to_owned(),
+    });
+    if !agent.disallowed.is_empty() {
+        detail.push(format!(
+            "denied: {}",
+            agent
+                .disallowed
+                .iter()
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    detail.push(format!(
+        "model: {}",
+        agent.model.as_deref().unwrap_or("inherit")
+    ));
+    if let Some(turns) = agent.max_turns {
+        detail.push(format!("max turns: {turns}"));
+    }
+    if let Some(effort) = agent.effort {
+        detail.push(format!("effort: {effort}"));
+    }
+    detail_notes(&mut detail, &agent.notes, &agent.ignored);
+    file_view(&mut detail, agent.source_text());
+    ExtensionRow {
+        name: agent.name.clone(),
+        kind: "agent",
+        source: agent.origin.label.clone(),
+        status,
+        detail,
+    }
+}
+
+/// The file's own lines after the settings, control characters dropped: it
+/// came from a repository and goes to a terminal.
+fn file_view(detail: &mut Vec<String>, text: Option<String>) {
+    let Some(text) = text else {
+        detail.push(
+            "file text: not shown (unreadable, over 1 MiB, or outside its directory)".to_owned(),
+        );
+        return;
+    };
+    detail.push("— file —".to_owned());
+    let total = text.lines().count();
+    detail.extend(text.lines().take(FILE_VIEW_LINES).map(sanitize));
+    if total > FILE_VIEW_LINES {
+        detail.push(format!("… {} more lines", total - FILE_VIEW_LINES));
+    }
+}
+
 /// A directory label cut from the left to `max` characters: the end of a
 /// path says which directory it is.
 fn short_dir(label: &str, max: usize) -> String {
@@ -250,6 +360,8 @@ fn short_dir(label: &str, max: usize) -> String {
 /// The panel's cursor: a row, or the whole text behind one.
 #[derive(Debug, Clone)]
 pub(crate) struct ExtensionsPicker {
+    /// What the panel is called: `skills and commands` or `agents`.
+    pub(crate) title: &'static str,
     pub(crate) rows: Vec<ExtensionRow>,
     pub(crate) selected: usize,
     pub(crate) detail: bool,
@@ -300,6 +412,35 @@ impl Chat {
             return Applied::none();
         }
         self.extensions = Some(ExtensionsPicker {
+            title: "skills and commands",
+            rows,
+            selected: 0,
+            detail: false,
+            scroll: 0,
+            drawn_lines: Cell::new(0),
+        });
+        Applied::none()
+    }
+
+    /// `/agents`: open the panel over every subagent definition found.
+    pub(crate) fn agents_command(&mut self, args: &str) -> Applied {
+        if !args.is_empty() {
+            self.push(LineKind::Note, format!("usage: /agents (got {args})"));
+            return Applied::none();
+        }
+        let sources = self.sources_now();
+        let rows = agent_rows(&sources);
+        if rows.is_empty() {
+            self.push(
+                LineKind::Note,
+                "agents: none found (looked in .titi/agents, .agents/agents, .claude/agents, \
+                 and the agent directory)"
+                    .to_owned(),
+            );
+            return Applied::none();
+        }
+        self.extensions = Some(ExtensionsPicker {
+            title: "agents",
             rows,
             selected: 0,
             detail: false,
@@ -385,7 +526,7 @@ pub(crate) fn extensions_panel(chat: &Chat, total: u16, width: u16) -> PanelView
         })
         .collect();
     panel_view(
-        Some(format!("skills and commands · {count}")),
+        Some(format!("{} · {count}", picker.title)),
         lines,
         Some(selected),
         panel_body(total),

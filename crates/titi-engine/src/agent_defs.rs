@@ -43,7 +43,7 @@ use titi_tools::ToolRegistry;
 
 use crate::frontmatter::{self, clean_line, text_of};
 use crate::runtime::TransportResolver;
-use crate::skills::{BODY_CAP, Refused, cap_at, read_capped};
+use crate::skills::{BODY_CAP, cap_at, read_capped};
 use crate::sources::{Kind, Origin, Root, Sources, stays_inside};
 
 /// Directories deeper than this under an agents root are not read.
@@ -101,12 +101,19 @@ pub struct AgentDef {
     pub notes: Vec<String>,
     pub ignored: Vec<String>,
     path: PathBuf,
+    bound: PathBuf,
 }
 
 impl AgentDef {
     /// The Markdown file the definition comes from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The file's text, for a person to read: `None` when it has moved, is
+    /// over 1 MiB, or resolves outside the directory it was found in.
+    pub fn source_text(&self) -> Option<String> {
+        read_inside(&self.path, &self.bound)
     }
 
     /// `.claude/agents/reviewer.md`, the way the panel names the file.
@@ -136,13 +143,35 @@ pub struct Shadowed {
     pub by: String,
 }
 
+/// A file that could not be used as a definition, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invalid {
+    /// The file's name without `.md`.
+    pub name: String,
+    pub origin: Origin,
+    pub reason: String,
+    path: PathBuf,
+    bound: PathBuf,
+}
+
+impl Invalid {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// As [`AgentDef::source_text`].
+    pub fn source_text(&self) -> Option<String> {
+        read_inside(&self.path, &self.bound)
+    }
+}
+
 /// Everything discovery found.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Listing {
     /// One definition per name, sorted by name.
     pub agents: Vec<AgentDef>,
     pub shadowed: Vec<Shadowed>,
-    pub invalid: Vec<Refused>,
+    pub invalid: Vec<Invalid>,
 }
 
 impl Listing {
@@ -311,7 +340,7 @@ pub enum Choice {
     Fallback(String),
 }
 
-fn discover(root: &Root) -> (Vec<AgentDef>, Vec<Refused>) {
+fn discover(root: &Root) -> (Vec<AgentDef>, Vec<Invalid>) {
     // `.claude/agents` nests by habit; the native directories are flat.
     let nested = root
         .origin
@@ -353,17 +382,19 @@ fn walk(dir: &Path, depth: usize, nested: bool, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn load(root: &Root, file: &Path) -> Result<AgentDef, Refused> {
+fn load(root: &Root, file: &Path) -> Result<AgentDef, Invalid> {
     let relative = file
         .strip_prefix(&root.origin.dir)
         .map_or_else(|_| String::new(), |rest| rest.display().to_string());
     let stem = file
         .file_stem()
         .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
-    let refuse = |reason: &str| Refused {
+    let refuse = |reason: &str| Invalid {
         name: stem.clone(),
         origin: root.origin.clone(),
         reason: reason.to_owned(),
+        path: file.to_path_buf(),
+        bound: root.bound.clone(),
     };
     if !stays_inside(file, &root.bound) {
         return Err(refuse("the file resolves outside its directory"));
@@ -455,7 +486,16 @@ fn load(root: &Root, file: &Path) -> Result<AgentDef, Refused> {
         notes,
         ignored,
         path: file.to_path_buf(),
+        bound: root.bound.clone(),
     })
+}
+
+/// The file's text when it is readable and really inside `bound`.
+fn read_inside(path: &Path, bound: &Path) -> Option<String> {
+    if !stays_inside(path, bound) {
+        return None;
+    }
+    read_capped(path)
 }
 
 /// A `tools` or `disallowedTools` value as titi tool names. `None` is a field
@@ -1065,5 +1105,27 @@ hooks:\n  PreToolUse: []\nmcpServers:\n  x: {command: evil}\ncolor: red\n---\n",
         let text = profile.system_prompt();
         assert!(text.starts_with("You are a subagent of titi"));
         assert!(text.ends_with("\n\nBe brief."));
+    }
+
+    #[test]
+    fn the_file_text_is_offered_only_from_inside_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join(".claude/agents/reviewer.md"), REVIEWER);
+        let listing = list(&src(dir.path()));
+        let text = listing.agents[0].source_text().unwrap();
+        assert!(text.contains("You review code."));
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            write(&outside.path().join("secret.md"), "top secret\n");
+            let agents = dir.path().join(".titi/agents");
+            fs::create_dir_all(&agents).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret.md"), agents.join("s.md"))
+                .unwrap();
+            let listing = list(&src(dir.path()));
+            assert_eq!(listing.invalid.len(), 1);
+            assert_eq!(listing.invalid[0].source_text(), None);
+        }
     }
 }
