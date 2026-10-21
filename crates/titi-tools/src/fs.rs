@@ -73,8 +73,9 @@ pub(crate) fn readable_path(
 /// `.git` directory. Reading is untouched, and a `.git` that is a plain file
 /// — a linked worktree's `gitdir:` pointer, which `git init` and `git clone
 /// --separate-git-dir` both write — does not gate its own non-existent
-/// subtree, so edits beside it stay allowed.
-pub(crate) fn refuse_git_dir(root: &Path, resolved: &Path, raw: &str) -> Result<(), String> {
+/// subtree, so edits beside it stay allowed. Hook files are refused too, by
+/// [`refuse_hook_config`].
+pub(crate) fn refuse_control_paths(root: &Path, resolved: &Path, raw: &str) -> Result<(), String> {
     let base = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let relative = resolved.strip_prefix(&base).unwrap_or(resolved);
     let mut ancestor = PathBuf::new();
@@ -93,6 +94,31 @@ pub(crate) fn refuse_git_dir(root: &Path, resolved: &Path, raw: &str) -> Result<
                 ));
             }
         }
+    }
+    refuse_hook_config(relative, raw)
+}
+
+/// The files a hook is read from. One written by a model is a command it chose
+/// to run on the user's machine, so the write tools refuse them like `.git/`
+/// (the trust hash in `titi-config` is the second line: a changed hook is
+/// untrusted at the next start). Names compare case-insensitively, as a macOS
+/// volume does.
+fn refuse_hook_config(relative: &Path, raw: &str) -> Result<(), String> {
+    let parts: Vec<String> = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let hit = match parts.as_slice() {
+        [dir, file] if dir == ".titi" => file == "hooks.json",
+        [dir, file] if dir == ".claude" => file == "settings.json" || file == "settings.local.json",
+        [dir, folder, ..] if dir == ".claude" => folder == "hooks",
+        _ => false,
+    };
+    if hit {
+        return Err(format!(
+            "{raw} is a hook file — titi refuses to write one: a hook is a command \
+             run on the user's machine, which the user adds themselves"
+        ));
     }
     Ok(())
 }
@@ -503,7 +529,9 @@ impl ToolHandler for WriteFileTool {
             return err("missing content");
         };
         match jail_path(&self.root, &path)
-            .and_then(|resolved| refuse_git_dir(&self.root, &resolved, &path).map(|_| resolved))
+            .and_then(|resolved| {
+                refuse_control_paths(&self.root, &resolved, &path).map(|_| resolved)
+            })
             .and_then(|resolved| {
                 // What the write replaces is read here, for the diff: this is the
                 // only moment that text exists.
@@ -581,7 +609,9 @@ impl ToolHandler for EditFileTool {
         };
         let replace_all = arg_bool(&args, "replace_all").unwrap_or(false);
         match readable_path(&self.root, &path, &self.policy)
-            .and_then(|resolved| refuse_git_dir(&self.root, &resolved, &path).map(|_| resolved))
+            .and_then(|resolved| {
+                refuse_control_paths(&self.root, &resolved, &path).map(|_| resolved)
+            })
             .and_then(|resolved| {
                 let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
                 let edit = apply_edit(&content, &old, &new, replace_all)?;
@@ -3197,6 +3227,43 @@ mod tests {
                 "orig\n"
             );
         }
+    }
+
+    /// A hook file is a command the engine runs on the user's behalf, so a
+    /// model that could write one would be writing its own way out of the
+    /// approval prompt. The trust hash would catch it at the next start; the
+    /// tool refusing is the first line.
+    #[tokio::test]
+    async fn a_write_to_a_hook_file_is_refused() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".titi")).unwrap();
+        fs::create_dir_all(root.join(".claude/hooks")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let write = WriteFileTool {
+            root: root.clone(),
+            cache: ReadCache::default(),
+        };
+        for path in [
+            ".titi/hooks.json",
+            ".claude/settings.json",
+            ".claude/Settings.local.json",
+            ".claude/hooks/check.sh",
+        ] {
+            let result = write
+                .invoke(serde_json::json!({ "path": path, "content": "{}" }))
+                .await;
+            assert!(result.is_error, "{path}: {}", result.output);
+            assert!(
+                result.output.to_string().contains("hook"),
+                "{path}: {}",
+                result.output
+            );
+            assert!(!root.join(path).exists(), "{path} was written");
+        }
+        let ordinary = write
+            .invoke(serde_json::json!({ "path": "src/hooks.json", "content": "{}" }))
+            .await;
+        assert!(!ordinary.is_error, "{}", ordinary.output);
     }
 
     #[tokio::test]
