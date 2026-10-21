@@ -1,12 +1,12 @@
 # Atlas evaluation over a multi-language corpus
 
-Harness: `scripts/atlas_eval.py`. Raw results: `/tmp/titi-qa/atlas-corpus/report.json`
+Harness: `scripts/atlas_eval.py`. Raw results: `/tmp/titi-qa/genome-corpus/report.json`
 (not in the repo). Built from master `f78d934` (`cargo build --release -p titi-cli -p titi-atlas --examples --locked`).
 Run on 2026-10-21, macOS arm64.
 
 ## Method
 
-- **Corpus**: shallow clones (`--depth 1`) under `/tmp/titi-qa/atlas-corpus/`, SHAs in the table
+- **Corpus**: shallow clones (`--depth 1`) under `/tmp/titi-qa/genome-corpus/`, SHAs in the table
   (`git clone --depth 1 https://github.com/<owner>/<repo>`; checkout the SHA to reproduce). One repo per
   language except C (kilo, hiredis). titi itself is a clone of `/Users/homie/proj/titi` at master `f78d934`.
   nlohmann/json is a *header-only* library: the real library is `single_include/nlohmann/json.hpp`
@@ -1144,3 +1144,33 @@ LSP probes failing or not pointing into the exporting file:
 - none
 
 Incremental: `{"file": "crates/titi-providers/src/transport.rs", "didOpen_ms": 4.194375000000861, "didOpen_sees_new_export": true, "didChange_revert_ms": 3.903166000000624, "didChange_revert_drops_export": true, "cold_reindex_ms": 338.9997079999994, "disk_sees_new_export": true, "map_after": {"file_in_map": true, "recent_flag": true, "new_export_listed": false}}`
+
+## Task-level (commit replay)
+
+`python3 scripts/atlas_eval.py --mode commits` (needs `cargo build --release -p titi-cli --locked`;
+clones deepened with `git fetch --deepen 150`). Per repo the 10 most recent non-merge commits whose
+message is at least 20 characters, that touch at most 12 files and modify 1-8 indexed source files; the
+index is built at the **parent** commit by the real `titi atlas dump --json` (the same ranking and map
+text the prompt uses, not a Python re-implementation); task = commit message; truth = the modified
+files that are in the index. recall@10 / @24 = share of truth in the first 10 / 24 files of the map
+order; map tokens = bytes of the 24-file map / 4; "leaky" = tasks whose message contains a truth file's
+base name. Raw JSON: `/tmp/titi-qa/genome-corpus/commit_replay.json` (atlas sha, corpus SHAs, per-task rows).
+A second ranking (`tool`, `ATLAS_TOOL_CMD`, see `CONDITIONS` in the script) plugs in the atlas tool when
+it exists; unset, it is skipped.
+
+Static baseline, atlas at master with `.atlasignore` (run 2026-10-21), 80 tasks:
+
+| repo | tasks | files | static r@10 | static r@24 | map tokens | leaky |
+|---|---|---|---|---|---|---|
+| cobra | 10 | 36 | 0.65 | 1.00 | 432 | 2 |
+| express | 10 | 141 | 0.54 | 0.54 | 218 | 3 |
+| requests | 10 | 37 | 0.71 | 0.87 | 392 | 1 |
+| ripgrep | 10 | 105 | 0.03 | 0.42 | 450 | 3 |
+| ky | 10 | 90 | 0.15 | 0.23 | 429 | 4 |
+| gson | 10 | 264 | 0.17 | 0.33 | 632 | 2 |
+| okio | 10 | 355 | 0.01 | 0.08 | 578 | 5 |
+| sinatra | 10 | 147 | 0.07 | 0.70 | 439 | 3 |
+| **ALL** | 80 | 147 | 0.29 | 0.52 | 446 | 23 |
+
+This reproduces the pilot's static row of `docs/research/atlas-v2/README.md` (0.29 / 0.52) with the real
+binary; the only difference per repo is okio recall@24 (0.08 here, 0.06 in the pilot, one task).

@@ -3,7 +3,7 @@
 
     python3 scripts/atlas_eval.py [--corpus DIR] [--only NAME[,NAME]] [--out report.json]
 
-For each repo under the corpus dir (default /tmp/titi-qa/atlas-corpus) it:
+For each repo under the corpus dir (default /tmp/titi-qa/genome-corpus) it:
   1. runs the `map` example with N=24 and parses the projection;
   2. runs `titi atlas check` from the repo root (exit code, diagnostics by code);
   3. measures cold index+render wall time and peak RSS (`/usr/bin/time -l`);
@@ -15,6 +15,9 @@ For each repo under the corpus dir (default /tmp/titi-qa/atlas-corpus) it:
   6. scores the map against hand-written ground truth (TRUTH below) and flags
      suspicious lines.
 
+`--mode commits` replays real commits instead (task = commit message, index built at the parent,
+truth = modified indexed files; recall@10/@24 and map tokens from the real `titi atlas dump`).
+
 Build first: cargo build --release -p titi-cli -p titi-atlas --examples --locked
 Stdlib only. Raw results go to --out (default <corpus>/report.json).
 """
@@ -24,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -572,13 +576,169 @@ def render_markdown(results):
     return "\n".join(out) + "\n"
 
 
+# ---- task-level eval: replay real commits ------------------------------------
+
+# Conditions rank the files of the index for one task. Each takes
+# (worktree, task_text, dump) and returns an ordered list of paths, or None when
+# the condition is not available on this machine. `static` is what the prompt
+# map shows today: the real `titi atlas dump` order, no task input.
+#
+# HOOK for the atlas tool (v2 step 3+): register a condition here. The
+# `tool` condition below runs the command in $ATLAS_TOOL_CMD as
+# `$ATLAS_TOOL_CMD <worktree> <task-file>` and reads a JSON list of paths from
+# its stdout; unset, it is skipped and absent from the report.
+def condition_static(worktree, task, dump):
+    return [f["path"] for f in dump["files"]]
+
+
+def condition_tool(worktree, task, dump):
+    cmd = os.environ.get("ATLAS_TOOL_CMD")
+    if not cmd:
+        return None
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write(task)
+    try:
+        p = subprocess.run([*cmd.split(), worktree, fh.name], capture_output=True, text=True, timeout=120)
+    finally:
+        os.unlink(fh.name)
+    if p.returncode:
+        raise RuntimeError(f"ATLAS_TOOL_CMD failed: {p.stderr[:200]}")
+    return list(json.loads(p.stdout))
+
+
+CONDITIONS = {"static": condition_static, "tool": condition_tool}
+SRC_EXT = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".java", ".kt", ".kts", ".c",
+           ".h", ".cpp", ".cc", ".hpp", ".cs", ".swift", ".php", ".rb"}
+
+
+def git(repo, *args, check=True):
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if check and p.returncode:
+        raise RuntimeError(p.stderr[:200])
+    return p.stdout
+
+
+def atlas_dump(worktree, limit=N):
+    p = subprocess.run([str(TITI_BIN), "atlas", "dump", "--json", "--limit", str(limit)], cwd=worktree,
+                       capture_output=True, text=True)
+    if p.returncode:
+        raise RuntimeError(f"atlas dump failed: {p.stderr[:200]}")
+    return json.loads(p.stdout)
+
+
+def replay_repo(repo, commits, max_files, min_msg, max_changed, scan, conditions):
+    """Tasks of one repo: recent non-merge commits, the index built at the PARENT tree."""
+    repo = Path(repo)
+    head = git(repo, "rev-parse", "HEAD").strip()
+    revs = git(repo, "rev-list", "--no-merges", "-n", str(scan), "HEAD").split()
+    tmp = tempfile.mkdtemp(prefix="atlas-replay-")
+    git(repo, "worktree", "add", "--detach", tmp, head)
+    tasks = []
+    try:
+        for rev in revs:
+            if len(tasks) >= commits:
+                break
+            parents = git(repo, "rev-list", "--parents", "-n", "1", rev).split()[1:]
+            if len(parents) != 1:
+                continue  # root or merge
+            parent = parents[0]
+            msg = git(repo, "log", "-1", "--format=%s%n%b", rev).strip()
+            status = git(repo, "diff", "--name-status", "-M", parent, rev).splitlines()
+            if len(msg) < min_msg or not status or len(status) > max_changed:
+                continue  # huge commits are refactors, not tasks
+            modified = [l.split("\t")[-1] for l in status if l.startswith("M")
+                        and os.path.splitext(l.split("\t")[-1])[1] in SRC_EXT]
+            if not 1 <= len(modified) <= max_files:
+                continue
+            try:
+                git(tmp, "checkout", "-q", "--detach", parent)
+                dump = atlas_dump(tmp)
+            except RuntimeError:
+                continue
+            indexed = {f["path"] for f in dump["files"]}
+            truth = [f for f in modified if f in indexed]
+            if not truth:
+                continue  # nothing the map could name (ignored or unsupported files)
+            names = {os.path.basename(f).rsplit(".", 1)[0].lower() for f in truth}
+            task = {"repo": repo.name, "rev": rev[:10], "parent": parent[:10], "msg": msg.split("\n")[0][:80],
+                    "truth": truth, "indexed_files": len(indexed), "map_tokens": len(dump["map"]["text"]) / 4,
+                    "leaky": any(n in msg.lower() for n in names if len(n) >= 4), "conditions": {}}
+            for name in conditions:
+                ranked = CONDITIONS[name](tmp, msg, dump)
+                if ranked is None:
+                    continue
+                task["conditions"][name] = {
+                    "r10": len(set(truth) & set(ranked[:10])) / len(truth),
+                    "r24": len(set(truth) & set(ranked[:24])) / len(truth),
+                }
+            tasks.append(task)
+    finally:
+        git(repo, "worktree", "remove", "--force", tmp, check=False)
+    return tasks
+
+
+def render_replay(tasks, conditions):
+    by = {}
+    for t in tasks:
+        by.setdefault(t["repo"], []).append(t)
+    names = [c for c in conditions if any(c in t["conditions"] for t in tasks)]
+
+    def mean(rows, f):
+        v = [f(r) for r in rows]
+        return sum(v) / len(v) if v else float("nan")
+
+    head = "| repo | tasks | files | " + " | ".join(f"{c} r@10 | {c} r@24" for c in names) + " | map tokens | leaky |"
+    out = [head, "|" + "---|" * (head.count("|") - 1)]
+    for repo, rows in list(by.items()) + [("**ALL**", tasks)]:
+        cells = " | ".join(
+            f"{mean([r for r in rows if c in r['conditions']], lambda r, c=c, k=k: r['conditions'][c][k]):.2f}"
+            for c in names for k in ("r10", "r24"))
+        out.append(f"| {repo} | {len(rows)} | {mean(rows, lambda r: r['indexed_files']):.0f} | {cells} "
+                   f"| {mean(rows, lambda r: r['map_tokens']):.0f} | {sum(r['leaky'] for r in rows)} |")
+    return "\n".join(out) + "\n"
+
+
+def replay_main(a):
+    corpus = Path(a.corpus)
+    only = set(filter(None, a.only.split(",")))
+    default = ["cobra", "express", "requests", "ripgrep", "ky", "gson", "okio", "sinatra"]
+    repos = [corpus / n for n in (sorted(only) if only else default)]
+    conditions = [c for c in a.conditions.split(",") if c]
+    tasks = []
+    for repo in repos:
+        print(f"== replay {repo.name}", file=sys.stderr, flush=True)
+        tasks += replay_repo(repo, a.commits, a.max_files, a.min_msg, a.max_changed, a.scan, conditions)
+    table = render_replay(tasks, conditions)
+    out = Path(a.out) if a.out else corpus / "commit_replay.json"
+    meta = {"atlas": git(Path(__file__).resolve().parent, "rev-parse", "HEAD", check=False).strip(),
+            "repos": {r.name: git(r, "rev-parse", "HEAD").strip() for r in repos},
+            "config": {k: getattr(a, k) for k in ("commits", "max_files", "min_msg", "max_changed", "scan")}}
+    out.write_text(json.dumps({"meta": meta, "tasks": tasks}, indent=1))
+    if a.md:
+        Path(a.md).write_text(table)
+    print(table)
+    print(f"wrote {out}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", default="/tmp/titi-qa/atlas-corpus")
+    ap.add_argument("--corpus", default="/tmp/titi-qa/genome-corpus")
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default=None)
     ap.add_argument("--md", default=None, help="also write the markdown tables here")
+    ap.add_argument("--mode", choices=("survey", "commits"), default="survey",
+                    help="survey: map/check/LSP over each repo; commits: replay real commits as tasks")
+    ap.add_argument("--commits", type=int, default=10, help="commits mode: tasks per repo")
+    ap.add_argument("--max-files", type=int, default=8, help="commits mode: modified indexed source files, at most")
+    ap.add_argument("--min-msg", type=int, default=20, help="commits mode: message length, at least")
+    ap.add_argument("--max-changed", type=int, default=12, help="commits mode: skip commits touching more files")
+    ap.add_argument("--scan", type=int, default=400, help="commits mode: recent non-merge commits to look through")
+    ap.add_argument("--conditions", default="static,tool", help="commits mode: rankings to score (tool needs ATLAS_TOOL_CMD)")
     a = ap.parse_args()
+    if a.mode == "commits":
+        if not TITI_BIN.exists():
+            sys.exit(f"missing {TITI_BIN}: cargo build --release -p titi-cli --locked")
+        return replay_main(a)
     for b in (MAP_BIN, TITI_BIN):
         if not b.exists():
             sys.exit(f"missing {b}: cargo build --release -p titi-cli -p titi-atlas --examples --locked")
