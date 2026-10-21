@@ -7,6 +7,7 @@ pub mod agent_tool;
 pub mod agents;
 pub mod change_review;
 pub mod claims;
+pub mod commands;
 pub mod compaction;
 pub mod council;
 pub mod difftrack;

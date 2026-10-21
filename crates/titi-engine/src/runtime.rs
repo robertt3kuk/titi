@@ -687,6 +687,9 @@ pub struct EngineConfig {
     /// `skills.foreignUserDirs`: also read skills and commands from `~/.agents`
     /// and `~/.claude`, which belong to other tools.
     pub foreign_user_dirs: bool,
+    /// Names the surface answers itself. A file command of one of these names
+    /// never expands: the surface's command wins.
+    pub reserved_commands: Vec<String>,
     /// Embeddings model from `memory.embeddingModel`. `None` uses the local
     /// trigram embedder, which needs no network.
     pub embedding_model: Option<String>,
@@ -755,6 +758,7 @@ impl EngineConfig {
             compaction: titi_core::compaction::CompactionPolicy::default(),
             agent_dir: None,
             foreign_user_dirs: false,
+            reserved_commands: Vec::new(),
             embedding_model: None,
             sensitive: titi_tools::SensitivePolicy::default(),
             mask_ips: true,
@@ -1953,10 +1957,19 @@ impl EngineRuntime {
     /// being pasted in, so a skill missing from a prompt is never silent.
     async fn expand_skills(&self, text: SmolStr) -> SmolStr {
         let sources = self.extension_sources();
+        let reserved = self.config.reserved_commands.clone();
         let typed = text.clone();
         // Reads directories and up to BODY_CAP per file: off the runtime thread.
-        let expanded =
-            tokio::task::spawn_blocking(move || crate::skills::expand(&typed, &sources)).await;
+        let expanded = tokio::task::spawn_blocking(move || {
+            // A prompt that opens with a file command's name is that command;
+            // otherwise `/name` anywhere in it may name a skill.
+            let command = crate::commands::expand(&typed, &sources, &reserved);
+            if command.text.is_some() || !command.notices.is_empty() {
+                return command;
+            }
+            crate::skills::expand(&typed, &sources)
+        })
+        .await;
         let Ok(expanded) = expanded else {
             return text;
         };
