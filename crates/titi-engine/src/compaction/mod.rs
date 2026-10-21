@@ -22,7 +22,7 @@ use titi_providers::{ChatMessage, Role, TokenUsage};
 use digest::{digest_message, digest_summary, is_digest};
 use mask::mask_tool_results;
 pub use reported::{PromptMemory, Reported, context_used};
-pub use summary::{COMPACT_ROLE, Summary, SummaryError, SummaryModel, summary_model};
+pub use summary::{Summary, SummaryError, SummaryModel, summary_model};
 
 /// What a compaction needs to know about the request it may shrink.
 #[derive(Clone, Copy)]

@@ -52,6 +52,7 @@ pub enum ConsultError {
 pub struct Advisor {
     resolver: Arc<dyn TransportResolver>,
     model: SmolStr,
+    effort: Option<titi_providers::Effort>,
 }
 
 impl Advisor {
@@ -59,7 +60,14 @@ impl Advisor {
         Self {
             resolver,
             model: model.into(),
+            effort: None,
         }
+    }
+
+    /// How hard the advisor thinks; a model with no effort ladder is sent none.
+    pub fn with_effort(mut self, effort: Option<titi_providers::Effort>) -> Self {
+        self.effort = effort;
+        self
     }
 
     /// The advisor's answer, or the reason there is none.
@@ -84,6 +92,7 @@ impl Advisor {
                 })?;
 
         let mut wire = WireRequest::new(resolved.wire_model.clone());
+        wire.reasoning = crate::router::reasoning_for(&resolved, self.effort);
         // No tool specs: the advisor has nothing it could call even if the
         // brief failed to convince it.
         wire.messages.push(ChatMessage {

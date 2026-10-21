@@ -442,6 +442,22 @@ async fn until_compacted_or_notice(engine: &mut titi_engine::Engine) -> Vec<Engi
     events
 }
 
+/// Everything up to the fold's own report; a notice on the way is kept.
+async fn until_compacted(engine: &mut titi_engine::Engine) -> Vec<EngineEvent> {
+    let mut events = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(5), engine.recv()).await {
+        let last = matches!(
+            event,
+            EngineEvent::Compacted { .. } | EngineEvent::Cancelled { .. }
+        );
+        events.push(event);
+        if last {
+            break;
+        }
+    }
+    events
+}
+
 fn old_history() -> Vec<ChatMessage> {
     vec![
         message(Role::User, "the first question, long enough to fold"),
@@ -611,7 +627,7 @@ async fn the_compact_role_picks_the_summary_model() {
             .await
             .unwrap();
         engine.send(Command::Compact { focus: None }).await.unwrap();
-        let events = until_compacted_or_notice(&mut engine).await;
+        let events = until_compacted(&mut engine).await;
         let by = events.iter().find_map(|event| match event {
             EngineEvent::Compacted { summary_model, .. } => summary_model.clone(),
             _ => None,
@@ -624,9 +640,22 @@ async fn the_compact_role_picks_the_summary_model() {
             }
             _ => {
                 // The chat transport only had a prompt-sized answer scripted,
-                // which it hands to the summary call.
+                // which it hands to the summary call. The slot that could not
+                // be used is said once, ahead of the fold.
                 assert_eq!(by.as_deref(), Some("primary"), "{events:?}");
                 assert!(cheap.requests().is_empty());
+                let said: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        EngineEvent::Notice { message } => Some(message.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(said.len(), 1, "{events:?}");
+                assert!(
+                    said[0].starts_with("modelRoles.compact: `nowhere` cannot be used"),
+                    "{said:?}"
+                );
             }
         }
     }

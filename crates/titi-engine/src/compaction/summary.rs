@@ -11,7 +11,6 @@
 //! hands the fold back to the structural digest, so compaction never depends
 //! on the provider being reachable.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,7 +18,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use smol_str::SmolStr;
 use titi_providers::{
-    ChatMessage, Credential, RequestCtx, Role, StreamEvent, TokenUsage, Transport, WireRequest,
+    ChatMessage, Credential, Effort, ModelCompat, RequestCtx, RequestOpts, Role, StreamEvent,
+    TokenUsage, Transport, WireRequest, resolve_reasoning,
 };
 
 use super::clamp_chars;
@@ -27,10 +27,6 @@ use super::digest::{digest_summary, is_digest};
 use super::mask::{call_for, target_of};
 use crate::registry::ResolvedModel;
 use crate::runtime::TransportResolver;
-
-/// The `modelRoles` slot that picks the summary model. Unset, the session's
-/// own model writes it.
-pub const COMPACT_ROLE: &str = "compact";
 
 /// What the request lets the model write.
 const MAX_OUTPUT_TOKENS: u32 = 4_096;
@@ -80,6 +76,8 @@ pub struct SummaryModel {
     wire_model: SmolStr,
     transport: Arc<dyn Transport>,
     credential: Option<Credential>,
+    compat: Option<ModelCompat>,
+    effort: Option<Effort>,
     aborted: Arc<AtomicBool>,
     timeout: Duration,
 }
@@ -95,9 +93,17 @@ impl SummaryModel {
             wire_model: resolved.wire_model,
             transport: resolved.transport,
             credential: resolved.credential,
+            compat: resolved.reasoning,
+            effort: None,
             aborted,
             timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// How hard the summary model thinks; a model with no ladder is sent none.
+    pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
+        self.effort = effort;
+        self
     }
 
     #[cfg(test)]
@@ -117,6 +123,13 @@ impl SummaryModel {
             return Err(SummaryError::Cancelled);
         }
         let mut request = WireRequest::new(self.wire_model.clone());
+        request.reasoning = resolve_reasoning(
+            self.transport.api(),
+            self.compat.as_ref(),
+            &RequestOpts {
+                effort: self.effort,
+            },
+        );
         request.system = Some(instructions(focus).into());
         request.max_tokens = Some(MAX_OUTPUT_TOKENS);
         request.messages.push(ChatMessage {
@@ -180,41 +193,27 @@ impl SummaryModel {
 }
 
 /// The model behind the summary: the `compact` role when the settings name
-/// one and it resolves, else `chat_model`. `None` when neither resolves, which
-/// leaves the fold to the structural digest.
+/// one and it can run, else `chat_model`. `None` when neither resolves, which
+/// leaves the fold to the structural digest. The notices are what the role's
+/// settings have to say that this session has not yet said.
 pub async fn summary_model(
-    resolver: &dyn TransportResolver,
+    resolver: &Arc<dyn TransportResolver>,
     chat_model: &str,
-    agent_dir: Option<PathBuf>,
-    workspace: Option<PathBuf>,
+    router: &crate::router::Router,
     aborted: Arc<AtomicBool>,
-) -> Option<SummaryModel> {
-    let role = match (
-        agent_dir,
-        workspace.or_else(|| std::env::current_dir().ok()),
-    ) {
-        (Some(agent_dir), Some(workspace)) => {
-            let chat = chat_model.to_owned();
-            tokio::task::spawn_blocking(move || {
-                let settings =
-                    titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok()?;
-                titi_config::roles::resolve_model_role(&settings, COMPACT_ROLE, &chat).ok()
-            })
-            .await
-            .ok()
-            .flatten()
-        }
-        _ => None,
-    };
-    role.iter()
-        .map(String::as_str)
-        .chain([chat_model])
+) -> (Option<SummaryModel>, Vec<SmolStr>) {
+    let routed = router
+        .route_async(crate::router::Role::Compact, chat_model, resolver)
+        .await;
+    let model = [routed.route.model.as_str(), chat_model]
+        .into_iter()
         .find_map(|id| {
-            resolver
-                .resolve(id)
-                .ok()
-                .map(|resolved| SummaryModel::new(id, resolved, Arc::clone(&aborted)))
-        })
+            resolver.resolve(id).ok().map(|resolved| {
+                SummaryModel::new(id, resolved, Arc::clone(&aborted))
+                    .with_effort(routed.route.effort)
+            })
+        });
+    (model, routed.notices)
 }
 
 /// What the model is told to write.

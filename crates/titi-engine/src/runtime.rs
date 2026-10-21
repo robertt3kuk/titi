@@ -44,31 +44,6 @@ async fn run_off_thread(
     tokio::task::spawn_blocking(work).await.ok().flatten()
 }
 
-/// Model role a `/advisor` consult runs on.
-const ADVISOR_ROLE: &str = "advisor";
-
-/// The model behind the `advisor` role, when the settings name one.
-///
-/// A second opinion from the turn's own model is still a second opinion, so
-/// an absent or unreadable role map is not a failure: the caller keeps the
-/// model it already has.
-async fn advisor_model(
-    agent_dir: Option<PathBuf>,
-    workspace: Option<PathBuf>,
-    current: SmolStr,
-) -> Option<SmolStr> {
-    let agent_dir = agent_dir?;
-    let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
-    let current = current.to_string();
-    run_off_thread(move || {
-        let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok()?;
-        titi_config::roles::resolve_model_role(&settings, ADVISOR_ROLE, &current)
-            .ok()
-            .map(SmolStr::from)
-    })
-    .await
-}
-
 /// The standing instruction a mode adds to the system prompt, if any.
 ///
 /// The tools already enforce the mode; this only tells the model what the
@@ -2006,17 +1981,16 @@ impl EngineRuntime {
         let conversation = self.config.restored_messages.clone();
         let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
-        let agent_dir = self.config.agent_dir.clone();
-        let workspace = self
-            .config
-            .workspace_root
-            .clone()
-            .or_else(|| self.config.genome_root.clone());
+        let router = self.router.clone();
         tokio::spawn(async move {
-            let model = advisor_model(agent_dir, workspace, current_model.clone())
-                .await
-                .unwrap_or(current_model);
-            let advisor = crate::advisor::Advisor::new(resolver, model);
+            let routed = router
+                .route_async(crate::router::Role::Advisor, &current_model, &resolver)
+                .await;
+            for notice in routed.notices {
+                let _ = events.send(EngineEvent::Notice { message: notice }).await;
+            }
+            let advisor = crate::advisor::Advisor::new(resolver, routed.route.model)
+                .with_effort(routed.route.effort);
             let event = match advisor.consult(&conversation, question.as_deref()).await {
                 Ok(text) => EngineEvent::AdvisorAnswer { text },
                 Err(error) => EngineEvent::AdvisorFailed {
@@ -2044,18 +2018,12 @@ impl EngineRuntime {
         else {
             return;
         };
-        let workspace = self
-            .config
-            .workspace_root
-            .clone()
-            .or_else(|| self.config.genome_root.clone())
-            .unwrap_or_else(|| PathBuf::from("."));
         crate::naming::SessionNamer::new(
             Arc::clone(&self.resolver),
             self.events.clone(),
             agent_dir,
             session_id,
-            workspace,
+            self.router.clone(),
             model,
         )
         .spawn(first_message);
@@ -2402,6 +2370,7 @@ impl EngineRuntime {
         let hooks = self.hooks.clone();
         let verifier = self.verifier.clone();
         let prompt_memory = self.prompt_memory.clone();
+        let router = self.router.clone();
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -2426,6 +2395,7 @@ impl EngineRuntime {
                 hooks,
                 verifier,
                 prompt_memory,
+                router,
             )
             .await;
             let _ = done
@@ -2455,8 +2425,7 @@ impl EngineRuntime {
         let mut history = self.config.restored_messages.clone();
         let policy = self.config.compaction.clone();
         let window = self.config.context_window;
-        let agent_dir = self.config.agent_dir.clone();
-        let workspace = self.config.workspace_root.clone();
+        let router = self.router.clone();
         let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
         let spent = Arc::clone(&self.spent);
@@ -2465,14 +2434,16 @@ impl EngineRuntime {
             unpriced_said: Arc::clone(&self.money_unpriced_said),
         };
         tokio::spawn(async move {
-            let summary = crate::compaction::summary_model(
-                resolver.as_ref(),
+            let (summary, notices) = crate::compaction::summary_model(
+                &resolver,
                 &primary_model,
-                agent_dir,
-                workspace,
+                &router,
                 Arc::clone(&task_abort),
             )
             .await;
+            for message in notices {
+                let _ = events.send(EngineEvent::Notice { message }).await;
+            }
             let outcome = compact_history(
                 &mut history,
                 &policy,
@@ -2858,20 +2829,17 @@ async fn turn_summary_model<'a>(
     resolver: &Arc<dyn TransportResolver>,
     chat_model: &str,
     aborted: &Arc<AtomicBool>,
-    agent_dir: Option<&std::path::Path>,
-    workspace: Option<&std::path::Path>,
+    router: &crate::router::Router,
+    events: &mpsc::Sender<EngineEvent>,
 ) -> Option<&'a crate::compaction::SummaryModel> {
     if slot.is_none() {
-        *slot = Some(
-            crate::compaction::summary_model(
-                resolver.as_ref(),
-                chat_model,
-                agent_dir.map(std::path::Path::to_path_buf),
-                workspace.map(std::path::Path::to_path_buf),
-                Arc::clone(aborted),
-            )
-            .await,
-        );
+        let (model, notices) =
+            crate::compaction::summary_model(resolver, chat_model, router, Arc::clone(aborted))
+                .await;
+        for message in notices {
+            let _ = events.send(EngineEvent::Notice { message }).await;
+        }
+        *slot = Some(model);
     }
     slot.as_ref().and_then(Option::as_ref)
 }
@@ -2914,6 +2882,7 @@ async fn run_turn(
     hooks: Hooks,
     verifier: crate::verify::Verifier,
     prompt_memory: crate::compaction::PromptMemory,
+    router: crate::router::Router,
 ) -> Option<Vec<ChatMessage>> {
     // The turn's own span opens here and closes at the tail — the one place
     // every path below reaches, because the early returns all belong to the
@@ -3161,8 +3130,8 @@ async fn run_turn(
                         &resolver,
                         &model,
                         &aborted,
-                        config.agent_dir.as_deref(),
-                        config.workspace_root.as_deref(),
+                        &router,
+                        &events,
                     )
                     .await;
                     crate::compaction::compact(&mut messages, &fold.summarizer(writer)).await
@@ -3355,8 +3324,8 @@ async fn run_turn(
                                     &resolver,
                                     &model,
                                     &aborted,
-                                    config.agent_dir.as_deref(),
-                                    config.workspace_root.as_deref(),
+                                    &router,
+                                    &events,
                                 )
                                 .await;
                                 if let Some(done) = compact_history(

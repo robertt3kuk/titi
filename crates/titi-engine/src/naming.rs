@@ -20,11 +20,9 @@ use titi_providers::{ChatMessage, RequestCtx, Role, StreamEvent, WireRequest};
 use tokio::sync::mpsc;
 
 use crate::protocol::EngineEvent;
+use crate::router::Router;
 use crate::runtime::TransportResolver;
 
-/// Model role the namer runs on. Naming is not worth the primary model, and
-/// the role map is where the user says which model is the cheap one.
-const NAMING_ROLE: &str = "smol";
 /// A title nobody is waiting for does not get to hold a task open forever.
 const NAMING_TIMEOUT: Duration = Duration::from_secs(30);
 /// Generation cap: three words need no more, and a chatty model is cut off
@@ -47,9 +45,9 @@ pub struct SessionNamer {
     /// Holds `state.db`, where the session catalog lives.
     agent_dir: PathBuf,
     session_id: SmolStr,
-    /// Project the config layers are read for.
-    workspace: PathBuf,
-    /// Model the turn ran on: what the `smol` role falls back to when the
+    /// Where the `namer` role is read, and which notices are already said.
+    router: Router,
+    /// Model the turn ran on: what the `namer` role falls back to when the
     /// user configured no role map at all.
     current_model: SmolStr,
 }
@@ -60,7 +58,7 @@ impl SessionNamer {
         events: mpsc::Sender<EngineEvent>,
         agent_dir: PathBuf,
         session_id: impl Into<SmolStr>,
-        workspace: PathBuf,
+        router: Router,
         current_model: impl Into<SmolStr>,
     ) -> Self {
         Self {
@@ -68,7 +66,7 @@ impl SessionNamer {
             events,
             agent_dir,
             session_id: session_id.into(),
-            workspace,
+            router,
             current_model: current_model.into(),
         }
     }
@@ -85,8 +83,8 @@ impl SessionNamer {
         if !self.needs_title().await? {
             return None;
         }
-        let model = self.naming_model().await?;
-        let answer = tokio::time::timeout(NAMING_TIMEOUT, self.ask(&model, &first_message))
+        let (model, effort) = self.naming_route().await?;
+        let answer = tokio::time::timeout(NAMING_TIMEOUT, self.ask(&model, effort, &first_message))
             .await
             .ok()??;
         let title = clean_title(&answer)?;
@@ -117,26 +115,39 @@ impl SessionNamer {
         .await
     }
 
-    /// The model behind the `smol` role. An absent role map keeps the turn's
-    /// own model, which is what the role resolver means by "current"; a map
-    /// that does not name the role means no naming at all.
-    async fn naming_model(&self) -> Option<SmolStr> {
-        let agent_dir = self.agent_dir.clone();
-        let workspace = self.workspace.clone();
-        let current = self.current_model.to_string();
-        off_thread(move || {
-            let settings =
-                titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok()?;
-            titi_config::roles::resolve_model_role(&settings, NAMING_ROLE, &current)
-                .ok()
-                .map(SmolStr::from)
-        })
-        .await
+    /// The model and effort behind the `namer` role (`smol` before that name
+    /// existed). An absent role map keeps the turn's own model; a map that
+    /// names neither role means no naming at all, as it always did.
+    async fn naming_route(&self) -> Option<(SmolStr, Option<titi_providers::Effort>)> {
+        let routed = self
+            .router
+            .route_async(
+                crate::router::Role::Namer,
+                &self.current_model,
+                &self.resolver,
+            )
+            .await;
+        for notice in routed.notices {
+            let _ = self
+                .events
+                .send(EngineEvent::Notice { message: notice })
+                .await;
+        }
+        if routed.has_map && !routed.route.configured {
+            return None;
+        }
+        Some((routed.route.model, routed.route.effort))
     }
 
-    async fn ask(&self, model: &str, first_message: &str) -> Option<String> {
+    async fn ask(
+        &self,
+        model: &str,
+        effort: Option<titi_providers::Effort>,
+        first_message: &str,
+    ) -> Option<String> {
         let resolved = self.resolver.resolve(model).ok()?;
         let mut wire = WireRequest::new(resolved.wire_model.clone());
+        wire.reasoning = crate::router::reasoning_for(&resolved, effort);
         wire.max_tokens = Some(NAMING_MAX_TOKENS);
         wire.messages.push(ChatMessage {
             role: Role::User,
