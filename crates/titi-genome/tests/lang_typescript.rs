@@ -200,3 +200,44 @@ fn commonjs_directory_requires_and_exports_reach_the_graph() {
         genome.check()
     );
 }
+
+/// A barrel publishes what it re-exports: `export { b as bee } from './b'`
+/// exports `bee` (an alias the barrel itself defines), and both it and `export * from './a'` are re-exports, so a
+/// file importing the barrel reaches the definers.
+#[test]
+fn typescript_barrels_publish_names_and_credit_the_definers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/index.ts",
+        "export * from './a'\nexport { b as bee } from './b'\nexport type { T } from './t'\n",
+    );
+    write(root, "src/a.ts", "export function alpha() {}\n");
+    write(root, "src/b.ts", "export function b() {}\n");
+    write(root, "src/t.ts", "export type T = string\n");
+    write(
+        root,
+        "src/use.ts",
+        "import { alpha, bee } from './index'\nalpha(); bee()\n",
+    );
+
+    let genome = index(root);
+    let barrel = &genome.files["src/index.ts"];
+    assert_eq!(barrel.exports, vec!["T".to_owned(), "bee".to_owned()]);
+    assert_eq!(
+        barrel.reexports,
+        vec![
+            "src/a.ts".to_owned(),
+            "src/b.ts".to_owned(),
+            "src/t.ts".to_owned()
+        ]
+    );
+    let uses = &genome.files["src/use.ts"].uses;
+    for (name, definer) in [("alpha", "src/a.ts"), ("bee", "src/index.ts")] {
+        assert!(
+            uses.iter().any(|u| u.name == name && u.definer == definer),
+            "{name} should reach {definer}: {uses:?}"
+        );
+    }
+}
