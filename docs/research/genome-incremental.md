@@ -248,3 +248,17 @@ already coalesces and prioritises.
    it. `sha2` is **already a direct dependency of two workspace crates** (`titi-memory`,
    `titi-providers`, `Cargo.lock:2240`), so it adds no compile unit. Recommendation: FNV-1a now, `sha2`
    only if a persistent index lands.
+
+## Addendum 2026-10: the tuple after scope resolution
+
+The tuple the graph is built from is no longer `(exports, imports,
+used_symbols)` resolved by name. A use now resolves to one definer through the
+file's scope (`scope.rs`), so `FileRecord` carries `uses: Vec<SymbolUse>` in
+place of `used_symbols`, and the tuple is `(exports, imports, reexports,
+inherits, external_uses, uses)`. A re-parse that leaves the first five alone
+and resolves to the same `uses` still leaves the maps untouched. A re-parse
+that changes the scope part (an import added, a `pub use` moved) or a path
+that appears or vanishes re-resolves every file, because what a file can reach
+through another's re-exports moved; a changed export re-resolves only the
+files whose raw mentions name it, as before. Users are recounted from the
+resolved uses on every rebuild and kept per definer in `Genome::used_by`.

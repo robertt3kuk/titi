@@ -4,7 +4,9 @@
 //! The graph has two kinds of edge: a file imports another file, and a file
 //! references a symbol another file defines. Both feed the same ranking and
 //! the same `(→N)` dependent count, so "what depends on this" answers in
-//! symbol terms instead of only file terms.
+//! symbol terms instead of only file terms. A reference links to the one file
+//! it is a use of, decided by the language's scope rules rather than by the
+//! name alone: see the `scope` module.
 //!
 //! The research note that used to specify this graph is gone; the paragraphs
 //! above are the description.
@@ -31,6 +33,7 @@ mod query;
 mod recency;
 mod refs;
 mod scan;
+mod scope;
 mod shared;
 mod symbols;
 
@@ -140,17 +143,30 @@ pub struct FileRecord {
     /// Tree-sitter `ERROR` nodes. Zero for languages without a grammar.
     /// A grammar that refuses the file counts as 1.
     pub syntax_errors: u32,
-    /// Exported symbols defined elsewhere that this file mentions — the
-    /// symbol-level half of the dependency graph. Resolved from
-    /// [`Self::raw_refs`] against the workspace's exports.
-    pub used_symbols: Vec<String>,
+    /// Files this file re-publishes: the subset of [`Self::imports`] that is a
+    /// `pub use`, a `pub mod x;`, an `export … from`, or any import of a
+    /// Python package's `__init__.py`. A name defined behind one of them is
+    /// reachable through this file.
+    pub reexports: Vec<String>,
+    /// Files whose scope this one extends (Rust's `use super::*`): what they
+    /// import, this file can name too.
+    pub inherits: Vec<String>,
+    /// First segments of the paths that name another crate (Rust), which the
+    /// index maps to that crate's `lib.rs` when the crate is in the workspace.
+    pub external_uses: Vec<String>,
+    /// Exported symbols defined elsewhere that this file mentions, each with
+    /// the one file it resolves to and why — the symbol-level half of the
+    /// dependency graph. Resolved from [`Self::raw_refs`] against the
+    /// workspace's exports by `scope::Resolver`.
+    pub uses: Vec<SymbolUse>,
     /// The identifiers this file mentions, as the parser collected them.
     ///
-    /// [`Self::used_symbols`] is the subset of these that resolve: a name
-    /// has to be exported by exactly one known file and not be this file's
-    /// own export to carry an edge. The raw list is what answers "which
-    /// files does an export change concern" without reading them — see
-    /// [`Genome::ref_index`]. Bounded by `refs::MAX_REFS`.
+    /// [`Self::uses`] is the subset of these that resolve: a name has to be
+    /// reachable from this file, or be the one distinctive definition in the
+    /// workspace, to carry an edge, and a file's own exports are never uses.
+    /// The raw list is what answers "which files does an export change
+    /// concern" without reading them — see [`Genome::ref_index`]. Bounded by
+    /// `refs::MAX_REFS`.
     pub raw_refs: Vec<String>,
     pub size: u64,
     pub mtime: SystemTime,
@@ -174,11 +190,10 @@ pub struct FileRecord {
     pub hash: u64,
 }
 
-/// A name exported by more than this many files is ambiguous under name-only
-/// resolution, so it carries neither edges nor a user count. One definition
-/// site means a mention that survived collection can only mean that file.
-/// A method call or a std-qualified path is not such a mention: `path.join`
-/// is not a use of the file that uniquely exports `join`.
+/// A name exported by more than this many files is ambiguous: goto-definition
+/// has no single answer for it and `titi genome check` reports it when the
+/// definers share a crate. The graph does not use this number: a use resolves
+/// to one definer by scope (see `scope`), whatever else defines the name.
 pub const MAX_DEFINERS: usize = 1;
 
 /// How fresh an `mtime` may be, against the clock of a read, before the walk
@@ -203,6 +218,43 @@ pub struct SymbolRecord {
     pub files: Vec<String>,
     /// Distinct files that reference it, excluding the definers.
     pub users: usize,
+}
+
+/// Why a mention was linked to its definer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The definer is in the file's scope: imported, re-exported to it, in
+    /// its crate facade or package directory.
+    Scope,
+    /// No scope evidence, but the name is long, uncommon and defined by one
+    /// file only. A guess, weighed as one.
+    Unique,
+}
+
+/// One mention that resolves to a definition in another file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolUse {
+    pub name: String,
+    /// The one file this use is a use of.
+    pub definer: String,
+    pub basis: Basis,
+}
+
+impl FileRecord {
+    /// The names of [`Self::uses`], in order.
+    pub fn used_symbols(&self) -> Vec<String> {
+        self.uses.iter().map(|used| used.name.clone()).collect()
+    }
+
+    /// Whether `other` resolves its imports the same way, which is everything
+    /// but its own exports that decides what *other* files can reach through
+    /// it and what it can reach.
+    fn same_scope(&self, other: &Self) -> bool {
+        self.imports == other.imports
+            && self.reexports == other.reexports
+            && self.inherits == other.inherits
+            && self.external_uses == other.external_uses
+    }
 }
 
 impl SymbolRecord {
@@ -233,7 +285,7 @@ pub struct RefreshStats {
     ///
     /// False only when nothing that feeds the graph moved: no path appeared or
     /// vanished, and every re-parse yielded the same `(exports, imports,
-    /// used_symbols)` tuple as the record it replaced. A body-only edit is the
+    /// re-exports, uses)` as the record it replaced. A body-only edit is the
     /// common case — a changed `mtime` and a changed byte range, no change to
     /// what the graph is built from — and it leaves the previous maps in
     /// place rather than paying the rank iteration to reproduce them.
@@ -268,8 +320,13 @@ pub struct Genome {
     pub files: HashMap<String, FileRecord>,
     pub ranks: HashMap<String, f64>,
     pub dependents: HashMap<String, usize>,
-    /// Symbol name → defining files and how many files reference it.
+    /// Symbol name → defining files and how many files reference it, summed
+    /// over the definers.
     pub symbols: HashMap<String, SymbolRecord>,
+    /// Defining file → its exports that other files use, each with the number
+    /// of distinct files whose uses resolve to *this* file, most used first.
+    /// A name two files define is counted separately for each.
+    pub used_by: HashMap<String, Vec<(String, usize)>>,
     /// Symbol name → the files whose raw mentions name it.
     ///
     /// The inversion of [`FileRecord::raw_refs`]. A name resolves in a file
@@ -292,6 +349,8 @@ pub struct Genome {
     root: std::path::PathBuf,
     /// What `[RECENT]` means for `root`; see [`recency`].
     recency: Option<recency::Recency>,
+    /// What the set of paths says about scope; see [`scope`].
+    layout: scope::Layout,
 }
 
 /// One refresh's file-level outcome, before the graph decision is folded in.
@@ -300,6 +359,10 @@ struct Absorption {
     content_unchanged: usize,
     /// Whether anything that feeds `ranks`/`dependents`/`symbols` moved.
     graph_moved: bool,
+    /// Whether what a file can *reach* moved: a path appeared, or a file's
+    /// imports, re-exports or crate names changed. Every file's resolution
+    /// can differ then, not only those that mention a moved name.
+    scope_moved: bool,
     /// The paths that were re-parsed, so the symbol pass knows which files
     /// can have a resolution to redo beyond the ones the moved names reach.
     dirty: Vec<String>,
@@ -328,7 +391,7 @@ impl Genome {
     ///
     /// `ranks`, `dependents` and `symbols` are rebuilt only when the graph
     /// inputs moved: a path appeared or vanished, or a re-parse changed some
-    /// file's `(exports, imports, used_symbols)`. [`RefreshStats`] reports
+    /// file's `(exports, imports, re-exports, uses)`. [`RefreshStats`] reports
     /// which happened.
     ///
     /// This is [`Self::refresh_urgent`] with nothing urgent: the walk's own
@@ -396,7 +459,11 @@ impl Genome {
         }
         let removed = gone.len();
         let graph_recomputed = absorbed.graph_moved || removed > 0;
-        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
+        let reresolved = self.finish(
+            graph_recomputed,
+            &absorbed.dirty,
+            absorbed.scope_moved || removed > 0,
+        );
         RefreshStats {
             parsed: absorbed.parsed,
             removed,
@@ -476,7 +543,11 @@ impl Genome {
         let absorbed = self.absorb(&listed, &known, paths, usize::MAX);
         self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved || removed > 0;
-        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
+        let reresolved = self.finish(
+            graph_recomputed,
+            &absorbed.dirty,
+            absorbed.scope_moved || removed > 0,
+        );
         Ok(RefreshStats {
             parsed: absorbed.parsed,
             removed,
@@ -523,7 +594,7 @@ impl Genome {
         let absorbed = self.absorb(&[listed], &known, &[path.to_owned()], usize::MAX);
         self.note_changed(&absorbed.dirty);
         let graph_recomputed = absorbed.graph_moved;
-        let reresolved = self.finish(graph_recomputed, &absorbed.dirty);
+        let reresolved = self.finish(graph_recomputed, &absorbed.dirty, absorbed.scope_moved);
         Ok(RefreshStats {
             parsed: absorbed.parsed,
             removed: 0,
@@ -645,31 +716,42 @@ impl Genome {
         let records = parse_batch(&stale, known, &self.files, &self.overlay, max_workers);
 
         // A parse can only move the graph by changing the tuple the graph is
-        // built from. `exports` and `imports` are compared exactly; `refs` are
-        // resolved here against the previous symbols — valid exactly when no
-        // `exports` moved, which is what the first pass establishes — and the
-        // resolved set compared to the record's. Same tuple on every re-parse,
-        // same path set, same graph.
+        // built from. `exports` and the scope (`imports`, re-exports, crate
+        // names) are compared exactly; the resolved uses are computed here
+        // against the previous symbols — valid exactly when no `exports` and
+        // no scope moved, which is what the first pass establishes — and
+        // compared to the record's. Same tuple on every re-parse, same path
+        // set, same graph.
         let mut graph_moved = false;
+        let mut scope_moved = !appeared.is_empty();
         for (record, parsed) in &records {
             if !*parsed {
                 continue;
             }
             match self.files.get(&record.path) {
-                Some(old) if old.exports == record.exports && old.imports == record.imports => {}
-                _ => graph_moved = true,
+                Some(old) if old.exports == record.exports && old.same_scope(record) => {}
+                Some(old) => {
+                    graph_moved = true;
+                    scope_moved |= !old.same_scope(record);
+                }
+                None => graph_moved = true,
             }
         }
         if !graph_moved {
+            let resolver = scope::Resolver {
+                files: &self.files,
+                symbols: &self.symbols,
+                layout: &self.layout,
+            };
             for (record, parsed) in &records {
                 if !*parsed {
                     continue;
                 }
-                let resolved = resolve(&record.raw_refs, &record.exports, &self.symbols);
+                let resolved = resolver.resolve(record);
                 if self
                     .files
                     .get(&record.path)
-                    .is_some_and(|old| old.used_symbols != resolved)
+                    .is_some_and(|old| old.uses != resolved)
                 {
                     graph_moved = true;
                     break;
@@ -685,7 +767,7 @@ impl Genome {
             let previous = self
                 .files
                 .get(&path)
-                .map(|old| (old.raw_refs.clone(), old.used_symbols.clone()));
+                .map(|old| (old.raw_refs.clone(), old.uses.clone()));
             if reparsed {
                 parsed += 1;
                 dirty.push(path.clone());
@@ -695,7 +777,7 @@ impl Genome {
                     // a resolution moved, and the parse only produced raw
                     // mentions.
                     if let Some((_, resolved)) = &previous {
-                        record.used_symbols = resolved.clone();
+                        record.uses = resolved.clone();
                     }
                 }
             } else {
@@ -715,11 +797,14 @@ impl Genome {
         // A specifier that named no file can name one now: this update added
         // it. The candidates the specifier was parsed with answer whether,
         // without reading the file that wrote it.
-        graph_moved |= self.resolve_new_imports(&appeared, known);
+        let arrived = self.resolve_new_imports(&appeared, known);
+        graph_moved |= arrived;
+        scope_moved |= arrived;
         Absorption {
             parsed,
             content_unchanged,
             graph_moved,
+            scope_moved,
             dirty,
         }
     }
@@ -827,12 +912,12 @@ impl Genome {
     /// update re-parsed; the symbol pass re-resolves those and the mentioners
     /// of any name whose definers moved, and nothing else. Returns how many
     /// files that pass visited.
-    fn finish(&mut self, graph_recomputed: bool, dirty: &[String]) -> usize {
+    fn finish(&mut self, graph_recomputed: bool, dirty: &[String], scope_moved: bool) -> usize {
         if !graph_recomputed {
             return 0;
         }
-        let reresolved = self.index_symbols(dirty);
-        let (ranks, dependents) = graph::rank(&self.files, &self.symbols);
+        let reresolved = self.index_symbols(dirty, scope_moved);
+        let (ranks, dependents) = graph::rank(&self.files);
         self.ranks = ranks;
         self.dependents = dependents;
         reresolved
@@ -841,19 +926,20 @@ impl Genome {
     /// Rebuild the symbol table, re-resolving only the files it can have
     /// changed, and count them.
     ///
-    /// Resolution is by name alone, so a name several files export — `is_empty`,
-    /// `new`, `len` — cannot say which definition a mention refers to. Those
-    /// names are ambiguous and carry no edges or user counts: counting them
-    /// would make every file depend on every other file that happens to share
-    /// a method name.
+    /// A mention resolves to one definer by scope — see [`scope`] — so a name
+    /// several files export, `new` or `len` or `render_item`, is no longer
+    /// all-or-nothing: each file that mentions it leans on the definer it can
+    /// reach, and on none when it can reach several or none.
     ///
     /// The definer table is rebuilt from every file's `exports`, which is a
     /// pass over stored names and reads nothing. What that pass does *not*
     /// cost is the other half: re-resolving every file's identifiers. A file
-    /// can only have a different resolution if it was re-parsed or if a name
-    /// it mentions moved definers, and [`Self::ref_index`] answers the second
-    /// without a scan. Everything else keeps the resolution it already had.
-    fn index_symbols(&mut self, dirty: &[String]) -> usize {
+    /// can only have a different resolution if it was re-parsed, if a name
+    /// it mentions moved definers — [`Self::ref_index`] answers that without
+    /// a scan — or if what files can reach moved (`scope_moved`), which is a
+    /// changed import list or path set and re-resolves everyone. Everything
+    /// else keeps the resolution it already had.
+    fn index_symbols(&mut self, dirty: &[String], scope_moved: bool) -> usize {
         let mut definers: HashMap<String, Vec<String>> = HashMap::new();
         for (path, record) in &self.files {
             for name in &record.exports {
@@ -876,67 +962,77 @@ impl Genome {
                 moved.insert(name.clone());
             }
         }
-
-        let previous = std::mem::take(&mut self.symbols);
-        let mut symbols: HashMap<String, SymbolRecord> = HashMap::with_capacity(definers.len());
-        for (name, files) in definers {
-            // A name no definer moved for keeps the count it had; the pass
-            // below recomputes the ones that changed.
-            let users = if moved.contains(&name) {
-                0
-            } else {
-                previous.get(&name).map_or(0, |symbol| symbol.users)
-            };
-            symbols.insert(name, SymbolRecord { files, users });
+        if scope_moved {
+            self.layout = scope::Layout::build(&self.files);
         }
 
-        let mut targets: HashSet<String> = dirty.iter().cloned().collect();
-        for name in &moved {
-            if let Some(files) = self.ref_index.get(name) {
-                targets.extend(files.iter().cloned());
+        let symbols: HashMap<String, SymbolRecord> = definers
+            .into_iter()
+            .map(|(name, files)| (name, SymbolRecord { files, users: 0 }))
+            .collect();
+
+        let targets: Vec<String> = if scope_moved {
+            self.files.keys().cloned().collect()
+        } else {
+            let mut targets: HashSet<String> = dirty.iter().cloned().collect();
+            for name in &moved {
+                if let Some(files) = self.ref_index.get(name) {
+                    targets.extend(files.iter().cloned());
+                }
             }
-        }
-        let mut affected: HashSet<String> = moved;
+            targets.into_iter().collect()
+        };
+        let resolver = scope::Resolver {
+            files: &self.files,
+            symbols: &symbols,
+            layout: &self.layout,
+        };
         let mut reresolved = 0;
-        let mut changed: Vec<(String, Vec<String>)> = Vec::new();
+        let mut changed: Vec<(String, Vec<SymbolUse>)> = Vec::new();
         for path in targets {
             let Some(record) = self.files.get(&path) else {
                 continue;
             };
-            let resolved = resolve(&record.raw_refs, &record.exports, &symbols);
-            affected.extend(
-                record
-                    .raw_refs
-                    .iter()
-                    .filter(|name| symbols.contains_key(*name))
-                    .cloned(),
-            );
+            let resolved = resolver.resolve(record);
             reresolved += 1;
-            if record.used_symbols != resolved {
+            if record.uses != resolved {
                 changed.push((path, resolved));
             }
         }
         for (path, resolved) in changed {
             if let Some(record) = self.files.get_mut(&path) {
-                record.used_symbols = resolved;
+                record.uses = resolved;
             }
         }
 
-        for name in &affected {
-            let Some(symbol) = symbols.get_mut(name) else {
-                continue;
-            };
-            symbol.users = self.ref_index.get(name).map_or(0, |files| {
-                files
-                    .iter()
-                    .filter(|path| {
-                        self.files
-                            .get(*path)
-                            .is_some_and(|record| record.used_symbols.contains(name))
-                    })
-                    .count()
-            });
+        // Users are counted from the uses themselves, per definer: a file
+        // resolves a name to one definer, so the per-definer counts of a name
+        // add up to the name's distinct users.
+        let mut symbols = symbols;
+        let mut counts: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+        for record in self.files.values() {
+            for used in &record.uses {
+                *counts
+                    .entry(used.definer.as_str())
+                    .or_default()
+                    .entry(used.name.as_str())
+                    .or_default() += 1;
+                if let Some(symbol) = symbols.get_mut(&used.name) {
+                    symbol.users += 1;
+                }
+            }
         }
+        self.used_by = counts
+            .into_iter()
+            .map(|(definer, names)| {
+                let mut names: Vec<(String, usize)> = names
+                    .into_iter()
+                    .map(|(name, users)| (name.to_owned(), users))
+                    .collect();
+                names.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                (definer.to_owned(), names)
+            })
+            .collect();
         self.symbols = symbols;
         reresolved
     }
@@ -1139,12 +1235,15 @@ fn parse_one(
             unresolved_imports: result.unresolved_imports,
             unresolved_candidates: result.unresolved_candidates,
             syntax_errors: result.syntax_errors,
+            reexports: result.reexports,
+            inherits: result.inherits,
+            external_uses: result.external_uses,
             // Resolved against the workspace's exports by `index_symbols`,
-            // once the batch is in — a name is only an edge when exactly one
-            // file exports it, which one file's parse cannot know. Empty here
+            // once the batch is in — a mention needs the whole file set to
+            // find its definer, which one file's parse cannot see. Empty here
             // means "not resolved yet", and a parse the graph pass skips
             // carries the previous record's list instead.
-            used_symbols: Vec::new(),
+            uses: Vec::new(),
             raw_refs: result.refs,
             size: file.size,
             mtime: file.mtime,
@@ -1153,31 +1252,6 @@ fn parse_one(
         },
         true,
     )
-}
-
-/// The identifiers of `refs` that can be edges: exported by exactly one known
-/// file, and not by this one.
-///
-/// Resolution is by name alone, so a name several files export — `is_empty`,
-/// `new`, `len` — cannot say which definition a mention refers to. Those names
-/// are ambiguous and carry no edges, and a file's own exports are definitions,
-/// not uses of itself. Shared by [`Genome::index_symbols`], which applies it
-/// to every file when the graph is rebuilt, and by [`Genome::absorb`], which
-/// applies it to one re-parse to ask whether the graph would even move.
-fn resolve(
-    refs: &[String],
-    own_exports: &[String],
-    symbols: &HashMap<String, SymbolRecord>,
-) -> Vec<String> {
-    refs.iter()
-        .filter(|name| {
-            symbols
-                .get(*name)
-                .is_some_and(|record| record.files.len() <= MAX_DEFINERS)
-                && !own_exports.contains(name)
-        })
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]

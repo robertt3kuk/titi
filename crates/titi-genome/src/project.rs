@@ -58,18 +58,16 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>, pending:
             out.push_str(" [RECENT]");
         }
         out.push('\n');
-        // `+Name (users)` — files that lean on that symbol, highest first.
-        // Unused exports are omitted, and at most four are shown.
-        let mut ranked_exports: Vec<(&String, usize)> = file
-            .exports
-            .iter()
-            .filter_map(|name| {
-                let users = genome.symbols.get(name).map_or(0, |s| s.users);
-                (users > 0).then_some((name, users))
-            })
-            .collect();
-        ranked_exports.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        for (name, users) in ranked_exports.into_iter().take(PROMPT_EXPORTS) {
+        // `+Name (users)` — distinct files whose uses of that name resolve to
+        // this file, highest first. Unused exports are not listed, and at most
+        // four are shown.
+        for (name, users) in genome
+            .used_by
+            .get(&file.path)
+            .into_iter()
+            .flatten()
+            .take(PROMPT_EXPORTS)
+        {
             out.push_str("  +");
             out.push_str(name);
             out.push_str(" (");

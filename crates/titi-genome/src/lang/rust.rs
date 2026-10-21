@@ -31,6 +31,27 @@ pub(crate) struct RustImport {
     pub is_mod: bool,
     /// The `#[path = "…"]` on a `mod x;`, which names the file directly.
     pub path_attr: Option<String>,
+    /// `pub use` / `pub mod`: the item is re-published to whoever imports
+    /// this file.
+    pub public: bool,
+    /// A path written inline in an expression or type (`crate::a::f()`), not
+    /// in a `use`. It is a dependency like an import, but a miss is not a
+    /// finding: `crate::Genome::index` is an item path, not a missing file.
+    pub quiet: bool,
+}
+
+impl RustImport {
+    /// `use super::*` and `use crate::*` bring in the target's private
+    /// imports too, because the importer is a descendant of the target.
+    fn inherits_scope(&self) -> bool {
+        let Some((last, path)) = self.segments.split_last() else {
+            return false;
+        };
+        !self.is_mod
+            && last == "*"
+            && (path.iter().all(|segment| segment == "super") && !path.is_empty()
+                || path == ["crate"])
+    }
 }
 
 /// Rust imports come from the syntax tree, not from a line regex. A `use` in a comment, in a string literal, or in the raw-string
@@ -53,25 +74,55 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
     collect_rust_imports(tree.root_node(), bytes, &mut mods, &mut rust_imports);
     let mut imports = Vec::new();
     let mut unresolved: Vec<UnresolvedImport> = Vec::new();
+    let mut reexports = Vec::new();
+    let mut inherits = Vec::new();
+    let mut external_uses = Vec::new();
+    // Names `use std::…::Name` binds: a mention of one is the standard
+    // library's, whatever else in the workspace is called `Name`.
+    let mut std_names: Vec<&str> = Vec::new();
     for item in &rust_imports {
         // A bare path is an external crate or a std path — `serde_json::json`,
-        // `std::collections::HashMap` — not a workspace lookup. Only the three
-        // crate/super/self prefixes name a file in this repo, exactly as
-        // before; a `mod x;` names a child of the module that declares it.
+        // `std::collections::HashMap` — not a workspace lookup for *this*
+        // file. Only the three crate/super/self prefixes name a file here,
+        // exactly as before; a `mod x;` names a child of the module that
+        // declares it. The first segment is kept as the name of a crate that
+        // may be one of the workspace's, which the index can tell.
         if !item.is_mod
             && !matches!(
                 item.segments.first().map(String::as_str),
                 Some("crate" | "self" | "super")
             )
         {
+            if let Some(root) = item.segments.first() {
+                if matches!(root.as_str(), "std" | "core" | "alloc") {
+                    if let Some(name) = item.segments.last() {
+                        std_names.push(name);
+                    }
+                } else {
+                    external_uses.push(root.clone());
+                }
+            }
             continue;
         }
         let candidates = rust_import_candidates(path, item, files);
-        if first_known(&candidates, files).as_deref() == Some(path) {
+        let resolved = first_known(&candidates, files);
+        if resolved.as_deref() == Some(path) {
             // `use super::*` inside an inline `mod` names the file's own
             // module. That is a self-edge, not a dependency, and reporting it
             // unresolved would claim a problem with a file that has none.
             continue;
+        }
+        if item.quiet {
+            imports.extend(resolved);
+            continue;
+        }
+        if let Some(target) = &resolved {
+            if item.public {
+                reexports.push(target.clone());
+            }
+            if item.inherits_scope() {
+                inherits.push(target.clone());
+            }
         }
         record(
             &item.segments.join("::"),
@@ -81,13 +132,24 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
             &mut unresolved,
         );
     }
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         rust_errors(&tree, source),
-    )
+    );
+    for list in [&mut reexports, &mut inherits, &mut external_uses] {
+        list.sort();
+        list.dedup();
+    }
+    parsed
+        .refs
+        .retain(|name| !std_names.contains(&name.as_str()));
+    parsed.reexports = reexports;
+    parsed.inherits = inherits;
+    parsed.external_uses = external_uses;
+    parsed
 }
 
 /// Tree-sitter `ERROR` nodes, with the pinned grammar's `&raw` token ambiguity
@@ -323,8 +385,34 @@ fn collect_rust_imports(
             }
             "use_declaration" => {
                 if let Some(argument) = child.child_by_field_name("argument") {
+                    let public = has_child_kind(child, "visibility_modifier");
                     let mut prefix = Vec::new();
-                    flatten_use(argument, source, &mut prefix, mods, out);
+                    flatten_use(argument, source, &mut prefix, mods, public, out);
+                }
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                // An inline path; its own `path` child is the same chain, so
+                // it is read once, whole, and not walked into.
+                let mut segments = Vec::new();
+                push_path(child, source, &mut segments);
+                // A crate-relative path names a file of this crate; a
+                // lowercase root may name another crate of the workspace.
+                let relative = matches!(
+                    segments.first().map(String::as_str),
+                    Some("crate" | "self" | "super")
+                );
+                let named_root = segments
+                    .first()
+                    .is_some_and(|root| root.starts_with(|c: char| c.is_ascii_lowercase()));
+                if segments.len() > 1 && (relative || named_root) {
+                    out.push(RustImport {
+                        segments,
+                        mods: mods.clone(),
+                        is_mod: false,
+                        path_attr: None,
+                        public: false,
+                        quiet: true,
+                    });
                 }
             }
             "mod_item" => {
@@ -343,6 +431,8 @@ fn collect_rust_imports(
                         mods: mods.clone(),
                         is_mod: true,
                         path_attr: path_attr.take(),
+                        public: has_child_kind(child, "visibility_modifier"),
+                        quiet: false,
                     });
                 }
             }
@@ -369,13 +459,14 @@ fn flatten_use(
     source: &[u8],
     prefix: &mut Vec<String>,
     mods: &[String],
+    public: bool,
     out: &mut Vec<RustImport>,
 ) {
     match node.kind() {
         "use_list" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                flatten_use(child, source, prefix, mods, out);
+                flatten_use(child, source, prefix, mods, public, out);
             }
         }
         "scoped_use_list" => {
@@ -384,7 +475,7 @@ fn flatten_use(
                 push_path(path, source, prefix);
             }
             if let Some(list) = node.child_by_field_name("list") {
-                flatten_use(list, source, prefix, mods, out);
+                flatten_use(list, source, prefix, mods, public, out);
             }
             prefix.truncate(saved);
         }
@@ -392,7 +483,7 @@ fn flatten_use(
             // The alias renames the path for the caller; it does not change
             // which file the path names.
             if let Some(path) = node.child_by_field_name("path") {
-                flatten_use(path, source, prefix, mods, out);
+                flatten_use(path, source, prefix, mods, public, out);
             }
         }
         "use_wildcard" => {
@@ -407,6 +498,8 @@ fn flatten_use(
                 mods: mods.to_vec(),
                 is_mod: false,
                 path_attr: None,
+                public,
+                quiet: false,
             });
             prefix.truncate(saved);
         }
@@ -418,6 +511,8 @@ fn flatten_use(
                 mods: mods.to_vec(),
                 is_mod: false,
                 path_attr: None,
+                public,
+                quiet: false,
             });
             prefix.truncate(saved);
         }
@@ -426,7 +521,7 @@ fn flatten_use(
 
 /// Appends the segments of one path node (`crate`, `super`, `self`, `a::b`).
 fn push_path(node: Node, source: &[u8], prefix: &mut Vec<String>) {
-    if node.kind() == "scoped_identifier" {
+    if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
         if let Some(path) = node.child_by_field_name("path") {
             push_path(path, source, prefix);
         }
@@ -471,10 +566,14 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<crate::E
                 }
             }
             "mod_item" => {
-                if public {
+                let body = child.child_by_field_name("body");
+                // `pub mod x;` only points at the file that defines `x`, which
+                // is the definition: exporting the name from the declaring
+                // file would make every `x::` path a use of `lib.rs`.
+                if public && body.is_some() {
                     push_field(child, source, out);
                 }
-                if let Some(body) = child.child_by_field_name("body") {
+                if let Some(body) = body {
                     rust_items(body, source, false, out);
                 }
             }

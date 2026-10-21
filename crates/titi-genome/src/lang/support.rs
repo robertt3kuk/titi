@@ -63,6 +63,7 @@ pub(crate) fn finish(
         unresolved_candidates: unresolved,
         refs,
         syntax_errors,
+        ..ParsedFile::default()
     }
 }
 

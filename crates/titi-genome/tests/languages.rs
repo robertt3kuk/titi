@@ -184,10 +184,10 @@ fn a_mention_without_an_import_is_still_a_symbol_edge() {
     );
     assert!(
         genome.files["src/consumer.rs"]
-            .used_symbols
+            .used_symbols()
             .contains(&"digest".to_owned()),
         "used_symbols: {:?}",
-        genome.files["src/consumer.rs"].used_symbols
+        genome.files["src/consumer.rs"].used_symbols()
     );
     // The symbol-level edge still makes consumer depend on hash.
     assert_eq!(
@@ -221,7 +221,7 @@ pub fn caller() {
     );
 
     let genome = Genome::index(root).unwrap();
-    let used = &genome.files["src/lib.rs"].used_symbols;
+    let used = &genome.files["src/lib.rs"].used_symbols();
     for noise in ["for", "let", "new", "iter", "println", "exported"] {
         assert!(
             !used.contains(&noise.to_owned()),
@@ -273,20 +273,28 @@ fn the_prompt_map_omits_unused_exports_and_caps_symbols() {
     write(
         root,
         "src/a.rs",
-        "pub fn a() { alpha(); beta(); gamma(); delta(); epsilon(); }\n",
+        "use crate::hub::*;\npub fn a() { alpha(); beta(); gamma(); delta(); epsilon(); }\n",
     );
     write(
         root,
         "src/b.rs",
-        "pub fn b() { alpha(); beta(); gamma(); delta(); }\n",
+        "use crate::hub::*;\npub fn b() { alpha(); beta(); gamma(); delta(); }\n",
     );
     write(
         root,
         "src/c.rs",
-        "pub fn c() { alpha(); beta(); gamma(); }\n",
+        "use crate::hub::*;\npub fn c() { alpha(); beta(); gamma(); }\n",
     );
-    write(root, "src/d.rs", "pub fn d() { alpha(); beta(); }\n");
-    write(root, "src/e.rs", "pub fn e() { alpha(); }\n");
+    write(
+        root,
+        "src/d.rs",
+        "use crate::hub::*;\npub fn d() { alpha(); beta(); }\n",
+    );
+    write(
+        root,
+        "src/e.rs",
+        "use crate::hub::*;\npub fn e() { alpha(); }\n",
+    );
 
     let genome = Genome::index(root).unwrap();
     let projected = genome.project(8);
@@ -326,7 +334,7 @@ fn an_ambiguous_name_carries_no_edges() {
         "an ambiguous name must not create a dependent"
     );
     assert_eq!(genome.dependents["src/b.rs"], 0);
-    assert!(genome.files["src/c.rs"].used_symbols.is_empty());
+    assert!(genome.files["src/c.rs"].used_symbols().is_empty());
     assert_eq!(genome.symbols["shared"].files.len(), 2, "both are recorded");
     assert_eq!(genome.symbols["shared"].users, 0, "but neither has users");
 }
@@ -398,10 +406,10 @@ fn nested_declarations_become_symbols_and_quoted_ones_do_not() {
     );
     assert!(
         !genome.files["app/caller.py"]
-            .used_symbols
+            .used_symbols()
             .contains(&"reconcile_ledger".to_owned()),
         "a method call is not a use: {:?}",
-        genome.files["app/caller.py"].used_symbols
+        genome.files["app/caller.py"].used_symbols()
     );
     assert_eq!(genome.symbols["reconcile_ledger"].users, 1);
     assert_eq!(genome.symbols["dispatchEnvelope"].users, 1);
@@ -466,10 +474,10 @@ fn method_calls_and_std_paths_are_not_uses_of_join() {
     );
     assert!(
         !genome.files["src/caller.rs"]
-            .used_symbols
+            .used_symbols()
             .contains(&"join".to_owned()),
         "used_symbols: {:?}",
-        genome.files["src/caller.rs"].used_symbols
+        genome.files["src/caller.rs"].used_symbols()
     );
     assert_eq!(
         genome.dependents["src/hub.rs"], 0,
@@ -485,17 +493,17 @@ fn a_module_qualified_call_is_still_a_symbol_use() {
     write(
         root,
         "src/caller.rs",
-        "pub fn run() { let _ = hub::join(); }\n",
+        "use crate::hub;\npub fn run() { let _ = hub::join(); }\n",
     );
 
     let genome = Genome::index(root).unwrap();
     assert_eq!(genome.symbols["join"].users, 1);
     assert!(
         genome.files["src/caller.rs"]
-            .used_symbols
+            .used_symbols()
             .contains(&"join".to_owned()),
         "used_symbols: {:?}",
-        genome.files["src/caller.rs"].used_symbols
+        genome.files["src/caller.rs"].used_symbols()
     );
     assert_eq!(genome.dependents["src/hub.rs"], 1);
 }
@@ -515,10 +523,10 @@ fn a_unique_type_mention_still_counts() {
     assert_eq!(genome.symbols["FallbackChain"].users, 1);
     assert!(
         genome.files["src/caller.rs"]
-            .used_symbols
+            .used_symbols()
             .contains(&"FallbackChain".to_owned()),
         "used_symbols: {:?}",
-        genome.files["src/caller.rs"].used_symbols
+        genome.files["src/caller.rs"].used_symbols()
     );
     assert_eq!(genome.dependents["src/fallback.rs"], 1);
 }

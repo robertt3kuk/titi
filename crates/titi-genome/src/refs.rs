@@ -224,7 +224,7 @@ const UBIQUITOUS: &[&str] = &[
 /// list. The names here are the std modules and types that are not themselves
 /// ubiquitous symbols, but must not qualify a project export either.
 const STD_QUALIFIERS: &[&str] = &[
-    "OsStr", "OsString", "char", "iter", "slice", "str", "thread",
+    "OsStr", "OsString", "alloc", "char", "core", "iter", "slice", "std", "str", "thread",
 ];
 
 fn is_std_qualifier(name: &str) -> bool {
@@ -286,7 +286,15 @@ pub(crate) fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
         let Some(matched) = cap.get(1) else {
             continue;
         };
-        if qualifier_before(source, matched.start()).is_some_and(is_std_qualifier) {
+        if qualifier_before(source, matched.start()).is_some_and(is_std_qualifier)
+            || rooted_in_std(source, matched.start())
+        {
+            continue;
+        }
+        // `tokio::sync`, `mem::take`: a path ending in a word every project
+        // uses names that word's own module as often as it names a project
+        // file, and the text cannot say which.
+        if crate::scope::is_common(matched.as_str()) {
             continue;
         }
         if record_ref(matched.as_str(), &own, &mut seen, &mut out) {
@@ -297,6 +305,10 @@ pub(crate) fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
         let Some(matched) = cap.get(1) else {
             continue;
         };
+        // `std::process::Command` is not a use of a project's `Command`.
+        if rooted_in_std(source, matched.start()) {
+            continue;
+        }
         if record_ref(matched.as_str(), &own, &mut seen, &mut out) {
             return out;
         }
@@ -340,8 +352,27 @@ fn preceded_by_path_sep(source: &str, name_start: usize) -> bool {
     i >= 2 && source.as_bytes()[i - 2] == b':' && source.as_bytes()[i - 1] == b':'
 }
 
+/// Whether the path the name ends starts at `std`, `core` or `alloc`:
+/// `std::process::Command`, however many modules lie between.
+fn rooted_in_std(source: &str, name_start: usize) -> bool {
+    let mut at = name_start;
+    while let Some((start, end)) = qualifier_span(source, at) {
+        if matches!(&source[start..end], "std" | "core" | "alloc") {
+            return true;
+        }
+        at = start;
+    }
+    false
+}
+
 /// Identifier immediately before `::name`, if the match is path-qualified.
 fn qualifier_before(source: &str, name_start: usize) -> Option<&str> {
+    let (start, end) = qualifier_span(source, name_start)?;
+    source.get(start..end)
+}
+
+/// Byte range of the identifier immediately before `::name`.
+fn qualifier_span(source: &str, name_start: usize) -> Option<(usize, usize)> {
     let bytes = source.as_bytes();
     let mut i = skip_ascii_ws_before(source, name_start);
     if i < 2 || bytes[i - 2] != b':' || bytes[i - 1] != b':' {
@@ -352,7 +383,7 @@ fn qualifier_before(source: &str, name_start: usize) -> Option<&str> {
     while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
         i -= 1;
     }
-    if i == end { None } else { source.get(i..end) }
+    (i != end).then_some((i, end))
 }
 
 #[cfg(test)]

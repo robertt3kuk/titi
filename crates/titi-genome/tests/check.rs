@@ -221,8 +221,7 @@ fn qualified_join_resolves_and_method_join_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let hub = "pub fn join() {}\n";
-    let caller =
-        "pub fn run(path: &Path) {\n    let _ = hub::join();\n    let _ = path.join(\"x\");\n}\n";
+    let caller = "use crate::hub;\npub fn run(path: &Path) {\n    let _ = hub::join();\n    let _ = path.join(\"x\");\n}\n";
     write(root, "src/hub.rs", hub);
     write(root, "src/caller.rs", caller);
 

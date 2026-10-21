@@ -52,6 +52,18 @@ pub struct ParsedFile {
     /// keywords. Resolved against the repo's exports to become the
     /// symbol-level half of the graph.
     pub refs: Vec<String>,
+    /// The subset of [`Self::imports`] this file re-publishes: Rust's `pub use`
+    /// and `pub mod x;`, TypeScript's `export … from`, a Python package's own
+    /// `__init__.py` imports. A name defined behind one of these is reachable
+    /// through this file.
+    pub reexports: Vec<String>,
+    /// Files whose scope this file's extends: Rust's `use super::*` and
+    /// `use crate::*`, which also bring in what the target itself imports.
+    pub inherits: Vec<String>,
+    /// First segments of paths that name another crate (`titi_providers` in
+    /// `use titi_providers::StreamEvent`). Rust only; the index maps them to
+    /// the crate's `lib.rs` once it knows which files exist.
+    pub external_uses: Vec<String>,
     /// Tree-sitter `ERROR` nodes, or 1 if a grammar language refused to parse.
     /// Languages without a grammar stay 0.
     pub syntax_errors: u32,

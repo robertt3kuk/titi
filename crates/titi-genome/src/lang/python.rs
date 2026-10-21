@@ -63,13 +63,18 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
             import_module(&spec, files, &mut imports, &mut unresolved);
         }
     }
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    // A package's `__init__.py` imports its submodules to publish them.
+    if path.rsplit('/').next() == Some("__init__.py") {
+        parsed.reexports = parsed.imports.clone();
+    }
+    parsed
 }
 
 /// A `from … import …` clause. The module path names a file when it can; when

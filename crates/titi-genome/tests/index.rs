@@ -76,11 +76,16 @@ pub fn hash() {}
     assert!(!genome.files.contains_key("src/scratch.txt"));
     assert!(!genome.files.keys().any(|path| path.starts_with("target/")));
 
+    // `pub mod auth;` points at the file that defines `auth`, and
+    // `pub use auth::Session;` re-publishes a definition: neither is one.
     assert!(
-        genome.files["src/lib.rs"]
-            .exports
-            .iter()
-            .any(|name| name == "Session" || name == "auth" || name == "util")
+        genome.files["src/lib.rs"].exports.is_empty(),
+        "{:?}",
+        genome.files["src/lib.rs"].exports
+    );
+    assert_eq!(
+        genome.files["src/lib.rs"].reexports,
+        vec!["src/auth.rs".to_owned(), "src/util.rs".to_owned()]
     );
     assert!(
         genome.files["src/auth.rs"]
@@ -589,7 +594,11 @@ fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "src/hub.rs", "pub fn hub() {}\n");
-    write(root, "src/leaf.rs", "pub fn leaf() { hub(); }\n");
+    write(
+        root,
+        "src/leaf.rs",
+        "use crate::hub::hub;\npub fn leaf() { hub(); }\n",
+    );
     // The hub is not what this test edits; a just-written file would be read
     // on its own account and counted, so age it into a settled one.
     settle(root, "src/hub.rs");
@@ -605,7 +614,7 @@ fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
     write(
         root,
         "src/leaf.rs",
-        "// a comment\npub fn leaf() { hub(); }\n",
+        "// a comment\nuse crate::hub::hub;\npub fn leaf() { hub(); }\n",
     );
     let stats = genome.refresh(root).unwrap();
 
@@ -618,7 +627,7 @@ fn a_body_only_edit_leaves_the_ranking_maps_untouched() {
     assert_eq!(genome.ranks["src/hub.rs"], 123.5, "ranks untouched");
     assert_eq!(genome.dependents["src/leaf.rs"], 9, "dependents untouched");
     assert_eq!(
-        genome.files["src/leaf.rs"].used_symbols,
+        genome.files["src/leaf.rs"].used_symbols(),
         vec!["hub".to_owned()],
         "the record still carries its resolved uses"
     );
@@ -820,11 +829,11 @@ fn an_export_change_reresolves_only_the_files_that_mention_the_name() {
     assert_eq!(genome.files.len(), 4);
     assert!(
         genome.files["src/user.rs"]
-            .used_symbols
+            .used_symbols()
             .contains(&"alpha".to_owned())
     );
     assert!(
-        genome.files["src/other.rs"].used_symbols.is_empty(),
+        genome.files["src/other.rs"].used_symbols().is_empty(),
         "nothing exports `fresh_export` yet"
     );
     assert_eq!(
@@ -850,10 +859,10 @@ fn an_export_change_reresolves_only_the_files_that_mention_the_name() {
     );
 
     assert_eq!(
-        genome.files["src/other.rs"].used_symbols,
+        genome.files["src/other.rs"].used_symbols(),
         vec!["fresh_export".to_owned()]
     );
-    assert!(genome.files["src/quiet.rs"].used_symbols.is_empty());
+    assert!(genome.files["src/quiet.rs"].used_symbols().is_empty());
     assert_eq!(
         genome.symbols["fresh_export"].files,
         vec!["src/lib.rs".to_owned()]

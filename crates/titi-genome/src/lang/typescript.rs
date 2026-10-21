@@ -22,7 +22,8 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, internal, mask_comments, record, resolve_relative, resolve_suffix,
+    Comments, Placement, finish, first_known, internal, mask_comments, record, resolve_relative,
+    resolve_suffix,
 };
 use crate::patterns::literal_regex;
 
@@ -37,6 +38,13 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         LazyLock::new(|| literal_regex(r#"(?m)(?:^|\s)(?:from|import)\s+['"]([^'"]+)['"]"#));
     static CALL: LazyLock<Regex> =
         LazyLock::new(|| literal_regex(r#"\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]"#));
+    // `export * from './x'` and `export { a, b as c } from './x'`: the file
+    // re-publishes what `./x` defines, which is how a barrel works.
+    static REEXPORT: LazyLock<Regex> = LazyLock::new(|| {
+        literal_regex(
+            r#"\bexport\s+(?:type\s+)?(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]"#,
+        )
+    });
     let Some(grammar) = super::grammar_for(path) else {
         return ParsedFile::default();
     };
@@ -63,13 +71,26 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
             );
         }
     }
-    finish(
+    let mut reexports = Vec::new();
+    for cap in REEXPORT.captures_iter(&masked) {
+        let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if let Placement::Candidates(candidates) | Placement::Optional(candidates) =
+            placement(path, spec)
+        {
+            reexports.extend(first_known(&candidates, files));
+        }
+    }
+    reexports.sort();
+    reexports.dedup();
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.reexports = reexports;
+    parsed
 }
 
 /// A relative specifier is resolved against the importing file and a miss is a

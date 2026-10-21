@@ -25,28 +25,52 @@ and renders `EngineEvent`; everything else sits under `titi-engine`.
 
 ## Genome: a ranked map instead of blind search
 
-Code: `crates/titi-genome/src/{lib,scan,graph,project,refs,symbols}.rs`,
+Code: `crates/titi-genome/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
 `crates/titi-genome/src/lang/{mod,support}.rs` and one module per language,
 example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
 
 ### What gets built
 
 `Genome` holds `files: HashMap<String, FileRecord>`, `ranks`, `dependents`,
-and `symbols: HashMap<String, SymbolRecord>`.
+`symbols: HashMap<String, SymbolRecord>` and `used_by`.
 
-- `FileRecord { path, language, exports, imports, used_symbols, size, mtime }`.
-- `SymbolRecord { files, users }`: who defines a symbol and how many distinct
-  files reference it.
-- **Two kinds of edges, one graph.** A file imports another file, or a file
-  references a symbol another file defines. Both feed the same ranking and
-  the same dependents count `(→N)`, so "what depends on this" is answered at
+- `FileRecord { path, language, exports, imports, reexports, inherits,
+  external_uses, uses, raw_refs, size, mtime, … }`. `uses` is the resolved
+  half of `raw_refs`: each entry names the one file it is a use of and why
+  (`Basis::Scope` or `Basis::Unique`).
+- `SymbolRecord { files, users }`: who defines a name and, summed over the
+  definers, how many distinct files use it. `used_by` is the per-definer
+  view the prompt map prints: definer path → `(export, distinct files whose
+  uses resolve to this file)`.
+- **Two kinds of edges, one graph.** A file imports another file, or a use in
+  it resolves to a definition in another. Both feed the same ranking and the
+  same dependents count `(→N)`, so "what depends on this" is answered at
   symbol level too.
+- **A use resolves to a definition only with evidence** (`scope.rs`). The
+  graph used to key edges by bare name, so any file exporting `sync` or `row`
+  collected every file that wrote the word. Now a use of `N` in `F` links to
+  definer `D` when `D` is in `F`'s scope: reached through `F`'s resolved
+  imports; behind a re-export of one (`pub use`, `pub mod x;`, a TypeScript
+  barrel's `export … from`, a Python `__init__.py`); the `lib.rs` of a
+  workspace crate `F` names (`use titi_providers::X`); an ancestor's imports
+  through `use super::*`; or, for Go, Java, Kotlin and C#, the same package
+  directory. Python, TypeScript, JavaScript, PHP, Ruby, Swift and C reach only
+  through imports and includes. Two definers in scope, or several and none in
+  scope, resolve to nothing. A name exactly one file of the same language
+  defines may still link without evidence, as a `Unique` guess, if it is at
+  least 5 characters and not in the common-word list (`scope::COMMON`: `sync`,
+  `model`, `row`, `table`, …). A common word links only to a file `F` imports
+  itself, and a path ending in one (`tokio::sync`) is not collected at all.
+  `use std::…::Name` and a `std::…::Name` path are the standard library's, never
+  a project's.
 - **Ranking is PageRank** (`graph.rs`): `DAMPING = 0.85`, `ITERATIONS = 20`,
   start at `1.0 / n` per node.
-- **Ambiguous names get no edges.** `MAX_DEFINERS = 1`: a name exported by
-  more than one file gets neither edges nor a user count. Otherwise `new`,
-  `len`, `is_empty` would make every file depend on every other. Resolution
-  is by name only, so ambiguity is excluded rather than guessed.
+- **`(→N)` counts distinct files with an edge to this one**, and `+Name (n)`
+  counts distinct files whose uses of `Name` resolve to *this* file. Two files
+  defining `Shared` are counted separately.
+- **`MAX_DEFINERS = 1` is no longer an edge rule.** It still decides what
+  `titi genome check` calls an ambiguous symbol and whether goto-definition
+  has one answer.
 - **References come from use sites.** `collect_refs` takes calls (`name(`),
   path-qualified names (`::name`), and capitalised identifiers (types and
   constructors). Bare lowercase identifiers are skipped on purpose: a local
@@ -307,7 +331,7 @@ clone carries no one's chat history or credentials.
 
 ## Sources
 
-- `crates/titi-genome/src/{lib,scan,graph,project,refs,symbols}.rs`,
+- `crates/titi-genome/src/{lib,scan,graph,project,refs,scope,recency,symbols}.rs`,
   `crates/titi-genome/src/lang/*.rs`, `examples/map.rs`
 - `crates/titi-tools/src/{lib,fs,cache}.rs`
 - `crates/titi-engine/src/{runtime,tool_loop,tool_agent,protocol}.rs`

@@ -168,7 +168,7 @@ impl Genome {
         let mut users: Vec<&String> = self
             .files
             .iter()
-            .filter(|(_, record)| record.used_symbols.iter().any(|used| used == &name))
+            .filter(|(_, record)| record.uses.iter().any(|used| used.name == name))
             .map(|(user, _)| user)
             .collect();
         users.sort();
