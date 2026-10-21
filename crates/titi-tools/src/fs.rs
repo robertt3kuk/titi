@@ -349,18 +349,23 @@ fn line_window(
     Ok(format!("[lines {offset}-{end} of {total}]\n{body}"))
 }
 
+/// The version-control directories a read's listing leaves out.
+const VCS_DIRS: [&str; 3] = [".git", ".hg", ".svn"];
+
 /// A directory as a read shows it: its entries by name, a directory marked
 /// with `/`, capped like a glob answer.
 fn listing(dir: &Path) -> Result<String, String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map_err(|error| error.to_string())?
         .flatten()
-        .map(|entry| {
+        .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                format!("{name}/")
+                // Version control's own directories are not workspace
+                // content, the way glob and grep do not walk `.git`.
+                (!VCS_DIRS.contains(&name.as_str())).then(|| format!("{name}/"))
             } else {
-                name
+                Some(name)
             }
         })
         .collect();
@@ -2820,6 +2825,28 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("8 bytes"), "{}", result.output);
+    }
+
+    /// A directory listing leaves out the version-control directories — noise
+    /// to a model that wants the workspace — and nothing else that merely
+    /// starts like one.
+    #[tokio::test]
+    async fn a_directory_listing_leaves_out_vcs_directories_only() {
+        let read = reader(&[
+            ("app/.git/config", b"c".to_vec()),
+            ("app/.hg/store", b"h".to_vec()),
+            ("app/.svn/entries", b"s".to_vec()),
+            ("app/.github/ci.yml", b"y".to_vec()),
+            ("app/.gitignore", b"target\n".to_vec()),
+            ("app/src/main.rs", b"m".to_vec()),
+            ("bare/.git/config", b"c".to_vec()),
+        ]);
+        let result = read.invoke(serde_json::json!({"path": "app"})).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, ".github/\n.gitignore\nsrc/\n");
+
+        let result = read.invoke(serde_json::json!({"path": "bare"})).await;
+        assert_eq!(result.output, "empty directory");
     }
 
     /// A range is those lines and nothing else, under one header that says

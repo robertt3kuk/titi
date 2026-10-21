@@ -21,6 +21,7 @@
 //! never folds: the point of the fold is to say "and more of the same", and
 //! those are the rows that are not.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::style::{Modifier, Style};
@@ -197,6 +198,15 @@ pub(crate) fn result_summary(
         return first();
     }
     match tool {
+        // A directory's listing is one entry per line, `… N more entries`
+        // standing for the ones past the cap. The target is how a surface
+        // knows it was a directory: the listing itself carries no marker.
+        "read" if Path::new(target).is_dir() => {
+            if output.trim() == "empty directory" {
+                return counted(0, "entry", "entries");
+            }
+            counted(listed(output, "more entries"), "entry", "entries")
+        }
         "read" => {
             let body = match output.strip_prefix("[lines ") {
                 Some(rest) => rest.split_once('\n').map_or("", |(_, body)| body),
@@ -836,6 +846,39 @@ mod tests {
         assert_eq!(
             sum("read", false, "src/x.rs is outside the workspace", None),
             "src/x.rs is outside the workspace"
+        );
+    }
+
+    /// A directory's listing is one entry per line, so what it reports is
+    /// entries, not lines of a file.
+    #[test]
+    fn a_directory_read_counts_entries() {
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let sum = |out: &str| result_summary("read", &dir, true, out, None);
+        assert_eq!(
+            sum("src/
+README.md
+Cargo.toml
+long.txt
+"),
+            "4 entries"
+        );
+        assert_eq!(
+            sum("src/
+"),
+            "1 entry"
+        );
+        assert_eq!(
+            sum("a
+… 7 more entries
+"),
+            "8 entries"
+        );
+        assert_eq!(sum("empty directory"), "0 entries");
+        // A file path is still lines.
+        assert_eq!(
+            result_summary("read", "README.md", true, "a\nb\n", None),
+            "2 lines"
         );
     }
 
