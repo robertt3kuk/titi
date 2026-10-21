@@ -62,7 +62,11 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
 fn kotlin_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        // An `actual` implements an `expect` declared elsewhere, which is the
+        // definition: exporting both would make one symbol two definers.
+        let actual = is_actual(child, source);
         match child.kind() {
+            _ if actual => {}
             "class_declaration" | "object_declaration" | "function_declaration" => {
                 push_field(child, source, out);
             }
@@ -84,6 +88,20 @@ fn kotlin_items(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
             kotlin_items(child, source, out);
         }
     }
+}
+
+/// Whether a declaration carries the multiplatform `actual` modifier.
+fn is_actual(node: Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+        .is_some_and(|modifiers| {
+            let mut inner = modifiers.walk();
+            modifiers.named_children(&mut inner).any(|modifier| {
+                modifier.kind() == "platform_modifier"
+                    && text(modifier, source).as_deref() == Some("actual")
+            })
+        })
 }
 
 /// The name of a `val`/`var`, which the grammar keeps on the declaration's
@@ -146,5 +164,34 @@ fn kotlin_imports(
             Placement::Optional(candidates)
         };
         record(&spec, placement, files, imports, unresolved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::lang::test_support::exports;
+
+    fn names(path: &str, source: &str) -> Vec<String> {
+        exports(path, source).unwrap_or_else(|| panic!("{path} parses"))
+    }
+
+    #[test]
+    fn expect_is_the_definition_and_actual_is_not_exported() {
+        let common = names(
+            "okio/src/commonMain/kotlin/okio/Buffer.kt",
+            "expect class Buffer {\n    fun size(): Long\n}\nexpect fun helper()\n",
+        );
+        assert!(common.contains(&"Buffer".to_owned()), "{common:?}");
+        assert!(common.contains(&"helper".to_owned()), "{common:?}");
+        let jvm = names(
+            "okio/src/jvmMain/kotlin/okio/Buffer.kt",
+            "actual class Buffer {\n    actual fun size(): Long = 0\n    fun jvmOnly() {}\n}\nactual fun helper() {}\nactual typealias IOException = java.io.IOException\ninternal actual val flag: Int = 1\nfun plain() {}\n",
+        );
+        for bad in ["Buffer", "size", "helper", "IOException", "flag"] {
+            assert!(!jvm.contains(&bad.to_owned()), "{bad}: {jvm:?}");
+        }
+        for good in ["jvmOnly", "plain"] {
+            assert!(jvm.contains(&good.to_owned()), "{good}: {jvm:?}");
+        }
     }
 }
