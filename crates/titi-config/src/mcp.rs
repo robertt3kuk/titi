@@ -34,6 +34,11 @@ pub const PROJECT_FILES: [&str; 2] = [".titi/mcp.json", ".mcp.json"];
 /// `timeout`. The same bound applies to the start-up handshake.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// The longest a `timeout` may ask for. The same bound applies to the
+/// start-up handshake and to every call, so a definition cannot stretch them
+/// to a day.
+pub const MAX_TIMEOUT_SECS: u64 = 300;
+
 /// Longest server name kept. The model-facing tool name is
 /// `mcp__<server>__<tool>` and providers cap a tool name at 64 characters,
 /// so the server's share of it is bounded here and the tool's after.
@@ -91,9 +96,18 @@ pub struct McpServerDef {
 }
 
 impl McpServerDef {
+    /// The bound on a request, in seconds: what the entry asked for, at most
+    /// [`MAX_TIMEOUT_SECS`].
+    pub fn timeout(&self) -> u64 {
+        self.timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .min(MAX_TIMEOUT_SECS)
+    }
+
     /// What the definition says that decides what runs, and only that: the
-    /// input of its hash. The timeout, `disabled` and the file it came from
-    /// change nothing about the code that starts. The environment is hashed
+    /// input of its hash. `disabled` and the file it came from change nothing
+    /// about the code that starts; the timeout is part of it, because it
+    /// decides how long a start-up and every call may stall the session. The environment is hashed
     /// by value as well as by key: `NODE_OPTIONS`, `PATH` and `LD_PRELOAD`
     /// are all one edit away from running something else.
     pub fn definition(&self) -> Value {
@@ -103,6 +117,7 @@ impl McpServerDef {
             "args": self.args,
             "env": self.env,
             "cwd": self.cwd.as_deref().unwrap_or(""),
+            "timeout": self.timeout(),
         })
     }
 
@@ -322,7 +337,8 @@ pub fn parse(text: &str, source: &str) -> Result<(Vec<McpServerDef>, Vec<String>
             timeout_secs: entry
                 .get("timeout")
                 .and_then(Value::as_u64)
-                .filter(|secs| *secs > 0),
+                .filter(|secs| *secs > 0)
+                .map(|secs| secs.min(MAX_TIMEOUT_SECS)),
             approval: None,
             source: source.to_owned(),
         });
@@ -457,7 +473,6 @@ mod tests {
         let base = def("npx", &["-y", "x"]);
         let mut same = base.clone();
         same.source = "other file".to_owned();
-        same.timeout_secs = Some(5);
         same.disabled = true;
         assert_eq!(base.hash(repo.path()), same.hash(repo.path()));
 
@@ -479,6 +494,10 @@ mod tests {
                 ..base.clone()
             },
             McpServerDef {
+                timeout_secs: Some(5),
+                ..base.clone()
+            },
+            McpServerDef {
                 env: BTreeMap::from([("NODE_OPTIONS".to_owned(), "--require ./x".to_owned())]),
                 ..base.clone()
             },
@@ -491,6 +510,27 @@ mod tests {
         let mut two = base.clone();
         two.env.insert("A".to_owned(), "2".to_owned());
         assert_ne!(one.hash(repo.path()), two.hash(repo.path()));
+    }
+
+    #[test]
+    fn the_timeout_is_capped_and_is_part_of_what_is_approved() {
+        let repo = tempfile::tempdir().unwrap();
+        let (defs, _) = parse(
+            r#"{"mcpServers": {"a": {"command": "x", "timeout": 86400}, "b": {"command": "x"}}}"#,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(defs[0].timeout_secs, Some(MAX_TIMEOUT_SECS));
+        assert_eq!(defs[0].timeout(), MAX_TIMEOUT_SECS);
+        assert_eq!(defs[1].timeout(), DEFAULT_TIMEOUT_SECS);
+        // A definition that did not come through `parse` is bounded too.
+        let mut raw = def("x", &[]);
+        raw.timeout_secs = Some(999_999);
+        assert_eq!(raw.timeout(), MAX_TIMEOUT_SECS);
+        // Raising the timeout after approval asks again.
+        let mut raised = def("x", &[]);
+        raised.timeout_secs = Some(120);
+        assert_ne!(def("x", &[]).hash(repo.path()), raised.hash(repo.path()));
     }
 
     #[test]

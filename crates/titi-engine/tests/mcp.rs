@@ -247,6 +247,64 @@ async fn a_server_that_is_still_starting_after_the_wait_does_not_hold_the_turn_f
     );
 }
 
+async fn hung_server_engine(transport: &Arc<MockTransport>) -> Engine {
+    let engine = start(transport, ApprovalMode::Yolo);
+    let mut hung = server("hung", &[("FIXTURE_NEVER_ANSWER", "1")]);
+    hung.timeout_secs = Some(120);
+    set_mcp(&engine, vec![hung]).await;
+    engine
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_is_read_while_a_prompt_waits_for_a_starting_server() {
+    let transport = Arc::new(MockTransport::new(vec![say("hello")]));
+    let mut engine = hung_server_engine(&transport).await;
+    submit(&engine, "first").await;
+    // The prompt is held, not run, and not answered with a stall.
+    engine.send(EngineCommand::Cancel).await.unwrap();
+    let started = Instant::now();
+    let events = until(&mut engine, |event| {
+        matches!(event, EngineEvent::PromptReturned { .. })
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(events.last(), Some(EngineEvent::PromptReturned { text }) if text == "first"),
+        "{events:?}"
+    );
+    assert_eq!(transport.call_count(), 0, "the turn never ran");
+
+    // Only the first prompt waits: the next one runs at once, hung server or no.
+    let started = Instant::now();
+    submit(&engine, "second").await;
+    until(&mut engine, turn_end).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_is_read_while_a_prompt_waits_and_stops_the_servers() {
+    let transport = Arc::new(MockTransport::new(vec![]));
+    let mut engine = hung_server_engine(&transport).await;
+    submit(&engine, "first").await;
+    engine.send(EngineCommand::Shutdown).await.unwrap();
+    let started = Instant::now();
+    while engine.recv().await.is_some() {}
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(transport.call_count(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_model_is_offered_the_tool_and_a_call_round_trips_under_yolo() {
     let transport = Arc::new(MockTransport::new(vec![

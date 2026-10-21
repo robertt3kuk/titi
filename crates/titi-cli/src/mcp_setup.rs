@@ -281,10 +281,17 @@ mod tests {
         // Edits that do not change what runs keep the consent.
         std::fs::write(
             s.repo.path().join(".mcp.json"),
-            r#"{"mcpServers": {"theirs": {"timeout": 5, "args": ["--x"], "command": "./bin/srv"}}}"#,
+            r#"{"mcpServers": {"theirs": {"disabled": false, "args": ["--x"], "command": "./bin/srv"}}}"#,
         )
         .unwrap();
         assert!(resolve(&s, false).pending.is_empty());
+        // The timeout bounds every start-up and call, so raising it asks again.
+        std::fs::write(
+            s.repo.path().join(".mcp.json"),
+            r#"{"mcpServers": {"theirs": {"timeout": 250, "args": ["--x"], "command": "./bin/srv"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve(&s, false).pending.len(), 1);
     }
 
     #[test]

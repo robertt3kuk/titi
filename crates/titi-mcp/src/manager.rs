@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use titi_config::mcp::{DEFAULT_TIMEOUT_SECS, McpApproval, McpServerDef};
+use titi_config::mcp::{McpApproval, McpServerDef};
 use titi_providers::ToolSpec;
 use titi_tools::{ApprovalTier, ToolHandler};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -393,7 +393,7 @@ fn launch_for(def: &McpServerDef, config: &ManagerConfig) -> Launch {
         env,
         cwd,
         stderr_log: Some(log_path(&config.agent_dir, &def.name)),
-        timeout: Duration::from_secs(def.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        timeout: Duration::from_secs(def.timeout()),
     }
 }
 

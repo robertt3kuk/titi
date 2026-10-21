@@ -312,9 +312,10 @@ fn server_lines(
         sanitize(&def.name)
     )];
     lines.push(format!(
-        "     {} · #{}",
+        "     {} · #{} · timeout {}s",
         sanitize(&def.source),
-        &def.hash(workspace)[..8]
+        &def.hash(workspace)[..8],
+        def.timeout()
     ));
     let command = sanitize_keep_newlines(&def.command_line());
     for (row, text) in wrap_plain(&command, room.saturating_sub(7).max(8))
@@ -789,6 +790,7 @@ mod tests {
         assert!(all.contains("env  TOKEN_FILE=./t[2Jxt"), "{all}");
         assert!(!all.contains('\u{1b}'), "control characters are stripped");
         assert!(all.contains("cwd  tools"), "{all}");
+        assert!(all.contains("timeout 60s"), "{all}");
         assert!(all.contains(".mcp.json") && all.contains(" · #"), "{all}");
     }
 

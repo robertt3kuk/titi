@@ -1398,6 +1398,10 @@ impl EngineRuntime {
         let (done_tx, mut done_rx) = mpsc::channel::<TurnDone>(8);
         let mut active: Option<(TurnId, Arc<AtomicBool>)> = None;
         let mut queued = VecDeque::<SmolStr>::new();
+        // While MCP servers a prompt is waiting for are still starting: when
+        // the wait ends. Prompts queue behind it like behind a running turn,
+        // and every other command is still read.
+        let mut mcp_hold: Option<tokio::time::Instant> = None;
         let mut primary_model = self.config.primary_model.clone();
 
         // A session started with `--mode plan|duck` has a badge to fill in:
@@ -1433,10 +1437,15 @@ impl EngineRuntime {
                                 // Nothing is queued: the prompt would only
                                 // wait for a cap that nothing lifts on its own.
                                 let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
-                            } else if active.is_some() {
+                            } else if active.is_some() || mcp_hold.is_some() {
+                                queued.push_back(text);
+                            } else if self.mcp.take_wait() {
+                                // The first prompt after servers were handed
+                                // over (a one-shot submits at once) gives
+                                // them a moment, so its turn has their tools.
+                                mcp_hold = Some(tokio::time::Instant::now() + crate::mcp::STARTUP_WAIT);
                                 queued.push_back(text);
                             } else {
-                                self.await_mcp_startup().await;
                                 let text = self.expand_skills(text).await;
                                 let system = self.system_prompt().await;
                                 active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
@@ -1476,6 +1485,7 @@ impl EngineRuntime {
                             // queue would sit there and fire at some later turn's
                             // end, answering a question the user walked away from.
                             // The text goes back to the surface instead.
+                            mcp_hold = None;
                             for text in queued.drain(..) {
                                 let _ = self.events.send(EngineEvent::PromptReturned { text }).await;
                             }
@@ -1792,7 +1802,20 @@ impl EngineRuntime {
                         }
                     }
                 }
-                Some(event) = self.mcp.rx.recv() => self.mcp_changed(event).await,
+                Some(event) = self.mcp.rx.recv() => {
+                    self.mcp_changed(event).await;
+                    if mcp_hold.is_some() && self.mcp.starting().is_empty() {
+                        mcp_hold = None;
+                        self.start_next(&mut queued, &mut active, &primary_model, &done_tx).await;
+                    }
+                }
+                _ = async { tokio::time::sleep_until(mcp_hold.unwrap_or_else(tokio::time::Instant::now)).await }, if mcp_hold.is_some() => {
+                    mcp_hold = None;
+                    let names = self.mcp.starting().join(", ");
+                    let message = format!("mcp: {names} still starting; its tools are not in this turn");
+                    let _ = self.events.send(EngineEvent::Notice { message: message.into() }).await;
+                    self.start_next(&mut queued, &mut active, &primary_model, &done_tx).await;
+                }
                 completed = done_rx.recv() => {
                     if let Some(completed) = completed
                         && active.as_ref().is_some_and(|(id, _)| *id == completed.turn_id)
@@ -2152,29 +2175,24 @@ impl EngineRuntime {
         }
     }
 
-    /// Before a turn: gives servers that are still starting a moment, so the
-    /// turn's tools include theirs. Servers that miss the deadline join a
-    /// later turn, and the surface is told which.
-    async fn await_mcp_startup(&mut self) {
-        let deadline = tokio::time::Instant::now() + crate::mcp::STARTUP_WAIT;
-        while !self.mcp.starting().is_empty() {
-            match tokio::time::timeout_at(deadline, self.mcp.rx.recv()).await {
-                Ok(Some(event)) => self.mcp_changed(event).await,
-                Ok(None) => break,
-                Err(_) => {
-                    let names = self.mcp.starting().join(", ");
-                    let message =
-                        format!("mcp: {names} still starting; its tools are not in this turn");
-                    let _ = self
-                        .events
-                        .send(EngineEvent::Notice {
-                            message: message.into(),
-                        })
-                        .await;
-                    break;
-                }
-            }
+    /// Starts the turn the oldest queued prompt asks for, if nothing is
+    /// running: what happens when a hold on MCP servers ends.
+    async fn start_next(
+        &mut self,
+        queued: &mut VecDeque<SmolStr>,
+        active: &mut Option<(TurnId, Arc<AtomicBool>)>,
+        primary_model: &SmolStr,
+        done_tx: &mpsc::Sender<TurnDone>,
+    ) {
+        if active.is_some() {
+            return;
         }
+        let Some(text) = queued.pop_front() else {
+            return;
+        };
+        let text = self.expand_skills(text).await;
+        let system = self.system_prompt().await;
+        *active = Some(self.spawn_turn(text, primary_model.clone(), system, done_tx.clone()));
     }
 
     async fn report_mcp(&self) {

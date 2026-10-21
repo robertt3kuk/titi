@@ -27,6 +27,9 @@ pub(crate) const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_s
 
 pub(crate) struct McpHost {
     manager: Option<McpManager>,
+    /// Servers were handed over and no prompt has yet had its moment to wait
+    /// for them.
+    wait_armed: bool,
     tx: UnboundedSender<McpEvent>,
     /// What the manager reports. A field, not a method, so the command loop
     /// can wait on it beside the command channel.
@@ -45,6 +48,7 @@ impl McpHost {
         let (tx, rx) = unbounded_channel();
         Self {
             manager: None,
+            wait_armed: false,
             tx,
             rx,
         }
@@ -57,6 +61,14 @@ impl McpHost {
             .manager
             .get_or_insert_with(|| McpManager::new(config, self.tx.clone()));
         manager.set_servers(servers);
+        self.wait_armed = true;
+    }
+
+    /// Whether the next prompt should wait for servers that are starting.
+    /// Only the first prompt after `set` does, and only when one is: later
+    /// prompts never stall on a server that is slow to come up.
+    pub(crate) fn take_wait(&mut self) -> bool {
+        std::mem::take(&mut self.wait_armed) && !self.starting().is_empty()
     }
 
     /// `false` when no server has that name.
