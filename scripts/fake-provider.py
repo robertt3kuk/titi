@@ -18,6 +18,9 @@ the real binary and the real HTTP stack:
   "loose edit"    an edit on README.md whose old_string is off in whitespace
   "slow"          60 chunks, 0.15 s apart (time to steer or press Ctrl+C)
   "run bash"      text, then a bash call: echo titi-smoke
+  "load skill"    a `skill` call naming the first skill the system prompt lists
+                  (`- name: description` under `# Skills`); `skill: none listed`
+                  when it lists none
   "run project"   a `project` call: {action: list} (detects the workspace's
                   ecosystem and prints the commands; runs nothing)
   "pin agents"    two `agent` calls in one round, each with a small task: the
@@ -108,7 +111,22 @@ def words(text: str, pause: float = 0.02) -> list[tuple[dict, float]]:
     return [(chunk({"content": word + " "}), pause) for word in text.split(" ")]
 
 
-def script(last: dict) -> list[tuple[dict, float]]:
+def first_listed_skill(messages: list[dict]) -> str | None:
+    """The first `- name: description` line under `# Skills` in a system message."""
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        text = str(message.get("content") or "")
+        _, found, rest = text.partition("# Skills\n")
+        if not found:
+            continue
+        for line in rest.splitlines():
+            if line.startswith("- "):
+                return line[2:].split(":", 1)[0].strip()
+    return None
+
+
+def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, float]]:
     """The chunks to stream for this request, each with the pause after it."""
     content = last.get("content") or ""
     if isinstance(content, list):
@@ -119,6 +137,11 @@ def script(last: dict) -> list[tuple[dict, float]]:
     if "[titi-review]" in content:
         answer = "VERDICT: FAIL — missing test\n- README.md:1 — no test covers the new title\n"
         return words(answer, 0) + [(chunk({}, "stop"), 0)]
+    if "load skill" in content:
+        name = first_listed_skill(messages or [])
+        if name is None:
+            return words("skill: none listed", 0) + [(chunk({}, "stop"), 0)]
+        return [(c, 0) for c in call("call_skill", "skill", {"name": name})]
     if "sleepy shell" in content:
         return [(c, 0) for c in call("call_sleepy", "bash", {"command": "sleep 3; echo slept"})]
     if "forever" in content:
@@ -313,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
         try:
-            for event, pause in script(last):
+            for event, pause in script(last, messages):
                 self.write_chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
                 if pause:
                     time.sleep(pause)
