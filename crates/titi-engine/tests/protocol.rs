@@ -13,7 +13,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use titi_engine::protocol::{JobInfo, SessionMode};
+use titi_config::hooks::{HookDef, HookEvent};
+use titi_engine::protocol::{HookOutcome, JobInfo, SessionMode};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
 use titi_providers::{ChatMessage, Effort, ErrorReason, Role, StopReason, ToolCallRef};
 use titi_tools::AskAnswer;
@@ -236,6 +237,37 @@ fn every_engine_command_round_trips_through_its_fixture() {
     command(
         EngineCommand::SetEffort { effort: None },
         r#"{"SetEffort":{"effort":null}}"#,
+    );
+    command(
+        EngineCommand::SetHooks {
+            hooks: vec![HookDef {
+                event: HookEvent::PreToolUse,
+                matcher: Some("Bash".into()),
+                command: "lint.sh".into(),
+                timeout_secs: Some(30),
+                source: ".titi/hooks.json".into(),
+            }],
+        },
+        r#"{"SetHooks":{"hooks":[{"event":"PreToolUse","matcher":"Bash","command":"lint.sh","timeout_secs":30,"source":".titi/hooks.json"}]}}"#,
+    );
+    // A client that sends nothing clears the hooks; one that sends a bare
+    // definition gets the defaults.
+    let bare: EngineCommand = serde_json::from_str(r#"{"SetHooks":{}}"#).expect("deserialize");
+    assert_eq!(bare, EngineCommand::SetHooks { hooks: vec![] });
+    let bare: EngineCommand =
+        serde_json::from_str(r#"{"SetHooks":{"hooks":[{"event":"Stop","command":"done.sh"}]}}"#)
+            .expect("deserialize");
+    assert_eq!(
+        bare,
+        EngineCommand::SetHooks {
+            hooks: vec![HookDef {
+                event: HookEvent::Stop,
+                matcher: None,
+                command: "done.sh".into(),
+                timeout_secs: None,
+                source: String::new(),
+            }]
+        }
     );
     command(EngineCommand::Shutdown, r#""Shutdown""#);
 }
@@ -466,6 +498,28 @@ fn every_engine_event_round_trips_through_its_fixture() {
             message: "refused".into(),
         },
         r#"{"Notice":{"message":"refused"}}"#,
+    );
+    event(
+        EngineEvent::HookRan {
+            turn_id: Some(TurnId(1)),
+            event: "PreToolUse".into(),
+            hook: "lint.sh".into(),
+            outcome: HookOutcome::Blocked,
+            detail: "no rm -rf".into(),
+            ms: 12,
+        },
+        r#"{"HookRan":{"turn_id":1,"event":"PreToolUse","hook":"lint.sh","outcome":"blocked","detail":"no rm -rf","ms":12}}"#,
+    );
+    event(
+        EngineEvent::HookRan {
+            turn_id: None,
+            event: "SessionStart".into(),
+            hook: "ctx.sh".into(),
+            outcome: HookOutcome::TimedOut,
+            detail: "".into(),
+            ms: 60000,
+        },
+        r#"{"HookRan":{"event":"SessionStart","hook":"ctx.sh","outcome":"timed_out","detail":"","ms":60000}}"#,
     );
     event(
         EngineEvent::ContextBreakdown {

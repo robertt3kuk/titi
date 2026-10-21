@@ -15,6 +15,7 @@ mod effort;
 pub mod findings;
 mod frontmatter;
 pub mod goal;
+pub mod hooks;
 pub mod judgment;
 pub mod naming;
 pub mod orchestrator;
@@ -49,6 +50,7 @@ pub use goal::{
     GateVerdict, Gates, GoalCancel, GoalLoop, GoalOutcome, GoalStop, Patch, RunnerCoder,
     goal_report, run_goal,
 };
+pub use hooks::Hooks;
 pub use judgment::{
     Capabilities, Capability, Choice, Confirm, JudgmentError, JudgmentModel, JudgmentProvider,
     RoleJudgmentModel,

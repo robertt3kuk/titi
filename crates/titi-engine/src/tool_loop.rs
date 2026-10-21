@@ -9,6 +9,7 @@ use titi_tools::{ApprovalMode, ApprovalTier, ToolHandler, ToolRegistry, ToolResu
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::claims::{ClaimError, Claims};
+use crate::hooks::{Hooks, PreToolVerdict};
 use crate::protocol::{EngineEvent, TurnId};
 use crate::spans::{self, OpenSpan, SpanSink};
 use titi_core::trace::{SpanKind, TOOL_ARGUMENTS_ATTR, TOOL_RESULT_ATTR};
@@ -151,8 +152,17 @@ const BLOCKING_TOOLS: &[&str] = &["ask", "agent"];
 /// Read tier and no approval needed, so nothing waits on a person, and not one
 /// of [`BLOCKING_TOOLS`]. An unknown name answers `Exec` from
 /// [`ToolRegistry::approval_tier`] and is therefore never grouped — it errors
-/// out on its own, in order.
-fn may_group(call: &PendingToolCall, tools: &ToolRegistry, approval_mode: ApprovalMode) -> bool {
+/// out on its own, in order. A call a hook watches is never grouped either:
+/// the group path skips `invoke_one`, which is where the hooks sit.
+fn may_group(
+    call: &PendingToolCall,
+    tools: &ToolRegistry,
+    approval_mode: ApprovalMode,
+    hooks: &Hooks,
+) -> bool {
+    if hooks.watches_tool(&call.name) {
+        return false;
+    }
     // A tool that writes is never grouped, whatever its tier says: the genome
     // fold and the file claim below key on the name, and a write that ran
     // beside another call would race both.
@@ -459,6 +469,7 @@ pub(crate) async fn execute_tools(
     agent_id: &SmolStr,
     mask_ips: bool,
     parent_span: Option<&str>,
+    hooks: &Hooks,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut assistant_calls = Vec::new();
@@ -491,12 +502,12 @@ pub(crate) async fn execute_tools(
         if aborted.load(Ordering::SeqCst) {
             break;
         }
-        if may_group(&call, tools, approval_mode) {
+        if may_group(&call, tools, approval_mode, hooks) {
             let mut group = vec![call];
             while group.len() < READ_GROUP_LIMIT
                 && queue
                     .peek()
-                    .is_some_and(|next| may_group(next, tools, approval_mode))
+                    .is_some_and(|next| may_group(next, tools, approval_mode, hooks))
             {
                 if let Some(next) = queue.next() {
                     group.push(next);
@@ -550,6 +561,8 @@ pub(crate) async fn execute_tools(
                     waiters,
                     aborted,
                     events,
+                    hooks,
+                    mask_ips,
                 )
                 .await;
                 claims.release(path, agent_id);
@@ -564,6 +577,8 @@ pub(crate) async fn execute_tools(
                     waiters,
                     aborted,
                     events,
+                    hooks,
+                    mask_ips,
                 )
                 .await
             }
@@ -674,6 +689,8 @@ async fn invoke_one(
     waiters: &ApprovalWaiters,
     aborted: &AtomicBool,
     events: &mpsc::Sender<EngineEvent>,
+    hooks: &Hooks,
+    mask_ips: bool,
 ) -> Executed {
     let call = &prepared.call;
     let args = &prepared.args;
@@ -698,8 +715,39 @@ async fn invoke_one(
             detail: None,
         };
     }
+    // The hooks see a call after the tool has said it would refuse it and
+    // before anyone is asked to approve it, so a denied call never reaches a
+    // prompt. They are handed the arguments masked, as the trajectory is: a
+    // hook is user or project code and has no use for a key a command carries.
+    let mut notes: Vec<String> = Vec::new();
+    let mut force_approval = false;
+    if !hooks.is_empty() {
+        let hook_args = mask_args(args, mask_ips);
+        match hooks
+            .pre_tool_use(&call.name, &call.call_id, &hook_args, turn_id, events)
+            .await
+        {
+            PreToolVerdict::Deny { reason } => {
+                return Executed {
+                    call_id: call.call_id.clone(),
+                    output: reason.into(),
+                    is_error: true,
+                    detail: None,
+                };
+            }
+            PreToolVerdict::Ask { context } => {
+                // R4: a hook can only tighten. Even `--approval yolo` asks.
+                force_approval = true;
+                notes.extend(context);
+            }
+            PreToolVerdict::Proceed { context } => notes.extend(context),
+        }
+        if aborted.load(Ordering::SeqCst) {
+            return aborted_answer(&call.call_id);
+        }
+    }
     let tier = tools.approval_tier(&call.name);
-    if !approval_mode.auto_approves(tier) {
+    if force_approval || !approval_mode.auto_approves(tier) {
         let _ = events
             .send(EngineEvent::ToolApprovalNeeded {
                 turn_id,
@@ -727,6 +775,28 @@ async fn invoke_one(
         is_error,
         detail,
     } = handler.invoke(args.clone()).await;
+    if !hooks.is_empty() {
+        notes.extend(
+            hooks
+                .post_tool_use(
+                    &call.name,
+                    &call.call_id,
+                    &mask_args(args, mask_ips),
+                    &mask(&output, mask_ips),
+                    is_error,
+                    turn_id,
+                    events,
+                )
+                .await,
+        );
+    }
+    // What the hooks added rides on the tool's answer, set apart and named so
+    // the model can tell the tool's words from a hook's.
+    let output = if notes.is_empty() {
+        output
+    } else {
+        format!("{output}\n\n{}", notes.join("\n\n")).into()
+    };
     Executed {
         call_id: call.call_id.clone(),
         output,
@@ -890,6 +960,7 @@ mod tests {
             &SmolStr::new_inline("Main"),
             false,
             None,
+            &Hooks::default(),
         )
         .await;
         assert_eq!(messages.len(), 2, "the call message and its result");

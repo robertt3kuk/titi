@@ -206,6 +206,14 @@ pub enum EngineCommand {
         #[serde(default)]
         effort: Option<Effort>,
     },
+    /// Replace the hooks the session runs. The surface sends only what it
+    /// resolved and the user approved: the engine never reads a hook file or
+    /// the trust store, so a repository's hooks reach it only through a
+    /// surface that asked.
+    SetHooks {
+        #[serde(default)]
+        hooks: Vec<titi_config::hooks::HookDef>,
+    },
     Shutdown,
 }
 
@@ -393,6 +401,22 @@ pub enum EngineEvent {
     Notice {
         message: SmolStr,
     },
+    /// A hook ran. One per command that matched, whatever it decided, so a
+    /// surface can say what a hook did to a call (`hook PreToolUse ·
+    /// lint.sh · blocked: …`) and a headless consumer can audit them.
+    HookRan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<TurnId>,
+        /// `PreToolUse`, `Stop`, …
+        event: SmolStr,
+        /// The program the hook's command starts with.
+        hook: SmolStr,
+        outcome: HookOutcome,
+        /// The reason or context the hook gave, cut to a line a row can hold.
+        #[serde(default)]
+        detail: SmolStr,
+        ms: u64,
+    },
     /// What fills the context window right now, part by part.
     ///
     /// The answer to [`EngineCommand::DescribeContext`]. There is no total
@@ -518,6 +542,27 @@ pub enum EngineEvent {
         #[serde(default)]
         cache_miss: bool,
     },
+}
+
+/// What one hook command decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOutcome {
+    /// Exit 0 with nothing to act on.
+    Ok,
+    /// Exit 0 and it added context for the model.
+    Context,
+    /// Exit 2: the hook refused, and its stderr is the reason.
+    Blocked,
+    /// A `PreToolUse` hook answered `permissionDecision: deny`.
+    Denied,
+    /// A `PreToolUse` hook answered `ask`: the call waits for the user.
+    Asked,
+    /// Any other exit, a hook that did not start, or output that made no
+    /// sense. Never blocks.
+    Warning,
+    /// The hook outlived its deadline and was killed. Never blocks.
+    TimedOut,
 }
 
 /// One labelled slice of the request a turn would send, with the estimated

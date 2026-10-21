@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::claims::Claims;
 use crate::findings::Findings;
+use crate::hooks::{Hooks, PromptVerdict};
 use crate::protocol::{ContextPart, EngineCommand, EngineEvent, TurnId};
 use crate::registry::{ModelPrice, RefreshOutcome, RegistryError, ResolvedModel};
 use crate::spans::{self, OpenSpan, SpanSink};
@@ -1118,6 +1119,9 @@ pub struct EngineRuntime {
     money_unpriced_said: Arc<AtomicBool>,
     /// What the next turns are allowed to do.
     mode: crate::protocol::SessionMode,
+    /// The session's hooks. Only `SetHooks` fills it: the engine reads no hook
+    /// file and no trust store.
+    hooks: Hooks,
 }
 
 impl EngineRuntime {
@@ -1246,6 +1250,16 @@ impl EngineRuntime {
             interrupt: config.interrupt.clone(),
             next: Arc::new(AtomicU64::new(0)),
         }));
+        let hooks = Hooks::new(
+            config.session_id.clone(),
+            config
+                .workspace_root
+                .clone()
+                .or_else(|| config.genome_root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from(".")),
+            config.interrupt.clone(),
+        );
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
             let root = config.workspace_root.clone()?;
@@ -1286,7 +1300,8 @@ impl EngineRuntime {
                 .with_max_rounds(config.agent_rounds)
                 .with_mask_ips(config.mask_ips)
                 .with_genome(genome.clone())
-                .with_spans(Arc::clone(&spans), config.trace_thinking),
+                .with_spans(Arc::clone(&spans), config.trace_thinking)
+                .with_hooks(&hooks),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
         // The surface builds the session's tools before the engine starts —
@@ -1316,6 +1331,7 @@ impl EngineRuntime {
         }
         let runtime = Self {
             mode: config.mode,
+            hooks,
             config,
             resolver,
             commands: command_rx,
@@ -1637,6 +1653,11 @@ impl EngineRuntime {
                                 !self.config.restored_messages.is_empty(),
                             );
                             let _ = self.events.send(report).await;
+                        }
+                        EngineCommand::SetHooks { hooks } => {
+                            for notice in self.hooks.set(hooks) {
+                                let _ = self.events.send(EngineEvent::Notice { message: notice.into() }).await;
+                            }
                         }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
@@ -2184,6 +2205,7 @@ impl EngineRuntime {
         // it cannot be measured — and the next turn says it again if the cap
         // arrived late.
         let money_bounded = self.money_budget.is_some();
+        let hooks = self.hooks.clone();
         tokio::spawn(async move {
             let history = run_turn(
                 turn_id,
@@ -2205,6 +2227,7 @@ impl EngineRuntime {
                 spent,
                 money,
                 money_bounded,
+                hooks,
             )
             .await;
             let _ = done
@@ -2551,6 +2574,7 @@ async fn run_turn(
     // `MoneyLedger`.
     money: MoneyLedger,
     money_bounded: bool,
+    hooks: Hooks,
 ) -> Option<Vec<ChatMessage>> {
     // The turn's own span opens here and closes at the tail — the one place
     // every path below reaches, because the early returns all belong to the
@@ -2624,6 +2648,48 @@ async fn run_turn(
         // What the last model to give up said, for the failure that ends the
         // turn when every model has: "unavailable" alone does not say why.
         let mut last_failure: Option<String> = None;
+        // The prompt hooks run once, before any model is asked. A blocked
+        // prompt never becomes a turn: the user gets the reason and their
+        // text back, and the history is untouched.
+        let hook_context = match hooks.user_prompt_submit(&prompt, turn_id, &events).await {
+            PromptVerdict::Block { reason } => {
+                turn_error = Some("the prompt was blocked by a UserPromptSubmit hook".to_owned());
+                let _ = events
+                    .send(EngineEvent::Notice {
+                        message: format!("a UserPromptSubmit hook blocked the prompt: {reason}")
+                            .into(),
+                    })
+                    .await;
+                let _ = events
+                    .send(EngineEvent::PromptReturned { text: prompt.clone() })
+                    .await;
+                return None;
+            }
+            PromptVerdict::Pass { context } => context,
+        };
+        let user_content: SmolStr = match hook_context {
+            Some(context) => format!(
+                "{contextual_prompt}\n\n<hook-context event=\"UserPromptSubmit\">\n{context}\n</hook-context>"
+            )
+            .into(),
+            None => contextual_prompt.clone(),
+        };
+        // `SessionStart` output joins the system prompt, computed once, so the
+        // prompt stays byte-stable from turn to turn. A duck is repo-blind.
+        let session_context = if config.mode == crate::protocol::SessionMode::Duck {
+            None
+        } else {
+            hooks.session_context(&events).await
+        };
+        let system: Option<SmolStr> = match (system.as_ref(), session_context) {
+            (Some(base), Some(context)) => Some(
+                format!("{base}\n\n<session-start-hook>\n{context}\n</session-start-hook>").into(),
+            ),
+            (None, Some(context)) => {
+                Some(format!("<session-start-hook>\n{context}\n</session-start-hook>").into())
+            }
+            (base, None) => base.cloned(),
+        };
         for model in models {
             if aborted.load(Ordering::SeqCst) {
                 return None;
@@ -2714,11 +2780,12 @@ async fn run_turn(
             messages.extend(config.restored_messages.iter().cloned());
             messages.push(ChatMessage {
                 role: Role::User,
-                content: contextual_prompt.clone(),
+                content: user_content.clone(),
                 tool_calls: Vec::new(),
                 ..Default::default()
             });
             let mut tool_rounds = 0;
+            let mut stop_continued = false;
             loop {
                 // `execute_tools` returns as soon as the abort lands, and the loop
                 // used to walk straight back into another stream. Nothing below
@@ -2789,6 +2856,7 @@ async fn run_turn(
                 let mut attempts = 0u32;
                 let mut last_error = None;
                 let mut completed = false;
+                let hold_finish = hooks.has_stop() && !stop_continued;
                 // One fold per turn for a request the provider rejected as too
                 // long: the window does not change, so a second rejection is
                 // the answer.
@@ -2828,6 +2896,7 @@ async fn run_turn(
                         Arc::clone(&aborted),
                         &tools,
                         &mut meter,
+                        hold_finish,
                     )
                     .await
                     {
@@ -2887,6 +2956,7 @@ async fn run_turn(
                                 &MAIN_AGENT,
                                 config.mask_ips,
                                 round_span_id.as_deref(),
+                                &hooks,
                             )
                             .await;
                             messages.extend(extra);
@@ -2979,6 +3049,34 @@ async fn run_turn(
                 }
                 round_span.finish(spans::now_ms());
                 if completed {
+                    // A `Stop` hook may refuse to let the turn end: its reason
+                    // goes to the model, which continues. Once per turn, so a
+                    // hook that always refuses cannot loop the turn forever.
+                    if !stop_continued
+                        && !aborted.load(Ordering::SeqCst)
+                        && let Some(reason) = hooks.stop(turn_id, &events).await
+                    {
+                        stop_continued = true;
+                        messages.push(ChatMessage {
+                            role: Role::User,
+                            content: format!(
+                                "A Stop hook asked you to keep going before you finish:\n{reason}"
+                            )
+                            .into(),
+                            tool_calls: Vec::new(),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                    if hold_finish
+                        && !aborted.load(Ordering::SeqCst)
+                        && let Some(reason) = round_report.as_ref().and_then(|report| report.stop)
+                    {
+                        let _ = events.send(meter.usage(turn_id)).await;
+                        let _ = events
+                            .send(EngineEvent::TurnFinished { turn_id, reason })
+                            .await;
+                    }
                     if let Some(recorder) = trajectory.lock().await.as_mut() {
                         let _ = recorder.record(titi_core::trajectory::EventKind::TurnEnd);
                     }
@@ -3142,6 +3240,9 @@ struct RoundReport {
     /// sends, so this is the only place a round's thinking can be counted for
     /// all of them.
     thinking: String,
+    /// Why the round ended, kept so a `TurnFinished` a `Stop` hook held back
+    /// can be sent with the reason it would have carried.
+    stop: Option<titi_providers::StopReason>,
 }
 
 /// What one turn has spent, round by round. A tool round re-sends the whole
@@ -3271,6 +3372,9 @@ async fn stream_attempt(
     tools: &ToolRegistry,
     // The turn's meter, which adds this request to the session's as well.
     meter: &mut TurnMeter<'_>,
+    // A `Stop` hook has yet to say whether the turn may end, so the surface
+    // is not told it has: the caller sends `TurnFinished` itself afterwards.
+    hold_finish: bool,
 ) -> Result<
     (
         SmolStr,
@@ -3376,9 +3480,10 @@ async fn stream_attempt(
                         }
                         _ => None,
                     },
+                    stop: Some(reason),
                     ..Default::default()
                 };
-                if calls.is_empty() {
+                if calls.is_empty() && !hold_finish {
                     let _ = events.send(meter.usage(turn_id)).await;
                     let _ = events
                         .send(EngineEvent::TurnFinished { turn_id, reason })

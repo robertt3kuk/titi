@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::agents::{AgentContext, AgentRequest, AgentRunner};
 use crate::claims::Claims;
+use crate::hooks::Hooks;
 use crate::protocol::TurnId;
 use crate::runtime::TransportResolver;
 use crate::spans::{self, OpenSpan, SpanSink};
@@ -59,6 +60,10 @@ pub struct ToolAgentRunner {
     /// Whether this subagent's reasoning text is recorded (`trace.thinking`),
     /// as the session asked for it.
     trace_thinking: bool,
+    /// The session's hooks. A subagent's tool calls pass through the same
+    /// `PreToolUse` gate as the main turn's: a policy a hook states must not
+    /// be one delegation away from being skipped.
+    hooks: Hooks,
 }
 
 impl ToolAgentRunner {
@@ -84,7 +89,15 @@ impl ToolAgentRunner {
             mask_ips: true,
             spans: SpanSink::default(),
             trace_thinking: false,
+            hooks: Hooks::default(),
         }
+    }
+
+    /// The session's hooks, applied to this runner's tool calls. A subagent
+    /// has no one to ask, so a hook's `ask` becomes a refusal here.
+    pub fn with_hooks(mut self, hooks: &Hooks) -> Self {
+        self.hooks = hooks.without_asking();
+        self
     }
 
     /// The session's span sink, and whether a round's reasoning text is
@@ -355,6 +368,7 @@ impl ToolAgentRunner {
                 &request.id,
                 self.mask_ips,
                 llm_span_id.as_deref(),
+                &self.hooks,
             )
             .await;
             messages.extend(results);
