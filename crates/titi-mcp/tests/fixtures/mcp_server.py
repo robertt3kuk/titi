@@ -18,6 +18,9 @@ chosen by environment variables so a test can ask for the awkward cases:
   FIXTURE_PAGES        serve tools/list in two pages
   FIXTURE_HOSTILE      add tools a client must not trust: an injected description,
                        a string schema, a 5000-character description, 200 more
+  FIXTURE_NO_NEWLINE   write 9 MiB of one unterminated line right away
+  FIXTURE_PING_FLOOD   after answering initialize: send N ping requests, then stop
+                       reading stdin for a while, then send list_changed
   FIXTURE_SPAWN_CHILD  path: start `sleep 300` in the same process group and
                        write its pid there (shutdown must kill it too)
 
@@ -72,6 +75,8 @@ def tools():
         tool("pid", "Report the process id"),
         tool("big", "A large text answer", {"size": {"type": "number"}}, ["size"]),
         tool("dotted.name", "A name providers reject"),
+        tool("storm", "Send 5000 list_changed notices"),
+        tool("noisy", "Write 3 MiB to stderr"),
     ]
     if extra_tool:
         listing.append(tool("extra", "Appeared after grow"))
@@ -122,10 +127,24 @@ def call(name, args):
         return text(str(os.getpid()))
     if name == "big":
         return text("x" * int(args.get("size", 10)))
+    if name == "storm":
+        for _ in range(5000):
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        return text("stormed")
+    if name == "noisy":
+        for _ in range(3 * 1024):
+            sys.stderr.write("n" * 1023 + "\n")
+        sys.stderr.write("noisy: last line\n")
+        sys.stderr.flush()
+        return text("noisy done")
     if name == "dotted.name":
         return text("dotted")
     return None
 
+
+if os.environ.get("FIXTURE_NO_NEWLINE"):
+    sys.stdout.write("x" * (9 << 20))
+    sys.stdout.flush()
 
 sys.stderr.write("fixture: started\n")
 sys.stderr.flush()
@@ -161,6 +180,13 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture", "version": "1"},
             },
         })
+        flood = os.environ.get("FIXTURE_PING_FLOOD")
+        if flood:
+            for n in range(int(flood)):
+                send({"jsonrpc": "2.0", "id": "p%d" % n, "method": "ping"})
+            time.sleep(2)
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            time.sleep(60)
         marker = os.environ.get("FIXTURE_CRASH_ONCE")
         if marker and not os.path.exists(marker):
             open(marker, "w").close()

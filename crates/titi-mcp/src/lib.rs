@@ -11,7 +11,10 @@ pub mod manager;
 mod tool;
 mod vet;
 
-pub use client::{CallOutput, Client, ClientEvent, Launch, McpError, ToolInfo, render_content};
+pub use client::{
+    CallOutput, Client, ClientEvent, Launch, MAX_LINE_BYTES, MAX_RESULT_CHARS, McpError,
+    STDERR_LOG_CAP, ToolInfo, render_content,
+};
 pub use manager::{
     MAX_RESTARTS, ManagerConfig, McpEvent, McpManager, ServerState, ServerStatus, ToolSummary,
     log_path,

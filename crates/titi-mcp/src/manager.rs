@@ -376,9 +376,25 @@ fn launch_for(def: &McpServerDef, config: &ManagerConfig) -> Launch {
     }
 }
 
+/// Bytes of the end of a stderr log that are read for the reason a server failed.
+const TAIL_BYTES: u64 = 4096;
+
+/// Least time between two re-lists of one server's tools, however often it
+/// says they changed.
+const RELIST_EVERY: Duration = Duration::from_secs(1);
+
 /// What a server said on standard error last, to put beside "it exited".
 fn stderr_tail(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    use std::io::{Read, Seek, SeekFrom};
+    // Only the end of the file: a log can be a megabyte, and what a failure
+    // left is in its last lines.
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
     Some(line.trim().chars().take(160).collect())
 }
@@ -434,6 +450,9 @@ async fn supervise(slot: Arc<Slot>, config: ManagerConfig, events: UnboundedSend
                                 }
                             }
                             let _ = events.send(McpEvent::Changed);
+                            // A server that announces a change over and over
+                            // is read at this pace, not at its own.
+                            tokio::time::sleep(RELIST_EVERY).await;
                         }
                         Some(ClientEvent::Exited(reason)) => break Some(reason),
                         None => break Some("the connection was lost".to_owned()),
@@ -518,4 +537,24 @@ fn publish(slot: &Slot, client: &Arc<Client>, tools: Vec<ToolInfo>) -> Vec<Strin
     state.listing = listing;
     state.client = Some(Arc::clone(client));
     notes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stderr_tail_reads_only_the_end_of_a_large_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        let mut text = "first line\n".to_owned();
+        text.push_str(&"filler line\n".repeat(300_000));
+        text.push_str("the failure\n\n");
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(stderr_tail(&path).as_deref(), Some("the failure"));
+        assert_eq!(stderr_tail(&dir.path().join("none.log")), None);
+        // A log that is nothing but one long line gives its end, cut to a row.
+        std::fs::write(&path, "y".repeat(100_000)).unwrap();
+        assert_eq!(stderr_tail(&path).unwrap().len(), 160);
+    }
 }

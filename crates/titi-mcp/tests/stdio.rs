@@ -144,7 +144,7 @@ async fn the_handshake_runs_in_order_and_the_tools_are_listed() {
     );
     let status = rig.manager.status();
     assert_eq!(status[0].command, format!("python3 {}", fixture()));
-    assert_eq!(status[0].tools.len(), 12, "{:?}", status[0].tools);
+    assert_eq!(status[0].tools.len(), 14, "{:?}", status[0].tools);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -257,7 +257,7 @@ async fn a_call_round_trips_and_pages_are_followed() {
     rig.manager
         .set_servers(vec![def("fixture", &[("FIXTURE_PAGES", "1")])]);
     ready(&rig, "fixture").await;
-    assert_eq!(rig.manager.status()[0].tools.len(), 12, "both pages");
+    assert_eq!(rig.manager.status()[0].tools.len(), 14, "both pages");
     let echo = tool(&rig, "mcp__fixture__echo");
     let out = echo.invoke(json!({ "text": "héllo" })).await;
     assert_eq!((out.output.as_str(), out.is_error), ("héllo", false));
@@ -698,4 +698,115 @@ fn content_blocks_become_text() {
         ] })),
         "a\n[audio]\n[future]"
     );
+}
+
+fn client_launch(env: &[(&str, &str)], log: Option<PathBuf>) -> titi_mcp::Launch {
+    let mut vars = titi_tools::hook_environment(
+        [("PATH".into(), std::env::var_os("PATH").unwrap_or_default())],
+        Path::new("."),
+    );
+    for (key, value) in env {
+        vars.push((key.into(), value.into()));
+    }
+    titi_mcp::Launch {
+        command: "python3".to_owned(),
+        args: vec![fixture()],
+        env: vars,
+        cwd: PathBuf::from("."),
+        stderr_log: log,
+        timeout: Duration::from_secs(10),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_past_the_cap_drops_the_connection_and_the_process() {
+    use titi_mcp::{Client, ClientEvent, McpError};
+    let (tx, _events) = unbounded_channel::<ClientEvent>();
+    let started = Instant::now();
+    let result = Client::connect(&client_launch(&[("FIXTURE_NO_NEWLINE", "1")], None), tx).await;
+    let Err(McpError::Closed(reason)) = result else {
+        panic!("expected the connection to be dropped: {result:?}");
+    };
+    assert!(reason.contains("line over 8 MiB"), "{reason}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_floods_pings_and_stops_reading_does_not_wedge_the_reader() {
+    use titi_mcp::{Client, ClientEvent};
+    let (tx, mut events) = unbounded_channel::<ClientEvent>();
+    let launch = client_launch(&[("FIXTURE_PING_FLOOD", "30000")], None);
+    let client = Client::connect(&launch, tx).await.unwrap();
+    // After the flood the server sends list_changed: the reader got through
+    // 30,000 pings whose replies cannot all be queued.
+    let seen = tokio::time::timeout(Duration::from_secs(15), events.recv()).await;
+    assert_eq!(seen.unwrap(), Some(ClientEvent::ToolsChanged));
+    let started = Instant::now();
+    client.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storm_of_list_changed_notices_is_one_event_until_the_list_is_read_again() {
+    use titi_mcp::{Client, ClientEvent};
+    let (tx, mut events) = unbounded_channel::<ClientEvent>();
+    let client = Client::connect(&client_launch(&[], None), tx)
+        .await
+        .unwrap();
+    client.call_tool("storm", json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut count = 0;
+    while let Ok(event) = events.try_recv() {
+        assert_eq!(event, ClientEvent::ToolsChanged);
+        count += 1;
+    }
+    assert_eq!(count, 1, "5000 notices, one re-list");
+    // Reading the list re-arms it.
+    client.list_tools().await.unwrap();
+    client.call_tool("storm", json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(events.try_recv(), Ok(ClientEvent::ToolsChanged));
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_cut_before_it_is_masked_and_stderr_stops_growing() {
+    use titi_mcp::{Client, ClientEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("mcp/fixture.log");
+    let (tx, _events) = unbounded_channel::<ClientEvent>();
+    let client = Client::connect(&client_launch(&[], Some(log.clone())), tx)
+        .await
+        .unwrap();
+    let big = client
+        .call_tool("big", json!({ "size": 5_000_000 }))
+        .await
+        .unwrap();
+    assert!(
+        big.text.chars().count() < titi_mcp::MAX_RESULT_CHARS + 200,
+        "{}",
+        big.text.len()
+    );
+    assert!(
+        big.text.contains("characters left out by the MCP client"),
+        "{}",
+        &big.text[..60]
+    );
+
+    client.call_tool("noisy", json!({})).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !lines(&log).iter().any(|line| line == "noisy: last line") {
+        assert!(Instant::now() < deadline, "the tail never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let size = std::fs::metadata(&log).unwrap().len();
+    assert!(size <= titi_mcp::STDERR_LOG_CAP + 8192, "{size}");
 }

@@ -530,3 +530,13 @@ async fn shutdown_stops_the_servers_before_the_engine_ends() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[test]
+fn the_clients_result_cap_leaves_the_engines_own_cut_to_do_its_work() {
+    // The client bounds what the masking pass sees; the engine's cap must
+    // stay the tighter of the two, or its note would never be written.
+    assert_eq!(
+        titi_mcp::MAX_RESULT_CHARS,
+        2 * titi_engine::tool_loop::MAX_TOOL_OUTPUT
+    );
+}

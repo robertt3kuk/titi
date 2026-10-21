@@ -22,11 +22,11 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,18 @@ pub const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-
 /// Pages of `tools/list` read before the list is cut: a server that never
 /// stops paging must not hold the session.
 const MAX_PAGES: usize = 20;
+
+/// Longest line read from a server. A line is one JSON-RPC message; a stream
+/// that never ends one would otherwise grow without bound.
+pub const MAX_LINE_BYTES: usize = 8 << 20;
+
+/// Messages waiting to be written to a server. A server that never reads its
+/// input fills this, and what does not fit is dropped (replies to its pings)
+/// or fails the request.
+const OUT_QUEUE: usize = 256;
+
+/// Longest a server's stderr log grows before it starts over.
+pub const STDERR_LOG_CAP: u64 = 1 << 20;
 
 /// How long a server gets to leave after its input is closed, and after
 /// `SIGTERM`, before the next, harder step.
@@ -110,8 +122,15 @@ pub struct Launch {
 
 enum Out {
     Line(String),
+    /// An answer to something the server asked. Counted apart, so a server
+    /// that floods requests cannot fill the queue the client's own messages
+    /// need.
+    Reply(String),
     Close,
 }
+
+/// Answers to the server's requests that may wait to be written.
+const MAX_QUEUED_REPLIES: usize = 32;
 
 #[derive(Default)]
 struct State {
@@ -127,7 +146,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Inner {
     state: Arc<Mutex<State>>,
-    out: Sender<Out>,
+    out: SyncSender<Out>,
     child: Arc<Mutex<Child>>,
     pid: u32,
     next_id: AtomicU64,
@@ -135,6 +154,8 @@ struct Inner {
     /// Set when this side ends the connection, so the reader does not report
     /// it as a crash.
     leaving: Arc<AtomicBool>,
+    /// A `list_changed` has been reported and the list not yet read again.
+    tools_pending: Arc<AtomicBool>,
 }
 
 /// A live connection. Dropping the last handle stops the server and the
@@ -177,6 +198,9 @@ impl Client {
 
     /// `tools/list`, following the cursor.
     pub async fn list_tools(&self) -> Result<Vec<ToolInfo>, McpError> {
+        // Cleared first: a change announced while the pages are read is a new
+        // event, not one this list already covers.
+        self.inner.tools_pending.store(false, Ordering::SeqCst);
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -297,9 +321,17 @@ impl Handshake {
 
 impl Inner {
     fn send(&self, message: &Value) -> Result<(), McpError> {
+        use std::sync::mpsc::TrySendError;
         self.out
-            .send(Out::Line(message.to_string()))
-            .map_err(|_| McpError::Closed("the server's input is closed".to_owned()))
+            .try_send(Out::Line(message.to_string()))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    McpError::Closed("the server is not reading its input".to_owned())
+                }
+                TrySendError::Disconnected(_) => {
+                    McpError::Closed("the server's input is closed".to_owned())
+                }
+            })
     }
 
     fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
@@ -353,7 +385,7 @@ impl Inner {
         if self.leaving.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.out.send(Out::Close);
+        let _ = self.out.try_send(Out::Close);
         let exited = |within: Duration| {
             let deadline = Instant::now() + within;
             while Instant::now() < deadline {
@@ -408,11 +440,6 @@ impl Drop for Pending<'_> {
 }
 
 fn spawn(launch: &Launch, events: UnboundedSender<ClientEvent>) -> Result<Inner, McpError> {
-    let stderr = launch
-        .stderr_log
-        .as_deref()
-        .and_then(open_log)
-        .map_or_else(Stdio::null, Stdio::from);
     let mut command = Command::new(&launch.command);
     command
         .args(&launch.args)
@@ -421,7 +448,11 @@ fn spawn(launch: &Launch, events: UnboundedSender<ClientEvent>) -> Result<Inner,
         .envs(launch.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(stderr);
+        .stderr(if launch.stderr_log.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
     // Its own process group, so a stop reaches what the server started too.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
@@ -436,14 +467,28 @@ fn spawn(launch: &Launch, events: UnboundedSender<ClientEvent>) -> Result<Inner,
             reason: "no standard streams".to_owned(),
         });
     };
+    if let (Some(stderr), Some(path)) = (child.stderr.take(), launch.stderr_log.clone()) {
+        std::thread::spawn(move || pump_stderr(stderr, &path));
+    }
     let pid = child.id();
     let child = Arc::new(Mutex::new(child));
     let state = Arc::new(Mutex::new(State::default()));
     let leaving = Arc::new(AtomicBool::new(false));
-    let (out, lines) = channel::<Out>();
+    let tools_pending = Arc::new(AtomicBool::new(false));
+    let (out, lines) = sync_channel::<Out>(OUT_QUEUE);
 
+    let replies = Arc::new(AtomicUsize::new(0));
+    let queued_replies = Arc::clone(&replies);
     std::thread::spawn(move || {
-        while let Ok(Out::Line(line)) = lines.recv() {
+        while let Ok(item) = lines.recv() {
+            let line = match item {
+                Out::Line(line) => line,
+                Out::Reply(line) => {
+                    queued_replies.fetch_sub(1, Ordering::SeqCst);
+                    line
+                }
+                Out::Close => break,
+            };
             if writeln!(stdin, "{line}")
                 .and_then(|()| stdin.flush())
                 .is_err()
@@ -457,7 +502,10 @@ fn spawn(launch: &Launch, events: UnboundedSender<ClientEvent>) -> Result<Inner,
         state: Arc::clone(&state),
         out: out.clone(),
         child: Arc::clone(&child),
+        pid,
+        replies,
         leaving: Arc::clone(&leaving),
+        tools_pending: Arc::clone(&tools_pending),
         events,
     };
     std::thread::spawn(move || reader.run(stdout));
@@ -470,40 +518,120 @@ fn spawn(launch: &Launch, events: UnboundedSender<ClientEvent>) -> Result<Inner,
         next_id: AtomicU64::new(1),
         timeout: launch.timeout,
         leaving,
+        tools_pending,
     })
+}
+
+/// Copies a server's standard error into its log, and starts the file over
+/// when it passes [`STDERR_LOG_CAP`]: the log is for the last failure, and a
+/// server that never stops talking must not fill the disk.
+fn pump_stderr(mut stream: impl Read, path: &Path) {
+    let Some(file) = open_log(path) else {
+        // No log to write: still drain the pipe, or the server blocks on it.
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        return;
+    };
+    let mut file = file;
+    let mut written = file.metadata().map_or(0, |meta| meta.len());
+    let mut chunk = [0u8; 8192];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        if written + read as u64 > STDERR_LOG_CAP {
+            if file.set_len(0).is_err() {
+                break;
+            }
+            written = 0;
+        }
+        if file.write_all(&chunk[..read]).is_err() {
+            break;
+        }
+        written += read as u64;
+    }
+    let _ = std::io::copy(&mut stream, &mut std::io::sink());
 }
 
 fn open_log(path: &Path) -> Option<std::fs::File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    // A log that has grown past a megabyte starts over: it is for the last
-    // failure, not for history.
-    let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() > 1 << 20);
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true);
-    if oversized {
-        options.truncate(true);
-    } else {
-        options.append(true);
-    }
+    options.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options.open(path).ok()
 }
 
+enum Line {
+    Message,
+    TooLong,
+    End,
+}
+
+/// One line into `buf`, newline excluded, never holding more than
+/// [`MAX_LINE_BYTES`] of it.
+fn read_capped(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Line> {
+    buf.clear();
+    loop {
+        let (done, used) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if buf.is_empty() {
+                    Line::End
+                } else {
+                    Line::Message
+                });
+            }
+            match available.iter().position(|byte| *byte == b'\n') {
+                Some(end) => {
+                    buf.extend_from_slice(&available[..end]);
+                    (true, end + 1)
+                }
+                None => {
+                    buf.extend_from_slice(available);
+                    (false, available.len())
+                }
+            }
+        };
+        reader.consume(used);
+        if buf.len() > MAX_LINE_BYTES {
+            return Ok(Line::TooLong);
+        }
+        if done {
+            return Ok(Line::Message);
+        }
+    }
+}
+
 struct Reader {
     state: Arc<Mutex<State>>,
-    out: Sender<Out>,
+    out: SyncSender<Out>,
     child: Arc<Mutex<Child>>,
+    pid: u32,
+    replies: Arc<AtomicUsize>,
     leaving: Arc<AtomicBool>,
+    tools_pending: Arc<AtomicBool>,
     events: UnboundedSender<ClientEvent>,
 }
 
 impl Reader {
     fn run(self, stdout: std::process::ChildStdout) {
-        for line in BufReader::new(stdout).split(b'\n') {
-            let Ok(line) = line else { break };
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        let mut dropped = None;
+        loop {
+            match read_capped(&mut reader, &mut line) {
+                Ok(Line::Message) => {}
+                Ok(Line::TooLong) => {
+                    dropped = Some(format!(
+                        "the server sent a line over {} MiB; connection dropped",
+                        MAX_LINE_BYTES >> 20
+                    ));
+                    break;
+                }
+                Ok(Line::End) | Err(_) => break,
+            }
             // A server may print something that is not a message; that is its
             // log, not a protocol error.
             let Ok(message) = serde_json::from_slice::<Value>(&line) else {
@@ -511,7 +639,15 @@ impl Reader {
             };
             self.dispatch(&message);
         }
-        let reason = self.exit_reason();
+        let reason = match dropped {
+            Some(reason) => {
+                // It is still talking: stop it, with whatever it started.
+                signal_group(self.pid, "KILL");
+                let _ = locked(&self.child).kill();
+                reason
+            }
+            None => self.exit_reason(),
+        };
         {
             let mut state = locked(&self.state);
             state.closed = Some(reason.clone());
@@ -519,7 +655,7 @@ impl Reader {
                 let _ = waiter.send(Err(McpError::Closed(reason.clone())));
             }
         }
-        let _ = self.out.send(Out::Close);
+        let _ = self.out.try_send(Out::Close);
         if !self.leaving.load(Ordering::SeqCst) {
             let _ = self.events.send(ClientEvent::Exited(reason));
         }
@@ -531,27 +667,37 @@ impl Reader {
         match (id, method) {
             (Some(id), None) => self.answer(id, message),
             (Some(id), Some("ping")) => {
-                let _ = self.out.send(Out::Line(
-                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }).to_string(),
-                ));
+                self.reply(json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
             }
             // No capability was declared, so any other request is one the
             // server had no business sending.
             (Some(id), Some(_)) => {
-                let _ = self.out.send(Out::Line(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": "Method not found" },
-                    })
-                    .to_string(),
-                ));
+                self.reply(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "Method not found" },
+                }));
             }
+            // One event stands for any number of notices until the list has
+            // been read again: a server that repeats it must not queue a
+            // re-list for each.
             (None, Some("notifications/tools/list_changed")) => {
-                let _ = self.events.send(ClientEvent::ToolsChanged);
+                if !self.tools_pending.swap(true, Ordering::SeqCst) {
+                    let _ = self.events.send(ClientEvent::ToolsChanged);
+                }
             }
             // Logging, progress and the rest are not acted on.
             (None, _) => {}
+        }
+    }
+
+    /// Queues an answer to the server, unless too many are already waiting: a
+    /// server that is not reading must not hold this thread or the queue.
+    fn reply(&self, message: Value) {
+        if self.replies.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED_REPLIES
+            || self.out.try_send(Out::Reply(message.to_string())).is_err()
+        {
+            self.replies.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -614,6 +760,30 @@ fn signal_group(_pid: u32, _signal: &str) {}
 /// <uri>]`. A result with no content but a `structuredContent` is that,
 /// as JSON.
 pub fn render_content(result: &Value) -> String {
+    cap_result(render_blocks(result))
+}
+
+/// Characters of a rendered result kept, twice what the engine puts in a
+/// message (`MAX_TOOL_OUTPUT`, which cuts to that and says so). The bound is
+/// here so the masking pass over the text never sees more than this.
+pub const MAX_RESULT_CHARS: usize = 80_000;
+
+fn cap_result(text: String) -> String {
+    let total = text.chars().count();
+    if total <= MAX_RESULT_CHARS {
+        return text;
+    }
+    let tail = MAX_RESULT_CHARS / 4;
+    let head = MAX_RESULT_CHARS - tail;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(total - tail).collect();
+    format!(
+        "{start}\n… [{} characters left out by the MCP client: the server's answer was longer than {MAX_RESULT_CHARS}] …\n{end}",
+        total - head - tail
+    )
+}
+
+fn render_blocks(result: &Value) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in result
         .get("content")
