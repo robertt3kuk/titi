@@ -170,3 +170,57 @@ fn a_missing_module_and_a_missing_module_path_are_still_reported() {
         "{reported:?}"
     );
 }
+
+/// `#[cfg(test)] #[path = "x_tests.rs"] mod tests;` names the file beside the
+/// declaring one, not `parent/tests.rs`: the attribute decides the path, and a
+/// declaration with no such file is still reported. This is how `chat.rs`
+/// pulls in four test files, each of which used to be an unresolved import.
+#[test]
+fn a_path_attribute_names_the_module_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "pub mod chat;\n");
+    write(
+        root,
+        "src/chat.rs",
+        "pub fn chat() {}\n\
+         \n\
+         #[cfg(test)]\n\
+         #[path = \"chat_tests.rs\"]\n\
+         mod tests;\n\
+         \n\
+         #[cfg(test)]\n\
+         #[path = \"gone_tests.rs\"]\n\
+         mod gone;\n",
+    );
+    write(root, "src/chat_tests.rs", "use super::*;\n");
+    let genome = Genome::index(root).unwrap();
+    let chat = &genome.files["src/chat.rs"];
+    assert!(
+        chat.imports.contains(&"src/chat_tests.rs".to_owned()),
+        "{:?}",
+        chat.imports
+    );
+    assert_eq!(
+        unresolved(&genome, "src/chat.rs"),
+        vec!["gone".to_owned()],
+        "only the module whose #[path] file is missing is reported"
+    );
+}
+
+/// `mod x;` beside a file `x/mod.rs` resolves to the directory form, from a
+/// plain `foo.rs` as well as from `mod.rs`.
+#[test]
+fn a_module_in_a_directory_resolves_from_a_plain_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/lib.rs", "mod outer;\n");
+    write(root, "src/outer.rs", "mod inner;\n");
+    write(root, "src/outer/inner/mod.rs", "pub fn deep() {}\n");
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(
+        genome.files["src/outer.rs"].imports,
+        vec!["src/outer/inner/mod.rs".to_owned()]
+    );
+    assert!(unresolved(&genome, "src/outer.rs").is_empty());
+}

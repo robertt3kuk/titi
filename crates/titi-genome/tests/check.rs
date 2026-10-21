@@ -659,3 +659,37 @@ fn lsp_reports_the_level_roster_and_keeps_it_out_of_file_diagnostics() {
         "the roster must not ride in the per-file reply: {text}"
     );
 }
+
+/// `pub type X = path::X;` re-publishes a type under its own name; it is not
+/// a second definition. `theme/symbols.rs` does this for `SymbolPreset`, which
+/// `titi genome check` reported as ambiguous with the file that defines it.
+#[test]
+fn a_same_name_type_alias_is_not_a_second_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/data.rs", "pub enum Preset { A }\n");
+    write(
+        root,
+        "src/symbols.rs",
+        "pub type Preset = crate::data::Preset;\npub type Alias = crate::data::Preset;\n",
+    );
+    let genome = Genome::index(root).unwrap();
+    assert_eq!(
+        genome.symbols["Preset"].files,
+        vec!["src/data.rs".to_owned()]
+    );
+    assert!(
+        genome.files["src/symbols.rs"]
+            .exports
+            .contains(&"Alias".to_owned()),
+        "a rename is a definition of the new name"
+    );
+    assert!(
+        genome
+            .check()
+            .iter()
+            .all(|item| item.code != "ambiguous-symbol"),
+        "{:?}",
+        genome.check()
+    );
+}

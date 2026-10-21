@@ -121,6 +121,7 @@ All notable user-facing changes to titi, newest first.
 - A paste of 100 lines or more — `paste.menuThreshold`, 0 to turn it off — offers how it should reach the model, the way omp's large-paste menu does: **attach as a block** sends it between fences, **attach as a file** writes it to `.titi/pastes/paste-<n>.txt` in the workspace and leaves that path in the draft for the model to `read` in ranges, and Esc keeps the plain `[Paste #1 · 150 lines]` marker every shorter paste gets. Nothing is written or wrapped unless a row is taken, and an attached file lands in the workspace's `.titi/pastes/`, which writes its own `.gitignore` (`*`) so a pasted log is never swept into a commit.
 
 ### Fixed
+- `titi genome check` is clean on titi's own tree again (it exited 1 on a fresh clone): a `#[path = "x_tests.rs"] mod tests;` names that file instead of `tests.rs`, and `pub type X = path::X;` is a re-export of `X`, not a second definition of it.
 - A provider that says how long to wait is waited for: a 429's `retry-after`, `retry-after-ms` or `x-ratelimit-reset-*` is honoured instead of the client's own 500 ms-doubling schedule, and a wait past a minute fails the attempt naming the number rather than holding the session.
 - A request the provider rejects for being longer than the model's window is folded once and asked again; a second rejection names the window.
 - A subagent that was stopped says so once: the status word is the whole message, so a cancelled batch no longer reads as `alpha — was stopped stopped`.

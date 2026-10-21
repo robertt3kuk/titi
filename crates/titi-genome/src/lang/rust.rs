@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{finish, first_known, internal, join, parent, record};
+use super::support::{finish, first_known, internal, join, normalize_join, parent, record};
 use crate::symbols::{self, Grammar, has_child_kind, push_field, text};
 use crate::{Candidate, UnresolvedImport};
 
@@ -29,6 +29,8 @@ pub(crate) struct RustImport {
     /// file's own module instead of a directory one level too high.
     pub mods: Vec<String>,
     pub is_mod: bool,
+    /// The `#[path = "…"]` on a `mod x;`, which names the file directly.
+    pub path_attr: Option<String>,
 }
 
 /// Rust imports come from the syntax tree, not from a line regex. A `use` in a comment, in a string literal, or in the raw-string
@@ -123,6 +125,19 @@ fn rust_import_candidates(
         dir = join(&dir, name);
     }
     if item.is_mod {
+        if let Some(attr) = &item.path_attr {
+            // Relative to the directory of the declaring file, plus the
+            // inline modules the declaration sits in; not to the module's
+            // own children directory, which is what `mod x;` uses.
+            let mut base = parent(from).unwrap_or("").to_owned();
+            for name in &item.mods {
+                base = join(&base, name);
+            }
+            return normalize_join(&base, attr)
+                .map(Candidate::Exact)
+                .into_iter()
+                .collect();
+        }
         let Some(name) = item.segments.first() else {
             return Vec::new();
         };
@@ -294,8 +309,18 @@ fn collect_rust_imports(
     out: &mut Vec<RustImport>,
 ) {
     let mut cursor = node.walk();
+    // The `#[path]` attribute is a sibling that precedes the `mod x;` it
+    // decorates, so it is carried until the next item consumes or drops it.
+    let mut path_attr: Option<String> = None;
     for child in node.named_children(&mut cursor) {
         match child.kind() {
+            "line_comment" | "block_comment" => continue,
+            "attribute_item" => {
+                if let Some(value) = text(child, source).as_deref().and_then(path_attribute) {
+                    path_attr = Some(value);
+                }
+                continue;
+            }
             "use_declaration" => {
                 if let Some(argument) = child.child_by_field_name("argument") {
                     let mut prefix = Vec::new();
@@ -317,12 +342,24 @@ fn collect_rust_imports(
                         segments: vec![name],
                         mods: mods.clone(),
                         is_mod: true,
+                        path_attr: path_attr.take(),
                     });
                 }
             }
             _ => collect_rust_imports(child, source, mods, out),
         }
+        path_attr = None;
     }
+}
+
+/// The string of a `#[path = "x.rs"]` attribute, and nothing else: another
+/// attribute (`#[cfg(test)]`, `#[pathological]`) is not one.
+fn path_attribute(attribute: &str) -> Option<String> {
+    let inner = attribute.trim().strip_prefix("#[")?.strip_suffix(']')?;
+    let rest = inner.trim().strip_prefix("path")?.trim_start();
+    let value = rest.strip_prefix('=')?.trim();
+    let value = value.strip_prefix('"')?.strip_suffix('"')?;
+    Some(value.to_owned())
 }
 
 /// Flattens one `use` argument into the full paths it names: `a::{b, c as d}`
@@ -369,6 +406,7 @@ fn flatten_use(
                 segments: prefix.clone(),
                 mods: mods.to_vec(),
                 is_mod: false,
+                path_attr: None,
             });
             prefix.truncate(saved);
         }
@@ -379,6 +417,7 @@ fn flatten_use(
                 segments: prefix.clone(),
                 mods: mods.to_vec(),
                 is_mod: false,
+                path_attr: None,
             });
             prefix.truncate(saved);
         }
@@ -416,12 +455,18 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<crate::E
             | "struct_item"
             | "enum_item"
             | "union_item"
-            | "type_item"
             | "const_item"
             | "static_item"
             | "associated_type"
             | "macro_definition" => {
                 if public {
+                    push_field(child, source, out);
+                }
+            }
+            "type_item" => {
+                // `pub type X = path::X;` re-publishes a type under its own
+                // name: the definition is at the end of the path.
+                if public && !republishes(child, source) {
                     push_field(child, source, out);
                 }
             }
@@ -449,6 +494,21 @@ fn rust_items(node: Node, source: &[u8], inherited: bool, out: &mut Vec<crate::E
             _ => {}
         }
     }
+}
+
+/// Whether a `type` alias is a plain path to a type of the same name.
+fn republishes(alias: Node, source: &[u8]) -> bool {
+    let (Some(name), Some(target)) = (
+        alias.child_by_field_name("name"),
+        alias.child_by_field_name("type"),
+    ) else {
+        return false;
+    };
+    target.kind() == "scoped_type_identifier"
+        && target
+            .child_by_field_name("name")
+            .and_then(|last| text(last, source))
+            == text(name, source)
 }
 
 #[cfg(test)]
