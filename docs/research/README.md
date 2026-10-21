@@ -44,6 +44,7 @@
 - [extensibility-marketplace/design-2026-10.md](extensibility-marketplace/design-2026-10.md) — skills/commands/hooks/MCP survey and titi's layered plan with the trust model.
 - [omp-parity/GAP.md](omp-parity/GAP.md) — what omp has and titi lacks, ranked; per-entry status.
 - [empryo-parity/README.md](empryo-parity/README.md) — ideas from Empryo's public docs, ranked; per-entry status.
+- [evals/README.md](evals/README.md) — `scripts/eval.py` harness: tasks graded by their own check, tokens, cost and tool-error rate from the event stream (practice #10).
 - [perf/README.md](perf/README.md) — `scripts/bench.py` method, baseline, hotspots and measured fixes.
 - [agent-tracing.md](agent-tracing.md) — span model, viewer, engine sink; phases B/C owner-gated.
 - [genome-incremental.md](genome-incremental.md) — Taimyr incremental index; phase 3 (watcher) owner-gated.
