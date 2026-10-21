@@ -24,6 +24,15 @@ the real binary and the real HTTP stack:
                   `tool_choice: "none"` it answers "Wrapped up: ..."
   "spin repeat"   the same `read` of README.md every round until a tool result
                   carries titi's `[titi:` nudge, then it answers and stops
+  "break syntax"  (first user message; needs `lib.rs` in the workspace holding
+                  `fn main() {\n    println!("hi");\n}\n`) an edit that leaves one
+                  `}` too many; when the tool result carries titi's `syntax:` line
+                  it repairs the file with a second edit, then answers with the
+                  `syntax:` line the repair returned
+  "verify loop"   (first user message) a write of a.txt, then "Done"; a user
+                  message that starts `verification failed:` (the turn-end
+                  verifier's feedback) makes it write ok.txt and answer "Fixed";
+                  set `verify.command: test -f ok.txt || exit 3` to see the loop
   "run bash"      text, then a bash call: echo titi-smoke
   "load skill"    a `skill` call naming the first skill the system prompt lists
                   (`- name: description` under `# Skills`); `skill: none listed`
@@ -162,6 +171,48 @@ def spin(request: dict) -> list[tuple[dict, float]] | None:
         # A different range each round, so no call ever repeats.
         args = {"path": "README.md", "limit": len(results) + 1}
     return [(c, 0) for c in call(f"call_spin_{len(results)}", "read", args)]
+
+
+def chain(request: dict) -> list[tuple[dict, float]] | None:
+    """The turn-end keywords: `break syntax` and `verify loop`.
+
+    Like `spin`, they key on the first user message and read the whole
+    conversation, because what they do next depends on what titi appended: a
+    `syntax:` line on an edit's result, or a `verification failed:` message.
+    """
+    messages = request.get("messages", [])
+    first = next((m for m in messages if m.get("role") == "user"), {})
+    opening = str(first.get("content") or "")
+    last = messages[-1] if messages else {}
+    text = str(last.get("content") or "")
+    done = [(chunk({}, "stop"), 0)]
+    if "break syntax" in opening:
+        if last.get("role") == "user":
+            args = {
+                "path": "lib.rs",
+                "old_string": '    println!("hi");\n}\n',
+                "new_string": '    println!("hi");\n}\n}\n',
+            }
+            return [(c, 0) for c in call("call_break", "edit", args)]
+        results = [m for m in messages if m.get("role") == "tool"]
+        syntax = next((l for l in text.splitlines() if l.startswith("syntax:")), "")
+        if len(results) == 1 and syntax:
+            args = {"path": "lib.rs", "old_string": "}\n}\n", "new_string": "}\n"}
+            return [(c, 0) for c in call("call_repair", "edit", args)]
+        return words(f"Syntax check said: {syntax or 'nothing'}", 0) + done
+    if "verify loop" in opening:
+        if last.get("role") == "user" and text.startswith("verification failed:"):
+            args = {"path": "ok.txt", "content": "fixed\n"}
+            return [(c, 0) for c in call("call_verify_fix", "write", args)]
+        if last.get("role") == "user":
+            args = {"path": "a.txt", "content": "hello\n"}
+            return [(c, 0) for c in call("call_verify_a", "write", args)]
+        fixed = any(
+            m.get("role") == "user" and str(m.get("content") or "").startswith("verification failed:")
+            for m in messages
+        )
+        return words("Fixed: ok.txt written." if fixed else "Done: a.txt written.", 0) + done
+    return None
 
 
 def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, float]]:
@@ -376,7 +427,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
         try:
-            for event, pause in (spin(request) or script(last, messages)):
+            for event, pause in (chain(request) or spin(request) or script(last, messages)):
                 self.write_chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
                 if pause:
                     time.sleep(pause)
