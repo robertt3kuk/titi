@@ -14,8 +14,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use titi_config::hooks::{HookDef, HookEvent};
+use titi_config::mcp::{McpApproval, McpServerDef};
 use titi_engine::protocol::{HookOutcome, JobInfo, SessionMode, VerifyOutcome};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
+use titi_mcp::{ServerState, ServerStatus, ToolSummary};
 use titi_providers::{ChatMessage, Effort, ErrorReason, Role, StopReason, ToolCallRef};
 use titi_tools::AskAnswer;
 
@@ -284,6 +286,52 @@ fn every_engine_command_round_trips_through_its_fixture() {
                 source: String::new(),
             }]
         }
+    );
+    command(
+        EngineCommand::SetMcp {
+            servers: vec![McpServerDef {
+                name: "files".into(),
+                command: "npx".into(),
+                args: vec!["-y".into(), "srv".into()],
+                env: [("ROOT".to_owned(), ".".to_owned())].into(),
+                cwd: Some("tools".into()),
+                disabled: false,
+                timeout_secs: Some(30),
+                approval: Some(McpApproval::Read),
+                source: ".mcp.json".into(),
+            }],
+        },
+        r#"{"SetMcp":{"servers":[{"name":"files","command":"npx","args":["-y","srv"],"env":{"ROOT":"."},"cwd":"tools","disabled":false,"timeout_secs":30,"approval":"read","source":".mcp.json"}]}}"#,
+    );
+    // A client that sends nothing clears the servers; a bare definition gets
+    // the defaults, which are the highest approval tier and no timeout.
+    let bare: EngineCommand = serde_json::from_str(r#"{"SetMcp":{}}"#).expect("deserialize");
+    assert_eq!(bare, EngineCommand::SetMcp { servers: vec![] });
+    let bare: EngineCommand =
+        serde_json::from_str(r#"{"SetMcp":{"servers":[{"name":"a","command":"srv"}]}}"#)
+            .expect("deserialize");
+    assert_eq!(
+        bare,
+        EngineCommand::SetMcp {
+            servers: vec![McpServerDef {
+                name: "a".into(),
+                command: "srv".into(),
+                args: vec![],
+                env: Default::default(),
+                cwd: None,
+                disabled: false,
+                timeout_secs: None,
+                approval: None,
+                source: String::new(),
+            }]
+        }
+    );
+    command(EngineCommand::ListMcp, r#""ListMcp""#);
+    command(
+        EngineCommand::RestartMcp {
+            name: "files".into(),
+        },
+        r#"{"RestartMcp":{"name":"files"}}"#,
     );
     command(EngineCommand::Shutdown, r#""Shutdown""#);
 }
@@ -569,6 +617,49 @@ fn every_engine_event_round_trips_through_its_fixture() {
             exit_code: None,
             ms: 300_000,
             retrying: false,
+        }
+    );
+    event(
+        EngineEvent::McpStatus {
+            servers: vec![
+                ServerStatus {
+                    name: "files".into(),
+                    state: ServerState::Ready,
+                    reason: String::new(),
+                    tools: vec![ToolSummary {
+                        name: "mcp__files__read".into(),
+                        description: "Read a file".into(),
+                    }],
+                    command: "npx -y srv".into(),
+                    source: "mcp.json".into(),
+                },
+                ServerStatus {
+                    name: "web".into(),
+                    state: ServerState::Failed,
+                    reason: "the server exited (exit status: 1)".into(),
+                    tools: vec![],
+                    command: "srv".into(),
+                    source: ".mcp.json".into(),
+                },
+            ],
+        },
+        r#"{"McpStatus":{"servers":[{"name":"files","state":"ready","reason":"","tools":[{"name":"mcp__files__read","description":"Read a file"}],"command":"npx -y srv","source":"mcp.json"},{"name":"web","state":"failed","reason":"the server exited (exit status: 1)","tools":[],"command":"srv","source":".mcp.json"}]}}"#,
+    );
+    // An older engine's status has only names and states.
+    let old: EngineEvent =
+        serde_json::from_str(r#"{"McpStatus":{"servers":[{"name":"a","state":"starting"}]}}"#)
+            .expect("deserialize");
+    assert_eq!(
+        old,
+        EngineEvent::McpStatus {
+            servers: vec![ServerStatus {
+                name: "a".into(),
+                state: ServerState::Starting,
+                reason: String::new(),
+                tools: vec![],
+                command: String::new(),
+                source: String::new(),
+            }]
         }
     );
     event(

@@ -1140,6 +1140,8 @@ pub struct EngineRuntime {
     /// The turn-end verify command. Only `SetVerify` fills it, for the same
     /// reason.
     verifier: crate::verify::Verifier,
+    /// The session's MCP servers. Only `SetMcp` fills it.
+    mcp: crate::mcp::McpHost,
 }
 
 impl EngineRuntime {
@@ -1362,6 +1364,7 @@ impl EngineRuntime {
             mode: config.mode,
             hooks,
             verifier,
+            mcp: crate::mcp::McpHost::new(),
             config,
             resolver,
             commands: command_rx,
@@ -1692,6 +1695,14 @@ impl EngineRuntime {
                         EngineCommand::SetVerify { command, on_edit } => {
                             self.verifier.set(command, on_edit);
                         }
+                        EngineCommand::SetMcp { servers } => self.set_mcp(servers).await,
+                        EngineCommand::ListMcp => self.report_mcp().await,
+                        EngineCommand::RestartMcp { name } => {
+                            if !self.mcp.restart(&name) {
+                                let message = format!("mcp: no server named {name}");
+                                let _ = self.events.send(EngineEvent::Notice { message: message.into() }).await;
+                            }
+                        }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
                                 aborted.store(true, Ordering::SeqCst);
@@ -1720,6 +1731,7 @@ impl EngineRuntime {
                             if let Some(agents) = &self.agents {
                                 agents.stop_all().await;
                             }
+                            self.mcp.shutdown();
                             break;
                         }
                         EngineCommand::ApproveTool { call_id, approved } => {
@@ -1774,6 +1786,7 @@ impl EngineRuntime {
                         }
                     }
                 }
+                Some(event) = self.mcp.rx.recv() => self.mcp_changed(event).await,
                 completed = done_rx.recv() => {
                     if let Some(completed) = completed
                         && active.as_ref().is_some_and(|(id, _)| *id == completed.turn_id)
@@ -2088,6 +2101,49 @@ impl EngineRuntime {
         } else {
             Some(joined.into())
         }
+    }
+
+    /// `SetMcp`: the servers start in the background; their tools arrive with
+    /// the status events that follow.
+    async fn set_mcp(&mut self, servers: Vec<titi_config::mcp::McpServerDef>) {
+        let workspace = self
+            .config
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let agent_dir = self
+            .config
+            .agent_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        self.mcp.set(
+            servers,
+            titi_mcp::ManagerConfig::from_process(&agent_dir, &workspace),
+        );
+        self.report_mcp().await;
+    }
+
+    /// A server changed: swap its tools into the registry the next turn will
+    /// take, and tell the surface.
+    async fn mcp_changed(&mut self, first: titi_mcp::McpEvent) {
+        let digest = self.mcp.digest(first);
+        for message in digest.notices {
+            let _ = self
+                .events
+                .send(EngineEvent::Notice {
+                    message: message.into(),
+                })
+                .await;
+        }
+        if digest.changed {
+            self.mcp.install(&mut self.tools);
+            self.report_mcp().await;
+        }
+    }
+
+    async fn report_mcp(&self) {
+        let servers = self.mcp.status();
+        let _ = self.events.send(EngineEvent::McpStatus { servers }).await;
     }
 
     /// The registry this mode's turns get.

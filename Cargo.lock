@@ -2686,6 +2686,7 @@ dependencies = [
  "titi-config",
  "titi-core",
  "titi-genome",
+ "titi-mcp",
  "titi-memory",
  "titi-providers",
  "titi-secrets",

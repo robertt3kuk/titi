@@ -17,6 +17,7 @@ mod frontmatter;
 pub mod goal;
 pub mod hooks;
 pub mod judgment;
+mod mcp;
 pub mod naming;
 pub mod orchestrator;
 pub mod project_context;

@@ -227,6 +227,22 @@ pub enum EngineCommand {
         #[serde(default = "default_on_edit")]
         on_edit: bool,
     },
+    /// Replace the MCP servers the session runs. As with hooks, the surface
+    /// sends only what it resolved and the user approved: a repository's
+    /// server reaches the engine only through a surface that asked. Servers
+    /// start in the background; each one's progress arrives as
+    /// [`EngineEvent::McpStatus`], and its tools join the next turn.
+    SetMcp {
+        #[serde(default)]
+        servers: Vec<titi_config::mcp::McpServerDef>,
+    },
+    /// Report every MCP server's state and tools.
+    ListMcp,
+    /// Stop an MCP server and start it again, with its restart allowance
+    /// renewed.
+    RestartMcp {
+        name: SmolStr,
+    },
     Shutdown,
 }
 
@@ -448,6 +464,12 @@ pub enum EngineEvent {
         ms: u64,
         #[serde(default)]
         retrying: bool,
+    },
+    /// Every MCP server and where it stands. Sent when the set changes, when a
+    /// server's state or tool list changes, and in answer to
+    /// [`EngineCommand::ListMcp`].
+    McpStatus {
+        servers: Vec<titi_mcp::ServerStatus>,
     },
     /// What fills the context window right now, part by part.
     ///
