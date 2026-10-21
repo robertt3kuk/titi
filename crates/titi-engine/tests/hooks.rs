@@ -512,3 +512,105 @@ async fn the_session_starts_before_the_first_prompt_is_judged() {
         "start\nprompt\n"
     );
 }
+
+const LEAK: &str = "KEY=sk-test-0000000000000000 host 203.0.113.7";
+
+fn assert_masked(text: &str) {
+    assert!(
+        !text.contains("sk-test-0000000000000000"),
+        "a key got through: {text}"
+    );
+    assert!(
+        !text.contains("203.0.113.7"),
+        "an address got through: {text}"
+    );
+}
+
+/// A hook prints what its script prints — `env`, a remote, a dotfile — and
+/// that must meet the same redactor a tool's output does before it reaches the
+/// model, the session or the wire.
+#[tokio::test]
+async fn what_a_hook_prints_is_masked_before_it_reaches_the_model() {
+    let transport = Arc::new(MockTransport::new(vec![
+        say("one"),
+        say("two"),
+        call("echo", r#"{"text":"x"}"#),
+        say("three"),
+    ]));
+    let mut engine = start(
+        &transport,
+        ApprovalMode::Write,
+        vec![
+            hook(
+                HookEvent::SessionStart,
+                None,
+                &format!("cat >/dev/null; echo '{LEAK}'"),
+            ),
+            hook(
+                HookEvent::UserPromptSubmit,
+                None,
+                &format!("cat >/dev/null; echo '{LEAK}'"),
+            ),
+            hook(
+                HookEvent::PostToolUse,
+                None,
+                &format!(
+                    r#"cat >/dev/null; printf '%s' '{{"hookSpecificOutput":{{"additionalContext":"{LEAK}"}}}}'"#
+                ),
+            ),
+            hook(
+                HookEvent::PreToolUse,
+                Some("echo"),
+                &format!(
+                    r#"cat >/dev/null; printf '%s' '{{"hookSpecificOutput":{{"permissionDecision":"ask","permissionDecisionReason":"{LEAK}"}}}}'"#
+                ),
+            ),
+            hook(
+                HookEvent::Stop,
+                None,
+                &format!("cat >/dev/null; echo '{LEAK}' >&2; exit 2"),
+            ),
+        ],
+    )
+    .await;
+    submit(&engine, "first").await;
+    let first = until(&mut engine, turn_end).await;
+    // The wire: every `HookRan` a headless client reads.
+    for (_, _, detail) in hook_rows(&first) {
+        assert_masked(&detail);
+    }
+    // The provider: system prompt, user message, the Stop nudge.
+    for request in transport.requests() {
+        for message in &request.messages {
+            assert_masked(&message.content);
+        }
+    }
+    // The prompt hook's context and SessionStart still arrived, masked.
+    let sent = &transport.requests()[0];
+    assert!(sent.messages.iter().any(|m| m.content.contains("[hook")));
+
+    // A tool round: the ask reason and the post note.
+    submit(&engine, "second").await;
+    let events = until(&mut engine, |event| {
+        matches!(event, EngineEvent::ToolApprovalNeeded { .. })
+    })
+    .await;
+    for (_, _, detail) in hook_rows(&events) {
+        assert_masked(&detail);
+    }
+    engine
+        .send(EngineCommand::ApproveTool {
+            call_id: "call-1".into(),
+            approved: true,
+        })
+        .await
+        .unwrap();
+    let rest = until(&mut engine, turn_end).await;
+    let (output, _) = tool_answer(&rest);
+    assert_masked(&output);
+    for request in transport.requests() {
+        for message in &request.messages {
+            assert_masked(&message.content);
+        }
+    }
+}

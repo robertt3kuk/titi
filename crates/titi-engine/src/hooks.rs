@@ -29,6 +29,7 @@ use titi_tools::{HookRun, Interrupt, PipeError};
 use tokio::sync::{OnceCell, mpsc};
 
 use crate::protocol::{EngineEvent, HookOutcome, TurnId};
+use crate::tool_loop::mask;
 
 /// How long a hook may run when its definition names no timeout: the same
 /// bound a `bash` call gets before it is handed to the background.
@@ -112,6 +113,9 @@ struct Inner {
     session_id: String,
     cwd: PathBuf,
     interrupt: Interrupt,
+    /// Whether addresses are masked in what hooks print, as in a tool's
+    /// output (`privacy.maskIps`); keys always are.
+    mask_ips: bool,
     /// What `SessionStart` hooks said, computed once: it goes into the system
     /// prompt, which must not change from turn to turn.
     session_context: OnceCell<Option<String>>,
@@ -128,7 +132,7 @@ pub struct Hooks {
 
 impl Default for Hooks {
     fn default() -> Self {
-        Self::new(None, PathBuf::from("."), Interrupt::new())
+        Self::new(None, PathBuf::from("."), Interrupt::new(), true)
     }
 }
 
@@ -169,13 +173,19 @@ struct Ran {
 }
 
 impl Hooks {
-    pub fn new(session_id: Option<String>, cwd: PathBuf, interrupt: Interrupt) -> Self {
+    pub fn new(
+        session_id: Option<String>,
+        cwd: PathBuf,
+        interrupt: Interrupt,
+        mask_ips: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 defs: RwLock::new(Arc::new(Vec::new())),
                 session_id: session_id.unwrap_or_default(),
                 cwd,
                 interrupt,
+                mask_ips,
                 session_context: OnceCell::new(),
             }),
             can_ask: true,
@@ -496,6 +506,7 @@ impl Hooks {
                 .map(|secs| Duration::from_secs(secs.clamp(1, MAX_TIMEOUT_SECS)))
                 .unwrap_or(DEFAULT_TIMEOUT);
             let cwd = self.inner.cwd.clone();
+            let mask_ips = self.inner.mask_ips;
             let interrupt = self.inner.interrupt.clone();
             let payload = Arc::clone(&payload);
             let name = def.display_name();
@@ -510,7 +521,7 @@ impl Hooks {
                         reason: error.to_string(),
                     })
                 });
-                (name, classify(event, raw), started.elapsed())
+                (name, classify(event, raw, mask_ips), started.elapsed())
             }
         });
         let mut ran = Vec::new();
@@ -586,7 +597,7 @@ fn describe(decision: &Decision) -> (HookOutcome, SmolStr) {
 }
 
 /// One command's exit and output, read as the hook contract says.
-fn classify(event: HookEvent, raw: Result<HookRun, PipeError>) -> Decision {
+fn classify(event: HookEvent, raw: Result<HookRun, PipeError>, mask_ips: bool) -> Decision {
     let run = match raw {
         Ok(run) => run,
         Err(PipeError::TimedOut { after, .. }) => {
@@ -595,12 +606,12 @@ fn classify(event: HookEvent, raw: Result<HookRun, PipeError>) -> Decision {
                 after.as_secs()
             ));
         }
-        Err(error) => return Decision::Warn(error.to_string()),
+        Err(error) => return Decision::Warn(mask(&error.to_string(), mask_ips)),
     };
     match run.exit_code {
-        Some(0) => classify_stdout(event, &run.stdout),
+        Some(0) => classify_stdout(event, &run.stdout, mask_ips),
         Some(2) => {
-            let reason = cap(run.stderr.trim(), REASON_CAP);
+            let reason = cap(&mask(run.stderr.trim(), mask_ips), REASON_CAP);
             Decision::Block(if reason.is_empty() {
                 "blocked with no reason given".to_owned()
             } else {
@@ -610,7 +621,10 @@ fn classify(event: HookEvent, raw: Result<HookRun, PipeError>) -> Decision {
         Some(code) => {
             let first = run.stderr.lines().find(|line| !line.trim().is_empty());
             Decision::Warn(match first {
-                Some(line) => format!("exited {code}: {}", cap(line.trim(), DETAIL_CAP)),
+                Some(line) => format!(
+                    "exited {code}: {}",
+                    cap(&mask(line.trim(), mask_ips), DETAIL_CAP)
+                ),
                 None => format!("exited {code}"),
             })
         }
@@ -620,7 +634,7 @@ fn classify(event: HookEvent, raw: Result<HookRun, PipeError>) -> Decision {
 
 /// An exit 0's stdout: a JSON object may carry a decision and context; any
 /// other text is context for the two events that take it.
-fn classify_stdout(event: HookEvent, stdout: &str) -> Decision {
+fn classify_stdout(event: HookEvent, stdout: &str, mask_ips: bool) -> Decision {
     let text = stdout.trim();
     if text.is_empty() {
         return Decision::Ok { context: None };
@@ -637,11 +651,11 @@ fn classify_stdout(event: HookEvent, stdout: &str) -> Decision {
         };
         let context = string_at(specific, "additionalContext")
             .or_else(|| string_at(Some(&Value::Object(object.clone())), "additionalContext"))
-            .map(|text| cap(&text, CONTEXT_CAP))
+            .map(|text| cap(&mask(&text, mask_ips), CONTEXT_CAP))
             .filter(|text| !text.trim().is_empty());
         let reason = string_at(specific, "permissionDecisionReason")
             .or_else(|| string_at(Some(&Value::Object(object.clone())), "reason"))
-            .map(|text| cap(&text, REASON_CAP));
+            .map(|text| cap(&mask(&text, mask_ips), REASON_CAP));
         // `decision: "block"` is the older spelling every event understands.
         if object.get("decision").and_then(Value::as_str) == Some("block") {
             return Decision::Block(
@@ -669,7 +683,7 @@ fn classify_stdout(event: HookEvent, stdout: &str) -> Decision {
     }
     match event {
         HookEvent::UserPromptSubmit | HookEvent::SessionStart => Decision::Ok {
-            context: Some(cap(text, CONTEXT_CAP)),
+            context: Some(cap(&mask(text, mask_ips), CONTEXT_CAP)),
         },
         _ => Decision::Ok { context: None },
     }
@@ -720,6 +734,7 @@ mod tests {
             Some("sess-1".into()),
             dir.path().to_path_buf(),
             Interrupt::new(),
+            true,
         );
         assert!(hooks.set(defs).is_empty());
         let (events, seen) = mpsc::channel(64);

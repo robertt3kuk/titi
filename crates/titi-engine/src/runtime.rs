@@ -1274,6 +1274,7 @@ impl EngineRuntime {
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from(".")),
             config.interrupt.clone(),
+            config.mask_ips,
         );
         let runner = runner.or_else(|| {
             let model = config.agent_model.clone()?;
