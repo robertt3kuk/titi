@@ -2677,6 +2677,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "serde_yaml",
  "smol_str",
  "tempfile",
  "thiserror 2.0.20",

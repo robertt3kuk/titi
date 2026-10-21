@@ -684,6 +684,9 @@ pub struct EngineConfig {
     /// Agent directory holding `SOUL.md`, `PERSONALITY.md` and the memory
     /// index. `None` sends no identity — only the genome map.
     pub agent_dir: Option<PathBuf>,
+    /// `skills.foreignUserDirs`: also read skills and commands from `~/.agents`
+    /// and `~/.claude`, which belong to other tools.
+    pub foreign_user_dirs: bool,
     /// Embeddings model from `memory.embeddingModel`. `None` uses the local
     /// trigram embedder, which needs no network.
     pub embedding_model: Option<String>,
@@ -751,6 +754,7 @@ impl EngineConfig {
             context_window: 128_000,
             compaction: titi_core::compaction::CompactionPolicy::default(),
             agent_dir: None,
+            foreign_user_dirs: false,
             embedding_model: None,
             sensitive: titi_tools::SensitivePolicy::default(),
             mask_ips: true,
@@ -1948,18 +1952,11 @@ impl EngineRuntime {
     /// and drew the text as typed. A refused body is reported instead of
     /// being pasted in, so a skill missing from a prompt is never silent.
     async fn expand_skills(&self, text: SmolStr) -> SmolStr {
-        let cwd = self
-            .config
-            .workspace_root
-            .clone()
-            .or_else(|| self.config.genome_root.clone());
-        let agent_dir = self.config.agent_dir.clone();
+        let sources = self.extension_sources();
         let typed = text.clone();
-        // Reads a directory and up to BODY_CAP per skill: off the runtime thread.
-        let expanded = tokio::task::spawn_blocking(move || {
-            crate::skills::expand(&typed, cwd.as_deref(), agent_dir.as_deref())
-        })
-        .await;
+        // Reads directories and up to BODY_CAP per file: off the runtime thread.
+        let expanded =
+            tokio::task::spawn_blocking(move || crate::skills::expand(&typed, &sources)).await;
         let Ok(expanded) = expanded else {
             return text;
         };
@@ -2046,14 +2043,23 @@ impl EngineRuntime {
         )
     }
 
+    /// Where skills and commands are looked for, from this session's config.
+    fn extension_sources(&self) -> crate::sources::Sources {
+        crate::sources::Sources {
+            cwd: self
+                .config
+                .workspace_root
+                .clone()
+                .or_else(|| self.config.genome_root.clone()),
+            agent_dir: self.config.agent_dir.clone(),
+            home: process_home(),
+            foreign_user_dirs: self.config.foreign_user_dirs,
+        }
+    }
+
     /// Name and description of discovered skills. Bodies stay on disk.
     fn skill_list(&self) -> Option<String> {
-        let cwd = self
-            .config
-            .workspace_root
-            .as_deref()
-            .or(self.config.genome_root.as_deref());
-        crate::skills::render(cwd, self.config.agent_dir.as_deref())
+        crate::skills::render(&self.extension_sources())
     }
 
     /// The memories relevant to this turn. The turn itself builds the copy

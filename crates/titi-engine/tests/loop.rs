@@ -1746,3 +1746,50 @@ async fn a_turns_request_is_a_byte_prefix_of_the_next_turns() {
         "ephemeral"
     );
 }
+
+/// The system prompt lists a `.claude/skills` skill and tells the model how to
+/// load it, and names nothing a skill hid from the model.
+#[tokio::test]
+async fn the_prompt_lists_claude_skills_and_points_at_the_skill_tool() {
+    let project = tempfile::tempdir().unwrap();
+    let skills = project.path().join(".claude/skills");
+    std::fs::create_dir_all(skills.join("shown")).unwrap();
+    std::fs::create_dir_all(skills.join("quiet")).unwrap();
+    std::fs::write(
+        skills.join("shown/SKILL.md"),
+        "---\nname: shown\ndescription: Visible to the model\n---\nBody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        skills.join("quiet/SKILL.md"),
+        "---\nname: quiet\ndescription: Hidden\ndisable-model-invocation: true\n---\nBody\n",
+    )
+    .unwrap();
+    let transport = done_transport();
+    let captured = Arc::clone(&transport);
+    let mut config = EngineConfig::new("primary");
+    config.workspace_root = Some(project.path().to_path_buf());
+    let mut engine = EngineRuntime::start(config, resolver(vec![("primary", transport)]));
+    engine
+        .send(EngineCommand::SubmitPrompt { text: "hi".into() })
+        .await
+        .unwrap();
+    let _ = collect_until_terminal(&mut engine).await;
+    let requests = captured.requests();
+    let system = requests[0]
+        .messages
+        .iter()
+        .find(|message| message.role == Role::System)
+        .expect("a system message");
+    assert!(
+        system.content.contains("- shown: Visible to the model"),
+        "{}",
+        system.content
+    );
+    assert!(
+        system.content.contains("`skill` tool"),
+        "{}",
+        system.content
+    );
+    assert!(!system.content.contains("quiet"), "{}", system.content);
+}
