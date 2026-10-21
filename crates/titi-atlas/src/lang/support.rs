@@ -29,8 +29,21 @@ pub(crate) fn first_known(candidates: &[Candidate], files: &HashSet<String>) -> 
                 return Some(path.clone());
             }
             // The file may live under a root prefix the specifier omitted.
+            // Several files can end the same way (`commonMain/…/Buffer.kt` and
+            // `jvmMain/…/Buffer.kt`); a hash set yields them in an order that
+            // changes from run to run, so the pick is by the data: the
+            // shallowest path, then the smallest.
             let needle = format!("/{path}");
-            files.iter().find(|known| known.ends_with(&needle)).cloned()
+            files
+                .iter()
+                .filter(|known| known.ends_with(&needle))
+                .min_by(|a, b| {
+                    a.matches('/')
+                        .count()
+                        .cmp(&b.matches('/').count())
+                        .then_with(|| a.cmp(b))
+                })
+                .cloned()
         }
     })
 }
@@ -560,4 +573,56 @@ pub(crate) fn inside(node: Node, kinds: &[&str]) -> bool {
         ancestor = parent.parent();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    /// Two files end with the suffix: the pick is the shallowest, then the
+    /// smallest, whatever order the set was built in (and each set has its own
+    /// hash seed, so many sets stand in for many runs).
+    #[test]
+    fn a_suffix_that_two_files_share_resolves_to_the_same_one_every_time() {
+        let candidates = [Candidate::Suffix("spec/spec_helper.rb".to_owned())];
+        let paths = [
+            "sinatra-contrib/spec/spec_helper.rb",
+            "rack-protection/spec/spec_helper.rb",
+            "other/deep/er/spec/spec_helper.rb",
+        ];
+        let forward = paths;
+        let mut backward = paths;
+        backward.reverse();
+        for _ in 0..50 {
+            for order in [forward, backward] {
+                assert_eq!(
+                    first_known(&candidates, &set(&order)).as_deref(),
+                    Some("rack-protection/spec/spec_helper.rb")
+                );
+            }
+        }
+        // The shallower file wins over a lexicographically smaller deeper one.
+        let shallow = set(&["a/b/c/Buffer.kt", "z/Buffer.kt"]);
+        assert_eq!(
+            first_known(&[Candidate::Suffix("Buffer.kt".to_owned())], &shallow).as_deref(),
+            Some("z/Buffer.kt")
+        );
+    }
+
+    #[test]
+    fn an_exact_path_still_beats_a_suffix_match() {
+        let files = set(&["spec/spec_helper.rb", "a/spec/spec_helper.rb"]);
+        assert_eq!(
+            first_known(
+                &[Candidate::Suffix("spec/spec_helper.rb".to_owned())],
+                &files
+            )
+            .as_deref(),
+            Some("spec/spec_helper.rb")
+        );
+    }
 }
