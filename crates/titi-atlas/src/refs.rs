@@ -313,7 +313,69 @@ pub(crate) fn collect_refs(source: &str, exports: &[String]) -> Vec<String> {
             return out;
         }
     }
+    for name in imported_names(source) {
+        if record_ref(&name, &own, &mut seen, &mut out) {
+            return out;
+        }
+    }
     out
+}
+
+/// The names an import statement binds, as the definition calls them: the
+/// original of `a as b`.
+///
+/// A bare lowercase identifier is not collected as a use — a local named
+/// `path` is not a dependency on whatever exports `path` — but an import is
+/// evidence of a different kind: it binds the name to a definition, and the
+/// file then calls it, passes it on or stores it. Read are the forms where the
+/// names sit in a list or at the end of a path: `import { a, b as c } from`,
+/// `from x import a, b`, `use x::{a, b};` and `use x::a;`. Resolution still
+/// decides which file the name means, through the file's own imports.
+fn imported_names(source: &str) -> Vec<String> {
+    static ES: LazyLock<Regex> = LazyLock::new(|| {
+        literal_regex(
+            r"(?m)^\s*(?:import|export)\s+(?:type\s+)?(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from",
+        )
+    });
+    static PY: LazyLock<Regex> =
+        LazyLock::new(|| literal_regex(r"(?m)^\s*from\s+[\w.]+\s+import\s+(\([^)]*\)|[^\n#(]+)"));
+    static RS_LIST: LazyLock<Regex> = LazyLock::new(|| {
+        literal_regex(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+[\w:]+::\{([^}]*)\}\s*;")
+    });
+    static RS_ONE: LazyLock<Regex> = LazyLock::new(|| {
+        literal_regex(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+[\w:]+::([A-Za-z_]\w*)\s*;")
+    });
+    let mut names = Vec::new();
+    for pattern in [&*ES, &*PY, &*RS_LIST] {
+        for cap in pattern.captures_iter(source) {
+            let Some(list) = cap.get(1) else {
+                continue;
+            };
+            for item in list.as_str().trim_matches(['(', ')']).split(',') {
+                let original = item.split_whitespace().next().unwrap_or("");
+                let original = original
+                    .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '$');
+                if original.len() >= 3
+                    && original != "self"
+                    && original != "super"
+                    && original != "default"
+                    && original != "type"
+                    && !names.iter().any(|known| known == original)
+                {
+                    names.push(original.to_owned());
+                }
+            }
+        }
+    }
+    for cap in RS_ONE.captures_iter(source) {
+        if let Some(name) = cap.get(1)
+            && name.as_str().len() >= 3
+            && !names.iter().any(|known| known == name.as_str())
+        {
+            names.push(name.as_str().to_owned());
+        }
+    }
+    names
 }
 
 fn record_ref(
