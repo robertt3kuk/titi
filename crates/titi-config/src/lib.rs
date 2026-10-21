@@ -11,6 +11,7 @@
 pub mod config_file;
 pub mod roles;
 pub mod settings;
+pub mod trust;
 
 use std::path::PathBuf;
 
