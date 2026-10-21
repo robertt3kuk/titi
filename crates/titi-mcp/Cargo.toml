@@ -1,0 +1,23 @@
+[package]
+name = "titi-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol_str = { version = "0.3", features = ["serde"] }
+thiserror = "2"
+titi-config = { workspace = true }
+titi-providers = { workspace = true }
+titi-tools = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

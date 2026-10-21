@@ -8,6 +8,7 @@ members = [
     "crates/titi-providers",
     "crates/titi-engine",
     "crates/titi-tools",
+    "crates/titi-mcp",
     "crates/titi-genome",
     "crates/titi-secrets",
     "crates/titi-tui",
@@ -29,6 +30,7 @@ titi-soul = { path = "crates/titi-soul" }
 titi-memory = { path = "crates/titi-memory" }
 titi-secrets = { path = "crates/titi-secrets" }
 titi-tools = { path = "crates/titi-tools" }
+titi-mcp = { path = "crates/titi-mcp" }
 titi-genome = { path = "crates/titi-genome" }
 titi-tui = { path = "crates/titi-tui" }
 tree-sitter = "0.24"
