@@ -166,3 +166,78 @@ fn python_reports_its_level_in_the_capability_roster() {
         .expect("a python capability");
     assert_eq!(python.level, Level::Full, "{}", python.note);
 }
+
+/// A package facade re-exports: `from .models import Request, Response as R`
+/// in `__init__.py`, an alias module of nothing but imports, and `__all__`.
+/// The names are exports of the facade and its imports are re-exports, so a
+/// user of `pkg.Request` reaches `models.py` through it.
+#[test]
+fn python_facades_and_alias_modules_publish_what_they_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "pkg/__init__.py",
+        "from .models import Request, Response as Resp\nfrom .api import *\nfrom os import path\nimport pkg.utils as helpers\n",
+    );
+    write(
+        root,
+        "pkg/models.py",
+        "class Request:\n    pass\n\nclass Response:\n    pass\n",
+    );
+    write(root, "pkg/api.py", "def get(url):\n    return url\n");
+    write(root, "pkg/utils.py", "def slug(x):\n    return x\n");
+    write(
+        root,
+        "pkg/compat.py",
+        "from .models import Request\nfrom json import loads\n",
+    );
+    write(
+        root,
+        "pkg/all.py",
+        "from .api import get\nfrom .models import Response\n__all__ = ['get']\nunrelated = 1\n",
+    );
+    write(
+        root,
+        "pkg/real.py",
+        "from .models import Request\n\ndef work():\n    return Request()\n",
+    );
+
+    let genome = index(root);
+    let init = &genome.files["pkg/__init__.py"];
+    assert_eq!(
+        init.exports,
+        vec!["Request", "Resp", "helpers"],
+        "{:?}",
+        init.exports
+    );
+    for target in ["pkg/models.py", "pkg/api.py", "pkg/utils.py"] {
+        assert!(
+            init.reexports.contains(&target.to_owned()),
+            "{target}: {:?}",
+            init.reexports
+        );
+    }
+    let compat = &genome.files["pkg/compat.py"];
+    assert_eq!(
+        compat.exports,
+        vec!["Request"],
+        "an import-only module publishes workspace names"
+    );
+    assert_eq!(compat.reexports, vec!["pkg/models.py".to_owned()]);
+    let all = &genome.files["pkg/all.py"];
+    assert_eq!(
+        all.exports,
+        vec!["get"],
+        "__all__ decides: {:?}",
+        all.exports
+    );
+    assert_eq!(all.reexports, vec!["pkg/api.py".to_owned()]);
+    let real = &genome.files["pkg/real.py"];
+    assert_eq!(
+        real.exports,
+        vec!["work"],
+        "a module with its own defs does not re-export"
+    );
+    assert!(real.reexports.is_empty());
+}

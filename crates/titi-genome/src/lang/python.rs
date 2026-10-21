@@ -63,6 +63,22 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
             import_module(&spec, files, &mut imports, &mut unresolved);
         }
     }
+    let is_init = path.rsplit('/').next() == Some("__init__.py");
+    let mut reexports = Vec::new();
+    let facade = Facade {
+        path,
+        files,
+        is_init,
+        own_defs: !sites.is_empty(),
+        all: dunder_all(tree.root_node(), source.as_bytes()),
+    };
+    python_facade(
+        tree.root_node(),
+        source.as_bytes(),
+        &facade,
+        &mut sites,
+        &mut reexports,
+    );
     let mut parsed = finish(
         source,
         sites,
@@ -71,9 +87,12 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         symbols::error_count(tree.root_node()),
     );
     // A package's `__init__.py` imports its submodules to publish them.
-    if path.rsplit('/').next() == Some("__init__.py") {
-        parsed.reexports = parsed.imports.clone();
+    if is_init {
+        reexports.extend(parsed.imports.iter().cloned());
     }
+    reexports.sort();
+    reexports.dedup();
+    parsed.reexports = reexports;
     parsed
 }
 
@@ -268,6 +287,203 @@ fn python_module(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// What decides whether a module re-publishes the names it imports.
+struct Facade<'a> {
+    path: &'a str,
+    files: &'a HashSet<String>,
+    is_init: bool,
+    /// The module defines a function, class or constant of its own.
+    own_defs: bool,
+    /// The strings of a module-level `__all__`, when there is one.
+    all: Option<HashSet<String>>,
+}
+
+impl Facade<'_> {
+    /// Whether the imported `name` is part of this module's public surface.
+    ///
+    /// An explicit `__all__` decides alone. Without one, a package's
+    /// `__init__.py` and a module that is nothing but imports (a `compat.py`)
+    /// are facades: what they import is what they offer. A module with code of
+    /// its own imports for its own use.
+    fn publishes(&self, name: &str) -> bool {
+        if let Some(all) = &self.all {
+            return all.contains(name);
+        }
+        !name.starts_with('_') && (self.is_init || !self.own_defs)
+    }
+
+    fn may_publish(&self) -> bool {
+        self.is_init || !self.own_defs || self.all.is_some()
+    }
+}
+
+/// The names in a top-level `__all__ = [...]` or `(...)`.
+fn dunder_all(root: Node, source: &[u8]) -> Option<HashSet<String>> {
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(assignment) = statement
+            .named_child(0)
+            .filter(|n| n.kind() == "assignment")
+        else {
+            continue;
+        };
+        let is_all = assignment
+            .child_by_field_name("left")
+            .and_then(|left| text(left, source))
+            .is_some_and(|left| left == "__all__");
+        let Some(list) = assignment.child_by_field_name("right") else {
+            continue;
+        };
+        if !is_all || !matches!(list.kind(), "list" | "tuple") {
+            continue;
+        }
+        let mut names = HashSet::new();
+        let mut items = list.walk();
+        for item in list.named_children(&mut items) {
+            if item.kind() == "string" {
+                if let Some(raw) = text(item, source) {
+                    names.insert(raw.trim_matches(['"', '\'']).to_owned());
+                }
+            }
+        }
+        return Some(names);
+    }
+    None
+}
+
+/// `from .models import Request` and `import pkg.utils as helpers` in a
+/// module that re-publishes its imports: the imported (or aliased) name is an
+/// export of this file and the file it came from is a re-export. A name that
+/// resolves to nothing in the workspace is a std or third-party name and is
+/// not claimed.
+fn python_facade(
+    node: Node,
+    source: &[u8],
+    facade: &Facade,
+    out: &mut Vec<crate::ExportSite>,
+    reexports: &mut Vec<String>,
+) {
+    if !facade.may_publish() {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "import_from_statement" => facade_from(child, source, facade, out, reexports),
+            "import_statement" => facade_import(child, source, facade, out, reexports),
+            "try_statement" | "if_statement" | "block" | "except_clause" | "else_clause"
+            | "finally_clause" | "elif_clause" => {
+                python_facade(child, source, facade, out, reexports);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn facade_from(
+    node: Node,
+    source: &[u8],
+    facade: &Facade,
+    out: &mut Vec<crate::ExportSite>,
+    reexports: &mut Vec<String>,
+) {
+    let Some(module) = node
+        .child_by_field_name("module_name")
+        .and_then(|module| text(module, source))
+    else {
+        return;
+    };
+    let mut bound: Vec<(String, Node)> = Vec::new();
+    let mut cursor = node.walk();
+    for name in node.children_by_field_name("name", &mut cursor) {
+        let node = match name.kind() {
+            "aliased_import" => name.child_by_field_name("alias"),
+            _ => Some(name),
+        };
+        let Some(node) = node else { continue };
+        let Some(full) = text(node, source) else {
+            continue;
+        };
+        let local = full.rsplit('.').next().unwrap_or(&full).to_owned();
+        bound.push((local, node));
+    }
+    let wildcard = bound.is_empty();
+    let imported: Vec<String> = {
+        let mut cursor = node.walk();
+        node.children_by_field_name("name", &mut cursor)
+            .filter_map(|name| match name.kind() {
+                "aliased_import" => name.child_by_field_name("name"),
+                _ => Some(name),
+            })
+            .filter_map(|name| text(name, source))
+            .collect()
+    };
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    from_clause(
+        facade.path,
+        &module,
+        &imported,
+        facade.files,
+        &mut resolved,
+        &mut unresolved,
+    );
+    if resolved.is_empty() {
+        return;
+    }
+    if wildcard {
+        if facade.is_init || !facade.own_defs {
+            reexports.extend(resolved);
+        }
+        return;
+    }
+    let mut any = false;
+    for (name, node) in bound {
+        if facade.publishes(&name) {
+            push_site(node, source, out);
+            any = true;
+        }
+    }
+    if any {
+        reexports.extend(resolved);
+    }
+}
+
+fn facade_import(
+    node: Node,
+    source: &[u8],
+    facade: &Facade,
+    out: &mut Vec<crate::ExportSite>,
+    reexports: &mut Vec<String>,
+) {
+    let mut cursor = node.walk();
+    for name in node.children_by_field_name("name", &mut cursor) {
+        if name.kind() != "aliased_import" {
+            continue;
+        }
+        let (Some(module), Some(alias)) = (
+            name.child_by_field_name("name")
+                .and_then(|n| text(n, source)),
+            name.child_by_field_name("alias"),
+        ) else {
+            continue;
+        };
+        let Some(local) = text(alias, source) else {
+            continue;
+        };
+        let mut resolved = Vec::new();
+        let mut unresolved = Vec::new();
+        import_module(&module, facade.files, &mut resolved, &mut unresolved);
+        if !resolved.is_empty() && facade.publishes(&local) {
+            push_site(alias, source, out);
+            reexports.extend(resolved);
         }
     }
 }
