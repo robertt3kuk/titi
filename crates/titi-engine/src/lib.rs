@@ -6,6 +6,7 @@ pub mod advisor;
 pub mod agent_defs;
 pub mod agent_tool;
 pub mod agents;
+pub mod cache_watch;
 pub mod change_review;
 pub mod claims;
 pub mod commands;
