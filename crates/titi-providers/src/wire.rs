@@ -791,6 +791,16 @@ fn reasoning_token(req: &WireRequest, format: ThinkingFormat) -> Option<&str> {
     }
 }
 
+/// Whether the body carries its family's "do not call a tool" switch.
+///
+/// Declared tools stay in the request when calls are forbidden: Anthropic
+/// refuses a history holding `tool_use` blocks when `tools` is missing, and
+/// the tool array is part of the cached prefix. With nothing declared there
+/// is nothing to forbid, and OpenAI rejects a `tool_choice` beside no tools.
+fn forbids_tool_calls(req: &WireRequest) -> bool {
+    req.forbid_tool_calls && !req.tools.is_empty()
+}
+
 /// Serialize a normalized request into a family-specific HTTP request.
 ///
 /// The auth scheme follows the credential's kind, not the family alone: the
@@ -841,6 +851,9 @@ pub fn build_http_request(
             if let Some(token) = reasoning_token(req, ThinkingFormat::OpenAi) {
                 body["reasoning_effort"] = Value::String(token.to_owned());
             }
+            if forbids_tool_calls(req) {
+                body["tool_choice"] = Value::String("none".into());
+            }
             HttpRequest {
                 method: "POST".into(),
                 url: format!("{}/chat/completions", base_url.trim_end_matches('/')).into(),
@@ -868,6 +881,9 @@ pub fn build_http_request(
                 "tools": responses_tools_wire(req),
                 "max_output_tokens": req.max_tokens,
             });
+            if forbids_tool_calls(req) {
+                body["tool_choice"] = Value::String("none".into());
+            }
             if let Some(sys) = &req.system {
                 body["instructions"] = Value::String(sys.to_string());
             }
@@ -940,6 +956,9 @@ pub fn build_http_request(
                 "tools": anthropic_tools_wire(req),
                 "max_tokens": req.max_tokens.unwrap_or(4096),
             });
+            if forbids_tool_calls(req) {
+                body["tool_choice"] = serde_json::json!({"type": "none"});
+            }
             // The block form is what carries a breakpoint; with nothing to
             // say the field is left out rather than sent as an empty block,
             // which the API rejects.
@@ -995,6 +1014,9 @@ pub fn build_http_request(
                 "contents": gemini_contents_wire(req, folded),
                 "tools": gemini_tools_wire(req),
             });
+            if forbids_tool_calls(req) {
+                body["toolConfig"] = serde_json::json!({"functionCallingConfig": {"mode": "NONE"}});
+            }
             if let Some(sys) = &system {
                 body["systemInstruction"] = serde_json::json!({"parts": [{"text": sys.as_str()}]});
             }
@@ -1928,6 +1950,46 @@ mod tests {
         );
         // Opt-in schema enforcement, never asked for.
         assert!(responses["tools"][0].get("strict").is_none(), "{responses}");
+    }
+
+    /// A request that forbids tool calls still declares its tools — Anthropic
+    /// refuses a history with `tool_use` blocks when `tools` is absent — and
+    /// says so in each family's own words. One that does not forbid them
+    /// carries no such field at all.
+    #[test]
+    fn forbidding_tool_calls_keeps_the_tools_and_adds_the_families_own_switch() {
+        let mut r = req_with_tools();
+        for api in [
+            ApiKind::OpenAiCompletions,
+            ApiKind::OpenAiResponses,
+            ApiKind::AnthropicMessages,
+            ApiKind::GeminiGenerateContent,
+        ] {
+            let open = body_of(api, &r);
+            assert!(open.get("tool_choice").is_none(), "{api:?}: {open}");
+            assert!(open.get("toolConfig").is_none(), "{api:?}: {open}");
+        }
+
+        r.forbid_tool_calls = true;
+        for api in [ApiKind::OpenAiCompletions, ApiKind::OpenAiResponses] {
+            let body = body_of(api, &r);
+            assert_eq!(body["tool_choice"], "none", "{api:?}: {body}");
+            assert_eq!(
+                body["tools"][0]["name"]
+                    .as_str()
+                    .or(body["tools"][0]["function"]["name"].as_str()),
+                Some("bash")
+            );
+        }
+        let anthropic = body_of(ApiKind::AnthropicMessages, &r);
+        assert_eq!(anthropic["tool_choice"]["type"], "none", "{anthropic}");
+        assert_eq!(anthropic["tools"][0]["name"], "bash");
+        let gemini = body_of(ApiKind::GeminiGenerateContent, &r);
+        assert_eq!(
+            gemini["toolConfig"]["functionCallingConfig"]["mode"], "NONE",
+            "{gemini}"
+        );
+        assert!(gemini["tools"].is_array(), "{gemini}");
     }
 
     /// A tool round trip on the Responses family: the assistant's calls replay

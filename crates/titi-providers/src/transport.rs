@@ -97,6 +97,10 @@ pub struct WireRequest {
     /// its own default.
     pub reasoning: Option<crate::compat::Reasoning>,
     pub extra: serde_json::Value,
+    /// Tools stay declared, but the model may not call one in its answer
+    /// (`tool_choice: none` and its Gemini equivalent). The engine sets it for
+    /// the final request of a turn that spent its tool budget.
+    pub forbid_tool_calls: bool,
 }
 
 impl WireRequest {
@@ -110,6 +114,7 @@ impl WireRequest {
             system: None,
             reasoning: None,
             extra: serde_json::Value::Null,
+            forbid_tool_calls: false,
         }
     }
 }
