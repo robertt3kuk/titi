@@ -128,67 +128,11 @@ impl HookDef {
     /// or a linter's own config pulls in is out of reach: both stay as
     /// residual risk (docs/research/extensibility-marketplace/design-2026-10.md).
     pub fn script(&self, workspace: &Path) -> Option<Script> {
-        let mut words = self.command.split_whitespace().map(unquote);
-        let first = words.next()?;
-        let candidate = if is_pathlike(&first) {
-            first
-        } else if INTERPRETERS.contains(&first.rsplit('/').next().unwrap_or(&first)) {
-            let mut found = None;
-            for word in words {
-                if !word.starts_with('-') {
-                    found = Some(word);
-                    break;
-                }
-                // `bash -c '…'`, `node -e '…'`, `python -m mod`: what follows
-                // is code or a module name, not a file of the repository.
-                if INLINE_FLAGS.contains(&word.as_str()) {
-                    return None;
-                }
-            }
-            found?
-        } else {
-            return None;
-        };
-        let candidate = candidate
-            .replace("${CLAUDE_PROJECT_DIR}", &workspace.to_string_lossy())
-            .replace("$CLAUDE_PROJECT_DIR", &workspace.to_string_lossy());
-        let base = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
-        let joined = if Path::new(&candidate).is_absolute() {
-            PathBuf::from(&candidate)
-        } else {
-            workspace.join(&candidate)
-        };
-        match std::fs::canonicalize(&joined) {
-            Ok(real) if real.starts_with(&base) && real.is_file() => {
-                let relative = real.strip_prefix(&base).unwrap_or(&real).to_owned();
-                let sha256 = std::fs::read(&real)
-                    .map(|bytes| crate::trust::sha256_hex(&bytes))
-                    .ok();
-                Some(Script {
-                    path: relative,
-                    sha256,
-                })
-            }
-            // Resolves outside the repository (a system binary, a symlink
-            // out): not the repository's file.
-            Ok(_) => None,
-            // Not there yet. If it is written later the hash changes, so a
-            // script that does not exist at approval time cannot be added
-            // under the same consent.
-            Err(_) => {
-                let lexical = joined.strip_prefix(workspace).ok()?;
-                if lexical
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
-                {
-                    return None;
-                }
-                Some(Script {
-                    path: lexical.to_owned(),
-                    sha256: None,
-                })
-            }
-        }
+        script_of(
+            self.command.split_whitespace().map(unquote),
+            workspace,
+            workspace,
+        )
     }
 
     /// The short name a transcript row calls the hook by: the program the
@@ -201,6 +145,84 @@ impl HookDef {
             self.command.chars().take(24).collect()
         } else {
             name.to_owned()
+        }
+    }
+}
+
+/// The repository file a command line runs, from its words (see
+/// [`HookDef::script`] for what counts). Relative paths resolve against
+/// `base`, the directory the command runs in; a file only counts when it lies
+/// inside `workspace`. An MCP server's `command` and `args` go through the
+/// same lookup, so a server that runs `node ./server.js` is hashed with that
+/// file.
+pub fn script_of(
+    words: impl IntoIterator<Item = String>,
+    workspace: &Path,
+    base: &Path,
+) -> Option<Script> {
+    let mut words = words.into_iter();
+    let first = words.next()?;
+    let candidate = if is_pathlike(&first) {
+        first
+    } else if INTERPRETERS.contains(&first.rsplit('/').next().unwrap_or(&first)) {
+        let mut found = None;
+        for word in words {
+            if !word.starts_with('-') {
+                found = Some(word);
+                break;
+            }
+            // `bash -c '…'`, `node -e '…'`, `python -m mod`: what follows
+            // is code or a module name, not a file of the repository.
+            if INLINE_FLAGS.contains(&word.as_str()) {
+                return None;
+            }
+        }
+        found?
+    } else {
+        return None;
+    };
+    let candidate = candidate
+        .replace("${CLAUDE_PROJECT_DIR}", &workspace.to_string_lossy())
+        .replace("$CLAUDE_PROJECT_DIR", &workspace.to_string_lossy());
+    let canonical_workspace =
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_owned());
+    let joined = if Path::new(&candidate).is_absolute() {
+        PathBuf::from(&candidate)
+    } else {
+        base.join(&candidate)
+    };
+    match std::fs::canonicalize(&joined) {
+        Ok(real) if real.starts_with(&canonical_workspace) && real.is_file() => {
+            let relative = real
+                .strip_prefix(&canonical_workspace)
+                .unwrap_or(&real)
+                .to_owned();
+            let sha256 = std::fs::read(&real)
+                .map(|bytes| crate::trust::sha256_hex(&bytes))
+                .ok();
+            Some(Script {
+                path: relative,
+                sha256,
+            })
+        }
+        // Resolves outside the repository (a system binary, a symlink
+        // out): not the repository's file.
+        Ok(_) => None,
+        // Not there yet. If it is written later the hash changes, so a
+        // script that does not exist at approval time cannot be added
+        // under the same consent.
+        Err(_) => {
+            let lexical = joined.strip_prefix(workspace).ok()?;
+            if lexical
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return None;
+            }
+            Some(Script {
+                path: lexical.to_owned(),
+                sha256: None,
+            })
         }
     }
 }
