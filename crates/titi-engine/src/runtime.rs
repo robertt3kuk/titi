@@ -551,38 +551,38 @@ mod tests {
         config
     }
 
-    #[test]
-    fn manual_compaction_folds_below_the_threshold() {
-        let mut config = folding_config();
-        config.restored_messages = vec![
+    #[tokio::test]
+    async fn manual_compaction_folds_below_the_threshold() {
+        let config = folding_config();
+        let mut history = vec![
             message(Role::User, "the first question, long enough to fold"),
             message(Role::Assistant, "the first answer"),
             message(Role::User, "now"),
         ];
 
-        let event = compact_history(&mut config, None, false, TurnId(7));
+        let done = compact_history(
+            &mut history,
+            &config.compaction,
+            config.context_window,
+            None,
+            None,
+        )
+        .await
+        .expect("a compaction");
 
-        match event {
-            EngineEvent::Compacted {
-                turn_id, folded, ..
-            } => {
-                assert_eq!(turn_id, TurnId(7));
-                assert_eq!(folded, 2);
-            }
-            other => panic!("expected a compaction, got {other:?}"),
-        }
-        assert_eq!(config.restored_messages.len(), 2);
-        assert_eq!(config.restored_messages[0].role, Role::User);
-        assert_eq!(config.restored_messages[1].content, "now");
+        assert_eq!(done.folded, 2);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].content, "now");
     }
 
     /// The digest keeps only the first line of each folded prompt, so a
     /// focus has to pull the rest of its thread back in or naming it does
     /// nothing.
-    #[test]
-    fn a_focused_compaction_keeps_the_lines_it_names() {
-        let mut config = folding_config();
-        config.restored_messages = vec![
+    #[tokio::test]
+    async fn a_focused_compaction_keeps_the_lines_it_names() {
+        let config = folding_config();
+        let mut history = vec![
             message(
                 Role::User,
                 "please review the diff\nthe auth guard moved to the middleware",
@@ -594,33 +594,22 @@ mod tests {
             message(Role::User, "now"),
         ];
 
-        let event = compact_history(&mut config, Some("auth"), false, TurnId(1));
+        compact_history(
+            &mut history,
+            &config.compaction,
+            config.context_window,
+            Some("auth"),
+            None,
+        )
+        .await
+        .expect("a compaction");
 
-        assert!(matches!(event, EngineEvent::Compacted { .. }), "{event:?}");
-        let digest = config.restored_messages[0].content.to_string();
+        let digest = history[0].content.to_string();
         assert!(
             digest.contains("the auth guard moved to the middleware"),
             "{digest}"
         );
         assert!(!digest.contains("pagination internals"), "{digest}");
-    }
-
-    /// A running turn hands its own history back when it ends. Folding
-    /// underneath it would be overwritten, or cost that turn its answer.
-    #[test]
-    fn manual_compaction_waits_for_a_running_turn() {
-        let mut config = folding_config();
-        config.restored_messages = vec![
-            message(Role::User, "the first question, long enough to fold"),
-            message(Role::Assistant, "the first answer"),
-            message(Role::User, "now"),
-        ];
-        let before = config.restored_messages.clone();
-
-        let event = compact_history(&mut config, None, true, TurnId(1));
-
-        assert!(matches!(event, EngineEvent::Notice { .. }), "{event:?}");
-        assert_eq!(config.restored_messages, before);
     }
 }
 
@@ -1785,11 +1774,21 @@ impl EngineRuntime {
                             let _ = self.events.send(EngineEvent::ContextBreakdown { parts, window }).await;
                         }
                         EngineCommand::Compact { focus } => {
-                            let turn_id = TurnId(self.next_turn.load(Ordering::SeqCst));
-                            let running = active.is_some();
-                            let event = compact_history(&mut self.config, focus.as_deref(), running, turn_id);
-                            self.prompt_memory.forget();
-                            let _ = self.events.send(event).await;
+                            // A running turn built its request on this history
+                            // and hands its own copy back when it ends, so
+                            // folding underneath it would be overwritten or
+                            // cost that turn its answer. The fold itself can
+                            // wait on a model, so it holds the turn slot like
+                            // a turn does: a prompt typed meanwhile queues
+                            // behind it and a cancel reaches it.
+                            if active.is_some() {
+                                let _ = self.events.send(EngineEvent::Notice {
+                                    message: "compact: a turn is running, try again when it finishes".into(),
+                                }).await;
+                            } else {
+                                self.prompt_memory.forget();
+                                active = Some(self.spawn_compaction(focus, primary_model.clone(), done_tx.clone()));
+                            }
                         }
                     }
                 }
@@ -2382,6 +2381,85 @@ impl EngineRuntime {
         (turn_id, aborted)
     }
 
+    /// `/compact`: folds a copy of the replayed history and hands it back the
+    /// way a turn does, so the history is replaced only if nothing rewound it
+    /// meanwhile and only if the job was not cancelled.
+    fn spawn_compaction(
+        &self,
+        focus: Option<SmolStr>,
+        primary_model: SmolStr,
+        done: mpsc::Sender<TurnDone>,
+    ) -> (TurnId, Arc<AtomicBool>) {
+        let epoch = self.history_epoch;
+        let turn_id = TurnId(self.next_turn.fetch_add(1, Ordering::SeqCst));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let task_abort = Arc::clone(&aborted);
+        let mut history = self.config.restored_messages.clone();
+        let policy = self.config.compaction.clone();
+        let window = self.config.context_window;
+        let agent_dir = self.config.agent_dir.clone();
+        let workspace = self.config.workspace_root.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let events = self.events.clone();
+        let spent = Arc::clone(&self.spent);
+        let money = MoneyLedger {
+            spent_micro_usd: Arc::clone(&self.spent_micro_usd),
+            unpriced_said: Arc::clone(&self.money_unpriced_said),
+        };
+        tokio::spawn(async move {
+            let summary = crate::compaction::summary_model(
+                resolver.as_ref(),
+                &primary_model,
+                agent_dir,
+                workspace,
+                Arc::clone(&task_abort),
+            )
+            .await;
+            let outcome = compact_history(
+                &mut history,
+                &policy,
+                window,
+                focus.as_deref(),
+                summary.as_ref(),
+            )
+            .await;
+            let mut folded = None;
+            if !task_abort.load(Ordering::SeqCst) {
+                match outcome {
+                    Some(done) => {
+                        let mut meter = TurnMeter::new(&spent, &money);
+                        if let (Some(usage), Some(label)) =
+                            (done.summary_usage, &done.summary_model)
+                        {
+                            meter.charge_other(resolver.price(label), usage);
+                        }
+                        meter.settle(&events, turn_id).await;
+                        let _ = events.send(compacted_event(turn_id, &done)).await;
+                        if let Some(failure) = &done.summary_failure {
+                            let _ = events.send(summary_failed_notice(failure)).await;
+                        }
+                        folded = Some(history);
+                    }
+                    None => {
+                        let _ = events
+                            .send(EngineEvent::Notice {
+                                message: "compact: nothing to fold yet".into(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            let _ = done
+                .send(TurnDone {
+                    turn_id,
+                    history: folded,
+                    epoch,
+                })
+                .await;
+        });
+        (turn_id, aborted)
+    }
+
     /// `/goal` runs the existing loop on the session model. It does not
     /// replace the active turn or queue a `SubmitPrompt`.
     fn spawn_goal(&self, text: SmolStr, model: SmolStr) {
@@ -2627,59 +2705,78 @@ fn context_part(label: &str, text: Option<&str>) -> ContextPart {
     }
 }
 
-/// Manual compaction: fold the replayed history now, whatever the threshold
-/// says, and report what happened.
+/// Manual compaction: fold `history` now, whatever the threshold says, by the
+/// same path the automatic fold takes — masking first, then the summary model
+/// if there is one, then the structural digest.
 ///
-/// A running turn built its request on this history and hands its own copy
-/// back when it ends, so folding underneath it would either be overwritten
-/// or cost that turn its answer. Manual compaction waits for it instead.
-///
-/// `focus` is what the user asked to keep: the lines of the folded prefix
-/// that mention it are appended to the digest, so the thread they named is
-/// not the part the fold takes away.
-fn compact_history(
-    config: &mut EngineConfig,
+/// `focus` is what the user asked to keep: the summary model is told to give
+/// it full detail, and the structural digest keeps the lines that mention it.
+async fn compact_history(
+    history: &mut Vec<ChatMessage>,
+    policy: &titi_core::compaction::CompactionPolicy,
+    context_window: u64,
     focus: Option<&str>,
-    turn_running: bool,
-    turn_id: TurnId,
-) -> EngineEvent {
-    if turn_running {
-        return EngineEvent::Notice {
-            message: "compact: a turn is running, try again when it finishes".into(),
-        };
-    }
+    summary: Option<&crate::compaction::SummaryModel>,
+) -> Option<crate::compaction::Compacted> {
     let forced = titi_core::compaction::CompactionPolicy {
         threshold_percent: 0.0,
-        ..config.compaction.clone()
+        ..policy.clone()
     };
-    let before = focus.map(|_| config.restored_messages.clone());
-    let Some(done) = crate::compaction::compact(
-        &mut config.restored_messages,
-        &crate::compaction::Fold::new(&forced, config.context_window.max(1)),
-    ) else {
-        return EngineEvent::Notice {
-            message: "compact: nothing to fold yet".into(),
-        };
-    };
-    if let (Some(focus), Some(before)) = (focus, before)
-        && done.folded > 0
-        && let Some(digest) = config.restored_messages.first_mut()
-    {
-        let folded: Vec<&str> = before
-            .iter()
-            .take(done.folded)
-            .map(|message| message.content.as_str())
-            .collect();
-        let kept = titi_core::compaction::focus_digest(focus, &folded);
-        digest.content = format!("{}\n{kept}", digest.content).into();
-    }
+    crate::compaction::compact(
+        history,
+        &crate::compaction::Fold::new(&forced, context_window.max(1))
+            .focus(focus)
+            .summarizer(summary),
+    )
+    .await
+}
+
+/// What a surface is told about a compaction.
+fn compacted_event(turn_id: TurnId, done: &crate::compaction::Compacted) -> EngineEvent {
     EngineEvent::Compacted {
         turn_id,
         folded: done.folded as u32,
         tokens_before: done.tokens_before,
-        strategy: done.strategy,
+        strategy: done.strategy.clone(),
         masked: done.masked as u32,
+        summary_model: done.summary_model.clone(),
     }
+}
+
+/// The Notice that says why a fold fell back to the structural digest.
+fn summary_failed_notice(failure: &str) -> EngineEvent {
+    EngineEvent::Notice {
+        message: format!(
+            "compaction: the summary model failed ({failure}); the structural digest was used"
+        )
+        .into(),
+    }
+}
+
+/// The summary model for a turn, looked up the first time a fold is due and
+/// kept for the rest of it: a request under the threshold never pays for the
+/// settings read, and a turn stuck over it pays once.
+async fn turn_summary_model<'a>(
+    slot: &'a mut Option<Option<crate::compaction::SummaryModel>>,
+    resolver: &Arc<dyn TransportResolver>,
+    chat_model: &str,
+    aborted: &Arc<AtomicBool>,
+    agent_dir: Option<&std::path::Path>,
+    workspace: Option<&std::path::Path>,
+) -> Option<&'a crate::compaction::SummaryModel> {
+    if slot.is_none() {
+        *slot = Some(
+            crate::compaction::summary_model(
+                resolver.as_ref(),
+                chat_model,
+                agent_dir.map(std::path::Path::to_path_buf),
+                workspace.map(std::path::Path::to_path_buf),
+                Arc::clone(aborted),
+            )
+            .await,
+        );
+    }
+    slot.as_ref().and_then(Option::as_ref)
 }
 
 /// What a finished turn hands back to the command loop.
@@ -2935,6 +3032,8 @@ async fn run_turn(
                 config.restored_messages.len(),
                 usize::from(system.is_some()),
             );
+            // The summary model, looked up the first time a fold is due.
+            let mut summary_slot: Option<Option<crate::compaction::SummaryModel>> = None;
             let mut tool_rounds = 0;
             let mut stop_continued = false;
             let mut verify = verifier.for_turn(touched.lock().await.edits());
@@ -2957,32 +3056,47 @@ async fn run_turn(
                 }
                 // A turn accumulates tool results without bound; fold the oldest
                 // away before the provider refuses the request.
-                if let Some(folded) = crate::compaction::compact(
-                    &mut messages,
-                    &crate::compaction::Fold::new(&config.compaction, config.context_window)
-                        .reported(reported),
-                ) {
+                let fold = crate::compaction::Fold::new(&config.compaction, config.context_window)
+                    .reported(reported);
+                let folded = if fold.due(&messages) {
+                    let writer = turn_summary_model(
+                        &mut summary_slot,
+                        &resolver,
+                        &model,
+                        &aborted,
+                        config.agent_dir.as_deref(),
+                        config.workspace_root.as_deref(),
+                    )
+                    .await;
+                    crate::compaction::compact(&mut messages, &fold.summarizer(writer)).await
+                } else {
+                    None
+                };
+                if let Some(folded) = folded {
                     // The count described a request that no longer exists.
                     reported = None;
+                    if let (Some(usage), Some(label)) = (folded.summary_usage, &folded.summary_model)
+                    {
+                        meter.charge_other(resolver.price(label), usage);
+                    }
+                    if let Some(failure) = &folded.summary_failure {
+                        let _ = events.send(summary_failed_notice(failure)).await;
+                    }
                     if let Some(recorder) = trajectory.lock().await.as_mut() {
                         let _ = recorder.record(titi_core::trajectory::EventKind::Compaction {
                             folded: folded.folded as u64,
                             strategy: folded.strategy.to_string(),
                         });
                     }
-                    let _ = events
-                        .send(EngineEvent::Compacted {
-                            turn_id,
-                            folded: folded.folded as u32,
-                            tokens_before: folded.tokens_before,
-                            strategy: folded.strategy.clone(),
-                            masked: folded.masked as u32,
-                        })
-                        .await;
+                    let _ = events.send(compacted_event(turn_id, &folded)).await;
                     OpenSpan::open(&spans, turn_span_id.clone(), SpanKind::Event, "fold")
                         .attr("titi.folded", serde_json::json!(folded.folded as u64))
                         .attr("titi.strategy", serde_json::json!(folded.strategy.as_str()))
                         .attr("titi.masked", serde_json::json!(folded.masked as u64))
+                        .attr(
+                            "titi.summary_model",
+                            serde_json::json!(folded.summary_model.as_deref()),
+                        )
                         .finish(spans::now_ms());
                 }
                 // The budget is spent: this request is the model's last word
@@ -3139,17 +3253,28 @@ async fn run_turn(
                             if !folded_for_length && error.is_context_too_long() && !visible_output
                             {
                                 folded_for_length = true;
-                                let forced = titi_core::compaction::CompactionPolicy {
-                                    threshold_percent: 0.0,
-                                    ..config.compaction.clone()
-                                };
-                                let _ = crate::compaction::compact(
+                                let writer = turn_summary_model(
+                                    &mut summary_slot,
+                                    &resolver,
+                                    &model,
+                                    &aborted,
+                                    config.agent_dir.as_deref(),
+                                    config.workspace_root.as_deref(),
+                                )
+                                .await;
+                                if let Some(done) = compact_history(
                                     &mut messages,
-                                    &crate::compaction::Fold::new(
-                                        &forced,
-                                        config.context_window.max(1),
-                                    ),
-                                );
+                                    &config.compaction,
+                                    config.context_window,
+                                    None,
+                                    writer,
+                                )
+                                .await
+                                    && let (Some(usage), Some(label)) =
+                                        (done.summary_usage, &done.summary_model)
+                                {
+                                    meter.charge_other(resolver.price(label), usage);
+                                }
                                 reported = None;
                                 OpenSpan::open(
                                     &spans,
@@ -3504,6 +3629,19 @@ impl<'a> TurnMeter<'a> {
         if !self.reported && (self.prompt > 0 || self.completion > 0) {
             let _ = events.send(self.usage(turn_id)).await;
         }
+    }
+
+    /// Charges a call made outside the turn's own rounds — a compaction's
+    /// summary — at the price of the model it ran on, which need not be the
+    /// one the turn is on.
+    fn charge_other(&mut self, price: Option<ModelPrice>, usage: titi_providers::TokenUsage) {
+        let own = std::mem::replace(&mut self.price, price);
+        self.charge(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens,
+        );
+        self.price = own;
     }
 
     /// Adds one round to the turn's totals and answers what that round cost,

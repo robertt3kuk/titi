@@ -523,7 +523,9 @@ async fn a_long_turn_folds_its_oldest_messages() {
     config.compaction = titi_core::compaction::CompactionPolicy {
         threshold_percent: 0.0,
         keep_recent_tokens: 4,
-        ..Default::default()
+        // The model-free digest is what these two pin; the summary model would
+        // take a scripted response of its own.
+        method_order: vec![titi_core::compaction::Strategy::SnapCompact],
     };
     let mut engine = EngineRuntime::start_with_tools(
         config,
@@ -602,7 +604,7 @@ async fn the_next_turn_starts_from_the_digest_not_the_folded_prefix() {
     config.compaction = titi_core::compaction::CompactionPolicy {
         threshold_percent: 0.0,
         keep_recent_tokens: 4,
-        ..Default::default()
+        method_order: vec![titi_core::compaction::Strategy::SnapCompact],
     };
     let mut engine = EngineRuntime::start_with_tools(
         config,

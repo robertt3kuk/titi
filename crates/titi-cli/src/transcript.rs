@@ -936,11 +936,16 @@ fn consider_image(found: &mut Vec<String>, raw: &str) {
 }
 
 /// The fold divider's own words, from the `Compacted` payload: how many
-/// messages went into the digest, how many tool results were elided, and how
-/// many tokens the request held when it happened. The mark and whether the
-/// history under it is drawn come from [`Details::folded`], so the same line
-/// reads `▸` collapsed and `▾` expanded.
-pub(crate) fn fold_divider_label(folded: u32, masked: u32, tokens_before: u64) -> String {
+/// messages went into the digest, how many tool results were elided, which
+/// model wrote the summary, and how many tokens the request held when it
+/// happened. The mark and whether the history under it is drawn come from
+/// [`Details::folded`], so the same line reads `▸` collapsed and `▾` expanded.
+pub(crate) fn fold_divider_label(
+    folded: u32,
+    masked: u32,
+    summary_model: Option<&str>,
+    tokens_before: u64,
+) -> String {
     let tokens = u32::try_from(tokens_before).unwrap_or(u32::MAX);
     let mut parts = Vec::new();
     if folded > 0 {
@@ -948,6 +953,9 @@ pub(crate) fn fold_divider_label(folded: u32, masked: u32, tokens_before: u64) -
     }
     if masked > 0 {
         parts.push(format!("masked {masked} tool results"));
+    }
+    if let Some(model) = summary_model {
+        parts.push(format!("summary by {model}"));
     }
     parts.push(format!(
         "{} tokens",

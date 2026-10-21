@@ -8711,6 +8711,7 @@ fn a_compaction_folds_the_history_behind_a_divider() {
         tokens_before: 22_000,
         strategy: "digest".into(),
         masked: 0,
+        summary_model: None,
     });
 
     let frame = frame_text(&mut chat);
@@ -8751,18 +8752,23 @@ fn the_fold_divider_is_drawn_from_the_payload() {
         tokens_before: 900,
         strategy: "digest".into(),
         masked: 0,
+        summary_model: None,
     });
     assert_eq!(
-        fold_divider_label(2, 0, 900),
+        fold_divider_label(2, 0, None, 900),
         "folded 2 messages · 900 tokens"
     );
     assert_eq!(
-        fold_divider_label(2, 5, 900),
+        fold_divider_label(2, 5, None, 900),
         "folded 2 messages · masked 5 tool results · 900 tokens"
     );
     assert_eq!(
-        fold_divider_label(0, 5, 900),
+        fold_divider_label(0, 5, None, 900),
         "masked 5 tool results · 900 tokens"
+    );
+    assert_eq!(
+        fold_divider_label(14, 6, Some("anthropic/claude-haiku"), 22_000),
+        "folded 14 messages · masked 6 tool results · summary by anthropic/claude-haiku · 22k tokens"
     );
 
     let rows = frame_rows(&mut chat, 80, 24);
@@ -8797,6 +8803,7 @@ fn each_fold_divider_carries_its_own_event() {
         tokens_before: 1_500,
         strategy: "digest".into(),
         masked: 0,
+        summary_model: None,
     });
     chat.push(LineKind::Assistant, "an answer between folds".to_owned());
     chat.on_event(EngineEvent::Compacted {
@@ -8805,6 +8812,7 @@ fn each_fold_divider_carries_its_own_event() {
         tokens_before: 120_000,
         strategy: "digest".into(),
         masked: 0,
+        summary_model: None,
     });
 
     let frame = frame_text(&mut chat);
@@ -8836,6 +8844,7 @@ fn a_masking_only_compaction_is_a_note_and_keeps_the_transcript() {
         tokens_before: 90_000,
         strategy: "mask".into(),
         masked: 12,
+        summary_model: None,
     });
 
     let frame = frame_text(&mut chat);

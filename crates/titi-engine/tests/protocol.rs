@@ -468,6 +468,7 @@ fn every_engine_event_round_trips_through_its_fixture() {
             tokens_before: 30,
             strategy: "digest".into(),
             masked: 0,
+            summary_model: None,
         },
         r#"{"Compacted":{"turn_id":1,"folded":2,"tokens_before":30,"strategy":"digest"}}"#,
     );
@@ -478,8 +479,20 @@ fn every_engine_event_round_trips_through_its_fixture() {
             tokens_before: 90_000,
             strategy: "mask".into(),
             masked: 12,
+            summary_model: None,
         },
         r#"{"Compacted":{"turn_id":2,"folded":0,"tokens_before":90000,"strategy":"mask","masked":12}}"#,
+    );
+    event(
+        EngineEvent::Compacted {
+            turn_id: TurnId(3),
+            folded: 40,
+            tokens_before: 120_000,
+            strategy: "remote".into(),
+            masked: 9,
+            summary_model: Some("anthropic/claude-haiku".into()),
+        },
+        r#"{"Compacted":{"turn_id":3,"folded":40,"tokens_before":120000,"strategy":"remote","masked":9,"summary_model":"anthropic/claude-haiku"}}"#,
     );
     event(
         EngineEvent::TurnUsage {

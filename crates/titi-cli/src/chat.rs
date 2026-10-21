@@ -1765,6 +1765,7 @@ impl Chat {
             EngineEvent::Compacted {
                 folded,
                 masked,
+                summary_model,
                 tokens_before,
                 ..
             } => {
@@ -1775,7 +1776,8 @@ impl Chat {
                 // folded — because the transcript cannot know either by
                 // looking at itself. Masking alone folded nothing away, so it
                 // is a note and the transcript stays whole.
-                let label = fold_divider_label(folded, masked, tokens_before);
+                let label =
+                    fold_divider_label(folded, masked, summary_model.as_deref(), tokens_before);
                 if folded > 0 {
                     self.push(LineKind::Fold, label);
                 } else {

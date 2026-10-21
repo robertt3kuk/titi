@@ -33,10 +33,10 @@ impl fmt::Display for CompactionError {
 
 impl std::error::Error for CompactionError {}
 
-/// Compaction strategies, tried in `method_order`. `Remote` is
-/// provider-native (OpenAI-compatible compaction endpoints, arrives with
-/// titi-providers); `SnapCompact` and `Handoff` are model-free; `Soft`
-/// is the local LLM summary.
+/// Compaction strategies, tried in `method_order`. `Remote` is the summary
+/// the session's own model writes (the engine runs it; this crate has no
+/// provider); `SnapCompact` and `Handoff` are model-free; `Soft` is the local
+/// LLM summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {

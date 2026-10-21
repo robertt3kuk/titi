@@ -10,23 +10,31 @@
 mod digest;
 mod mask;
 mod reported;
+mod summary;
 
 use smol_str::SmolStr;
-use titi_core::compaction::{CompactionPolicy, StructuredSummarizer, Summarizer, estimate_tokens};
+use titi_core::compaction::{
+    CompactionPolicy, Strategy, StructuredSummarizer, Summarizer, estimate_tokens, focus_digest,
+};
 use titi_core::session::{Entry, Role as EntryRole};
-use titi_providers::{ChatMessage, Role};
+use titi_providers::{ChatMessage, Role, TokenUsage};
 
 use digest::{digest_message, digest_summary, is_digest};
 use mask::mask_tool_results;
 pub use reported::{PromptMemory, Reported, context_used};
+pub use summary::{COMPACT_ROLE, Summary, SummaryError, SummaryModel, summary_model};
 
 /// What a compaction needs to know about the request it may shrink.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Fold<'a> {
     pub policy: &'a CompactionPolicy,
     pub context_window: u64,
     /// The provider's count for the request, when there is one.
     pub reported: Option<Reported>,
+    /// What the user asked the digest to keep (`/compact <focus>`).
+    pub focus: Option<&'a str>,
+    /// The model that writes the summary; without one the fold is structural.
+    pub summarizer: Option<&'a SummaryModel>,
 }
 
 impl<'a> Fold<'a> {
@@ -35,12 +43,32 @@ impl<'a> Fold<'a> {
             policy,
             context_window,
             reported: None,
+            focus: None,
+            summarizer: None,
         }
     }
 
     pub fn reported(mut self, reported: Option<Reported>) -> Self {
         self.reported = reported;
         self
+    }
+
+    pub fn focus(mut self, focus: Option<&'a str>) -> Self {
+        self.focus = focus;
+        self
+    }
+
+    pub fn summarizer(mut self, summarizer: Option<&'a SummaryModel>) -> Self {
+        self.summarizer = summarizer;
+        self
+    }
+
+    /// Whether `messages` have reached the threshold. Cheap, and asked before
+    /// the summary model is looked up, so a request under the threshold never
+    /// pays for that.
+    pub fn due(&self, messages: &[ChatMessage]) -> bool {
+        self.policy
+            .should_compact(context_used(messages, self.reported), self.context_window)
     }
 }
 
@@ -51,13 +79,19 @@ pub struct Compacted {
     pub folded: usize,
     /// Tool results whose bodies were replaced by a one-line stub.
     pub masked: usize,
-    /// Estimated tokens before folding.
+    /// Tokens before folding, by the provider's count when it gave one.
     pub tokens_before: u64,
     /// `mask` when only tool results were elided, else the strategy that
     /// wrote the digest.
     pub strategy: SmolStr,
+    /// The model that wrote the digest, when one did.
+    pub summary_model: Option<SmolStr>,
+    /// What the summary call cost, for the session's meter.
+    pub summary_usage: Option<TokenUsage>,
+    /// Why the summary model did not write the digest, when it was asked to
+    /// and the fold fell back.
+    pub summary_failure: Option<String>,
 }
-
 /// Estimated tokens of a whole request.
 pub fn estimate_request(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(|m| estimate_tokens(&m.content)).sum()
@@ -88,13 +122,17 @@ fn clamp_chars(text: &str, max: usize) -> String {
 /// Shrinks the request when it crosses the policy threshold, and returns
 /// what happened. Tool results older than the kept tail are masked first; if
 /// that brings the request under the threshold it stops there, otherwise the
-/// oldest messages are folded into one digest. `None` when nothing was done:
-/// below the threshold, or no prefix left to shrink.
-pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compacted> {
+/// oldest messages are folded into one digest, written by the summary model
+/// when there is one and by the structural summarizer when there is not or
+/// it fails. `None` when nothing was done: below the threshold, or no prefix
+/// left to shrink.
+pub async fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compacted> {
     let Fold {
         policy,
         context_window,
         reported,
+        focus,
+        summarizer: summary_model,
     } = *fold;
     let used = context_used(messages, reported);
     if !policy.should_compact(used, context_window) {
@@ -109,12 +147,23 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
     }
     let mut first_kept = lead + target.first_kept;
     // A tool result without the assistant call that produced it is an invalid
-    // request, so the kept tail may not begin with one.
-    while first_kept < messages.len() && messages[first_kept].role == Role::Tool {
-        first_kept += 1;
+    // request, so the kept tail may not begin with one: the cut moves past
+    // the results and folds the whole pair.
+    let mut cut = first_kept;
+    while cut < messages.len() && messages[cut].role == Role::Tool {
+        cut += 1;
     }
-    if first_kept >= messages.len() {
-        return None;
+    if cut < messages.len() {
+        first_kept = cut;
+    } else {
+        // Nothing but results after the cut — the newest result alone is over
+        // the tail budget. Keep that pair instead, and fold what is before it.
+        while first_kept > lead && messages[first_kept].role == Role::Tool {
+            first_kept -= 1;
+        }
+        if first_kept <= lead {
+            return None;
+        }
     }
 
     let masked = mask_tool_results(messages, first_kept);
@@ -123,6 +172,9 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
         masked: masked.count,
         tokens_before: used,
         strategy: "mask".into(),
+        summary_model: None,
+        summary_usage: None,
+        summary_failure: None,
     };
     if masked.count > 0
         && !policy.should_compact(used.saturating_sub(masked.saved_tokens), context_window)
@@ -131,25 +183,60 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
     }
 
     let prefix = &entries[..first_kept - lead];
-    let mut summarizer = StructuredSummarizer;
+    let mut structural = StructuredSummarizer;
     let mut chosen = None;
+    let mut summary_failure = None;
     for strategy in &policy.method_order {
-        if let Ok(summary) = summarizer.summarize(*strategy, prefix) {
-            chosen = Some((*strategy, summary));
+        if *strategy == Strategy::Remote {
+            let Some(model) = summary_model else { continue };
+            // The bodies masking just replaced are what the model most needs
+            // to read — a command's outcome is in its result — so it gets
+            // them back, clamped to what fits.
+            let mut readable = messages[lead..first_kept].to_vec();
+            for (at, original) in &masked.originals {
+                readable[at - lead].content = original.clone();
+            }
+            match model.summarize(&readable, focus, context_window).await {
+                Ok(written) => {
+                    chosen = Some((
+                        *strategy,
+                        written.text,
+                        Some(model.label.clone()),
+                        written.usage,
+                    ));
+                    break;
+                }
+                Err(error) => summary_failure = Some(format!("{}: {error}", model.label)),
+            }
+        } else if let Ok(digest) = structural.summarize(*strategy, prefix) {
+            chosen = Some((*strategy, digest, None, None));
             break;
         }
     }
-    let Some((strategy, mut summary)) = chosen else {
+    let Some((strategy, mut summary, written_by, summary_usage)) = chosen else {
         // No strategy could write a digest; what masking already did stands.
-        return (masked.count > 0).then_some(masked_only);
+        return (masked.count > 0).then_some(Compacted {
+            summary_failure,
+            ..masked_only
+        });
     };
 
-    // The structural digest names prompts and counts; what an earlier fold
-    // already knew would otherwise be lost to a second one.
     let folded_messages = &messages[lead..first_kept];
-    if let Some(earlier) = folded_messages.iter().find(|m| is_digest(m)) {
-        summary.push_str("\n\nCarried from an earlier fold:\n");
-        summary.push_str(&clamp_chars(digest_summary(earlier), CARRIED_CHARS));
+    if written_by.is_none() {
+        // The structural digest names prompts and counts; what an earlier
+        // fold already knew would otherwise be lost to a second one.
+        if let Some(earlier) = folded_messages.iter().find(|m| is_digest(m)) {
+            summary.push_str("\n\nCarried from an earlier fold:\n");
+            summary.push_str(&clamp_chars(digest_summary(earlier), CARRIED_CHARS));
+        }
+        // The model was told the focus; the structural digest keeps only the
+        // lines that mention it.
+        if let Some(focus) = focus {
+            let folded_text: Vec<&str> =
+                prefix.iter().map(|entry| entry.content.as_str()).collect();
+            summary.push('\n');
+            summary.push_str(&focus_digest(focus, &folded_text));
+        }
     }
     let folded = first_kept - lead;
     let digest = digest_message(&summary, folded, folded_messages);
@@ -159,6 +246,9 @@ pub fn compact(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compa
         masked: masked.count,
         tokens_before: used,
         strategy: strategy.as_str().into(),
+        summary_model: written_by,
+        summary_usage,
+        summary_failure,
     })
 }
 
@@ -179,12 +269,16 @@ fn to_entry(message: &ChatMessage) -> Entry {
 mod tests {
     use super::*;
 
+    fn run(messages: &mut Vec<ChatMessage>, fold: &Fold<'_>) -> Option<Compacted> {
+        futures::executor::block_on(super::compact(messages, fold))
+    }
+
     fn compact(
         messages: &mut Vec<ChatMessage>,
         policy: &CompactionPolicy,
         context_window: u64,
     ) -> Option<Compacted> {
-        super::compact(messages, &Fold::new(policy, context_window))
+        run(messages, &Fold::new(policy, context_window))
     }
 
     fn user(text: &str) -> ChatMessage {
@@ -459,7 +553,7 @@ mod tests {
         };
         let mut by_estimate = history();
         assert_eq!(
-            super::compact(&mut by_estimate, &Fold::new(&policy, 1_000)),
+            run(&mut by_estimate, &Fold::new(&policy, 1_000)),
             None,
             "a dozen tokens of a thousand-token window is nowhere near"
         );
@@ -469,7 +563,7 @@ mod tests {
             prompt_tokens: 900,
             messages: 3,
         };
-        let done = super::compact(
+        let done = run(
             &mut by_count,
             &Fold::new(&policy, 1_000).reported(Some(seen)),
         )
@@ -496,7 +590,7 @@ mod tests {
             messages: 3,
         };
         assert_eq!(
-            super::compact(
+            run(
                 &mut messages,
                 &Fold::new(&policy, 1_200).reported(Some(seen))
             ),
@@ -539,5 +633,232 @@ mod tests {
         assert!(second.contains("fix the lexer"), "{second}");
         assert!(second.contains("- src/parser.rs"), "{second}");
         assert!(second.contains("- src/lexer.rs"), "{second}");
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use titi_providers::{
+        BlockId, MockBody, MockTransport, StopReason, StreamEvent, Transport, TransportError,
+    };
+
+    fn summarizer(
+        bodies: Vec<MockBody>,
+        aborted: Arc<AtomicBool>,
+    ) -> (SummaryModel, Arc<MockTransport>) {
+        let transport = Arc::new(MockTransport::new(bodies));
+        let model = SummaryModel::new(
+            "scripted/summarizer",
+            crate::registry::ResolvedModel::without_credential(
+                "scripted/summarizer",
+                Arc::clone(&transport) as Arc<dyn Transport>,
+            ),
+            aborted,
+        );
+        (model, transport)
+    }
+
+    fn written(text: &str) -> MockBody {
+        MockBody::Events(vec![
+            StreamEvent::TextDelta {
+                id: BlockId::new("text"),
+                text: text.into(),
+            },
+            StreamEvent::Usage(TokenUsage {
+                prompt_tokens: 800,
+                completion_tokens: 120,
+                cached_tokens: 0,
+            }),
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+            },
+        ])
+    }
+
+    /// Every kind of fold wants the same policy: threshold gone, a small tail.
+    fn forced() -> CompactionPolicy {
+        CompactionPolicy {
+            threshold_percent: 0.0,
+            keep_recent_tokens: 20,
+            ..CompactionPolicy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_session_model_writes_the_digest() {
+        let (model, transport) = summarizer(
+            vec![written(
+                "## Goal\nfix the parser\n## Next step\nrun the lexer tests",
+            )],
+            Arc::default(),
+        );
+        let mut messages = heavy_with_tools();
+        let policy = forced();
+
+        let done = compact_with(&mut messages, &policy, Some(&model), None)
+            .await
+            .expect("a compaction");
+
+        assert_eq!(done.strategy, "remote");
+        assert_eq!(done.summary_model.as_deref(), Some("scripted/summarizer"));
+        assert_eq!(done.summary_failure, None);
+        assert_eq!(done.summary_usage.map(|u| u.completion_tokens), Some(120));
+        let digest = &messages[0];
+        assert_eq!(digest.role, Role::User);
+        assert!(digest.content.contains("## Goal\nfix the parser"));
+        assert!(
+            !digest.content.contains("earlier message(s) folded"),
+            "the structural digest was not used: {}",
+            digest.content
+        );
+        assert!(
+            digest.content.contains("- src/parser.rs"),
+            "the re-read list is appended to the model's summary: {}",
+            digest.content
+        );
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_model_reads_the_results_masking_replaced() {
+        let (model, transport) = summarizer(vec![written("## Goal\nx")], Arc::default());
+        let mut messages = heavy_with_tools();
+
+        let done = compact_with(&mut messages, &forced(), Some(&model), None)
+            .await
+            .expect("a compaction");
+
+        assert_eq!(done.masked, 2);
+        let requests = transport.requests();
+        let sent = &requests[0].messages[0].content;
+        assert!(
+            sent.contains("test output"),
+            "the outcome is readable: {sent}"
+        );
+        assert!(!sent.contains("tool result elided"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_leaves_the_structural_digest() {
+        let (model, _) = summarizer(
+            vec![MockBody::Err(TransportError::Fatal {
+                status: Some(401),
+                message: "no key".into(),
+                context_too_long: false,
+            })],
+            Arc::default(),
+        );
+        let mut messages = heavy_with_tools();
+
+        let done = compact_with(&mut messages, &forced(), Some(&model), None)
+            .await
+            .expect("the fold still happens");
+
+        assert_eq!(done.strategy, "snapcompact");
+        assert_eq!(done.summary_model, None);
+        let failure = done.summary_failure.expect("the failure is reported");
+        assert!(failure.contains("scripted/summarizer"), "{failure}");
+        assert!(failure.contains("no key"), "{failure}");
+        assert!(messages[0].content.contains("earlier message(s) folded"));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_summary_leaves_the_structural_digest() {
+        let aborted = Arc::new(AtomicBool::new(true));
+        let (model, transport) = summarizer(vec![written("never")], aborted);
+        let mut messages = heavy_with_tools();
+
+        let done = compact_with(&mut messages, &forced(), Some(&model), None)
+            .await
+            .expect("the fold still happens");
+
+        assert_eq!(done.strategy, "snapcompact");
+        assert!(done.summary_failure.unwrap().contains("cancelled"));
+        assert!(transport.requests().is_empty(), "nothing was asked");
+    }
+
+    #[tokio::test]
+    async fn masking_alone_never_asks_the_model() {
+        let (model, transport) = summarizer(vec![written("unused")], Arc::default());
+        let mut messages = heavy_with_tools();
+        let policy = CompactionPolicy {
+            threshold_percent: 50.0,
+            keep_recent_tokens: 20,
+            ..CompactionPolicy::default()
+        };
+
+        let done = {
+            let fold = Fold::new(&policy, 4_000).summarizer(Some(&model));
+            super::compact(&mut messages, &fold)
+                .await
+                .expect("a compaction")
+        };
+
+        assert_eq!(done.strategy, "mask");
+        assert_eq!(done.summary_model, None);
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_focus_goes_to_the_model_and_to_the_structural_fallback() {
+        let (model, transport) = summarizer(vec![written("## Goal\nx")], Arc::default());
+        let mut messages = heavy_with_tools();
+        compact_with(&mut messages, &forced(), Some(&model), Some("the parser"))
+            .await
+            .expect("a compaction");
+        let requests = transport.requests();
+        assert!(
+            requests[0]
+                .system
+                .as_deref()
+                .unwrap()
+                .contains("the parser"),
+            "the model is told what to keep"
+        );
+
+        let mut fallback = heavy_with_tools();
+        compact_with(&mut fallback, &forced(), None, Some("parser"))
+            .await
+            .expect("a compaction");
+        assert!(
+            fallback[0]
+                .content
+                .contains("Kept for the requested focus (parser)"),
+            "{}",
+            fallback[0].content
+        );
+    }
+
+    async fn compact_with(
+        messages: &mut Vec<ChatMessage>,
+        policy: &CompactionPolicy,
+        model: Option<&SummaryModel>,
+        focus: Option<&str>,
+    ) -> Option<Compacted> {
+        let fold = Fold::new(policy, 4_000).summarizer(model).focus(focus);
+        super::compact(messages, &fold).await
+    }
+
+    /// The newest message is a result bigger than the whole tail budget. The
+    /// cut may not leave it without its call, and folding nothing would leave
+    /// the request stuck over the threshold: the pair stays, what is before
+    /// it folds.
+    #[test]
+    fn an_oversized_newest_result_keeps_its_call_and_folds_what_precedes() {
+        let mut messages = vec![
+            user("old question"),
+            assistant("old answer"),
+            user("read it"),
+            call("c1", "read", r#"{"path":"big.rs"}"#),
+            result("c1", &"line\n".repeat(900)),
+        ];
+        let policy = CompactionPolicy {
+            threshold_percent: 0.0,
+            keep_recent_tokens: 4,
+            method_order: vec![titi_core::compaction::Strategy::SnapCompact],
+        };
+        let done = compact(&mut messages, &policy, 4_000).expect("a compaction");
+        assert_eq!(done.folded, 3);
+        assert_eq!(messages[1].tool_calls.len(), 1, "{messages:#?}");
+        assert_eq!(messages[2].role, Role::Tool);
     }
 }

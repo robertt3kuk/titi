@@ -373,6 +373,11 @@ pub enum EngineEvent {
         /// Tool results whose bodies became stubs.
         #[serde(default, skip_serializing_if = "is_zero")]
         masked: u32,
+        /// The model that wrote the digest. `None` when the structural
+        /// digest was used, either because no summary model was available or
+        /// because it failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_model: Option<SmolStr>,
     },
     TurnUsage {
         turn_id: TurnId,
