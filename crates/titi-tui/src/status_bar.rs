@@ -456,6 +456,9 @@ pub struct StatusSnapshot {
     pub state_color: ThemeColor,
     /// Active model id, as the provider names it.
     pub model: String,
+    /// The reasoning effort the model is sent, shown beside it; `None` shows
+    /// nothing.
+    pub effort: Option<String>,
     /// Plan/duck/… label; `None` hides the mode segment (plain agent).
     pub mode: Option<String>,
     /// Background loops the engine reported; `None` hides the segment.
@@ -496,6 +499,7 @@ impl Default for StatusSnapshot {
             state: None,
             state_color: ThemeColor::Dim,
             model: "no-model".to_owned(),
+            effort: None,
             mode: None,
             loops: None,
             path: String::new(),
@@ -638,10 +642,7 @@ pub fn render_status_line(
                 &mut left,
                 &mut right,
                 Segment::Model,
-                theme.fg(
-                    ThemeColor::Muted,
-                    &model_part(theme, ascii, &short_model(&snap.model)),
-                ),
+                model_segment(theme, ascii, &short_model(&snap.model), snap),
             );
             continue;
         }
@@ -651,7 +652,7 @@ pub fn render_status_line(
             &mut left,
             &mut right,
             Segment::Model,
-            fitted_model(theme, ascii, &snap.model, room),
+            fitted_model(theme, ascii, &snap.model, &effort_suffix(snap), room),
         );
         break;
     }
@@ -818,7 +819,7 @@ fn segment_text(seg: Segment, theme: &Theme, ascii: bool, snap: &StatusSnapshot)
             .state
             .as_ref()
             .map(|state| theme.fg(snap.state_color, state)),
-        Segment::Model => Some(theme.fg(ThemeColor::Muted, &model_part(theme, ascii, &snap.model))),
+        Segment::Model => Some(model_segment(theme, ascii, &snap.model, snap)),
         Segment::Mode => snap
             .mode
             .as_ref()
@@ -894,6 +895,21 @@ fn cost_part(theme: &Theme, snap: &StatusSnapshot) -> Option<String> {
 }
 
 /// The model with its icon.
+/// The model, and beside it `(high)` when the session asks it to think at a
+/// stated effort.
+fn model_segment(theme: &Theme, ascii: bool, model: &str, snap: &StatusSnapshot) -> String {
+    theme.fg(
+        ThemeColor::Muted,
+        &format!("{}{}", model_part(theme, ascii, model), effort_suffix(snap)),
+    )
+}
+
+fn effort_suffix(snap: &StatusSnapshot) -> String {
+    snap.effort
+        .as_ref()
+        .map_or_else(String::new, |effort| format!(" ({effort})"))
+}
+
 fn model_part(theme: &Theme, ascii: bool, model: &str) -> String {
     let icon = sym(theme, ascii, "icon.model");
     if icon.is_empty() {
@@ -905,16 +921,16 @@ fn model_part(theme: &Theme, ascii: bool, model: &str) -> String {
 
 /// The model cut to `room` cells with an ellipsis in the middle: the last
 /// resort, when even the short form does not fit beside the rest of the line.
-fn fitted_model(theme: &Theme, ascii: bool, model: &str, room: usize) -> String {
+fn fitted_model(theme: &Theme, ascii: bool, model: &str, suffix: &str, room: usize) -> String {
     let icon = sym(theme, ascii, "icon.model");
     let prefix = if icon.is_empty() {
         String::new()
     } else {
         format!("{icon} ")
     };
-    let room = room.saturating_sub(visible_width(&prefix));
+    let room = room.saturating_sub(visible_width(&prefix) + visible_width(suffix));
     let shown = middle_ellipsis(&short_model(model), room.max(1));
-    theme.fg(ThemeColor::Muted, &format!("{prefix}{shown}"))
+    theme.fg(ThemeColor::Muted, &format!("{prefix}{shown}{suffix}"))
 }
 
 /// The working directory, hidden when empty.
@@ -1829,6 +1845,43 @@ mod tests {
             &s,
         ));
         assert!(cut.contains('…'), "{cut:?}");
+    }
+
+    #[test]
+    fn the_effort_is_shown_beside_the_model_only_when_set() {
+        let theme = theme();
+        let mut s = snap();
+        let none = visible(&render_status_line(
+            &theme,
+            120,
+            style(StatusLinePreset::Default),
+            &s,
+        ));
+        assert!(!none.contains("glm-5.3-flash ("), "{none:?}");
+        s.effort = Some("high".to_owned());
+        let set = visible(&render_status_line(
+            &theme,
+            120,
+            style(StatusLinePreset::Default),
+            &s,
+        ));
+        assert!(set.contains("glm-5.3-flash (high)"), "{set:?}");
+    }
+
+    #[test]
+    fn a_narrow_pane_cuts_the_model_before_it_loses_the_effort() {
+        let theme = theme();
+        let mut s = snap();
+        s.model = "opencode-go/glm-5.3-flash-with-a-very-long-suffix".to_owned();
+        s.effort = Some("xhigh".to_owned());
+        let line = visible(&render_status_line(
+            &theme,
+            24,
+            style(StatusLinePreset::Default),
+            &s,
+        ));
+        assert!(line.contains('…'), "{line:?}");
+        assert!(line.contains("(xhigh)"), "{line:?}");
     }
 
     #[test]
