@@ -1016,6 +1016,11 @@ impl Genome {
         let mut counts: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
         for record in self.files.values() {
             for used in &record.uses {
+                // A file that re-publishes the definer is the road to the name,
+                // not a user of it.
+                if record.reexports.contains(&used.definer) {
+                    continue;
+                }
                 *counts
                     .entry(used.definer.as_str())
                     .or_default()

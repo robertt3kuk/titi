@@ -128,10 +128,10 @@ impl Genome {
         out
     }
 
-    /// `definers` without a TypeScript/JavaScript barrel that re-publishes
-    /// another one of them. Only there is a re-exported file a re-exported
-    /// *name*: Rust's `pub mod other;` publishes a module, and a `Session` in
-    /// both files is two types.
+    /// `definers` without a TypeScript/JavaScript barrel or a Python facade
+    /// that re-publishes another one of them. Only there is a re-exported file
+    /// a re-exported *name*: Rust's `pub mod other;` publishes a module, and a
+    /// `Session` in both files is two types.
     fn without_pass_throughs<'a>(&self, definers: &'a [String]) -> Vec<&'a String> {
         definers
             .iter()
@@ -139,7 +139,9 @@ impl Genome {
                 let Some(record) = self.files.get(candidate.as_str()).filter(|record| {
                     matches!(
                         record.language,
-                        crate::Language::TypeScript | crate::Language::JavaScript
+                        crate::Language::TypeScript
+                            | crate::Language::JavaScript
+                            | crate::Language::Python
                     )
                 }) else {
                     return true;
