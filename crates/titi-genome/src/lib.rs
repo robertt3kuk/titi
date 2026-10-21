@@ -32,6 +32,7 @@ mod project;
 mod query;
 mod recency;
 mod refs;
+mod role;
 mod scan;
 mod scope;
 mod shared;

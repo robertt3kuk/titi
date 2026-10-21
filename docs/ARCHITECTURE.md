@@ -53,7 +53,9 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   definer `D` when `D` is in `F`'s scope: reached through `F`'s resolved
   imports; behind a re-export of one (`pub use`, `pub mod x;`, a TypeScript
   barrel's `export … from`, a Python `__init__.py`); the `lib.rs` of a
-  workspace crate `F` names (`use titi_providers::X`); an ancestor's imports
+  workspace crate `F` names (`use titi_providers::X`; the crate is found by
+  its manifest's `[lib] name`/`[package] name`, else its directory, and `F`
+  also gets an edge to that `lib.rs`); an ancestor's imports
   through `use super::*`; or, for Go, Java, Kotlin and C#, the same package
   directory. Python, TypeScript, JavaScript, PHP, Ruby, Swift and C reach only
   through imports and includes. Two definers in scope, or several and none in
@@ -72,6 +74,15 @@ example `examples/map.rs`. Обзор темы — `docs/research/README.md`.
   over its edges in proportion to their weights. A file's edges weigh at least
   1 together (`MIN_OUTBOUND`): a file whose only edge is a guess passes half
   its rank to it, not all of it.
+- **A path has a role** (`role.rs`). Tests (`test`/`tests`/`spec`, `*_test.go`,
+  `FooTests.cs`, `*.spec.ts`, `conftest.py`), examples, docs, fixtures,
+  benchmarks, vendored and generated files (`*.generated.*`, `*_pb2.py`,
+  `*.min.js`) are *auxiliary*: they start with a quarter of the rank
+  (`AUXILIARY_SHARE`), their edges weigh 0.7 (`AUXILIARY_EDGE`), and the map
+  scores them at a quarter (`AUXILIARY_FACTOR`) unless the session touched
+  them. Entry points (`main.*`, `Program.cs`, `lib.rs`, a shallow `index.*`,
+  a package's `__init__.py`) start with four times the rank and are scored at
+  twice. `(→N)` still counts every dependent, tests included.
 - **`(→N)` counts distinct files with an edge to this one**, and `+Name (n)`
   counts distinct files whose uses of `Name` resolve to *this* file. Two files
   defining `Shared` are counted separately.

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::Genome;
+use crate::role::{Role, classify};
 
 /// Symbol lines shown under one file in the prompt map. File ranking is
 /// untouched. An export nobody uses is omitted: a zero is not a blast radius.
@@ -9,6 +10,14 @@ const PROMPT_EXPORTS: usize = 4;
 /// Multiplier applied to files the session just edited or read, so the map
 /// follows the work instead of the static graph alone.
 const TOUCHED_BOOST: f64 = 3.0;
+
+/// What a test, example or generated file keeps of its rank on the page.
+/// Touching one is the way back: someone editing a test wants it listed.
+const AUXILIARY_FACTOR: f64 = 0.25;
+
+/// What an entry point is worth on the page beyond its rank, which counts who
+/// imports it and so is nothing for a binary's `main`.
+const ENTRY_FACTOR: f64 = 2.0;
 
 /// Render the prompt map.
 ///
@@ -29,7 +38,11 @@ pub fn render(genome: &Genome, limit: usize, touched: &HashSet<String>, pending:
             let score = if touched.contains(path) {
                 base * TOUCHED_BOOST
             } else {
-                base
+                match classify(path) {
+                    Role::Auxiliary => base * AUXILIARY_FACTOR,
+                    Role::Entry => base * ENTRY_FACTOR,
+                    Role::Source => base,
+                }
             };
             (path.as_str(), score)
         })

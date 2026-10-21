@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::role::{Role, classify};
 use crate::scope::Layout;
 use crate::{Basis, FileRecord};
 
@@ -18,6 +19,17 @@ const GUESS: f64 = 0.25;
 
 /// What a file's edges weigh at least, however light they are.
 const MIN_OUTBOUND: f64 = 1.0;
+
+/// How much of a file's say a test, example or generated file has: the share
+/// of rank it starts with and the weight of the edges it draws. A hundred
+/// tests leaning on a helper are not a hundred reasons the helper matters.
+const AUXILIARY_SHARE: f64 = 0.25;
+const AUXILIARY_EDGE: f64 = 0.7;
+
+/// How much more of the start-of-walk rank an entry point holds. Nothing
+/// imports a binary's `main`, so by inbound edges alone it is the least
+/// important file in the repo, and it is where everything it runs hangs from.
+const ENTRY_SHARE: f64 = 4.0;
 
 /// PageRank over the file graph, and each file's dependent count.
 ///
@@ -42,12 +54,26 @@ pub(crate) fn rank(
         .enumerate()
         .map(|(at, path)| (path.as_str(), at))
         .collect();
+    let shares: Vec<f64> = nodes
+        .iter()
+        .map(|path| match classify(path) {
+            Role::Source => 1.0,
+            Role::Entry => ENTRY_SHARE,
+            Role::Auxiliary => AUXILIARY_SHARE,
+        })
+        .collect();
+    let share_total: f64 = shares.iter().sum();
     let mut dependents = vec![0usize; n];
     let mut inbound: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     let mut outbound = vec![0.0f64; n];
 
     for (from_at, from) in nodes.iter().enumerate() {
         let record = &files[*from];
+        let from_edge = if classify(from) == Role::Auxiliary {
+            AUXILIARY_EDGE
+        } else {
+            1.0
+        };
         // Two edge kinds, one graph: a file imports another, or it mentions a
         // symbol that other file defines. Either way it depends on it.
         let mut evidence: Vec<(usize, f64)> = Vec::new();
@@ -82,7 +108,7 @@ pub(crate) fn rank(
                 total += evidence[at].1;
                 at += 1;
             }
-            let weight = edge_weight(total);
+            let weight = edge_weight(total) * from_edge;
             outbound[from_at] += weight;
             inbound[to_at].push((from_at, weight));
             dependents[to_at] += 1;
@@ -102,7 +128,6 @@ pub(crate) fn rank(
         return (HashMap::new(), dependents);
     }
 
-    let teleport = (1.0 - DAMPING) / n as f64;
     let mut score = vec![1.0 / n as f64; n];
     let mut next = vec![0.0; n];
     for _ in 0..ITERATIONS {
@@ -111,7 +136,7 @@ pub(crate) fn rank(
             for &(src, weight) in sources {
                 incoming += score[src] * weight / outbound[src];
             }
-            next[at] = teleport + DAMPING * incoming;
+            next[at] = (1.0 - DAMPING) * shares[at] / share_total + DAMPING * incoming;
         }
         std::mem::swap(&mut score, &mut next);
     }
