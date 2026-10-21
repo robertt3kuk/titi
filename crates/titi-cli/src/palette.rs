@@ -105,6 +105,11 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Bool,
     ),
     setting(
+        cfg::ATLAS_TOOL_KEY,
+        "give the model the atlas query tool",
+        Values::Bool,
+    ),
+    setting(
         cfg::ATLAS_BUDGET_KEY,
         "tokens the repo map and lens may add to a turn",
         Values::Free,

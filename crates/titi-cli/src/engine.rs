@@ -1027,6 +1027,9 @@ pub fn start_engine_with(
     if std::env::var_os("TITI_NO_ATLAS").is_none() && atlas_enabled {
         engine_config.atlas_root = Some(workspace.clone());
     }
+    engine_config.atlas_tool = settings.as_ref().is_none_or(|settings| {
+        !titi_config::settings::switch_off(settings, titi_config::settings::ATLAS_TOOL_KEY)
+    });
     // A subagent runs the same tool loop as the main turn, in the workspace,
     // on the chosen model. Read-only by default; writes stay with the main
     // turn, which has an approval surface.

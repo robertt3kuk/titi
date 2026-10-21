@@ -22,6 +22,7 @@ use std::time::SystemTime;
 
 pub mod ast_edit;
 
+mod ask;
 mod cochange;
 mod content;
 mod graph;
@@ -43,6 +44,10 @@ mod symbol;
 mod symbols;
 pub mod syntax_check;
 
+pub use ask::{
+    AskError, DEFAULT_LIMIT, FileHit, FindKind, Found, Impact, MAX_LIMIT, Outline, SymbolHit, User,
+    Uses, clip_to_tokens,
+};
 pub use cochange::{CoChange, head_stamp as cochange_head_stamp, probe as probe_cochange};
 pub use lang::{Capability, Language, Level};
 pub use lens::{Lens, LensBudget, LensEntry, MAX_LENS_FILES, SeedInput, SeedKind, Seeds};

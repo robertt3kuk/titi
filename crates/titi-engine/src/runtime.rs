@@ -889,6 +889,9 @@ pub struct EngineConfig {
     pub approval_mode: ApprovalMode,
     /// Workspace root kept indexed turn-by-turn. `None` disables the Atlas.
     pub atlas_root: Option<PathBuf>,
+    /// Whether the model gets the `atlas` tool (`atlas.tool`, on unless set
+    /// off). Only meaningful with an `atlas_root`: no index, no tool.
+    pub atlas_tool: bool,
     /// Tokens the atlas may add to one turn, the prompt map and the lens
     /// together (`atlas.budget`). `None` sizes it from the repository.
     pub atlas_budget: Option<usize>,
@@ -983,6 +986,7 @@ impl EngineConfig {
             approval_mode: ApprovalMode::Write,
             atlas_root: None,
             atlas_budget: None,
+            atlas_tool: true,
             workspace_root: None,
             agent_model: None,
             agent_writes: false,
@@ -1570,6 +1574,13 @@ impl EngineRuntime {
                 .with_router(router.clone()),
             ) as Arc<dyn crate::agents::AgentRunner>)
         });
+        // The index answers questions as well as annotating the prompt: the
+        // model's `atlas` tool reads the same snapshot the map was built from.
+        if config.atlas_tool
+            && let Some(handle) = &atlas
+        {
+            tools.register(Arc::new(crate::atlas_tool::AtlasTool::new(handle.clone())));
+        }
         // The surface builds the session's tools before the engine starts —
         // a subagent's registry is built here — so this is where `bash`
         // learns where a command that outlives the turn goes.

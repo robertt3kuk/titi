@@ -167,7 +167,7 @@ pub struct Lens {
 
 /// How a file is linked to a neighbour in the lens's walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EdgeKind {
+pub(crate) enum EdgeKind {
     /// The file itself depends on the neighbour.
     Uses,
     /// The neighbour depends on the file.
@@ -186,10 +186,10 @@ const COCHANGE_CAP: f64 = 2.0;
 /// What the lens needs from the records, built once per graph.
 #[derive(Debug, Default)]
 pub(crate) struct LensIndex {
-    paths: Vec<String>,
-    at: HashMap<String, u32>,
+    pub(crate) paths: Vec<String>,
+    pub(crate) at: HashMap<String, u32>,
     /// `(neighbour, weight, kind)`; see [`EdgeKind`].
-    adj: Vec<Vec<(u32, f64, EdgeKind)>>,
+    pub(crate) adj: Vec<Vec<(u32, f64, EdgeKind)>>,
     out_sum: Vec<f64>,
     exact: HashMap<String, Vec<u32>>,
     lower: HashMap<String, Vec<u32>>,
@@ -286,6 +286,10 @@ impl LensIndex {
 
     /// Files a spelled path names: the exact key, else every file whose path
     /// ends with it (`runtime.rs`, `engine/runtime.rs`).
+    pub(crate) fn resolve_path_public(&self, atlas: &Atlas, spelled: &str) -> Vec<u32> {
+        self.resolve_path(atlas, spelled)
+    }
+
     fn resolve_path(&self, atlas: &Atlas, spelled: &str) -> Vec<u32> {
         let spelled = spelled.replace('\\', "/");
         if let Some(key) = atlas.key(&spelled)
@@ -344,6 +348,11 @@ fn flush(current: &mut String, words: &mut Vec<String>) {
 }
 
 impl Atlas {
+    /// The graph index the lens and the query layer walk, built on first use.
+    pub(crate) fn lens_index(&self) -> &LensIndex {
+        self.lens.get_or_build(self)
+    }
+
     /// The seeds `input` gives: see the module's table.
     pub fn seeds(&self, input: &SeedInput) -> Seeds {
         let index = self.lens.get_or_build(self);

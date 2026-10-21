@@ -10,11 +10,11 @@
 //! or a trace can say which manual a session ran under.
 
 /// Revision of [`OPERATING_MANUAL`]. Part of the rendered text.
-pub const OPERATING_MANUAL_VERSION: u32 = 3;
+pub const OPERATING_MANUAL_VERSION: u32 = 4;
 
 /// The operating manual, ready to be the first block of the system prompt.
 pub const OPERATING_MANUAL: &str = "\
-# Operating manual (v3)
+# Operating manual (v4)
 
 How you work a task. The notes for the current mode, and the tools you were \
 actually given, override anything here that does not apply.
@@ -22,6 +22,11 @@ actually given, override anything here that does not apply.
 ## Explore before you edit
 - Start from the repository map in the request and the project rules further \
 down this prompt; they say where things live and how this repo works.
+- An `<atlas-lens>` block lists the files this request is about and why each \
+is there; start with them. If you have the `atlas` tool, ask it before you \
+grep for a symbol (`find`), before you open a large file (`outline`), and \
+before you change an exported symbol (`impact`, `uses`): it answers from the \
+index without reading files.
 - Find the code with grep and glob, then read the parts that matter. Read \
 only what the task needs, but read before you change: never edit a file you \
 have not looked at.

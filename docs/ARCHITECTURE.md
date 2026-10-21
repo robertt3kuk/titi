@@ -253,6 +253,21 @@ src/runtime.rs (→3) [RECENT]
   [RECENT]`. It is never longer than its budget and never empty. The engine
   sends it once and again only when the set of files it lists changes
   (`previous_map_matches`), not when a count, a signature or `[RECENT]` does.
+- **The query layer and the `atlas` tool** (`ask.rs`, `titi-engine/src/atlas_tool.rs`).
+  One layer answers the questions asked of a snapshot — `find` (symbols by
+  exact name, name ignoring case, or a part of it; files by stem, name or
+  path; paged), `outline` (a file's symbols with line ranges and signatures,
+  imports, dependents, the tests among them), `uses` (the definitions and
+  the files that use a name with the lines that mention it), `impact` (what
+  changing a file or a symbol touches: direct dependents, then through those,
+  tests among them, co-change partners) and `related` (the lens for a query)
+  — and three front ends read it: the model's `atlas` tool (one tool with an
+  `op`, read tier, on unless `atlas.tool: false`, absent without an index so
+  a duck stays repo-blind; each answer starts `atlas gen=N` and says
+  `stale=K` when the index is catching up, and is cut at 1500 estimated
+  tokens), the LSP's `references` (one location per mention instead of one
+  per file) and `titi atlas`. An unknown name is an error that names the
+  closest ones.
 - **Co-change** (`cochange.rs`): `git log -n 500 --no-merges --name-only` is
   read once per `HEAD` (stamp = `.git/HEAD` plus the reflog's mtime, no
   process) on a thread of its own with a 2.5 s cap, started by the index

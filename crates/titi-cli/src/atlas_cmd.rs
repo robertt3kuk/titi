@@ -67,6 +67,9 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         Some("lens") => {
             lens_cmd(workspace, &args[1..]);
         }
+        Some(op @ ("find" | "outline" | "uses" | "impact" | "related")) => {
+            ask_cmd(workspace, op, &args[1..]);
+        }
         Some("capabilities") => {
             capabilities_cmd();
         }
@@ -83,7 +86,7 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         Some(name) => {
             eprintln!("atlas: unknown command {name}");
             eprintln!(
-                "usage: titi atlas [on|off|budget <tokens>|check|dump|lens|capabilities|lsp]"
+                "usage: titi atlas [on|off|budget <tokens>|check|dump|lens|find|outline|uses|impact|related|capabilities|lsp]"
             );
             std::process::exit(USAGE_EXIT);
         }
@@ -219,6 +222,84 @@ fn save_setting(
         Ok(()) => println!("{line}"),
         Err(why) => {
             eprintln!("atlas: not saved ({why})");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `titi atlas find|outline|uses|impact|related <text…> [--json]`: the questions
+/// the model's `atlas` tool answers, asked from a terminal — the same query
+/// layer, the same text. `--json` prints the matched paths in order, which is
+/// what an evaluation scores.
+fn ask_cmd(workspace: &Path, op: &str, args: &[String]) {
+    let json = args.iter().any(|arg| arg == "--json");
+    let words: Vec<&str> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .map(String::as_str)
+        .collect();
+    if words.is_empty() {
+        eprintln!("usage: titi atlas {op} <text…> [--json]");
+        std::process::exit(USAGE_EXIT);
+    }
+    let text = words.join(" ");
+    let mut atlas = match titi_atlas::Atlas::index(workspace) {
+        Ok(atlas) => atlas,
+        Err(reason) => {
+            eprintln!("atlas: {op} failed ({reason})");
+            std::process::exit(1);
+        }
+    };
+    if let Some(found) = titi_atlas::probe_cochange(workspace) {
+        atlas.set_cochange(found);
+    }
+    let outcome: Result<(String, Vec<String>), titi_atlas::AskError> = match op {
+        "find" => {
+            let found = atlas.find(&text, titi_atlas::FindKind::Any, titi_atlas::MAX_LIMIT, 0);
+            let mut paths: Vec<String> = Vec::new();
+            for hit in &found.symbols {
+                if !paths.contains(&hit.path) {
+                    paths.push(hit.path.clone());
+                }
+            }
+            for hit in &found.files {
+                if !paths.contains(&hit.path) {
+                    paths.push(hit.path.clone());
+                }
+            }
+            Ok((found.render(0), paths))
+        }
+        "outline" => atlas.outline(&text).map(|outline| {
+            let paths = vec![outline.path.clone()];
+            (outline.render(), paths)
+        }),
+        "uses" => atlas.uses(&text, None).map(|uses| {
+            let paths = uses.users.iter().map(|user| user.path.clone()).collect();
+            (uses.render(), paths)
+        }),
+        "impact" => atlas.impact(&text).map(|impact| {
+            let mut paths = impact.direct.clone();
+            paths.extend(impact.indirect.iter().cloned());
+            (impact.render(), paths)
+        }),
+        _ => {
+            let lens = atlas.related(&text, titi_atlas::MAX_LIMIT);
+            let paths = lens
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect();
+            Ok((lens.render_lines(), paths))
+        }
+    };
+    match outcome {
+        Ok((rendered, paths)) if json => {
+            let _ = rendered;
+            println!("{}", serde_json::json!({ "paths": paths }));
+        }
+        Ok((rendered, _)) => print!("{rendered}"),
+        Err(error) => {
+            eprintln!("atlas {op}: {error}");
             std::process::exit(1);
         }
     }

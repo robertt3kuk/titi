@@ -218,18 +218,14 @@ impl Atlas {
                 out.push(loc);
             }
         }
-        let mut users: Vec<&String> = self
-            .files
-            .iter()
-            .filter(|(_, record)| record.uses.iter().any(|used| used.name == name))
-            .map(|(user, _)| user)
-            .collect();
-        users.sort();
-        for user in users {
+        // Every mention in every file whose use of the name resolves to one of
+        // its definitions, at the line and column it is written: the same
+        // answer `atlas uses` gives, as positions.
+        for (user, line, character) in self.use_sites(&name, None) {
             let loc = Location {
-                path: user.clone(),
-                line: 1,
-                character: 0,
+                path: user,
+                line,
+                character,
             };
             if seen.insert((loc.path.clone(), loc.line, loc.character)) {
                 out.push(loc);

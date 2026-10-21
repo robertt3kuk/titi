@@ -86,6 +86,11 @@ pub const THEME_LIGHT_KEY: &str = "theme.light";
 /// `atlas.limit`, a file count, which nothing reads any more.
 pub const ATLAS_BUDGET_KEY: &str = "atlas.budget";
 
+/// Whether the model gets the `atlas` tool: find, outline, uses, impact and
+/// related, answered from the index. Unset means on; `false`, `off` or `no`
+/// takes the tool out of the request. This crate owns the name only.
+pub const ATLAS_TOOL_KEY: &str = "atlas.tool";
+
 /// Smallest `atlas.budget`: below it the map is a few lines and the lens none.
 pub const MIN_ATLAS_BUDGET: i64 = 200;
 
