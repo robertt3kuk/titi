@@ -190,3 +190,32 @@ fn generated_and_fixture_files_rank_below_source() {
     assert!(at("src/api.ts") < at("src/api.generated.ts"), "{map:?}");
     assert!(at("src/api.ts") < at("tests/fixtures/data.ts"), "{map:?}");
 }
+
+/// `MapFrom` is the library's method name and, once, a class a test file
+/// declares for itself. A hundred library files calling `.MapFrom(` are not
+/// users of that class.
+#[test]
+fn a_production_file_does_not_guess_a_definition_into_test_code() {
+    let mut files: Vec<(String, String)> = vec![(
+        "src/UnitTests/Bug.cs".into(),
+        "public class MapFromHelper { }\n".into(),
+    )];
+    for n in 0..5 {
+        files.push((
+            format!("src/Lib/Thing{n}.cs"),
+            format!("public class Thing{n} {{ void Go() {{ var x = new MapFromHelper(); }} }}\n"),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_str()))
+        .collect();
+    let (_dir, genome) = index(&refs);
+
+    assert_eq!(
+        genome.dependents["src/UnitTests/Bug.cs"],
+        0,
+        "production code pointed at a test-local class by name alone"
+    );
+}
+

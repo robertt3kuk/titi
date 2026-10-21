@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::role::{Role, classify};
 use crate::{Basis, FileRecord, Language, SymbolRecord, SymbolUse};
 
 /// Names shorter than this are never guessed.
@@ -44,6 +45,14 @@ const COMMON: &[&str] = &[
     "route", "row", "select", "start", "state", "status", "string", "style", "sync", "table",
     "title", "update", "value", "write",
 ];
+
+/// Whether a guess would point product code at a definition that only a test,
+/// example or fixture declares. A name that a test file defines for itself and
+/// the library also uses as its own method name is not evidence that the
+/// library depends on the test.
+fn guesses_into_auxiliary(from: &str, definer: &str) -> bool {
+    classify(definer) == Role::Auxiliary && classify(from) != Role::Auxiliary
+}
 
 /// Whether a name defined once may be linked without evidence.
 pub(crate) fn is_distinctive(name: &str) -> bool {
@@ -220,6 +229,7 @@ impl Resolver<'_> {
                     [only]
                         if *only != record.path
                             && is_distinctive(name)
+                            && !guesses_into_auxiliary(&record.path, only)
                             && self
                                 .files
                                 .get(only)
