@@ -103,6 +103,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "list, search, or forget memories",
     },
     Command {
+        name: "verify",
+        about: "the turn-end check (usage: /verify [save|trust])",
+    },
+    Command {
         name: "genome",
         about: "manage the prompt map: on, off, or limit",
     },

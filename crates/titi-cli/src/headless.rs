@@ -336,6 +336,19 @@ pub async fn run_prompt(
                     eprintln!("{row}");
                 }
             }
+            EngineEvent::VerifyFinished {
+                command,
+                outcome,
+                exit_code,
+                ms,
+                retrying,
+                ..
+            } => {
+                let (row, _) = crate::verify_setup::finished_row(
+                    command, *outcome, *exit_code, *ms, *retrying,
+                );
+                eprintln!("{row}");
+            }
             _ => {}
         }
         if matches!(

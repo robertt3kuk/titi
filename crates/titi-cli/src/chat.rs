@@ -1821,6 +1821,21 @@ impl Chat {
                 }
                 Applied::none()
             }
+            EngineEvent::VerifyStarted { command, .. } => {
+                self.verify_started(&command);
+                Applied::none()
+            }
+            EngineEvent::VerifyFinished {
+                command,
+                outcome,
+                exit_code,
+                ms,
+                retrying,
+                ..
+            } => {
+                self.verify_finished(&command, outcome, exit_code, ms, retrying);
+                Applied::none()
+            }
             EngineEvent::ReviewFinished { report } => {
                 self.review_finished(report);
                 Applied::none()
@@ -2457,6 +2472,7 @@ impl Chat {
             "copy" => self.copy_command(args),
             "errors" => self.errors_command(args),
             "skills" => self.skills_command(args),
+            "verify" => self.verify_command(args),
             _ => {
                 // A known skill or file command is not a built-in: it goes to
                 // the model as a prompt, and the engine expands it there.

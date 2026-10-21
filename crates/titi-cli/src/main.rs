@@ -369,17 +369,30 @@ fn main() -> io::Result<()> {
     // The engine runs only the hooks it is handed: the user's own, and the
     // repository's that the trust store already holds. The rest wait for the
     // panel (screen) or are skipped (headless).
-    let hooks_startup = {
+    let (hooks_startup, verify_startup) = {
         let agent_dir = titi_config::agent_dir();
         let workspace = titi_cli::session_fs::current_workspace();
         let settings = titi_config::settings::Settings::load(&agent_dir, &workspace, &[]).ok();
-        titi_cli::hooks_setup::HookStartup::resolve(
-            &agent_dir,
-            &workspace,
-            settings.as_ref(),
-            trust_project,
+        (
+            titi_cli::hooks_setup::HookStartup::resolve(
+                &agent_dir,
+                &workspace,
+                settings.as_ref(),
+                trust_project,
+            ),
+            // The same rule for the turn-end command: the user's own runs,
+            // the repository's only once trusted.
+            titi_cli::verify_setup::VerifyStartup::resolve(
+                &agent_dir,
+                &workspace,
+                settings.as_ref(),
+                trust_project,
+            ),
         )
     };
+    if verify_startup.command.is_some() {
+        let _ = engine.try_send(verify_startup.engine_command());
+    }
     if !hooks_startup.approved.is_empty() {
         let _ = engine.try_send(titi_engine::EngineCommand::SetHooks {
             hooks: hooks_startup.approved.clone(),
@@ -405,6 +418,9 @@ fn main() -> io::Result<()> {
             eprintln!("{note}");
         }
         for note in hooks_startup.headless_notices() {
+            eprintln!("{note}");
+        }
+        for note in &verify_startup.notices {
             eprintln!("{note}");
         }
         let code = match (review, goal, prompt) {
@@ -446,7 +462,11 @@ fn main() -> io::Result<()> {
         theme,
         // Two notes can be owed at once (`--continue` with nothing to resume,
         // and a pinned model that is not available): each is its own line.
-        [pin_note, continue_note].into_iter().flatten().collect(),
+        [pin_note, continue_note]
+            .into_iter()
+            .flatten()
+            .chain(verify_startup.notices)
+            .collect(),
         hooks_startup,
     )
 }

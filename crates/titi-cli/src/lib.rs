@@ -46,6 +46,10 @@ pub mod trace_cmd;
 pub mod transcript;
 #[cfg(test)]
 mod usage_tests;
+pub(crate) mod verify_cmd;
+pub mod verify_setup;
+#[cfg(test)]
+mod verify_tests;
 pub mod vim;
 pub mod wallclock;
 pub mod welcome;
