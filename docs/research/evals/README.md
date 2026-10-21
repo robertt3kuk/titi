@@ -81,25 +81,26 @@ scripts/eval.py --bin target/release/titi --tasks evals/tasks \
 | --- | --- | --- |
 | `atlas-off` | `TITI_NO_ATLAS=1` | no `<atlas>` map, no lens |
 | `atlas-full` | (default) | map, per-prompt lens and, once it exists, the atlas tool |
-| `atlas-map` | **missing knob** | the map only |
+| `atlas-map` | `atlas.lens: false`, `atlas.tool: false` in the run's copy of `config.yml` | the map only |
 
-`atlas-map` is not run today: titi has no setting or environment variable
-that turns off the lens (and, later, the atlas tool) while keeping the map,
-so the harness reports it as "not run" instead of silently running it as
-`atlas-full`. When such a knob exists, add it without touching the script:
-`--condition-env atlas-map=TITI_ATLAS_NO_LENS=1` (name and value are whatever
-the knob is; repeat the flag for several variables, and any other name defines
-a new condition). Atlas variables inherited from the shell are cleared for a
-named condition. Without `--conditions` the run is as before, one unnamed
+`atlas-map` is done with settings, not environment: the harness appends
+`atlas:\n  lens: false\n  tool: false` to the per-run copy of the agent dir's
+`config.yml` (it refuses a config that already has a top-level `atlas:` block).
+`--condition-env NAME=KEY=VALUE` (repeatable) adds environment to a condition
+or defines a new one. Atlas variables inherited from the shell are cleared for
+a named condition. Without `--conditions` the run is as before, one unnamed
 condition, and the report has no conditions table.
 
 Smoke (proves the plumbing with the scripted provider, no key): point an agent
 dir at `scripts/fake-provider.py` as in its docstring, start it, and run
 `scripts/eval.py --bin target/release/titi --tasks evals/tasks --only _smoke
 --smoke --runs 2 --agent-dir <dir> --conditions atlas-off,atlas-map,atlas-full`.
-`_smoke` is solved in both runnable conditions, `atlas-map` is listed as not
-run, and the provider's `requests.jsonl` shows `<atlas>` in the `atlas-full`
-requests only.
+`_smoke` is solved in all three conditions, and the provider's `requests.jsonl`
+shows: no `<atlas>` block and 19 tools under `atlas-off`; the `<atlas>` map and
+19 tools (no `atlas` tool) under `atlas-map`; the map and 20 tools, `atlas`
+among them, under `atlas-full`. The prompt `edit readme` has no seeds, so no
+`<atlas-lens>` appears in any condition; `atlas.lens` itself is covered by the
+engine's tests.
 
 ## What the numbers mean
 

@@ -1175,29 +1175,31 @@ Static baseline, atlas at master with `.atlasignore` (run 2026-10-21), 80 tasks:
 This reproduces the pilot's static row of `docs/research/atlas-v2/README.md` (0.29 / 0.52) with the real
 binary; the only difference per repo is okio recall@24 (0.08 here, 0.06 in the pilot, one task).
 
-### Rankings compared (atlas at e4a4e99, run 2026-10-21, 80 tasks)
+### Rankings compared (atlas at c40d30c, run 2026-10-21, 80 tasks)
 
 `--conditions static,lens,find,lens+find,map+lens` (the default): `static` is the prompt map's order
 (`atlas dump`); `lens` is `titi atlas lens --task <message> --json` as the turn builds it (default budget);
-`find` is `titi atlas find "<message>" --json` (the atlas tool's answer, which caps its list at 16, so
-r@24 is bounded by that); `lens+find` is the lens entries then the find paths, deduplicated; `map+lens` is
-the lens entries then the map's files, i.e. what the prompt carries before the model acts. r@k is over
-the first k paths of each list.
+`find` is `titi atlas find "<message>" --limit 24 --json` (the atlas tool's answer, paged to the k scored;
+it falls back to the lens reading when nothing matches by symbol or file); `lens+find` is the lens entries
+then the find paths, deduplicated; `map+lens` is the lens entries then the map's files, i.e. what the
+prompt carries before the model acts. r@k is over the first k paths of each list.
 
 | repo | tasks | files | static r@10 | static r@24 | lens r@10 | lens r@24 | find r@10 | find r@24 | lens+find r@10 | lens+find r@24 | map+lens r@10 | map+lens r@24 | map tokens | leaky |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| cobra | 10 | 36 | 0.65 | 1.00 | 0.70 | 0.70 | 0.75 | 0.80 | 0.80 | 0.80 | 1.00 | 1.00 | 432 | 2 |
+| cobra | 10 | 36 | 0.65 | 1.00 | 0.70 | 0.70 | 0.75 | 0.75 | 0.80 | 0.80 | 1.00 | 1.00 | 432 | 2 |
 | express | 10 | 141 | 0.54 | 0.54 | 0.40 | 0.40 | 0.17 | 0.30 | 0.40 | 0.45 | 0.57 | 0.72 | 218 | 3 |
-| requests | 10 | 37 | 0.71 | 0.87 | 0.70 | 0.75 | 0.43 | 0.43 | 0.87 | 0.92 | 0.82 | 0.92 | 392 | 1 |
-| ripgrep | 10 | 105 | 0.03 | 0.42 | 0.77 | 0.80 | 0.45 | 0.70 | 0.77 | 0.80 | 0.77 | 0.80 | 450 | 3 |
-| ky | 10 | 90 | 0.15 | 0.23 | 0.65 | 0.67 | 0.27 | 0.28 | 0.72 | 0.79 | 0.69 | 0.78 | 429 | 4 |
-| gson | 10 | 264 | 0.17 | 0.33 | 0.57 | 0.57 | 0.53 | 0.57 | 0.78 | 0.80 | 0.62 | 0.68 | 632 | 2 |
-| okio | 10 | 355 | 0.01 | 0.10 | 0.64 | 0.70 | 0.23 | 0.34 | 0.64 | 0.72 | 0.64 | 0.70 | 604 | 5 |
+| requests | 10 | 37 | 0.71 | 0.87 | 0.72 | 0.78 | 0.43 | 0.43 | 0.89 | 0.94 | 0.84 | 0.92 | 404 | 1 |
+| ripgrep | 10 | 105 | 0.03 | 0.42 | 0.77 | 0.80 | 0.45 | 0.73 | 0.77 | 0.80 | 0.77 | 0.80 | 450 | 3 |
+| ky | 10 | 90 | 0.15 | 0.23 | 0.64 | 0.67 | 0.33 | 0.38 | 0.70 | 0.84 | 0.67 | 0.78 | 428 | 4 |
+| gson | 10 | 264 | 0.17 | 0.33 | 0.57 | 0.57 | 0.53 | 0.68 | 0.78 | 0.80 | 0.62 | 0.68 | 632 | 2 |
+| okio | 10 | 355 | 0.01 | 0.10 | 0.69 | 0.75 | 0.23 | 0.35 | 0.69 | 0.77 | 0.69 | 0.75 | 604 | 5 |
 | sinatra | 10 | 147 | 0.07 | 0.70 | 1.00 | 1.00 | 0.37 | 0.77 | 1.00 | 1.00 | 1.00 | 1.00 | 439 | 3 |
-| **ALL** | 80 | 147 | 0.29 | 0.52 | 0.68 | 0.70 | 0.40 | 0.52 | 0.75 | 0.78 | 0.76 | 0.82 | 449 | 23 |
-| **ALL, message names no truth file** | 57 | 137 | 0.31 | 0.57 | 0.64 | 0.66 | 0.38 | 0.51 | 0.73 | 0.76 | 0.75 | 0.80 | 445 | 0 |
+| **ALL** | 80 | 147 | 0.29 | 0.52 | 0.69 | 0.71 | 0.41 | 0.55 | 0.75 | 0.80 | 0.77 | 0.83 | 451 | 23 |
+| **ALL, message names no truth file** | 57 | 137 | 0.31 | 0.57 | 0.65 | 0.67 | 0.38 | 0.55 | 0.74 | 0.78 | 0.76 | 0.81 | 447 | 0 |
 
-Reading: the lens lifts recall@10 from 0.29 to 0.68 and `find` alone reaches 0.40 with a 16-path cap;
-the two together give 0.75 / 0.78, and lens plus the map's files 0.76 / 0.82. Messages that name no truth
-file (57 tasks) give the same picture (lens 0.64, lens+find 0.73, map+lens 0.75), so the gain is not
-only leakage. `find` is weakest where messages are short or generic (express 0.17, requests 0.43).
+Reading: the lens lifts recall@10 from 0.29 to 0.69 and `find --limit 24` alone reaches 0.41 / 0.55; the
+two together give 0.75 / 0.80, and lens plus the map's files 0.77 / 0.83. Messages that name no truth file
+(57 tasks) give the same picture (lens 0.65, lens+find 0.74, map+lens 0.76), so the gain is not only
+leakage. Against the previous run (find capped at 16): find r@24 0.52 -> 0.55, lens+find r@24 0.78 -> 0.80;
+the lens moved slightly (0.68 -> 0.69) with the atlas changes since. `find` is still weakest where messages
+are short or generic (express 0.17 / 0.30, requests 0.43).

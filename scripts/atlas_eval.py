@@ -667,8 +667,8 @@ def condition_lens(worktree, task, dump):
 
 
 def condition_find(worktree, task, dump):
-    """`titi atlas find "<task>"`: the query the atlas tool answers (it caps its list)."""
-    data = _atlas_json(worktree, "find", task, "--json")
+    """`titi atlas find "<task>" --limit 24`: the query the atlas tool answers, paged to the k the report scores."""
+    data = _atlas_json(worktree, "find", task, "--limit", "24", "--json")
     return list((data or {}).get("paths", []))
 
 

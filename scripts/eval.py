@@ -27,12 +27,11 @@ Python 3 standard library only.
 
 Conditions (`--conditions a,b,...`) run every task x run once per condition
 with that condition's environment, for an A/B in one command: `atlas-off`
-(`TITI_NO_ATLAS=1`: no map, no lens), `atlas-full` (the default: map, lens and,
-once it exists, the atlas tool) and `atlas-map` (the map only). Titi has no
-switch yet that turns the per-prompt lens or the atlas tool off while keeping
-the map, so `atlas-map` is skipped with a note until one exists; give it with
-`--condition-env atlas-map=KEY=VALUE` (repeatable, also defines new conditions)
-and it runs. The report adds, per condition, the pass rate, tokens, cost, wall
+(`TITI_NO_ATLAS=1`: no map, no lens), `atlas-full` (the default: map, lens and
+the atlas tool) and `atlas-map` (the map only: `atlas.lens: false` and
+`atlas.tool: false` appended to the run's copy of the agent dir's config.yml).
+`--condition-env NAME=KEY=VALUE` (repeatable) adds environment to a condition
+or defines a new one. The report adds, per condition, the pass rate, tokens, cost, wall
 time, tool calls and how often the model called the `atlas` tool.
 """
 
@@ -50,13 +49,18 @@ import time
 # (`--prompt` resumes the newest one), traces, and state that belongs to a
 # person's own use. Keys (`auth.db`) and `config.yml` stay.
 AGENT_DIR_SKIP = ("sessions", "traces", "trajectories", "state.db*", "memory.db*")
-# Environment each named condition adds. `None` means: the knob that would make
-# the condition differ from `atlas-full` does not exist in titi yet.
+# Environment each named condition adds. `None` means the knob that would make
+# the condition differ from `atlas-full` does not exist in titi.
 ATLAS_VARS = ("TITI_NO_ATLAS",)
 CONDITIONS = {
     "atlas-off": {"TITI_NO_ATLAS": "1"},
-    "atlas-map": None,
+    "atlas-map": {},
     "atlas-full": {},
+}
+# Settings (the agent dir's config.yml, `crates/titi-config/src/settings.rs`) a condition adds, as
+# nested keys: `atlas-map` keeps the map and turns the per-prompt lens and the atlas tool off.
+CONDITION_SETTINGS = {
+    "atlas-map": {"atlas": {"lens": False, "tool": False}},
 }
 DEFAULT_TIMEOUT_S = 600
 CHECK_TIMEOUT_S = 300
@@ -227,6 +231,22 @@ def run_check(task, workdir):
     return done.returncode == 0, done.stdout[-2000:]
 
 
+def apply_settings(agent_dir, settings):
+    """Append `settings` (nested dicts of scalars) to the agent dir's config.yml as top-level YAML blocks.
+    A key the file already sets at the top level is refused: two blocks of one key would be ambiguous."""
+    if not settings:
+        return
+    path = os.path.join(agent_dir, "config.yml")
+    text = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
+    block = ""
+    for key, body in settings.items():
+        if any(line.startswith(f"{key}:") for line in text.splitlines()):
+            sys.exit(f"eval: {path} already has a top-level `{key}:` block; a condition cannot add settings to it")
+        block += f"{key}:\n" + "".join(f"  {k}: {str(v).lower()}\n" for k, v in body.items())
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text + ("" if text.endswith("\n") or not text else "\n") + block)
+
+
 def run_one(args, task, index, agent_src, condition=None, condition_env=None):
     scratch = tempfile.mkdtemp(prefix="titi-eval-")
     workdir = os.path.join(scratch, "repo")
@@ -237,6 +257,7 @@ def run_one(args, task, index, agent_src, condition=None, condition_env=None):
     git(workdir, "commit", "-q", "-m", "start")
     shutil.copytree(agent_src, agent_dir, symlinks=True,
                     ignore=shutil.ignore_patterns(*AGENT_DIR_SKIP))
+    apply_settings(agent_dir, CONDITION_SETTINGS.get(condition))
     timeout_s = args.timeout or task["meta"].get("timeout_s", DEFAULT_TIMEOUT_S)
     started = time.monotonic()
     code, out, err, timed_out = run_titi(args.bin, task["prompt"], workdir, agent_dir, timeout_s, condition_env)
@@ -372,8 +393,7 @@ def resolve_conditions(names, overrides):
         if name not in table:
             sys.exit(f"eval: unknown condition {name!r} (known: {', '.join(sorted(table))})")
         if table[name] is None:
-            unavailable.append((name, "titi has no switch that turns off the lens and the atlas tool but keeps the map; "
-                                      "pass --condition-env %s=KEY=VALUE once one exists" % name))
+            unavailable.append((name, "no knob for it exists in titi; pass --condition-env %s=KEY=VALUE" % name))
         else:
             runnable.append((name, table[name]))
     return runnable, unavailable
