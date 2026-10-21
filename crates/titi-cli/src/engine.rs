@@ -790,17 +790,19 @@ pub fn apply_tool_round_limits(
 pub fn model_roles_from(
     settings: &titi_config::settings::Settings,
 ) -> std::collections::BTreeMap<String, String> {
-    settings
-        .get("modelRoles")
-        .and_then(|value| value.as_object().cloned())
-        .map(|roles| {
-            roles
-                .into_iter()
-                .filter_map(|(name, model)| Some((name, model.as_str()?.trim().to_owned())))
-                .filter(|(_, model)| !model.is_empty())
-                .collect()
+    let Some(map) = settings.get("modelRoles") else {
+        return std::collections::BTreeMap::new();
+    };
+    let Some(roles) = map.as_object() else {
+        return std::collections::BTreeMap::new();
+    };
+    roles
+        .keys()
+        .filter_map(|name| {
+            let slot = titi_config::roles::role_slot(Some(&map), name).ok()??;
+            Some((name.clone(), slot.model?))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Whether the genome prompt map is enabled from settings; `genome.enabled` as a boolean.
@@ -1190,7 +1192,8 @@ mod tests {
         std::fs::create_dir_all(&agent).expect("agent dir");
         std::fs::write(
             agent.join("config.yml"),
-            "modelRoles:\n  fast: local/small\n  default: openai/gpt-4.1\n  odd: 7\n",
+            "modelRoles:\n  fast: local/small\n  default: openai/gpt-4.1\n  odd: 7\n  \
+             review: {model: local/judge, effort: low}\n  explore: {effort: high}\n",
         )
         .expect("config");
         let settings =
@@ -1202,6 +1205,10 @@ mod tests {
             Some("openai/gpt-4.1")
         );
         assert_eq!(roles.get("odd"), None);
+        // The nested form names a model for a definition to use; one that
+        // names only an effort names none.
+        assert_eq!(roles.get("review").map(String::as_str), Some("local/judge"));
+        assert_eq!(roles.get("explore"), None);
     }
 
     /// The two round limits reach the engine config; unset keeps the engine's

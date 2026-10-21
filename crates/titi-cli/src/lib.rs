@@ -39,6 +39,7 @@ pub mod pickers;
 pub mod recap;
 pub mod reveal;
 pub mod review_cmd;
+pub(crate) mod router_cmd;
 pub mod secrets;
 pub mod session_fs;
 pub mod session_log;

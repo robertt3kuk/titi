@@ -239,6 +239,10 @@ pub(crate) const COMMANDS: &[Command] = &[
         about: "subagent definitions found, where, and what was left out",
     },
     Command {
+        name: "router",
+        about: "which model each kind of side work runs on (modelRoles), read-only",
+    },
+    Command {
         name: "statusline",
         about: "choose the status line preset (default, minimal, compact, full, ascii)",
     },

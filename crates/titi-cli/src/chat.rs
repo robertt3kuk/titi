@@ -2491,6 +2491,7 @@ impl Chat {
             "mcp" => self.mcp_command(args),
             "skills" => self.skills_command(args),
             "agents" => self.agents_command(args),
+            "router" => self.router_command(args),
             "verify" => self.verify_command(args),
             _ => {
                 // A known skill or file command is not a built-in: it goes to

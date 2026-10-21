@@ -147,6 +147,23 @@ impl Route {
         }
         text
     }
+
+    /// What is wrong with the settings for this role other than a model that
+    /// cannot run, which [`describe`](Self::describe) already says.
+    pub fn problems(&self) -> Vec<&str> {
+        self.notes
+            .iter()
+            .map(String::as_str)
+            .filter(|note| {
+                !self.fallback.as_ref().is_some_and(|fallback| {
+                    note.starts_with(&format!(
+                        "modelRoles.{}: `{}` cannot be used",
+                        fallback.slot, fallback.asked
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 /// Resolves `role` against a `modelRoles` value. `default` is the model the
@@ -229,6 +246,18 @@ pub fn reasoning_for(resolved: &ResolvedModel, effort: Option<Effort>) -> Option
         resolved.reasoning.as_ref(),
         &RequestOpts { effort },
     )
+}
+
+/// Every role's route, in [`Role::ALL`] order: what the `/router` view shows.
+pub fn table(
+    map: Option<&Value>,
+    default: &str,
+    usable: &dyn Fn(&str) -> Result<(), String>,
+) -> Vec<Route> {
+    Role::ALL
+        .into_iter()
+        .map(|role| resolve(map, role, default, usable))
+        .collect()
 }
 
 /// A [`Route`] and the notices it has not yet shown.
