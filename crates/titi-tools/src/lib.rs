@@ -16,6 +16,7 @@ pub mod pipe;
 pub mod project;
 pub mod pty;
 pub mod sensitive;
+mod syntax_note;
 pub mod web;
 
 use std::collections::HashMap;

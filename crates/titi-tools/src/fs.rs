@@ -562,11 +562,21 @@ impl ToolHandler for WriteFileTool {
                 Ok((resolved.display().to_string(), before))
             }) {
             Ok((written, before)) => {
-                // The answer is the one line it always was; the diff is the
-                // surface's to draw, and the model never reads it.
+                // The answer is the one line it always was, plus a syntax line
+                // when the write changed the file's error count; the diff is
+                // the surface's to draw, and the model never reads it.
+                let answer = match &before {
+                    Some(before) => crate::syntax_note::with_note(
+                        format!("wrote {written}"),
+                        &path,
+                        before,
+                        &content,
+                    ),
+                    None => format!("wrote {written}"),
+                };
                 match before.and_then(|before| unified_diff(&path, &before, &content)) {
-                    Some(diff) => ok_with_detail(format!("wrote {written}"), diff),
-                    None => ok(format!("wrote {written}")),
+                    Some(diff) => ok_with_detail(answer, diff),
+                    None => ok(answer),
                 }
             }
             Err(error) => err(error),
@@ -634,9 +644,9 @@ impl ToolHandler for EditFileTool {
                 let content = fs::read_to_string(&resolved).map_err(|error| error.to_string())?;
                 let edit = apply_edit(&content, &old, &new, replace_all)?;
                 fs::write(&resolved, &edit.text).map_err(|error| error.to_string())?;
-                Ok((unified_diff(&path, &content, &edit.text), edit))
+                Ok((unified_diff(&path, &content, &edit.text), edit, content))
             }) {
-            Ok((diff, edit)) => {
+            Ok((diff, edit, before)) => {
                 let answer = if edit.loose {
                     "edited: old_string matched once whitespace was set aside, and the \
                      new lines took the file's indentation"
@@ -646,6 +656,7 @@ impl ToolHandler for EditFileTool {
                 } else {
                     "edited".to_owned()
                 };
+                let answer = crate::syntax_note::with_note(answer, &path, &before, &edit.text);
                 match diff {
                     Some(diff) => ok_with_detail(answer, diff),
                     None => ok(answer),

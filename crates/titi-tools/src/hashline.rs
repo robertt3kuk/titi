@@ -148,12 +148,17 @@ impl HashlineEditTool {
         }
 
         let updated = render(&segments, start, &anchors, &replacement, &raw_path)?;
-        fs::write(&path, updated).map_err(|error| HashlineError::Io {
+        fs::write(&path, &updated).map_err(|error| HashlineError::Io {
             path: raw_path.clone(),
             reason: error.to_string(),
         })?;
         self.cache.invalidate(&path);
-        Ok(format!("edited {raw_path}:{start}-{end}"))
+        Ok(crate::syntax_note::with_note(
+            format!("edited {raw_path}:{start}-{end}"),
+            &raw_path,
+            &content,
+            &updated,
+        ))
     }
 }
 

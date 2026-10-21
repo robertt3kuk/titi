@@ -2777,6 +2777,7 @@ dependencies = [
  "smol_str",
  "tempfile",
  "thiserror 2.0.20",
+ "titi-genome",
  "titi-providers",
  "tokio",
 ]
