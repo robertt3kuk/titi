@@ -41,7 +41,7 @@ the state at `238e911`, before the 2026-10-21 waves.
 | # | Idea | Why it matters | titi today | Status |
 |---|---|---|---|---|
 | 17 | `project` tool | lint / typecheck / test / build resolved from the repo, one structured result, no guessing `npm test` vs `npx jest` | the model guesses a `bash` command | have (`c8f60f0`) |
-| 18 | Diagnostics diff after edit | the tool result says which errors an edit introduced or fixed | none | open |
+| 18 | Diagnostics diff after edit | the tool result says which errors an edit introduced or fixed | none | have (branch `wt/verify`: `write`/`edit`/`hashline_edit` append `syntax: this edit introduced N errors (line L: …)` or `syntax: fixed N errors` from the genome's grammars; no LSP diagnostics) |
 | 19 | Independent review verdict | clean-context reviewer of the session's edits, PASS/FAIL/PARTIAL, one key to apply | `/goal` has a reviewer; no standalone `/review` | have (`d39298f`: `/review`, `apply`, `list`, `titi --review` exit codes) |
 | 20 | Pre-commit gate | an agent `git commit` runs lint + typecheck first | none | open |
 | 21 | Symbol-addressed edits | edit a function by name, all-or-nothing batches | text/hashline edits | open |

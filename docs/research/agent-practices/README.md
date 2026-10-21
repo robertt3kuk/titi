@@ -81,6 +81,7 @@ Method and limits:
   - `/review` exists (`change_review.rs`).
   - In an ordinary turn nothing runs a check, and the prompt never says to (#1).
   - ast_edit's reparse guard (`BrokenResult`, `ast_edit.rs:253-263`) is not reachable from any tool.
+  - Update (branch `wt/verify`): `write`/`edit`/`hashline_edit` now append a `syntax:` line when an edit changed the file's tree-sitter error count (`titi_genome::syntax_check`), and `verify.command` runs when a turn that edited files ends, feeding a failure back once. The reparse guard is still not a tool.
 - **Do:**
   - Add a post-edit cheap syntax/diagnostic check to `edit`/`write` results, reported as "introduced N errors" (empryo-parity #18, still open).
   - Add an optional `verify.command` setting that runs when the model ends its turn, and feeds failures back once (a Stop-hook equivalent).
