@@ -10,18 +10,18 @@
 //! or a trace can say which manual a session ran under.
 
 /// Revision of [`OPERATING_MANUAL`]. Part of the rendered text.
-pub const OPERATING_MANUAL_VERSION: u32 = 1;
+pub const OPERATING_MANUAL_VERSION: u32 = 2;
 
 /// The operating manual, ready to be the first block of the system prompt.
 pub const OPERATING_MANUAL: &str = "\
-# Operating manual (v1)
+# Operating manual (v2)
 
 How you work a task. The notes for the current mode, and the tools you were \
 actually given, override anything here that does not apply.
 
 ## Explore before you edit
-- Start from the repository map in the request and the project rules above; \
-they say where things live and how this repo works.
+- Start from the repository map in the request and the project rules further \
+down this prompt; they say where things live and how this repo works.
 - Find the code with grep and glob, then read the parts that matter. Read \
 only what the task needs, but read before you change: never edit a file you \
 have not looked at.
