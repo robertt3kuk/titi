@@ -33,10 +33,11 @@
 - Код: композер (bracketed paste, non-blocking очередь), slash-команды + автодополнение, overlay-панели, transcript-рендер, статус-линия, session switcher.
 - DoD: smoke-сессия в реальном терминале: ввод, стрим, прерывание, свитч модели.
 
-## M6 — Extensibility
+## M6 — Extensibility (открыт владельцем 2026-10-21)
 - Темы: extensibility-marketplace, mcp
 - Код: extensions/hooks-загрузчик, skills (SKILL.md), rulebook matching, marketplace installer, MCP-клиент (transports stdio/HTTP).
 - DoD: пример-skill подхватывается и работает; MCP-сервер подключается и его тулы доступны.
+- Порядок и модель доверия: [extensibility-marketplace/design-2026-10.md](research/extensibility-marketplace/design-2026-10.md) — L0 trust store → L1 skills v2 → L2 команды → L3 hooks → L4 MCP stdio → L6 плагины; L5 (агенты из файлов) — в M7.
 
 ## M7 — Agents & Security
 - Темы: agents-hub-security

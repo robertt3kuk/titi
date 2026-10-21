@@ -111,8 +111,11 @@ agent is the supervisor; its playbook is skill `supervisor-review`.
 
 - Empryo is a closed, untrusted binary: never vendor it, run it, or download
   it. Re-implement its ideas in open Rust only.
-- PLAN gates GPUI (M9) and the MCP/skills/hooks runtime (M6). Do not start
-  them early.
+- PLAN gates GPUI (M9); do not start it early. M6 (skills, commands, hooks,
+  MCP) was opened by the owner on 2026-10-21, layer by layer as
+  `docs/research/extensibility-marketplace/design-2026-10.md` lays out:
+  code-bearing project config (hooks, MCP servers) runs only with the user's
+  recorded consent.
 - nvimq's local branch `goal-loop` conflicts with `master` in
   `crates/titi-cli/src/chat.rs`; merging it needs a manual resolution.
 

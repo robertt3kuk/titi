@@ -40,7 +40,8 @@
 Статусы ведутся в [STATE.md](STATE.md) — единая точка возобновления.
 
 ## Cross-cutting research (not one of the 20 themes)
-
+- [agent-practices/README.md](agent-practices/README.md) — best practices of coding-agent harnesses (Oct 2026), ranked, mapped to titi with file:line.
+- [extensibility-marketplace/design-2026-10.md](extensibility-marketplace/design-2026-10.md) — skills/commands/hooks/MCP survey and titi's layered plan with the trust model.
 - [omp-parity/GAP.md](omp-parity/GAP.md) — what omp has and titi lacks, ranked; per-entry status.
 - [empryo-parity/README.md](empryo-parity/README.md) — ideas from Empryo's public docs, ranked; per-entry status.
 - [perf/README.md](perf/README.md) — `scripts/bench.py` method, baseline, hotspots and measured fixes.
