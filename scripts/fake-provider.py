@@ -37,6 +37,8 @@ the real binary and the real HTTP stack:
   "load skill"    a `skill` call naming the first skill the system prompt lists
                   (`- name: description` under `# Skills`); `skill: none listed`
                   when it lists none
+  "call mcp"      a `mcp__fixture__echo` call {text: "hello from mcp"} (the tool
+                  a server named `fixture` offers; see crates/titi-mcp/tests/fixtures)
   "run project"   a `project` call: {action: list} (detects the workspace's
                   ecosystem and prints the commands; runs nothing)
   "pin agents"    two `agent` calls in one round, each with a small task: the
@@ -259,6 +261,9 @@ def script(last: dict, messages: list[dict] | None = None) -> list[tuple[dict, f
             "multi": False,
         }
         return [(c, 0) for c in call("call_ask", "ask", args)]
+    if "call mcp" in content:
+        args = {"text": "hello from mcp"}
+        return [(c, 0) for c in call("call_mcp", "mcp__fixture__echo", args)]
     if "slow" in content:
         return [(chunk({"content": f"tick{i} "}), 0.15) for i in range(60)] + [(chunk({}, "stop"), 0)]
     if "run project" in content:
