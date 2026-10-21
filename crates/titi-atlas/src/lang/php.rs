@@ -18,10 +18,12 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
+use super::support::{
+    Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment, symbols_from_sites,
+};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_field, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Php, source) else {
@@ -46,13 +48,28 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &php_kind);
+    parsed
+}
+
+/// The kind of a PHP declaration node, for the symbols list.
+fn php_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "class_declaration" => SymbolKind::Class,
+        "interface_declaration" => SymbolKind::Interface,
+        "trait_declaration" => SymbolKind::Trait,
+        "enum_declaration" => SymbolKind::Enum,
+        "function_definition" => SymbolKind::Function,
+        "method_declaration" => SymbolKind::Method,
+        _ => return None,
+    })
 }
 
 /// Declarations a caller can name: a `class`/`interface`/`trait`/`enum`, a
@@ -178,4 +195,72 @@ fn place(
         Placement::Optional(candidates)
     };
     record(spec, placement, files, imports, unresolved);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"<?php
+namespace App;
+
+/** Docs. */
+final class Client extends Base implements Contract
+{
+    public function send(string $body, int $retries = 3): void
+    {
+    }
+}
+
+interface Contract {}
+
+trait Loud {}
+
+function helper(array $items): int
+{
+    return 1;
+}
+"#;
+
+    #[test]
+    fn php_symbols_carry_kind_span_and_signature() {
+        let client = symbol("src/Client.php", SRC, "Client");
+        assert_eq!((client.kind, client.span), (SymbolKind::Class, (5, 10)));
+        assert_eq!(
+            client.signature.as_deref(),
+            Some("final class Client extends Base implements Contract")
+        );
+        let send = symbol("src/Client.php", SRC, "send");
+        assert_eq!((send.kind, send.span), (SymbolKind::Method, (7, 9)));
+        assert_eq!(
+            send.signature.as_deref(),
+            Some("public function send(string $body, int $retries = 3): void")
+        );
+        assert_eq!(
+            symbol("src/Client.php", SRC, "Contract").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(
+            symbol("src/Client.php", SRC, "Loud").kind,
+            SymbolKind::Trait
+        );
+        let helper = symbol("src/Client.php", SRC, "helper");
+        assert_eq!((helper.kind, helper.span), (SymbolKind::Function, (16, 19)));
+        assert_eq!(
+            helper.signature.as_deref(),
+            Some("function helper(array $items): int")
+        );
+    }
+
+    #[test]
+    fn a_long_php_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("int $argument{n}")).collect();
+        let source = format!("<?php\nfunction long({}) {{}}\n", params.join(", "));
+        let signature = symbol("a.php", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
+    }
 }

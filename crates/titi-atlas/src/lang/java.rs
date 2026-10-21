@@ -22,10 +22,12 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
+use super::support::{
+    Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment, symbols_from_sites,
+};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, has_child_kind, push_field, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Java, source) else {
@@ -50,13 +52,26 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &java_kind);
+    parsed
+}
+
+/// The kind of a Java declaration node, for the symbols list.
+fn java_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "class_declaration" | "record_declaration" => SymbolKind::Class,
+        "interface_declaration" => SymbolKind::Interface,
+        "enum_declaration" => SymbolKind::Enum,
+        "method_declaration" => SymbolKind::Method,
+        _ => return None,
+    })
 }
 
 /// Types a caller can name — a `class`, `interface`, `enum` or `record`, at
@@ -165,4 +180,67 @@ fn java_import(
         Placement::Optional(candidates)
     };
     record(&spec, placement, files, imports, unresolved);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"package app;
+
+/** Docs. */
+@Deprecated
+public class Service<T> extends Base implements Runnable {
+    @Override
+    public void run(String id, int count) throws Exception {
+        work();
+    }
+}
+
+public interface Handler {
+    void handle(String event);
+}
+
+public enum Level { INFO, WARN }
+"#;
+
+    #[test]
+    fn java_symbols_carry_kind_span_and_signature() {
+        let service = symbol("app/Service.java", SRC, "Service");
+        assert_eq!((service.kind, service.span), (SymbolKind::Class, (4, 10)));
+        assert_eq!(
+            service.signature.as_deref(),
+            Some("public class Service<T> extends Base implements Runnable")
+        );
+        let run = symbol("app/Service.java", SRC, "run");
+        assert_eq!((run.kind, run.span), (SymbolKind::Method, (6, 9)));
+        assert_eq!(
+            run.signature.as_deref(),
+            Some("public void run(String id, int count) throws Exception")
+        );
+        let handler = symbol("app/Service.java", SRC, "Handler");
+        assert_eq!(
+            (handler.kind, handler.span),
+            (SymbolKind::Interface, (12, 14))
+        );
+        assert_eq!(
+            symbol("app/Service.java", SRC, "Level").kind,
+            SymbolKind::Enum
+        );
+    }
+
+    #[test]
+    fn a_long_java_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("int argument{n}")).collect();
+        let source = format!(
+            "public class A {{\n public void run({}) {{}}\n}}\n",
+            params.join(", ")
+        );
+        let signature = symbol("A.java", &source, "run")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
+    }
 }

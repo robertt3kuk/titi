@@ -18,10 +18,13 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, internal, record, resolve_relative, resolve_suffix};
+use super::support::{
+    Placement, finish, inside, internal, record, resolve_relative, resolve_suffix,
+    symbols_from_sites,
+};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_site, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Ruby, source) else {
@@ -43,13 +46,34 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &ruby_kind);
+    parsed
+}
+
+/// The kind of a Ruby declaration node, for the symbols list. A `def` inside a
+/// class or module is a method; an `attr_*` call publishes accessors.
+fn ruby_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "method" => {
+            if inside(node, &["class", "module"]) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        "singleton_method" => SymbolKind::Method,
+        "class" => SymbolKind::Class,
+        "module" => SymbolKind::Module,
+        "call" => SymbolKind::Method,
+        _ => return None,
+    })
 }
 
 /// Every declaration and every `require`, from the grammar's nodes: a `def`
@@ -178,4 +202,66 @@ fn push_site_at(at: Node, name: &str, out: &mut Vec<crate::ExportSite>) {
             .saturating_add(1),
         character: u32::try_from(point.column).unwrap_or(u32::MAX),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"# Docs.
+module App
+  class Client < Base
+    attr_reader :id
+
+    def send(body, retries = 3)
+      body
+    end
+  end
+
+  def self.build(options = {})
+    new
+  end
+end
+
+def helper(a, b)
+  a + b
+end
+"#;
+
+    #[test]
+    fn ruby_symbols_carry_kind_span_and_signature() {
+        let app = symbol("lib/app.rb", SRC, "App");
+        assert_eq!((app.kind, app.span), (SymbolKind::Module, (2, 14)));
+        assert_eq!(app.signature.as_deref(), Some("module App"));
+        let client = symbol("lib/app.rb", SRC, "Client");
+        assert_eq!((client.kind, client.span), (SymbolKind::Class, (3, 9)));
+        assert_eq!(client.signature.as_deref(), Some("class Client < Base"));
+        let send = symbol("lib/app.rb", SRC, "send");
+        assert_eq!((send.kind, send.span), (SymbolKind::Method, (6, 8)));
+        assert_eq!(
+            send.signature.as_deref(),
+            Some("def send(body, retries = 3)")
+        );
+        let build = symbol("lib/app.rb", SRC, "build");
+        assert_eq!(build.kind, SymbolKind::Method);
+        assert_eq!(
+            build.signature.as_deref(),
+            Some("def self.build(options = {})")
+        );
+        let helper = symbol("lib/app.rb", SRC, "helper");
+        assert_eq!((helper.kind, helper.span), (SymbolKind::Function, (16, 18)));
+        assert_eq!(symbol("lib/app.rb", SRC, "id").kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn a_long_ruby_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument_{n}")).collect();
+        let source = format!("def long({})\n  1\nend\n", params.join(", "));
+        let signature = symbol("a.rb", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
+    }
 }

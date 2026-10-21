@@ -19,10 +19,12 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment};
+use super::support::{
+    Placement, finish, is_workspace_spec, record, resolve_suffix, root_segment, symbols_from_sites,
+};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_field, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::CSharp, source) else {
@@ -47,13 +49,27 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols =
+        symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &csharp_kind);
+    parsed
+}
+
+/// The kind of a C# declaration node, for the symbols list.
+fn csharp_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "class_declaration" | "record_declaration" => SymbolKind::Class,
+        "interface_declaration" => SymbolKind::Interface,
+        "enum_declaration" => SymbolKind::Enum,
+        "struct_declaration" => SymbolKind::Struct,
+        _ => return None,
+    })
 }
 
 /// Types a file publishes — `class`, `interface`, `record`, `enum`, `struct`,
@@ -136,4 +152,55 @@ fn using_spec(node: Node, source: &[u8]) -> Option<String> {
         .iter()
         .find(|child| child.kind() == "identifier")
         .and_then(|child| text(*child, source))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"namespace App;
+
+[Serializable]
+public class Mapper<T> : IMapper where T : class
+{
+    public void Map(string id) { }
+}
+
+public interface IMapper { }
+
+public struct Point { public int X; }
+
+public enum Level { Info, Warn }
+"#;
+
+    #[test]
+    fn csharp_symbols_carry_kind_span_and_signature() {
+        let mapper = symbol("App/Mapper.cs", SRC, "Mapper");
+        assert_eq!((mapper.kind, mapper.span), (SymbolKind::Class, (3, 7)));
+        assert_eq!(
+            mapper.signature.as_deref(),
+            Some("public class Mapper<T> : IMapper where T : class")
+        );
+        assert_eq!(
+            symbol("App/Mapper.cs", SRC, "IMapper").kind,
+            SymbolKind::Interface
+        );
+        assert_eq!(
+            symbol("App/Mapper.cs", SRC, "Point").kind,
+            SymbolKind::Struct
+        );
+        assert_eq!(symbol("App/Mapper.cs", SRC, "Level").kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn a_long_csharp_signature_is_cut_to_the_limit() {
+        let bases: Vec<String> = (0..30).map(|n| format!("IInterfaceNumber{n}")).collect();
+        let source = format!("public class Long : {} {{ }}\n", bases.join(", "));
+        let signature = symbol("A.cs", &source, "Long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
+    }
 }
