@@ -174,6 +174,12 @@ that also narrated its own reach could no longer say "clean".
   only `crate::`, `self::` and `super::` name a file. A quoted `#include` that
   names no file *is* reported — it is a real error — while `<system.h>` is not
   an include this crate looks at.
+- **A second look** (`reresolve.rs`) runs once per parse over what a module
+  left unresolved. TypeScript/JavaScript: `./a.js` is `./a.ts`/`.tsx`, and a
+  relative specifier may name a directory's `index.*`; an `export … from` it
+  settles is a re-export. Go: with a root `go.mod`, a path below the module
+  is the package directory (the file named like it, else the first non-test
+  file), and a path outside the module is a dependency and drops out.
 
 Symbol edges (`used_symbols`) come to every language through `finish()` →
 `refs::collect_refs()`, and every language contributes export sites.

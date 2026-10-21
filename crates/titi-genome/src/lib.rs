@@ -32,6 +32,7 @@ mod project;
 mod query;
 mod recency;
 mod refs;
+mod reresolve;
 mod role;
 mod scan;
 mod scope;
@@ -1226,10 +1227,17 @@ fn parse_one(
             return (record, false);
         }
     }
-    let result = lang::parse(&file.path, source, known);
+    let language = Language::from_path(&file.path);
+    let mut result = lang::parse(&file.path, source, known);
+    let root = file
+        .abs
+        .ancestors()
+        .nth(file.path.split('/').count())
+        .unwrap_or(Path::new(""));
+    reresolve::retry(root, &file.path, language, source, &mut result, known);
     (
         FileRecord {
-            language: Language::from_path(&file.path),
+            language,
             path: file.path.clone(),
             exports: result.exports,
             export_sites: result.export_sites,
