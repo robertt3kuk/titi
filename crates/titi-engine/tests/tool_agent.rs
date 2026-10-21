@@ -271,12 +271,66 @@ async fn a_subagent_with_writes_enabled_still_respects_a_foreign_claim() {
     );
 }
 
+/// A subagent that spends its tool budget is asked to say what is done and
+/// what is left, the way the main turn is, and that answer goes to its parent
+/// as a result rather than an error.
 #[tokio::test]
-async fn a_subagent_stops_at_the_tool_round_cap() {
+async fn a_subagent_at_the_tool_round_cap_wraps_up_and_returns_its_summary() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("note.txt"), "body").unwrap();
-    // Every request asks for another read, so the cap is the only exit. One
-    // more body than the cap: the request that trips it must still arrive.
+    let transport = Arc::new(MockTransport::new(vec![
+        MockBody::Events(tool_call("read", r#"{"path":"note.txt"}"#)),
+        MockBody::Events(tool_call("read", r#"{"path":"note.txt"}"#)),
+        MockBody::Events(text("read note.txt twice; the rest is untouched")),
+    ]));
+
+    let mut config = agent_config(workspace.path());
+    config.agent_rounds = 2;
+    let mut engine = EngineRuntime::start_with_tools(
+        config,
+        resolver(Arc::clone(&transport) as _),
+        ToolRegistry::new(),
+    );
+
+    let (summary, events) = spawn_and_collect(&mut engine, "loop forever").await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::AgentFinished { success: true, .. })),
+        "the wrap-up is a result, not a failure: {events:?}"
+    );
+    assert!(
+        summary.starts_with("(stopped at the tool budget)"),
+        "the parent is told the work was cut short: {summary}"
+    );
+    assert!(summary.contains("the rest is untouched"), "{summary}");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 3, "two rounds, then the wrap-up request");
+    assert!(
+        requests[..2]
+            .iter()
+            .all(|request| !request.forbid_tool_calls),
+        "the rounds inside the budget may call tools"
+    );
+    let last = &requests[2];
+    assert!(last.forbid_tool_calls, "the wrap-up forbids tool calls");
+    assert!(
+        !last.tools.is_empty(),
+        "and still declares them: the history holds tool calls"
+    );
+    let note = last.messages.last().expect("the wrap-up note");
+    assert_eq!(note.role, titi_providers::Role::User);
+    assert!(note.content.contains("tool budget reached"), "{note:?}");
+}
+
+/// A model that calls a tool anyway on the wrap-up request has nothing run:
+/// the loop ends there instead of spending past its budget.
+#[tokio::test]
+async fn a_tool_call_on_a_subagents_wrap_up_request_is_not_executed() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("note.txt"), "body").unwrap();
     let mut bodies = Vec::new();
     for _ in 0..4 {
         bodies.push(MockBody::Events(tool_call(
@@ -299,16 +353,16 @@ async fn a_subagent_stops_at_the_tool_round_cap() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, EngineEvent::AgentFinished { success: false, .. })),
-        "a runaway subagent fails rather than hanging: {events:?}"
+            .any(|event| matches!(event, EngineEvent::AgentFinished { success: true, .. })),
+        "{events:?}"
     );
     assert!(
-        summary.contains("round cap"),
-        "the failure names the cap, not a spent mock: {summary}"
+        summary.contains("(stopped at the tool budget)"),
+        "{summary}"
     );
     assert_eq!(
         transport.call_count(),
         3,
-        "two rounds run, the third request trips the cap"
+        "two rounds run, the third request is the wrap-up and the last"
     );
 }

@@ -37,8 +37,12 @@ use crate::tool_loop::{
 };
 use titi_core::trace::SpanKind;
 
-/// Rounds a subagent may spend calling tools before it is stopped.
+/// Rounds a subagent may spend calling tools before it is asked to wrap up.
 pub const DEFAULT_AGENT_ROUNDS: u32 = 40;
+
+/// Opens the result of a subagent that was asked to wrap up at its cap, so
+/// its parent reads the answer as cut short.
+const STOPPED_MARK: &str = "(stopped at the tool budget)";
 
 /// Runs a subagent as a tool-calling turn.
 pub struct ToolAgentRunner {
@@ -218,11 +222,26 @@ impl ToolAgentRunner {
         let trajectory = TrajectorySink::default();
 
         let mut rounds = 0;
+        let mut stopped = false;
         let mut watch = LoopWatch::default();
         loop {
             if context.is_aborted() {
                 aborted.store(true, Ordering::SeqCst);
                 return Err("aborted".into());
+            }
+            // At the cap the subagent is not cut off: it gets one more
+            // request, with tool calls forbidden, to say what is done and
+            // what is left — the main turn's wrap-up, so the parent gets an
+            // answer to read instead of an error.
+            let wrap_up = rounds >= self.max_rounds;
+            if wrap_up {
+                stopped = true;
+                messages.push(crate::tool_budget::wrap_up_message());
+                context
+                    .activity(format!(
+                        "tool budget reached after {rounds} tool rounds: asked to summarise"
+                    ))
+                    .await;
             }
 
             // This round's model call, under the agent's own span: a subagent
@@ -248,6 +267,7 @@ impl ToolAgentRunner {
             let mut wire = WireRequest::new(resolved.wire_model.clone());
             wire.messages = messages.clone();
             wire.tools = self.tools.specs();
+            wire.forbid_tool_calls = wrap_up;
             let mut stream = match resolved
                 .transport
                 .stream(
@@ -328,13 +348,8 @@ impl ToolAgentRunner {
                 }
             }
             llm_span.finish(spans::now_ms());
-            if calls.is_empty() {
+            if calls.is_empty() || wrap_up {
                 break;
-            }
-            if rounds >= self.max_rounds {
-                return Err(
-                    format!("subagent tool round cap reached ({})", self.max_rounds).into(),
-                );
             }
             rounds += 1;
             let issued = IssuedCall::of(&calls);
@@ -382,7 +397,11 @@ impl ToolAgentRunner {
         // supervisor releases them too, belt and braces.
         self.claims.release_all(&request.id);
 
-        if summary.is_empty() {
+        if stopped {
+            Ok(format!("{STOPPED_MARK} {}", summary.trim_start())
+                .trim_end()
+                .into())
+        } else if summary.is_empty() {
             Ok(format!("{} complete", request.name).into())
         } else {
             Ok(summary.into())

@@ -113,6 +113,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed
 
+- A subagent that spends its tool budget (`agent.subagentMaxToolRounds`) no longer comes back as `subagent tool round cap reached`: like the main turn it gets one last request with tool calls forbidden, asked what is done and what is left, and its parent receives that summary as a normal answer opening with `(stopped at the tool budget)`. The `/review` reviewer is handed the same way when it runs out of rounds, so its verdict reads as `partial` instead of the review failing.
+
 - The code map ranks by how much a file leans on another, not only by whether it does: an edge weighs the square root of the imports and resolved names behind it (a guess counts a quarter), so a file that uses four names of a hub ties to it more than a file that mentions one in passing, and a file's rank is shared over its edges in that proportion.
 
 - The code map's file lines read `path (→N)` instead of `path:(→N)`: the colon made the line look like a `file:line` reference to the path it names, which is not a place in the file.
