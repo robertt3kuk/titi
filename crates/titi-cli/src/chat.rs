@@ -5274,14 +5274,8 @@ fn local_genome_note(chat: &mut Chat, verb: &str, workspace: &Path) {
         chat.push(LineKind::Note, "genome: clean".to_owned());
         return;
     }
-    for diagnostic in &diagnostics {
-        chat.push(
-            LineKind::Note,
-            format!(
-                "{}:{}: {}: {}",
-                diagnostic.path, diagnostic.line, diagnostic.code, diagnostic.message
-            ),
-        );
+    for line in titi_genome::format_check_report(&diagnostics, 50) {
+        chat.push(LineKind::Note, line);
     }
 }
 

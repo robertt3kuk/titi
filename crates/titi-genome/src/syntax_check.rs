@@ -96,6 +96,17 @@ pub fn delta(path: &str, before: &str, after: &str) -> Option<SyntaxDelta> {
     }
 }
 
+/// The first place the grammar could not read in `source`, for a file the
+/// index has already counted errors in. `None` when no grammar reads `path`,
+/// the text is past [`MAX_BYTES`], or nothing in it is an error.
+pub(crate) fn first_issue(path: &str, source: &str) -> Option<SyntaxIssue> {
+    if source.len() > MAX_BYTES {
+        return None;
+    }
+    let tree = parse(grammar_for(path)?, source)?;
+    scan(&tree.root_node(), source).issues.into_iter().next()
+}
+
 #[derive(Default)]
 struct Scan {
     count: u32,

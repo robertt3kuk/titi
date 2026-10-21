@@ -44,6 +44,7 @@ pub use lang::{Capability, Language, Level};
 pub use live::GenomeHandle;
 pub use lsp::serve_lsp;
 pub use project::render;
+pub use query::format_check_report;
 pub use scan::list_files;
 pub use shared::SharedGenome;
 

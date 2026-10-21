@@ -3,18 +3,19 @@ use std::collections::HashSet;
 use crate::refs;
 use crate::{Diagnostic, ExportSite, Genome, Location, MAX_DEFINERS, Severity};
 
-const CHECK_LIMIT: usize = 32;
-
 impl Genome {
     /// Index diagnostics: syntax first, then unresolved imports, then
-    /// ambiguous symbols. Capped so a noisy repo cannot flood a client.
+    /// ambiguous symbols. Every finding is returned; a client that wants fewer
+    /// lines asks [`format_check_report`] for them and is told how many it cut.
     ///
     /// An ambiguous name — one that more than [`MAX_DEFINERS`] files export,
     /// so it carries no edge — is a finding only when its definers are in the
     /// **same crate**. `Level` defined in `titi-genome` and in `titi-tools` is
     /// two unrelated types that happen to share a name, and nothing in either
     /// crate can be confused by the other; two files of one crate exporting
-    /// the same name is the case a reader can act on.
+    /// the same name is the case a reader can act on. A barrel that
+    /// re-publishes the file defining the name (`export { X } from './x'`) is
+    /// the road to it, not a second definition.
     ///
     /// Findings only. What the index *understands* — the level each language
     /// rests on — is reference information about the index rather than
@@ -22,7 +23,20 @@ impl Genome {
     /// [`Self::capabilities`]: a vetter that also narrated its own reach could
     /// no longer say "clean".
     pub fn check(&self) -> Vec<Diagnostic> {
-        let mut paths: Vec<&String> = self.files.keys().collect();
+        self.diagnose(None)
+    }
+
+    /// [`Self::check`] for one file: what an editor asks for per document.
+    pub fn check_file(&self, path: &str) -> Vec<Diagnostic> {
+        self.diagnose(Some(path))
+    }
+
+    fn diagnose(&self, only: Option<&str>) -> Vec<Diagnostic> {
+        let mut paths: Vec<&String> = self
+            .files
+            .keys()
+            .filter(|path| only.is_none_or(|only| only == path.as_str()))
+            .collect();
         paths.sort();
 
         let mut syntax = Vec::new();
@@ -31,11 +45,19 @@ impl Genome {
             let Some(record) = self.files.get(path) else {
                 continue;
             };
+            // The text is read only for a file that has something to point at.
+            let source = (record.syntax_errors > 0 || !record.unresolved_imports.is_empty())
+                .then(|| self.source_of(path))
+                .flatten();
             if record.syntax_errors > 0 {
                 let plural = if record.syntax_errors == 1 { "" } else { "s" };
+                let line = source
+                    .as_deref()
+                    .and_then(|source| crate::syntax_check::first_issue(path, source))
+                    .map_or(1, |issue| u32::try_from(issue.line).unwrap_or(1));
                 syntax.push(Diagnostic {
                     path: path.clone(),
-                    line: 1,
+                    line,
                     character: 0,
                     severity: Severity::Warning,
                     code: "syntax-error".to_owned(),
@@ -43,10 +65,14 @@ impl Genome {
                 });
             }
             for spec in &record.unresolved_imports {
+                let (line, character) = source
+                    .as_deref()
+                    .and_then(|source| locate(source, spec))
+                    .unwrap_or((1, 0));
                 imports.push(Diagnostic {
                     path: path.clone(),
-                    line: 1,
-                    character: 0,
+                    line,
+                    character,
                     severity: Severity::Warning,
                     code: "unresolved-import".to_owned(),
                     message: format!("unresolved import `{spec}`"),
@@ -69,26 +95,32 @@ impl Genome {
             if symbol.files.len() <= MAX_DEFINERS {
                 continue;
             }
-            let Some(path) = symbol.files.first() else {
+            let definers = self.without_pass_throughs(&symbol.files);
+            if definers.len() <= MAX_DEFINERS {
+                continue;
+            }
+            let Some(path) = definers.first().copied() else {
                 continue;
             };
+            if only.is_some_and(|only| only != path.as_str()) {
+                continue;
+            }
             // One name, several crates: not a collision a reader can act on.
             let crate_of = self.crate_of(path);
-            if symbol
-                .files
+            if definers
                 .iter()
                 .any(|file| self.crate_of(file) != crate_of)
             {
                 continue;
             }
-            let definers = symbol.files.join(", ");
+            let listed: Vec<&str> = definers.iter().map(|file| file.as_str()).collect();
             ambiguous.push(Diagnostic {
                 path: path.clone(),
                 line: 1,
                 character: 0,
                 severity: Severity::Info,
                 code: "ambiguous-symbol".to_owned(),
-                message: format!("`{name}` is defined in {definers}"),
+                message: format!("`{name}` is defined in {}", listed.join(", ")),
             });
         }
         sort_diagnostics(&mut ambiguous);
@@ -96,8 +128,34 @@ impl Genome {
         let mut out = syntax;
         out.extend(imports);
         out.extend(ambiguous);
-        out.truncate(CHECK_LIMIT);
         out
+    }
+
+    /// `definers` without a TypeScript/JavaScript barrel that re-publishes
+    /// another one of them. Only there is a re-exported file a re-exported
+    /// *name*: Rust's `pub mod other;` publishes a module, and a `Session` in
+    /// both files is two types.
+    fn without_pass_throughs<'a>(&self, definers: &'a [String]) -> Vec<&'a String> {
+        definers
+            .iter()
+            .filter(|candidate| {
+                let Some(record) = self
+                    .files
+                    .get(candidate.as_str())
+                    .filter(|record| {
+                        matches!(
+                            record.language,
+                            crate::Language::TypeScript | crate::Language::JavaScript
+                        )
+                    })
+                else {
+                    return true;
+                };
+                !definers
+                    .iter()
+                    .any(|other| other != *candidate && record.reexports.contains(other))
+            })
+            .collect()
     }
 
     /// One entry per language this index understands, sorted by language: its
@@ -332,4 +390,52 @@ fn identifier_at(source: &str, line: u32, character: u32) -> Option<(String, usi
         current += 1;
     }
     None
+}
+
+/// Where `needle` first appears in `source`: a 1-based line and the byte
+/// offset on it.
+fn locate(source: &str, needle: &str) -> Option<(u32, u32)> {
+    source.lines().enumerate().find_map(|(at, line)| {
+        let column = line.find(needle)?;
+        Some((
+            u32::try_from(at + 1).ok()?,
+            u32::try_from(column).unwrap_or(0),
+        ))
+    })
+}
+
+/// `path:line: code: message`, one line per diagnostic, at most `limit` of
+/// them. When some are left out the last line says how many and what they
+/// were, so a count read off the report is never a silent lower bound.
+pub fn format_check_report(diagnostics: &[Diagnostic], limit: usize) -> Vec<String> {
+    let mut lines: Vec<String> = diagnostics
+        .iter()
+        .take(limit)
+        .map(|item| {
+            format!(
+                "{}:{}: {}: {}",
+                item.path, item.line, item.code, item.message
+            )
+        })
+        .collect();
+    let left = diagnostics.len().saturating_sub(limit);
+    if left > 0 {
+        let mut by_code: Vec<(&str, usize)> = Vec::new();
+        for item in diagnostics {
+            match by_code.iter_mut().find(|(code, _)| *code == item.code) {
+                Some((_, count)) => *count += 1,
+                None => by_code.push((item.code.as_str(), 1)),
+            }
+        }
+        let summary: Vec<String> = by_code
+            .iter()
+            .map(|(code, count)| format!("{code} {count}"))
+            .collect();
+        lines.push(format!(
+            "… and {left} more ({} total: {})",
+            diagnostics.len(),
+            summary.join(", ")
+        ));
+    }
+    lines
 }

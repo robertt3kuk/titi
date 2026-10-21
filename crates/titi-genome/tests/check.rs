@@ -279,7 +279,7 @@ fn qualified_join_resolves_and_method_join_does_not() {
 }
 
 #[test]
-fn check_keeps_syntax_ahead_of_imports_and_caps_at_32() {
+fn check_keeps_syntax_ahead_of_imports_and_keeps_all_of_them() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut body = String::from("pub fn broken( {\n");
@@ -289,7 +289,10 @@ fn check_keeps_syntax_ahead_of_imports_and_caps_at_32() {
     write(root, "src/broken.rs", &body);
 
     let diagnostics = Genome::index(root).unwrap().check();
-    assert_eq!(diagnostics.len(), 32);
+    // The cap of 32 that used to sit here made a count a lower bound and kept
+    // every file past the 32nd from ever getting a per-file diagnostic; the
+    // report is what truncates now, and says so.
+    assert_eq!(diagnostics.len(), 41);
     assert_eq!(diagnostics[0].code, "syntax-error");
     assert!(
         diagnostics[1..]
@@ -688,6 +691,80 @@ fn a_same_name_type_alias_is_not_a_second_definition() {
             .check()
             .iter()
             .all(|item| item.code != "ambiguous-symbol"),
+        "{:?}",
+        genome.check()
+    );
+}
+
+/// Every diagnostic used to say `:1:`, so the person (or model) had to search
+/// the file for the thing it named.
+#[test]
+fn a_diagnostic_points_at_the_line_it_is_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/lib.rs",
+        "// header\npub fn present() {}\nuse crate::missing::Thing;\n",
+    );
+    write(
+        root,
+        "src/broken.rs",
+        "pub fn fine() {}\n\npub fn broken( {\n",
+    );
+    let genome = Genome::index(root).unwrap();
+    let diagnostics = genome.check();
+
+    let import = diagnostics
+        .iter()
+        .find(|item| item.code == "unresolved-import")
+        .unwrap();
+    assert_eq!((import.path.as_str(), import.line), ("src/lib.rs", 3));
+    let syntax = diagnostics
+        .iter()
+        .find(|item| item.code == "syntax-error")
+        .unwrap();
+    assert_eq!(syntax.line, 3, "{syntax:?}");
+}
+
+/// A cap that hides the rest makes a count a lower bound. The report says how
+/// many it left out, and the diagnostics themselves are all there.
+#[test]
+fn check_keeps_every_diagnostic_and_the_report_says_how_many_it_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for n in 0..60 {
+        write(
+            root,
+            &format!("src/f{n}.rs"),
+            &format!("use crate::gone{n}::Thing;\n"),
+        );
+    }
+    let genome = Genome::index(root).unwrap();
+    let diagnostics = genome.check();
+    assert_eq!(diagnostics.len(), 60);
+
+    let lines = titi_genome::format_check_report(&diagnostics, 50);
+    assert_eq!(lines.len(), 51, "{lines:?}");
+    assert!(
+        lines[50].contains("10 more") && lines[50].contains("60") && lines[50].contains("unresolved-import"),
+        "{}",
+        lines[50]
+    );
+    assert_eq!(titi_genome::format_check_report(&diagnostics[..3], 50).len(), 3);
+}
+
+/// `export { Button } from './button'` lists `Button` among the barrel's
+/// exports; the barrel is the road to it, not a second definition.
+#[test]
+fn a_barrel_that_re_exports_a_name_does_not_make_it_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/ui/button.ts", "export const Button = 1;\n");
+    write(root, "src/ui/index.ts", "export { Button } from './button';\n");
+    let genome = Genome::index(root).unwrap();
+    assert!(
+        genome.check().iter().all(|item| item.code != "ambiguous-symbol"),
         "{:?}",
         genome.check()
     );

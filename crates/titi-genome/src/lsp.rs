@@ -216,9 +216,8 @@ fn diagnostic(genome: &Genome, root: &Path, message: &Value) -> Value {
         return json!({ "kind": "full", "items": [] });
     };
     let items: Vec<Value> = genome
-        .check()
+        .check_file(&rel)
         .into_iter()
-        .filter(|item| item.path == rel)
         .map(|item| {
             json!({
                 "range": lsp_range(item.line, item.character, 0),

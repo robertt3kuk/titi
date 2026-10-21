@@ -85,6 +85,9 @@ fn status(settings: &Option<Settings>, agent_dir: &Path) {
     std::process::exit(0);
 }
 
+/// Diagnostic lines `check` prints before it says how many it left out.
+const CHECK_LINES: usize = 200;
+
 /// `titi genome check`: index the workspace, print one line per diagnostic.
 ///
 /// `path:line: code: message`, one line each; severity decides the exit: a
@@ -105,11 +108,8 @@ fn check_cmd(workspace: &Path) {
         println!("genome: clean");
         std::process::exit(0);
     }
-    for diagnostic in &diagnostics {
-        println!(
-            "{}:{}: {}: {}",
-            diagnostic.path, diagnostic.line, diagnostic.code, diagnostic.message
-        );
+    for line in titi_genome::format_check_report(&diagnostics, CHECK_LINES) {
+        println!("{line}");
     }
     let has_problem = diagnostics
         .iter()

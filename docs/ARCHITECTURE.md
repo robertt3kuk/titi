@@ -255,7 +255,10 @@ stderr prints `"{files} files, {edges} edges"`, stdout the projection.
 `genome_root = None` means no genome at all. `titi genome check` prints
 `path:line: code: message` per diagnostic and exits 1 on any Warning or
 Error (`genome: clean`, exit 0, when there is nothing wrong — an
-`ambiguous-symbol` line is `Info` and does not change the exit code).
+`ambiguous-symbol` line is `Info` and does not change the exit code). The
+line is the one the problem is on (the import's, the first syntax error's),
+`Genome::check()` returns every finding, and the command prints the first 200
+and ends with `… and N more (T total: code n, …)` rather than a silent cap.
 `titi genome capabilities` prints the per-language roster described above
 and needs no workspace at all. `titi genome lsp` serves those symbols over
 LSP stdio framing.
