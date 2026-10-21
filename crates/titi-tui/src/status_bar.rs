@@ -859,20 +859,25 @@ fn errors_part(theme: &Theme, ascii: bool, snap: &StatusSnapshot) -> Option<Stri
     Some(theme.fg(ThemeColor::Error, &format!("{mark} {}", snap.errors)))
 }
 
-/// `✎ +1 ~2`: files the agent created and edited. Hidden while both are zero;
-/// the ASCII line says `edit` where the pencil would be.
+/// `✎ +1 ~2`: files the agent created and edited. Hidden while both are zero,
+/// and a half that is zero is left out (`✎ ~1`), so the segment carries only
+/// counts that say something; the ASCII line says `edit` for the pencil.
 fn edits_part(theme: &Theme, ascii: bool, snap: &StatusSnapshot) -> Option<String> {
     let (created, edited) = snap.edits;
     if created == 0 && edited == 0 {
         return None;
     }
     let mark = if ascii { "edit" } else { "✎" };
-    Some(format!(
-        "{} {} {}",
-        theme.fg(ThemeColor::Muted, mark),
-        theme.fg(ThemeColor::StatusLineStaged, &format!("+{created}")),
-        theme.fg(ThemeColor::StatusLineDirty, &format!("~{edited}")),
-    ))
+    let mut text = theme.fg(ThemeColor::Muted, mark);
+    if created > 0 {
+        text.push(' ');
+        text.push_str(&theme.fg(ThemeColor::StatusLineStaged, &format!("+{created}")));
+    }
+    if edited > 0 {
+        text.push(' ');
+        text.push_str(&theme.fg(ThemeColor::StatusLineDirty, &format!("~{edited}")));
+    }
+    Some(text)
 }
 
 /// `$0.04`, with a `~` in front when some turn went unpriced and the figure is
@@ -2015,7 +2020,14 @@ mod tests {
         );
 
         let created_only = paint((3, 0), default);
-        assert!(created_only.contains("✎ +3 ~0"), "{created_only:?}");
+        assert!(created_only.contains("✎ +3"), "{created_only:?}");
+        assert!(
+            !created_only.contains("~0"),
+            "a zero half says nothing: {created_only:?}"
+        );
+        let edited_only = paint((0, 2), default);
+        assert!(edited_only.contains("✎ ~2"), "{edited_only:?}");
+        assert!(!edited_only.contains("+0"), "{edited_only:?}");
 
         let zero = paint((0, 0), default);
         assert!(!zero.contains('✎'), "{zero:?}");
