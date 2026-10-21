@@ -15,7 +15,7 @@
 
 use titi_engine::protocol::{JobInfo, SessionMode};
 use titi_engine::{AgentKind, AgentStatus, ContextPart, EngineCommand, EngineEvent, TurnId};
-use titi_providers::{ChatMessage, ErrorReason, Role, StopReason, ToolCallRef};
+use titi_providers::{ChatMessage, Effort, ErrorReason, Role, StopReason, ToolCallRef};
 use titi_tools::AskAnswer;
 
 /// The variant encodes to exactly `json`, and `json` decodes to exactly it.
@@ -227,6 +227,16 @@ fn every_engine_command_round_trips_through_its_fixture() {
         },
         r#"{"SetMode":{"mode":"plan"}}"#,
     );
+    command(
+        EngineCommand::SetEffort {
+            effort: Some(Effort::High),
+        },
+        r#"{"SetEffort":{"effort":"high"}}"#,
+    );
+    command(
+        EngineCommand::SetEffort { effort: None },
+        r#"{"SetEffort":{"effort":null}}"#,
+    );
     command(EngineCommand::Shutdown, r#""Shutdown""#);
 }
 
@@ -322,6 +332,22 @@ fn every_engine_event_round_trips_through_its_fixture() {
     event(
         EngineEvent::AgentFocused { agent_id: None },
         r#"{"AgentFocused":{"agent_id":null}}"#,
+    );
+    event(
+        EngineEvent::EffortChanged {
+            effort: Some(Effort::Xhigh),
+            applied: Some(Effort::High),
+            cache_miss: true,
+        },
+        r#"{"EffortChanged":{"effort":"xhigh","applied":"high","cache_miss":true}}"#,
+    );
+    event(
+        EngineEvent::EffortChanged {
+            effort: None,
+            applied: None,
+            cache_miss: false,
+        },
+        r#"{"EffortChanged":{"effort":null,"applied":null,"cache_miss":false}}"#,
     );
     event(
         EngineEvent::ModelSwitched {
@@ -550,5 +576,23 @@ fn every_engine_event_round_trips_through_its_fixture() {
             mode: SessionMode::Duck,
         },
         r#"{"ModeChanged":{"mode":"duck"}}"#,
+    );
+}
+
+/// A client that predates a field sends the variant without it, and an older
+/// engine's event arrives without the new ones: both decode to the quiet
+/// default (nothing set, nothing applied, no cache miss).
+#[test]
+fn effort_variants_decode_without_their_optional_fields() {
+    let command: EngineCommand = serde_json::from_str(r#"{"SetEffort":{}}"#).expect("decodes");
+    assert_eq!(command, EngineCommand::SetEffort { effort: None });
+    let event: EngineEvent = serde_json::from_str(r#"{"EffortChanged":{}}"#).expect("decodes");
+    assert_eq!(
+        event,
+        EngineEvent::EffortChanged {
+            effort: None,
+            applied: None,
+            cache_miss: false,
+        }
     );
 }

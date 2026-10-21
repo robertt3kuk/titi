@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use titi_providers::{
     ApiKind, CredKind, Credential, DiscoveryError, FamilyTransport, HttpFetch, LadderLevel,
-    Transport, TransportError,
+    ModelCompat, Transport, TransportError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +174,13 @@ pub struct ModelDescriptor {
     /// from a rate nobody stated.
     #[serde(default)]
     pub price: Option<ModelPrice>,
+    /// The reasoning effort the model accepts: which levels, and in which
+    /// dialect. `None` is a model that takes none, and it is then sent none
+    /// whatever the session asks for — a field a provider does not know is
+    /// answered with a 400, not ignored. A model nobody has written this
+    /// down for (a discovered one, an unrecognised id) stays `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ModelCompat>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +337,7 @@ pub async fn discover_models(
             // pulled tag costs this machine is not something the endpoint
             // states.
             price: None,
+            reasoning: None,
         })
         .collect())
 }
@@ -339,6 +347,9 @@ pub struct ResolvedModel {
     pub wire_model: SmolStr,
     pub transport: Arc<dyn Transport>,
     pub credential: Option<Credential>,
+    /// What the model's descriptor says about reasoning effort; `None` sends
+    /// none.
+    pub reasoning: Option<ModelCompat>,
 }
 
 impl ResolvedModel {
@@ -349,6 +360,7 @@ impl ResolvedModel {
             wire_model: id,
             transport,
             credential: None,
+            reasoning: None,
         }
     }
 }
@@ -833,6 +845,7 @@ impl ProviderRegistry {
             wire_model: model.wire_model.clone(),
             transport: Arc::clone(&provider.transport),
             credential,
+            reasoning: model.reasoning.clone(),
         })
     }
 }
@@ -1017,6 +1030,7 @@ mod tests {
             wire_model: wire_model.into(),
             context_window: None,
             price: None,
+            reasoning: None,
         }
     }
 
@@ -1121,6 +1135,61 @@ mod tests {
             Some(3_000_000)
         );
         assert_eq!(registry.price("nobody/knows"), None);
+    }
+
+    /// A model's reasoning declaration is read from the user's own settings
+    /// and rides the resolved model, so the engine decides what to send from
+    /// the descriptor and never from the model's name. An undeclared model
+    /// resolves with none, which is what keeps a field it would reject off
+    /// the wire.
+    #[test]
+    fn a_models_declared_reasoning_reaches_its_resolved_model() {
+        let (parsed, problems) = ProviderRegistryConfig::from_user_settings(&serde_json::json!({
+            "providers": [{
+                "id": "g",
+                "api": "gemini-generate-content",
+                "base_url": "http://127.0.0.1:1",
+                "credential_required": false,
+            }],
+            "models": [
+                {
+                    "id": "g/flash", "provider": "g", "wire_model": "flash",
+                    "reasoning": {
+                        "efforts": ["low", "medium", "high"],
+                        "thinking_format": "google-budget",
+                    },
+                },
+                {"id": "g/plain", "provider": "g", "wire_model": "plain"},
+            ],
+        }));
+        assert_eq!(problems, Vec::<String>::new());
+        let registry = ProviderRegistry::new(
+            parsed.expect("a config"),
+            Arc::new(EnvCredentialSource),
+            Arc::new(RecordingFactory::default()),
+        )
+        .expect("registry builds");
+        let flash = registry.resolve("g/flash").expect("resolves");
+        let declared = flash.reasoning.expect("declared");
+        assert_eq!(
+            declared.efforts,
+            vec![
+                titi_providers::Effort::Low,
+                titi_providers::Effort::Medium,
+                titi_providers::Effort::High
+            ]
+        );
+        assert_eq!(
+            declared.thinking_format,
+            Some(titi_providers::ThinkingFormat::GoogleBudget)
+        );
+        assert!(
+            registry
+                .resolve("g/plain")
+                .expect("resolves")
+                .reasoning
+                .is_none()
+        );
     }
 
     /// Two gateways of the same family differ only by URL, so a model must

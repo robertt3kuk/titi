@@ -723,6 +723,10 @@ pub struct EngineConfig {
     /// environment variable, then [`titi_tools::BACKGROUND_AFTER`]. Tests set
     /// a tiny one so a `sleep 5` need not take five seconds.
     pub background_after: Option<std::time::Duration>,
+    /// Reasoning effort the main turns ask for (`model.effort`). `None` sends
+    /// nothing, so the provider's own default applies. `SetEffort` changes it
+    /// for the rest of the session.
+    pub effort: Option<titi_providers::Effort>,
 }
 
 impl EngineConfig {
@@ -757,6 +761,7 @@ impl EngineConfig {
             mode: crate::protocol::SessionMode::Agent,
             interrupt: titi_tools::Interrupt::new(),
             background_after: None,
+            effort: None,
         }
     }
 }
@@ -1355,6 +1360,19 @@ impl EngineRuntime {
                 .await;
         }
 
+        // The same for an effort the config set: the surface is told what the
+        // session started with instead of having to read the settings itself.
+        if self.config.effort.is_some() {
+            let report = crate::effort::changed(
+                self.resolver.as_ref(),
+                &primary_model,
+                None,
+                self.config.effort,
+                false,
+            );
+            let _ = self.events.send(report).await;
+        }
+
         loop {
             tokio::select! {
                 command = self.commands.recv() => {
@@ -1583,6 +1601,20 @@ impl EngineRuntime {
                             // with; the mode picks the tools of the next one.
                             self.mode = mode;
                             let _ = self.events.send(EngineEvent::ModeChanged { mode }).await;
+                        }
+                        EngineCommand::SetEffort { effort } => {
+                            // A running turn keeps the effort it started
+                            // with; the next request is the first to carry
+                            // the new one.
+                            let previous = std::mem::replace(&mut self.config.effort, effort);
+                            let report = crate::effort::changed(
+                                self.resolver.as_ref(),
+                                &primary_model,
+                                previous,
+                                effort,
+                                !self.config.restored_messages.is_empty(),
+                            );
+                            let _ = self.events.send(report).await;
                         }
                         EngineCommand::Shutdown => {
                             if let Some((_, aborted)) = active.take() {
@@ -2600,6 +2632,15 @@ async fn run_turn(
             let credential = resolved.credential;
             let wire_model = resolved.wire_model;
             let transport = resolved.transport;
+            // Per model, not per turn: a fallback has its own ladder (or none),
+            // and is sent what *it* accepts, not what the primary was.
+            let reasoning = titi_providers::resolve_reasoning(
+                transport.api(),
+                resolved.reasoning.as_ref(),
+                &titi_providers::RequestOpts {
+                    effort: config.effort,
+                },
+            );
             // The price of *this* model: a fallback is a different price, not
             // the same one, and the meter charges each round at its own rate.
             let price = resolver.price(&model);
@@ -2749,6 +2790,7 @@ async fn run_turn(
                         &wire_model,
                         Arc::clone(&transport),
                         credential.clone(),
+                        reasoning.clone(),
                         events.clone(),
                         Arc::clone(&aborted),
                         &tools,
@@ -3190,6 +3232,7 @@ async fn stream_attempt(
     model: &SmolStr,
     transport: Arc<dyn Transport>,
     credential: Option<Credential>,
+    reasoning: Option<titi_providers::Reasoning>,
     events: mpsc::Sender<EngineEvent>,
     aborted: Arc<AtomicBool>,
     tools: &ToolRegistry,
@@ -3221,6 +3264,7 @@ async fn stream_attempt(
     let mut request = WireRequest::new(model.clone());
     request.messages = messages.to_vec();
     request.tools = tools.specs();
+    request.reasoning = reasoning;
     let context = RequestCtx {
         credential,
         aborted: Arc::clone(&aborted),

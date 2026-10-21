@@ -78,6 +78,7 @@ fn model(id: &str, provider: &str, wire_model: &str) -> ModelDescriptor {
         wire_model: wire_model.into(),
         context_window: None,
         price: None,
+        reasoning: None,
     }
 }
 

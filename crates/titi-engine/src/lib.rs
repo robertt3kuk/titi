@@ -10,6 +10,7 @@ pub mod claims;
 pub mod compaction;
 pub mod council;
 pub mod difftrack;
+mod effort;
 pub mod findings;
 pub mod goal;
 pub mod judgment;

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use titi_providers::{ChatMessage, ErrorReason, StopReason};
+use titi_providers::{ChatMessage, Effort, ErrorReason, StopReason};
 // The answer a surface sends back is the same value the `ask` tool renders,
 // so one vocabulary covers both halves: what the tool waits for and what the
 // wire carries are not two enums that could drift apart.
@@ -193,6 +193,18 @@ pub enum EngineCommand {
     /// Switch what the next turns are allowed to do.
     SetMode {
         mode: SessionMode,
+    },
+    /// Set how hard the model is asked to think from the next request on.
+    /// `None` clears the setting: nothing is sent and the provider's own
+    /// default applies.
+    ///
+    /// The engine answers with [`EngineEvent::EffortChanged`], which says what
+    /// the model will really be sent and whether the change costs the prompt
+    /// cache. A level the model's ladder lacks is moved to the nearest one it
+    /// has; a model that takes no effort is sent none.
+    SetEffort {
+        #[serde(default)]
+        effort: Option<Effort>,
     },
     Shutdown,
 }
@@ -487,6 +499,24 @@ pub enum EngineEvent {
     /// its own keypress: the mode that matters is the one the turns run in.
     ModeChanged {
         mode: SessionMode,
+    },
+    /// The session's reasoning effort is now `effort`; the answer to
+    /// [`EngineCommand::SetEffort`], and also the engine's report of the
+    /// setting it started with.
+    ///
+    /// `applied` is what the primary model will be sent: the level after its
+    /// ladder moved the request, or `None` when it takes no effort at all and
+    /// is sent nothing whatever `effort` says. `cache_miss` is set when the
+    /// change alters that value in a session that already has history: the
+    /// effort is part of the prompt the provider caches, so the next request
+    /// reads none of it.
+    EffortChanged {
+        #[serde(default)]
+        effort: Option<Effort>,
+        #[serde(default)]
+        applied: Option<Effort>,
+        #[serde(default)]
+        cache_miss: bool,
     },
 }
 
