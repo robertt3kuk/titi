@@ -2655,6 +2655,7 @@ fn compact_history(
         };
     };
     if let (Some(focus), Some(before)) = (focus, before)
+        && done.folded > 0
         && let Some(digest) = config.restored_messages.first_mut()
     {
         let folded: Vec<&str> = before
@@ -2670,6 +2671,7 @@ fn compact_history(
         folded: done.folded as u32,
         tokens_before: done.tokens_before,
         strategy: done.strategy,
+        masked: done.masked as u32,
     }
 }
 
@@ -2958,11 +2960,13 @@ async fn run_turn(
                             folded: folded.folded as u32,
                             tokens_before: folded.tokens_before,
                             strategy: folded.strategy.clone(),
+                            masked: folded.masked as u32,
                         })
                         .await;
                     OpenSpan::open(&spans, turn_span_id.clone(), SpanKind::Event, "fold")
                         .attr("titi.folded", serde_json::json!(folded.folded as u64))
                         .attr("titi.strategy", serde_json::json!(folded.strategy.as_str()))
+                        .attr("titi.masked", serde_json::json!(folded.masked as u64))
                         .finish(spans::now_ms());
                 }
                 // The budget is spent: this request is the model's last word

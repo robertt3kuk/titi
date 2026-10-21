@@ -936,15 +936,24 @@ fn consider_image(found: &mut Vec<String>, raw: &str) {
 }
 
 /// The fold divider's own words, from the `Compacted` payload: how many
-/// messages went into the digest and how many tokens the request held when it
-/// happened. The mark and whether the history under it is drawn come from
-/// [`Details::folded`], so the same line reads `▸` collapsed and `▾` expanded.
-pub(crate) fn fold_divider_label(folded: u32, tokens_before: u64) -> String {
+/// messages went into the digest, how many tool results were elided, and how
+/// many tokens the request held when it happened. The mark and whether the
+/// history under it is drawn come from [`Details::folded`], so the same line
+/// reads `▸` collapsed and `▾` expanded.
+pub(crate) fn fold_divider_label(folded: u32, masked: u32, tokens_before: u64) -> String {
     let tokens = u32::try_from(tokens_before).unwrap_or(u32::MAX);
-    format!(
-        "folded {folded} turns · {} tokens",
+    let mut parts = Vec::new();
+    if folded > 0 {
+        parts.push(format!("folded {folded} messages"));
+    }
+    if masked > 0 {
+        parts.push(format!("masked {masked} tool results"));
+    }
+    parts.push(format!(
+        "{} tokens",
         titi_tui::status::compact_tokens(tokens)
-    )
+    ));
+    parts.join(" · ")
 }
 
 /// The fold divider as a row: the fold's mark, then the payload's own words.

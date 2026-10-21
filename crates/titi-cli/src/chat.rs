@@ -1764,15 +1764,23 @@ impl Chat {
             }
             EngineEvent::Compacted {
                 folded,
+                masked,
                 tokens_before,
                 ..
             } => {
-                // A divider, not a note: it stands for the history above it,
-                // which the fold keeps off the screen until `/details folded
-                // expanded`. Both numbers come from this payload — the count
-                // and the tokens the engine held when it folded — because the
-                // transcript cannot know either by looking at itself.
-                self.push(LineKind::Fold, fold_divider_label(folded, tokens_before));
+                // A fold is a divider, not a note: it stands for the history
+                // above it, which the fold keeps off the screen until
+                // `/details folded expanded`. Both numbers come from this
+                // payload — the count and the tokens the engine held when it
+                // folded — because the transcript cannot know either by
+                // looking at itself. Masking alone folded nothing away, so it
+                // is a note and the transcript stays whole.
+                let label = fold_divider_label(folded, masked, tokens_before);
+                if folded > 0 {
+                    self.push(LineKind::Fold, label);
+                } else {
+                    self.push(LineKind::Note, label);
+                }
                 Applied::none()
             }
             EngineEvent::ContextBreakdown { parts, window } => {

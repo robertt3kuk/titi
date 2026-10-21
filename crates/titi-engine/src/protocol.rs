@@ -10,6 +10,10 @@ use titi_tools::AskAnswer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TurnId(pub u64);
 
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
@@ -355,13 +359,20 @@ pub enum EngineEvent {
         tokens: u64,
         window: u64,
     },
-    /// The request crossed the context threshold and the oldest messages were
-    /// folded into one digest.
+    /// The request crossed the context threshold. Tool results older than the
+    /// kept tail were replaced by one-line stubs, and unless that was enough
+    /// the oldest messages were folded into one digest.
     Compacted {
         turn_id: TurnId,
+        /// Messages the digest replaced; zero when masking was enough.
         folded: u32,
         tokens_before: u64,
+        /// `mask` when only tool results were elided, else the strategy that
+        /// wrote the digest.
         strategy: SmolStr,
+        /// Tool results whose bodies became stubs.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        masked: u32,
     },
     TurnUsage {
         turn_id: TurnId,

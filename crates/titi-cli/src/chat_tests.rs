@@ -8710,10 +8710,14 @@ fn a_compaction_folds_the_history_behind_a_divider() {
         folded: 14,
         tokens_before: 22_000,
         strategy: "digest".into(),
+        masked: 0,
     });
 
     let frame = frame_text(&mut chat);
-    assert!(frame.contains("▸ folded 14 turns · 22k tokens"), "{frame}");
+    assert!(
+        frame.contains("▸ folded 14 messages · 22k tokens"),
+        "{frame}"
+    );
     assert!(
         !frame.contains("the question that was folded"),
         "the folded history is not on screen: {frame}"
@@ -8721,7 +8725,10 @@ fn a_compaction_folds_the_history_behind_a_divider() {
 
     command(&mut chat, "/details folded expanded");
     let frame = frame_text(&mut chat);
-    assert!(frame.contains("▾ folded 14 turns · 22k tokens"), "{frame}");
+    assert!(
+        frame.contains("▾ folded 14 messages · 22k tokens"),
+        "{frame}"
+    );
     assert!(
         frame.contains("the question that was folded"),
         "expanding the fold brings the history back: {frame}"
@@ -8729,7 +8736,7 @@ fn a_compaction_folds_the_history_behind_a_divider() {
 
     command(&mut chat, "/details folded hidden");
     let frame = frame_text(&mut chat);
-    assert!(!frame.contains("folded 14 turns"), "{frame}");
+    assert!(!frame.contains("folded 14 messages"), "{frame}");
     assert!(!frame.contains("the question that was folded"), "{frame}");
 }
 
@@ -8743,11 +8750,23 @@ fn the_fold_divider_is_drawn_from_the_payload() {
         folded: 2,
         tokens_before: 900,
         strategy: "digest".into(),
+        masked: 0,
     });
-    assert_eq!(fold_divider_label(2, 900), "folded 2 turns · 900 tokens");
+    assert_eq!(
+        fold_divider_label(2, 0, 900),
+        "folded 2 messages · 900 tokens"
+    );
+    assert_eq!(
+        fold_divider_label(2, 5, 900),
+        "folded 2 messages · masked 5 tool results · 900 tokens"
+    );
+    assert_eq!(
+        fold_divider_label(0, 5, 900),
+        "masked 5 tool results · 900 tokens"
+    );
 
     let rows = frame_rows(&mut chat, 80, 24);
-    let (x, y) = cell_of(&rows, "▸ folded 2 turns").expect("the divider is on screen");
+    let (x, y) = cell_of(&rows, "▸ folded 2 messages").expect("the divider is on screen");
     let buffer = frame_buffer(&mut chat, 80, 24);
     assert_eq!(
         buffer[(x, y)].fg,
@@ -8760,7 +8779,7 @@ fn the_fold_divider_is_drawn_from_the_payload() {
     command(&mut chat, "/details folded expanded");
     let rows = frame_rows(&mut chat, 80, 24);
     assert!(
-        rows.iter().any(|row| row.contains("▾ folded 2 turns")),
+        rows.iter().any(|row| row.contains("▾ folded 2 messages")),
         "an expanded fold opens its chevron: {rows:?}"
     );
 }
@@ -8777,6 +8796,7 @@ fn each_fold_divider_carries_its_own_event() {
         folded: 3,
         tokens_before: 1_500,
         strategy: "digest".into(),
+        masked: 0,
     });
     chat.push(LineKind::Assistant, "an answer between folds".to_owned());
     chat.on_event(EngineEvent::Compacted {
@@ -8784,17 +8804,47 @@ fn each_fold_divider_carries_its_own_event() {
         folded: 40,
         tokens_before: 120_000,
         strategy: "digest".into(),
+        masked: 0,
     });
 
     let frame = frame_text(&mut chat);
-    assert!(frame.contains("▸ folded 40 turns · 120k tokens"), "{frame}");
-    assert!(!frame.contains("folded 3 turns"), "{frame}");
+    assert!(
+        frame.contains("▸ folded 40 messages · 120k tokens"),
+        "{frame}"
+    );
+    assert!(!frame.contains("folded 3 messages"), "{frame}");
 
     command(&mut chat, "/details folded expanded");
     let frame = frame_text(&mut chat);
-    assert!(frame.contains("folded 3 turns · 1.5k tokens"), "{frame}");
-    assert!(frame.contains("folded 40 turns · 120k tokens"), "{frame}");
+    assert!(frame.contains("folded 3 messages · 1.5k tokens"), "{frame}");
+    assert!(
+        frame.contains("folded 40 messages · 120k tokens"),
+        "{frame}"
+    );
     assert!(frame.contains("the oldest question"), "{frame}");
+}
+
+/// Masking elides tool results in the request and folds nothing away, so the
+/// transcript above it stays on screen and the line is a note, not a divider.
+#[test]
+fn a_masking_only_compaction_is_a_note_and_keeps_the_transcript() {
+    let mut chat = chat();
+    chat.push(LineKind::User, "the question that stays".to_owned());
+    chat.on_event(EngineEvent::Compacted {
+        turn_id: titi_engine::TurnId(1),
+        folded: 0,
+        tokens_before: 90_000,
+        strategy: "mask".into(),
+        masked: 12,
+    });
+
+    let frame = frame_text(&mut chat);
+    assert!(
+        frame.contains("masked 12 tool results · 90k tokens"),
+        "{frame}"
+    );
+    assert!(!frame.contains("▸ masked"), "not a divider: {frame}");
+    assert!(frame.contains("the question that stays"), "{frame}");
 }
 
 #[test]

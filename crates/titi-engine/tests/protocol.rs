@@ -467,8 +467,19 @@ fn every_engine_event_round_trips_through_its_fixture() {
             folded: 2,
             tokens_before: 30,
             strategy: "digest".into(),
+            masked: 0,
         },
         r#"{"Compacted":{"turn_id":1,"folded":2,"tokens_before":30,"strategy":"digest"}}"#,
+    );
+    event(
+        EngineEvent::Compacted {
+            turn_id: TurnId(2),
+            folded: 0,
+            tokens_before: 90_000,
+            strategy: "mask".into(),
+            masked: 12,
+        },
+        r#"{"Compacted":{"turn_id":2,"folded":0,"tokens_before":90000,"strategy":"mask","masked":12}}"#,
     );
     event(
         EngineEvent::TurnUsage {

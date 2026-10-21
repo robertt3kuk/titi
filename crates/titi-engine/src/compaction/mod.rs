@@ -7,18 +7,26 @@
 //!
 //! Spec: `docs/research/compaction-context`.
 
+mod mask;
+
 use smol_str::SmolStr;
 use titi_core::compaction::{CompactionPolicy, StructuredSummarizer, Summarizer, estimate_tokens};
 use titi_core::session::{Entry, Role as EntryRole};
 use titi_providers::{ChatMessage, Role};
 
+use mask::mask_tool_results;
+
 /// What one compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compacted {
-    /// Messages replaced by the digest.
+    /// Messages replaced by the digest. Zero when masking alone was enough.
     pub folded: usize,
+    /// Tool results whose bodies were replaced by a one-line stub.
+    pub masked: usize,
     /// Estimated tokens before folding.
     pub tokens_before: u64,
+    /// `mask` when only tool results were elided, else the strategy that
+    /// wrote the digest.
     pub strategy: SmolStr,
 }
 
@@ -27,9 +35,11 @@ pub fn estimate_request(messages: &[ChatMessage]) -> u64 {
     messages.iter().map(|m| estimate_tokens(&m.content)).sum()
 }
 
-/// Folds the oldest messages into one digest when the request crosses the
-/// policy threshold, and returns what happened. `None` when nothing was
-/// folded: below the threshold, or no prefix left to fold.
+/// Shrinks the request when it crosses the policy threshold, and returns
+/// what happened. Tool results older than the kept tail are masked first; if
+/// that brings the request under the threshold it stops there, otherwise the
+/// oldest messages are folded into one digest. `None` when nothing was done:
+/// below the threshold, or no prefix left to shrink.
 pub fn compact(
     messages: &mut Vec<ChatMessage>,
     policy: &CompactionPolicy,
@@ -55,6 +65,18 @@ pub fn compact(
         return None;
     }
 
+    let masked = mask_tool_results(messages, first_kept);
+    if masked.count > 0
+        && !policy.should_compact(used.saturating_sub(masked.saved_tokens), context_window)
+    {
+        return Some(Compacted {
+            folded: 0,
+            masked: masked.count,
+            tokens_before: used,
+            strategy: "mask".into(),
+        });
+    }
+
     let prefix = &entries[..first_kept];
     let mut summarizer = StructuredSummarizer;
     let mut chosen = None;
@@ -78,6 +100,7 @@ pub fn compact(
     );
     Some(Compacted {
         folded: first_kept,
+        masked: masked.count,
         tokens_before: used,
         strategy: strategy.as_str().into(),
     })
@@ -201,5 +224,108 @@ mod tests {
     fn the_estimate_covers_every_message() {
         let messages = vec![user("1234"), assistant("12345678")];
         assert_eq!(estimate_request(&messages), 1 + 2);
+    }
+
+    fn call(id: &str, name: &str, arguments: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            tool_calls: vec![titi_providers::ToolCallRef {
+                call_id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn result(id: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Tool,
+            content: text.into(),
+            tool_call_id: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A request whose weight is two old tool results, then a short tail.
+    fn heavy_with_tools() -> Vec<ChatMessage> {
+        vec![
+            user("fix the parser"),
+            call("c1", "read", r#"{"path":"src/parser.rs"}"#),
+            result("c1", &"fn parse() {}\n".repeat(600)),
+            call("c2", "bash", r#"{"command":"cargo test"}"#),
+            result("c2", &"test output\n".repeat(600)),
+            assistant("the parser is fixed"),
+            user("thanks, now the lexer"),
+            assistant("on it"),
+            user("newest"),
+        ]
+    }
+
+    #[test]
+    fn masking_alone_is_enough_when_the_tool_results_were_the_weight() {
+        let mut messages = heavy_with_tools();
+        let before = messages.len();
+        let policy = CompactionPolicy {
+            threshold_percent: 50.0,
+            keep_recent_tokens: 20,
+            ..CompactionPolicy::default()
+        };
+
+        let done = compact(&mut messages, &policy, 4_000).expect("a compaction");
+
+        assert_eq!(done.strategy, "mask");
+        assert_eq!(done.folded, 0);
+        assert_eq!(done.masked, 2);
+        assert_eq!(messages.len(), before, "nothing was folded away");
+        assert_eq!(
+            messages[2].content,
+            "[tool result elided: read src/parser.rs · 8400 chars · re-run to see it]"
+        );
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        assert!(messages[4].content.contains("bash cargo test"));
+        assert_eq!(messages.last().unwrap().content, "newest");
+        assert_eq!(compact(&mut messages, &policy, 4_000), None, "one rewrite");
+    }
+
+    #[test]
+    fn when_masking_is_not_enough_the_fold_follows_it() {
+        let mut messages = heavy_with_tools();
+        let policy = CompactionPolicy {
+            threshold_percent: 0.0,
+            keep_recent_tokens: 20,
+            method_order: vec![titi_core::compaction::Strategy::SnapCompact],
+        };
+
+        let done = compact(&mut messages, &policy, 4_000).expect("a compaction");
+
+        assert_eq!(done.strategy, "snapcompact");
+        assert_eq!(done.masked, 2);
+        assert_eq!(done.folded, 5, "{done:?}");
+    }
+
+    #[test]
+    fn a_tool_result_in_the_kept_tail_is_not_masked() {
+        let mut messages = vec![
+            user("old question"),
+            assistant("old answer"),
+            user("read it"),
+            call("c1", "read", r#"{"path":"big.rs"}"#),
+            result("c1", &"line\n".repeat(900)),
+        ];
+        let policy = CompactionPolicy {
+            threshold_percent: 0.0,
+            keep_recent_tokens: 1_126,
+            method_order: vec![titi_core::compaction::Strategy::SnapCompact],
+        };
+        let done = compact(&mut messages, &policy, 4_000).expect("a compaction");
+        assert_eq!(done.folded, 3);
+        assert_eq!(done.masked, 0, "nothing older than the tail was a result");
+        assert_eq!(
+            messages.last().unwrap().content,
+            "line\n".repeat(900),
+            "the newest result is read whole"
+        );
     }
 }
