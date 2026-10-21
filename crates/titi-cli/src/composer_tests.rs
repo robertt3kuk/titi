@@ -1001,7 +1001,7 @@ fn hotkeys_and_help_list_the_new_keys() {
     chat.set_agent_dir(agent.path());
     type_text(&mut chat, "/hotkeys");
     press(&mut chat, Key::Enter);
-    type_text(&mut chat, "/help");
+    type_text(&mut chat, "/help all");
     press(&mut chat, Key::Enter);
     let all: Vec<&str> = chat.lines.iter().map(|l| l.text.as_str()).collect();
     for wanted in ["alt+s", "alt+p", "  @ ", "recall earlier prompts"] {

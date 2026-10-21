@@ -472,6 +472,8 @@ pub(crate) struct Palette {
     pub(crate) entries: Vec<Entry>,
     pub(crate) query: String,
     pub(crate) selected: usize,
+    /// Opened by `/help`: the commands alone, and a title that says so.
+    pub(crate) help: bool,
 }
 
 impl Palette {
@@ -480,6 +482,22 @@ impl Palette {
             entries: entries(),
             query: String::new(),
             selected: 0,
+            help: false,
+        }
+    }
+
+    /// `/help`: every command and nothing else, with `query` already typed.
+    fn help(query: &str) -> Self {
+        Self {
+            entries: entries()
+                .into_iter()
+                .filter(|entry| {
+                    matches!(entry.action, Action::Command(_)) && entry.label.starts_with('/')
+                })
+                .collect(),
+            query: query.to_owned(),
+            selected: 0,
+            help: true,
         }
     }
 
@@ -621,11 +639,16 @@ pub(crate) fn palette_view(chat: &Chat, total: u16) -> Option<PanelView> {
             })
             .collect()
     };
+    let (name, noun) = if palette.help {
+        ("help", " commands")
+    } else {
+        ("palette", "")
+    };
     let title = if palette.query.is_empty() {
-        format!("palette · {}", palette.entries.len())
+        format!("{name} · {}{noun}", palette.entries.len())
     } else {
         format!(
-            "palette · {} of {} · {}",
+            "{name} · {} of {}{noun} · {}",
             matched.len(),
             palette.entries.len(),
             palette.query
@@ -686,6 +709,12 @@ impl Chat {
         self.picker = 0;
         self.picker_hidden = false;
         self.scroll_offset = 0;
+        Applied::none()
+    }
+
+    /// `/help`: the palette on the commands alone, `query` typed in.
+    pub(crate) fn open_help(&mut self, query: &str) -> Applied {
+        self.palette.list = Some(Palette::help(query.trim()));
         Applied::none()
     }
 

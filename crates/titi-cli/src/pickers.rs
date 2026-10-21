@@ -64,7 +64,7 @@ pub(crate) const COMMANDS: &[Command] = &[
     },
     Command {
         name: "help",
-        about: "list these commands",
+        about: "browse these commands; /help all prints them",
     },
     Command {
         name: "hotkeys",

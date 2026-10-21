@@ -2398,7 +2398,7 @@ impl Chat {
             "context" => self.describe_context(args),
             "compact" => self.compact(args),
             "details" => self.details(args),
-            "help" => self.help(),
+            "help" => self.help(args),
             "hotkeys" => self.hotkeys(),
             "login" => self.login(args),
             "logout" => self.logout(args),
@@ -2884,7 +2884,12 @@ impl Chat {
         Applied::none()
     }
 
-    fn help(&mut self) -> Applied {
+    /// `/help`: the command palette on the commands alone, pre-filtered by
+    /// whatever follows; `/help all` is the old text listing.
+    fn help(&mut self, args: &str) -> Applied {
+        if !args.trim().eq_ignore_ascii_case("all") {
+            return self.open_help(args);
+        }
         for command in COMMANDS {
             self.push(
                 LineKind::Note,

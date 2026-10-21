@@ -123,7 +123,7 @@ titi --mode plan
 | `/leave` | Leaves the hub, which unregisters this peer |
 | `/btw` | Sends a message that is not recorded in the history; during a turn it steers instead of starting one |
 | `/pause` | Holds the composer and stops the running turn. `/pause` again resumes |
-| `/help` | Lists these commands |
+| `/help` | Opens the command palette on the commands, `/help <text>` pre-filtered; `/help all` prints them as text |
 | Up / Down | Move through the command list. It opens only when `/` is the start of the line |
 | Tab | Fills the highlighted command. Enter on a prefix runs it. Esc clears the slash |
 
@@ -364,7 +364,7 @@ titi --mode plan
 | `/diagnose` | Печатает блок диагностики, чтобы вставить в баг-репорт |
 | `/btw` | Сообщение, которое не пишется в историю; во время хода это steering, а не новый ход |
 | `/pause` | Держит ввод и останавливает ход. Ещё раз `/pause` продолжает |
-| `/help` | Список этих команд |
+| `/help` | Открывает палитру команд, `/help <текст>` с готовым фильтром; `/help all` печатает их текстом |
 | Up / Down | Список команд. Он открывается, только если `/` стоит в начале строки |
 | Tab | Подставляет выбранную команду. Enter на префиксе выполняет её. Esc стирает слэш |
 

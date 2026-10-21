@@ -5774,7 +5774,8 @@ fn guard_every_listed_command_dispatches_and_does_something() {
             || applied.log.is_some()
             || chat.lines.len() > lines_before
             // A picker is an answer too: `/model`, `/login` and `/theme`
-            // open one instead of printing.
+            // open one instead of printing, and `/help` opens the palette.
+            || chat.palette.list.is_some()
             || chat.model_picker.is_some()
             || chat.login_picker.is_some()
             || chat.theme_picker.is_some();

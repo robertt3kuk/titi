@@ -83,6 +83,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed
 
+- `/help` no longer dumps about 48 note lines into the transcript: it opens the command palette on the commands (`help · 48 commands`), `/help <text>` opens it pre-filtered, and `/help all` prints the old text listing with its `keys …` line.
+
 - Reading a directory says `4 entries` instead of `4 lines`, and the listing the model gets no longer starts with `.git/` (`.hg/` and `.svn/` are left out too; `.github/` and `.gitignore` stay).
 
 - The `todo` row no longer repeats itself: `✓ Planned 1/3 · Fix the parser  1/3 done` is `✓ Planned 1/3 · Fix the parser`, and the result column only says what the target does not (`1 cancelled`).

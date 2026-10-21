@@ -263,15 +263,15 @@ def smoke(args) -> None:
             )
             print(f"tui-smoke: `/` listed the commands after {waited:.1f}s")
 
-            # 3. `/help` prints the catalog into the transcript.
+            # 3. `/help` opens the command palette on the commands.
             session.send(b"help\r")
             waited = session.expect(
-                ["list these commands", "switch model"],
+                ["browse these commands", "switch model"],
                 args.step_timeout,
                 "/help output",
                 deadline,
             )
-            print(f"tui-smoke: /help printed the catalog after {waited:.1f}s")
+            print(f"tui-smoke: /help opened the commands after {waited:.1f}s")
 
             # 4. Ctrl+D on an empty composer quits.
             session.send(b"\x04")

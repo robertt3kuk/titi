@@ -531,3 +531,82 @@ fn the_setting_table_covers_every_key_constant_of_the_config_crate() {
         );
     }
 }
+
+// ---- /help -------------------------------------------------------------------
+
+/// Bare `/help` opens the palette on the commands alone, with a title that
+/// counts them, instead of dumping a note per command into the transcript.
+#[test]
+fn bare_help_opens_the_palette_on_the_commands() {
+    let agent = tempfile::tempdir().expect("agent");
+    let mut chat = chat_in(agent.path());
+    type_text(&mut chat, "/help");
+    press(&mut chat, Key::Enter);
+    assert!(chat.palette.list.is_some(), "the palette is up");
+    assert!(
+        chat.lines.is_empty(),
+        "nothing is written to the transcript: {:?}",
+        notes(&chat)
+    );
+    let title = panel_title(&chat);
+    let count = crate::pickers::COMMANDS.len();
+    assert_eq!(title, format!("help · {count} commands"));
+    let rows = panel_rows(&chat);
+    assert_eq!(rows.len(), count, "{rows:?}");
+    assert!(
+        rows.iter().all(|row| row.starts_with('/')),
+        "commands only, no panels or settings: {rows:?}"
+    );
+}
+
+/// `/help <text>` opens the same palette with the text already typed.
+#[test]
+fn help_with_text_opens_the_palette_filtered() {
+    let agent = tempfile::tempdir().expect("agent");
+    let mut chat = chat_in(agent.path());
+    type_text(&mut chat, "/help ctx");
+    press(&mut chat, Key::Enter);
+    let title = panel_title(&chat);
+    assert!(title.starts_with("help · "), "{title}");
+    assert!(title.ends_with("ctx"), "{title}");
+    let rows = panel_rows(&chat);
+    assert!(rows[0].starts_with("/context"), "{rows:?}");
+    assert!(rows.iter().all(|row| row.starts_with('/')), "{rows:?}");
+}
+
+/// Enter on a row of the help palette runs that command.
+#[test]
+fn a_row_of_the_help_palette_runs_its_command() {
+    let agent = tempfile::tempdir().expect("agent");
+    let mut chat = chat_in(agent.path());
+    type_text(&mut chat, "/help hotkeys");
+    press(&mut chat, Key::Enter);
+    press(&mut chat, Key::Enter);
+    assert!(chat.palette.list.is_none());
+    assert!(
+        notes(&chat).iter().any(|row| row.contains("alt+s")),
+        "/hotkeys ran: {:?}",
+        notes(&chat)
+    );
+    assert!(
+        !notes(&chat)
+            .iter()
+            .any(|row| row.starts_with("keys  @file")),
+        "the text listing did not run: {:?}",
+        notes(&chat)
+    );
+}
+
+/// `/help all` keeps the old text listing, keys line included.
+#[test]
+fn help_all_lists_every_command_as_text() {
+    let agent = tempfile::tempdir().expect("agent");
+    let mut chat = chat_in(agent.path());
+    type_text(&mut chat, "/help all");
+    press(&mut chat, Key::Enter);
+    assert!(chat.palette.list.is_none());
+    let all = notes(&chat);
+    assert_eq!(all.len(), crate::pickers::COMMANDS.len() + 1, "{all:#?}");
+    assert!(all[0].starts_with('/'), "{all:#?}");
+    assert!(all.last().is_some_and(|row| row.starts_with("keys  @file")));
+}
