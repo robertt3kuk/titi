@@ -25,6 +25,7 @@ pub mod project_context;
 pub mod protocol;
 pub mod registry;
 pub mod review;
+pub mod router;
 pub mod runtime;
 pub mod skill_tool;
 pub mod skills;
