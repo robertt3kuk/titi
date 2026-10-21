@@ -41,9 +41,9 @@ the state at `238e911`, before the 2026-10-21 waves.
 | # | Idea | Why it matters | titi today | Status |
 |---|---|---|---|---|
 | 17 | `project` tool | lint / typecheck / test / build resolved from the repo, one structured result, no guessing `npm test` vs `npx jest` | the model guesses a `bash` command | have (`c8f60f0`) |
-| 18 | Diagnostics diff after edit | the tool result says which errors an edit introduced or fixed | none | have (branch `wt/verify`: `write`/`edit`/`hashline_edit` append `syntax: this edit introduced N errors (line L: …)` or `syntax: fixed N errors` from the genome's grammars; no LSP diagnostics) |
+| 18 | Diagnostics diff after edit | the tool result says which errors an edit introduced or fixed | none | partial (`859182d` series: `write`/`edit`/`hashline_edit` append `syntax: this edit introduced N errors (line L: …)` or `syntax: fixed N errors` from the genome's grammars; no type/LSP diagnostics) |
 | 19 | Independent review verdict | clean-context reviewer of the session's edits, PASS/FAIL/PARTIAL, one key to apply | `/goal` has a reviewer; no standalone `/review` | have (`d39298f`: `/review`, `apply`, `list`, `titi --review` exit codes) |
-| 20 | Pre-commit gate | an agent `git commit` runs lint + typecheck first | none | open |
+| 20 | Pre-commit gate | an agent `git commit` runs lint + typecheck first | none | partial (`26e5e05`: `verify.command` runs at the end of a turn that edited files and feeds one failure back; not tied to `git commit`) |
 | 21 | Symbol-addressed edits | edit a function by name, all-or-nothing batches | text/hashline edits | open |
 | 22 | Compound refactors | rename/move symbol through the LSP in one call | none | gated (needs LSP client) |
 
@@ -52,7 +52,7 @@ the state at `238e911`, before the 2026-10-21 waves.
 | # | Idea | Why it matters | titi today | Status |
 |---|---|---|---|---|
 | 23 | Measured prompt budget | bytes per turn by part (system, tools, map, diff, history) | `/context` estimates | have (`scripts/bench.py`, [`../perf/README.md`](../perf/README.md)) |
-| 24 | Size-budgeted tool results | every result capped so a single grep is not re-billed for the rest of the session | 40k-char cap per result | partial (map/diff resent only on change `07ec079`; schemas −11% `52011bd`; per-result budget open) |
+| 24 | Size-budgeted tool results | every result capped so a single grep is not re-billed for the rest of the session | 40k-char cap per result | partial (map/diff resent only on change `07ec079`; schemas −11% `52011bd`; old results elided to stubs when compaction fires) |
 | 25 | Cache-break diagnostics | a notice naming what changed in the prefix and what it cost | none | open |
 | 26 | On-demand tool loading | rare tools behind a search tool, decided per session so the cache holds | every tool every turn | open (measured proposal in the perf README) |
 | 27 | Co-change ranking | the map ranks files that change together | import graph + touched set | open |
