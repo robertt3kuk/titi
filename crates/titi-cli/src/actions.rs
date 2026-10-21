@@ -153,6 +153,7 @@ pub(crate) fn verb(tool: &str) -> &str {
         "todo" => "Planned",
         "agent" => "Delegated",
         "ask" => "Asked",
+        "atlas" => "Looked up",
         other => other,
     }
 }
@@ -220,6 +221,7 @@ pub(crate) fn result_summary(
             count => counted(count, "match", "matches"),
         },
         "bash" => "exit 0".to_owned(),
+        "atlas" => atlas_summary(target, output),
         // The target carries `done/total`, so the answer's own `done/total
         // done` is only worth a word when it adds something.
         "todo" => {
@@ -236,6 +238,105 @@ pub(crate) fn result_summary(
             _ => first(),
         },
         _ => first(),
+    }
+}
+
+/// What an `atlas` call found, read from the counts its answer already prints.
+///
+/// The answer's first line is a header (`atlas gen=7`) that says which index
+/// generation answered; it is never a summary. The op is the first word of the
+/// target (`find Foo`): `find` counts `symbols (1–1 of 1):` and `files (…)`,
+/// `outline` the symbol rows, `uses` `used by N files:`, `impact` the
+/// `direct dependents (N):` and `then, through those (M):` lists, `related`
+/// its rows.
+fn atlas_summary(target: &str, output: &str) -> String {
+    let body: Vec<&str> = output
+        .lines()
+        .skip_while(|line| line.starts_with("atlas gen="))
+        .collect();
+    let op = target.split_whitespace().next().unwrap_or_default();
+    // `title (N):` / `title (a–b of N):` → N.
+    let total = |title: &str| -> Option<usize> {
+        body.iter().find_map(|line| {
+            let rest = line.strip_prefix(title)?.strip_prefix(" (")?;
+            let inside = rest.split_once(')')?.0;
+            inside.rsplit(' ').next()?.parse().ok()
+        })
+    };
+    match op {
+        "find" => {
+            let symbols = total("symbols");
+            let files = total("files");
+            match (symbols, files) {
+                (Some(s), Some(f)) => format!(
+                    "{}, {}",
+                    counted(s, "symbol", "symbols"),
+                    counted(f, "file", "files")
+                ),
+                (Some(s), None) => counted(s, "symbol", "symbols"),
+                (None, Some(f)) => counted(f, "file", "files"),
+                (None, None)
+                    if body
+                        .iter()
+                        .any(|line| line.starts_with("no symbol or file")) =>
+                {
+                    let related = body
+                        .iter()
+                        .skip(1)
+                        .filter(|line| !line.trim().is_empty())
+                        .count();
+                    format!(
+                        "no match, {}",
+                        counted(related, "related file", "related files")
+                    )
+                }
+                (None, None) => "no match".to_owned(),
+            }
+        }
+        "related" => counted(
+            body.iter().filter(|line| !line.trim().is_empty()).count(),
+            "file",
+            "files",
+        ),
+        "outline" => counted(
+            body.iter()
+                .filter(|line| {
+                    let first = line.split_whitespace().next().unwrap_or_default();
+                    line.starts_with(' ')
+                        && first.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && first.chars().all(|c| c.is_ascii_digit() || c == '-')
+                })
+                .count(),
+            "symbol",
+            "symbols",
+        ),
+        "uses" => {
+            let users = body.iter().find_map(|line| {
+                line.strip_prefix("used by ")?
+                    .strip_suffix(" files:")?
+                    .parse::<usize>()
+                    .ok()
+            });
+            match users {
+                Some(count) => counted(count, "user", "users"),
+                None => "no users".to_owned(),
+            }
+        }
+        "impact" => {
+            let touched =
+                total("direct dependents").unwrap_or(0) + total("then, through those").unwrap_or(0);
+            if touched == 0 {
+                "nothing depends on it".to_owned()
+            } else {
+                format!("{} touched", counted(touched, "file", "files"))
+            }
+        }
+        _ => body
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .map(|line| one_line(line, TOOL_PREVIEW))
+            .unwrap_or_default(),
     }
 }
 
@@ -778,6 +879,7 @@ mod tests {
             ("todo", "Planned"),
             ("agent", "Delegated"),
             ("ask", "Asked"),
+            ("atlas", "Looked up"),
             ("settings", "settings"),
             ("git_commit", "git_commit"),
         ] {
@@ -851,6 +953,106 @@ mod tests {
 
     /// A directory's listing is one entry per line, so what it reports is
     /// entries, not lines of a file.
+    #[test]
+    fn an_atlas_call_summarises_what_it_found_never_its_header() {
+        let sum = |target: &str, out: &str| result_summary("atlas", target, true, out, None);
+        // find: the totals of the symbol and file lists
+        assert_eq!(
+            sum(
+                "find Foo",
+                "atlas gen=1\nsymbols (1\u{2013}1 of 1):\n  a.rs:3  fn foo()  (\u{2192}2)\n"
+            ),
+            "1 symbol"
+        );
+        assert_eq!(
+            sum(
+                "find Foo",
+                "atlas gen=1\nsymbols (1\u{2013}20 of 31):\n  x\nfiles (1\u{2013}3 of 3):\n  b.rs (\u{2192}1)\nmore: pass offset=20\n"
+            ),
+            "31 symbols, 3 files"
+        );
+        assert_eq!(
+            sum(
+                "find Foo",
+                "atlas gen=1\nfiles (1\u{2013}2 of 2):\n  a\n  b\n"
+            ),
+            "2 files"
+        );
+        assert_eq!(
+            sum("find Foo", "atlas gen=1\nnothing in the index matches\n"),
+            "no match"
+        );
+        assert_eq!(
+            sum(
+                "find the store",
+                "atlas gen=1\nno symbol or file is named like that; related by the words of the query:\na.rs (\u{2192}1) x\nb.rs (\u{2192}0) y\n"
+            ),
+            "no match, 2 related files"
+        );
+        // related: its rows
+        assert_eq!(
+            sum(
+                "related store",
+                "atlas gen=2\na.rs (\u{2192}1) x\nb.rs (\u{2192}0) y\nc.rs (\u{2192}3) z\n"
+            ),
+            "3 files"
+        );
+        // outline: the symbol rows, not the import / used-by lists
+        assert_eq!(
+            sum(
+                "outline src/a.rs",
+                "atlas gen=3\nsrc/a.rs  rust  (\u{2192}2)\n        1  pub struct A\n    3-9  pub fn run()\n  12-12  fn hidden()  (private)\nimports (1):\n  src/b.rs\nused by (2):\n  src/c.rs\n  src/d.rs\n"
+            ),
+            "3 symbols"
+        );
+        // uses
+        assert_eq!(
+            sum(
+                "uses Foo",
+                "atlas gen=4\ndefined: a.rs:1  fn foo()  (\u{2192}12)\nused by 12 files:\n  b.rs (2 lines)\n"
+            ),
+            "12 users"
+        );
+        assert_eq!(
+            sum(
+                "uses Foo",
+                "atlas gen=4\ndefined: a.rs:1  fn foo()\nused by 1 files:\n  b.rs (1 lines)\n"
+            ),
+            "1 user"
+        );
+        assert_eq!(
+            sum(
+                "uses Foo",
+                "atlas gen=4\ndefined: a.rs:1  fn foo()\nno file in the index uses it\n"
+            ),
+            "no users"
+        );
+        // impact: direct and indirect together
+        assert_eq!(
+            sum(
+                "impact src/a.rs",
+                "atlas gen=5\nchanging src/a.rs touches:\ndirect dependents (2):\n  x\n  y\nthen, through those (79):\n  z\n"
+            ),
+            "81 files touched"
+        );
+        assert_eq!(
+            sum(
+                "impact src/a.rs",
+                "atlas gen=5\nchanging src/a.rs touches:\n  nothing else in the index depends on it\n"
+            ),
+            "nothing depends on it"
+        );
+        // a failure and an unknown op still say what the tool said, header apart
+        assert_eq!(
+            result_summary("atlas", "find", false, "atlas: needs a query", None),
+            "atlas: needs a query"
+        );
+        assert_eq!(
+            sum("frob x", "atlas gen=6\nsomething new\n"),
+            "something new"
+        );
+    }
+
     #[test]
     fn a_directory_read_counts_entries() {
         let dir = std::env::temp_dir().to_string_lossy().into_owned();
