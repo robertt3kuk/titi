@@ -53,7 +53,7 @@ the state at `238e911`, before the 2026-10-21 waves.
 |---|---|---|---|---|
 | 23 | Measured prompt budget | bytes per turn by part (system, tools, map, diff, history) | `/context` estimates | have (`scripts/bench.py`, [`../perf/README.md`](../perf/README.md)) |
 | 24 | Size-budgeted tool results | every result capped so a single grep is not re-billed for the rest of the session | 40k-char cap per result | partial (map/diff resent only on change `07ec079`; schemas −11% `52011bd`; old results elided to stubs when compaction fires `2ea13de`; still no budget per result below the 40k cap) |
-| 25 | Cache-break diagnostics | a notice naming what changed in the prefix and what it cost | none | open |
+| 25 | Cache-break diagnostics | a notice naming what changed in the prefix and what it cost | `cache_watch`: one notice naming the first change, `/cache` | built (`crates/titi-engine/src/cache_watch.rs`; the cost is the cached share, not a price) |
 | 26 | On-demand tool loading | rare tools behind a search tool, decided per session so the cache holds | every tool every turn | open (measured proposal in the perf README) |
 | 27 | Co-change ranking | the map ranks files that change together | import graph + touched set | open |
 
