@@ -236,9 +236,23 @@ src/runtime.rs (→3) [RECENT]
   (tested).
 - Paths containing `<` or `>` are dropped, so a file name cannot forge the
   closing tag — prompt-injection hygiene.
-- File limit: `EngineConfig::atlas_limit`, default 24, overridden by the
-  `atlas.limit` setting (1..=64, the project `.titi/config.yml` winning);
-  `TITI_NO_ATLAS=1` drops the map.
+- **Budget**: `EngineConfig::atlas_budget` (`atlas.budget`, 200..=4000 tokens,
+  the project `.titi/config.yml` winning; unset sizes it from the repository:
+  800 below 200 files, 1000 below 2000, 1300 beyond) is what the map and the
+  lens may add to a turn together, split 60/40 (`split_budget`). It replaced
+  `atlas.limit`, a file count, which nothing reads any more. `TITI_NO_ATLAS=1`
+  drops the map.
+- **The map is a skeleton** (`skeleton`): the repository's structure, the same
+  whatever the session does — no touched boost, nothing but the graph and the
+  roles. File lines come first, in rank order, until they have used 55% of the
+  map's budget (at most 48 files); the rest goes to the symbols under them,
+  top files first, each `  +Name (users)` followed by two spaces and its
+  one-line signature where the language module extracted one. A file line is
+  `path (→N)` plus ` [entry]`, ` [test]`, ` [example]`, ` [docs]`, ` [bench]`,
+  ` [fixture]`, ` [vendor]` or ` [gen]` for what the path is for, and `
+  [RECENT]`. It is never longer than its budget and never empty. The engine
+  sends it once and again only when the set of files it lists changes
+  (`previous_map_matches`), not when a count, a signature or `[RECENT]` does.
 - **Co-change** (`cochange.rs`): `git log -n 500 --no-merges --name-only` is
   read once per `HEAD` (stamp = `.git/HEAD` plus the reflog's mtime, no
   process) on a thread of its own with a 2.5 s cap, started by the index

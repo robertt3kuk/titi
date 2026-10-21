@@ -8191,22 +8191,22 @@ fn atlas_off_persists_and_the_next_note_reads_it_back() {
         .find(|line| line.text.contains("atlas: off"))
         .expect("the status note names the off state");
     assert!(note.text.contains("reason: setting"), "{}", note.text);
-    assert!(note.text.contains("limit: 24"), "{}", note.text);
+    assert!(note.text.contains("budget: auto"), "{}", note.text);
 }
 
-/// An in-range `/atlas limit` persists on its own key and the note
-/// reports it; the limit is not coupled to the enabled state.
+/// An in-range `/atlas budget` persists on its own key and the note
+/// reports it; the budget is not coupled to the enabled state.
 #[test]
-fn atlas_limit_persists_and_is_reported() {
+fn atlas_budget_persists_and_is_reported() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/atlas limit 4");
+    type_text(&mut chat, "/atlas budget 800");
     chat.on_key(Key::Enter, Instant::now());
     let config = std::fs::read_to_string(chat.agent_dir.join("config.yml")).unwrap();
-    assert!(config.contains("limit: 4"), "{config}");
+    assert!(config.contains("budget: 800"), "{config}");
     assert!(!config.contains("enabled"), "{config}");
 
     chat.lines.clear();
@@ -8215,20 +8215,20 @@ fn atlas_limit_persists_and_is_reported() {
     let note = chat
         .lines
         .iter()
-        .find(|line| line.text.contains("limit: 4"))
-        .expect("the note states the saved cap");
+        .find(|line| line.text.contains("budget: 800 tokens"))
+        .expect("the note states the saved budget");
     assert!(note.text.contains("atlas: on"), "{}", note.text);
 }
 
-/// An out-of-range `/atlas limit` writes nothing and says the range.
+/// An out-of-range `/atlas budget` writes nothing and says the range.
 #[test]
-fn atlas_limit_out_of_range_is_refused_without_a_write() {
+fn atlas_budget_out_of_range_is_refused_without_a_write() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat();
     chat.agent_dir = dir.path().to_path_buf();
     std::fs::create_dir_all(&chat.agent_dir).unwrap();
 
-    type_text(&mut chat, "/atlas limit 0");
+    type_text(&mut chat, "/atlas budget 0");
     chat.on_key(Key::Enter, Instant::now());
     assert!(
         !chat.agent_dir.join("config.yml").exists(),
@@ -8237,7 +8237,7 @@ fn atlas_limit_out_of_range_is_refused_without_a_write() {
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "atlas limit: expected an integer from 1 to 64")
+            .any(|line| line.text == "atlas budget: expected an integer from 200 to 4000 (tokens)")
     );
 }
 
@@ -8314,7 +8314,7 @@ fn atlas_unknown_subcommand_shows_usage() {
     assert!(
         chat.lines
             .iter()
-            .any(|line| line.text == "usage: titi atlas [on|off|limit <n>|check|lsp]")
+            .any(|line| line.text == "usage: titi atlas [on|off|budget <tokens>|check|lsp]")
     );
 }
 

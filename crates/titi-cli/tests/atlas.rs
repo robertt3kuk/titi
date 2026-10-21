@@ -47,7 +47,7 @@ fn unreadable_root(parent: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// A fresh agent directory reports the built-in state: on, unreasoned, at the
-/// engine's default cap.
+/// engine's automatic budget.
 #[test]
 fn status_on_an_empty_agent_dir_is_default_on() {
     let dir = tempfile::tempdir().expect("temp agent dir");
@@ -55,7 +55,7 @@ fn status_on_an_empty_agent_dir_is_default_on() {
     assert_eq!(code, 0);
     assert!(stdout.contains("atlas: on\n"), "{stdout}");
     assert!(stdout.contains("reason: default\n"), "{stdout}");
-    assert!(stdout.contains("limit: 24\n"), "{stdout}");
+    assert!(stdout.contains("budget: auto\n"), "{stdout}");
     assert!(
         stdout.contains(&format!(
             "config: {}\n",
@@ -95,30 +95,30 @@ fn on_after_off_flips_the_key_back() {
     assert!(stdout.contains("reason: setting\n"), "{stdout}");
 }
 
-/// An in-range cap is stored on its own key, leaving `enabled` untouched, and
-/// the status reports the effective value.
+/// An in-range budget is stored on its own key, leaving `enabled` untouched,
+/// and the status reports the effective value.
 #[test]
-fn limit_n_is_stored_and_reported() {
+fn budget_n_is_stored_and_reported() {
     let dir = tempfile::tempdir().expect("temp agent dir");
-    let (stdout, _, code) = run(dir.path(), dir.path(), &["atlas", "limit", "4"]);
+    let (stdout, _, code) = run(dir.path(), dir.path(), &["atlas", "budget", "800"]);
     assert_eq!(code, 0, "{stdout}");
-    assert!(stdout.contains("atlas limit: 4\n"), "{stdout}");
+    assert!(stdout.contains("atlas budget: 800 tokens\n"), "{stdout}");
     let config = std::fs::read_to_string(dir.path().join("config.yml")).expect("config written");
     assert!(config.contains("enabled: false") == false, "{config}");
     let (stdout, _, _) = run(dir.path(), dir.path(), &["atlas"]);
-    assert!(stdout.contains("limit: 4\n"), "{stdout}");
+    assert!(stdout.contains("budget: 800 tokens\n"), "{stdout}");
 }
 
 /// Zero is refused with exit 2, and nothing is written: a typo must not seed
 /// the config with a value every later run has to ignore.
 #[test]
-fn limit_zero_is_refused_and_writes_nothing() {
+fn budget_zero_is_refused_and_writes_nothing() {
     let dir = tempfile::tempdir().expect("temp agent dir");
-    let (stdout, stderr, code) = run(dir.path(), dir.path(), &["atlas", "limit", "0"]);
+    let (stdout, stderr, code) = run(dir.path(), dir.path(), &["atlas", "budget", "0"]);
     assert_eq!(code, 2);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(
-        stderr.contains("atlas limit: expected an integer from 1 to 64"),
+        stderr.contains("atlas budget: expected an integer from 200 to 4000"),
         "{stderr}"
     );
     assert!(
@@ -127,28 +127,30 @@ fn limit_zero_is_refused_and_writes_nothing() {
     );
 }
 
-/// Sixty-five is the other side of the same refusal.
+/// Past the ceiling, and below the floor, is the other side of the same refusal.
 #[test]
-fn limit_above_the_ceiling_is_refused() {
+fn budget_outside_the_range_is_refused() {
     let dir = tempfile::tempdir().expect("temp agent dir");
-    let (_, stderr, code) = run(dir.path(), dir.path(), &["atlas", "limit", "65"]);
+    let (_, _, code) = run(dir.path(), dir.path(), &["atlas", "budget", "199"]);
+    assert_eq!(code, 2);
+    let (_, stderr, code) = run(dir.path(), dir.path(), &["atlas", "budget", "4001"]);
     assert_eq!(code, 2);
     assert!(
-        stderr.contains("atlas limit: expected an integer from 1 to 64"),
+        stderr.contains("atlas budget: expected an integer from 200 to 4000"),
         "{stderr}"
     );
-    let (_, _, code) = run(dir.path(), dir.path(), &["atlas", "limit", "banana"]);
+    let (_, _, code) = run(dir.path(), dir.path(), &["atlas", "budget", "banana"]);
     assert_eq!(code, 2);
 }
 
-/// A limit with no number at all is the same refusal.
+/// A budget with no number at all is the same refusal.
 #[test]
-fn limit_without_a_number_is_refused() {
+fn budget_without_a_number_is_refused() {
     let dir = tempfile::tempdir().expect("temp agent dir");
-    let (_, stderr, code) = run(dir.path(), dir.path(), &["atlas", "limit"]);
+    let (_, stderr, code) = run(dir.path(), dir.path(), &["atlas", "budget"]);
     assert_eq!(code, 2);
     assert!(
-        stderr.contains("atlas limit: expected an integer from 1 to 64"),
+        stderr.contains("atlas budget: expected an integer from 200 to 4000"),
         "{stderr}"
     );
 }
@@ -302,7 +304,9 @@ fn an_unknown_atlas_subcommand_is_named_and_shows_usage() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("atlas: unknown command wat\n"), "{stderr}");
     assert!(
-        stderr.contains("usage: titi atlas [on|off|limit <n>|check|dump|lens|capabilities|lsp]\n"),
+        stderr.contains(
+            "usage: titi atlas [on|off|budget <tokens>|check|dump|lens|capabilities|lsp]\n"
+        ),
         "{stderr}"
     );
 }

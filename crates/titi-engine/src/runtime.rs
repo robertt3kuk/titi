@@ -146,7 +146,7 @@ const ATLAS_QUIESCE: std::time::Duration = std::time::Duration::from_millis(40);
 /// [`ATLAS_QUIESCE`].
 async fn atlas_map(
     root: Option<PathBuf>,
-    limit: usize,
+    budget: Option<usize>,
     atlas: Option<&AtlasHandle>,
     touched: &TouchedSink,
     quiesce: std::time::Duration,
@@ -178,16 +178,15 @@ async fn atlas_map(
         // over-reporting staleness costs a re-read, never a wrong answer.
         let pending = atlas.pending();
         let (snapshot, _generation) = atlas.snapshot();
-        Some(SmolStr::from(
-            snapshot.project_with_pending(limit, &touched, pending),
-        ))
+        // The map is the repository's structure: it does not move with the
+        // session (the lens carries that), so it can be sent once and left
+        // alone.
+        let total = budget.unwrap_or_else(|| titi_atlas::default_budget(snapshot.files.len()));
+        let (map_tokens, _) = titi_atlas::split_budget(total);
+        Some(SmolStr::from(snapshot.skeleton(map_tokens, pending)))
     })
     .await
 }
-
-/// What the lens may cost per turn, in estimated tokens. The prompt map
-/// alongside it is its own budget; the two together are what the atlas adds.
-const LENS_TOKENS: usize = 400;
 
 /// The part of the repository this prompt is about: seeds from the text, the
 /// session's touched files and the working tree's changes, walked over the
@@ -198,6 +197,7 @@ const LENS_TOKENS: usize = 400;
 /// the same generation and names the same backlog. No model is asked.
 async fn atlas_lens(
     root: Option<PathBuf>,
+    budget: Option<usize>,
     atlas: Option<&AtlasHandle>,
     prompt: &str,
     touched: &TouchedSink,
@@ -216,10 +216,50 @@ async fn atlas_lens(
             touched: &touched,
             changed: &changed,
         });
-        let lens = snapshot.lens(&seeds, titi_atlas::LensBudget::tokens(LENS_TOKENS));
+        let total = budget.unwrap_or_else(|| titi_atlas::default_budget(snapshot.files.len()));
+        let (_, lens_tokens) = titi_atlas::split_budget(total);
+        let lens = snapshot.lens(&seeds, titi_atlas::LensBudget::tokens(lens_tokens));
         (!lens.is_empty()).then(|| SmolStr::from(lens.render(pending)))
     })
     .await
+}
+
+/// Whether the newest prompt map in `history` already lists exactly the files
+/// `block` lists. The map is structure and does not move with the session, so
+/// a turn whose map differs only in a dependent count, a signature or the
+/// `[RECENT]` marker adds nothing: the model has the picture, and resending
+/// it costs the whole block and a layer of near-duplicates in the history.
+fn previous_map_matches(history: &[ChatMessage], block: &str) -> bool {
+    let newest = history
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::User && has_marker(&message.content, "<atlas"))
+        .find_map(|message| {
+            let start = message
+                .content
+                .match_indices("<atlas")
+                .map(|(at, _)| at)
+                .find(|&at| !message.content[at + "<atlas".len()..].starts_with('-'))?;
+            let end = message.content[start..].find("</atlas>")?;
+            Some(&message.content[start..start + end + "</atlas>".len()])
+        });
+    let Some(newest) = newest else {
+        return false;
+    };
+    let mut before = map_paths(newest);
+    let mut now = map_paths(block);
+    before.sort_unstable();
+    now.sort_unstable();
+    before == now
+}
+
+/// The paths a rendered map lists: the lines that are not symbols or tags.
+fn map_paths(block: &str) -> Vec<&str> {
+    block
+        .lines()
+        .filter(|line| !line.starts_with(' ') && !line.starts_with('<'))
+        .filter_map(|line| line.split(" (→").next())
+        .collect()
 }
 
 /// Whether the newest lens in `history` already lists exactly the files
@@ -383,7 +423,7 @@ mod tests {
 
         let behind = atlas_map(
             Some(root.to_path_buf()),
-            8,
+            Some(400),
             Some(&atlas),
             &touched,
             std::time::Duration::from_millis(1),
@@ -398,7 +438,7 @@ mod tests {
         // Given time, the same call renders the graph the batch landed in.
         let settled = atlas_map(
             Some(root.to_path_buf()),
-            8,
+            Some(400),
             Some(&atlas),
             &touched,
             std::time::Duration::from_secs(30),
@@ -410,7 +450,8 @@ mod tests {
     }
 
     /// A handle whose first index is still running is not an empty map: the
-    /// turn waits for the walk and renders the whole tree.
+    /// turn waits for the walk and renders the repository, as many files as
+    /// the budget allows.
     #[tokio::test]
     async fn a_deferred_index_renders_the_whole_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,7 +471,7 @@ mod tests {
             AtlasHandle::spawn_deferred(root, titi_atlas::live::Options::default()).unwrap();
         let map = atlas_map(
             Some(root.to_path_buf()),
-            200,
+            Some(4000),
             Some(&atlas),
             &TouchedSink::default(),
             std::time::Duration::from_secs(30),
@@ -438,7 +479,7 @@ mod tests {
         .await
         .expect("a map");
         assert!(!map.contains("pending="), "{map}");
-        assert_eq!(map.matches("src_").count(), 150, "{map}");
+        assert!(map.matches("src_").count() >= 40, "{map}");
     }
 
     /// No root, no map — the guard the duck mode relies on.
@@ -446,7 +487,7 @@ mod tests {
     async fn a_turn_without_a_root_renders_no_map() {
         let touched = TouchedSink::default();
         assert!(
-            atlas_map(None, 8, None, &touched, ATLAS_QUIESCE)
+            atlas_map(None, Some(400), None, &touched, ATLAS_QUIESCE)
                 .await
                 .is_none()
         );
@@ -455,7 +496,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), "pub fn a() {}\n").unwrap();
         let atlas = AtlasHandle::spawn(root, titi_atlas::live::Options::default()).unwrap();
         assert!(
-            atlas_map(None, 8, Some(&atlas), &touched, ATLAS_QUIESCE)
+            atlas_map(None, Some(400), Some(&atlas), &touched, ATLAS_QUIESCE)
                 .await
                 .is_none()
         );
@@ -595,6 +636,7 @@ mod tests {
 
         let lens = atlas_lens(
             Some(root.to_path_buf()),
+            None,
             Some(&atlas),
             "why does SessionStore lose entries?",
             &touched,
@@ -611,6 +653,7 @@ mod tests {
         assert!(
             atlas_lens(
                 Some(root.to_path_buf()),
+                None,
                 Some(&atlas),
                 "hello",
                 &touched,
@@ -621,9 +664,16 @@ mod tests {
         );
         // Repo-blind without a root, like the map.
         assert!(
-            atlas_lens(None, Some(&atlas), "SessionStore", &touched, Vec::new())
-                .await
-                .is_none()
+            atlas_lens(
+                None,
+                None,
+                Some(&atlas),
+                "SessionStore",
+                &touched,
+                Vec::new()
+            )
+            .await
+            .is_none()
         );
         // The session alone is a signal: a touched file, in any spelling.
         touched
@@ -632,6 +682,7 @@ mod tests {
             .insert(root.join("service.rs").display().to_string());
         let from_session = atlas_lens(
             Some(root.to_path_buf()),
+            None,
             Some(&atlas),
             "continue",
             &touched,
@@ -643,6 +694,34 @@ mod tests {
             from_session.contains("touched this session"),
             "{from_session}"
         );
+    }
+
+    /// The map is structure. A turn whose map differs only in a count, a
+    /// signature, a tag or the backlog header lists the same files and is not
+    /// sent again; a different set of files is.
+    #[test]
+    fn a_map_over_the_same_files_is_not_resent_whatever_else_moved() {
+        let first =
+            "<atlas>\nsrc/a.rs (→4) [RECENT]\n  +A (3)  pub struct A\nsrc/b.rs (→1)\n</atlas>";
+        let drifted = "<atlas pending=\"2\">\nsrc/b.rs (→2) [test]\nsrc/a.rs (→5)\n  +A (4)  pub struct A { x: u32 }\n</atlas>";
+        let different = "<atlas>\nsrc/a.rs (→4)\nsrc/c.rs (→9)\n</atlas>";
+        let history = vec![
+            message(
+                Role::User,
+                &format!("{first}\n\n<atlas-lens>\nsrc/z.rs (→0) x\n</atlas-lens>\n\nfix it"),
+            ),
+            message(Role::Assistant, "done"),
+        ];
+        assert!(previous_map_matches(&history, drifted));
+        assert!(!previous_map_matches(&history, different));
+        assert!(!previous_map_matches(&[], first));
+        // A lens-only message does not hide the map copy behind it.
+        let mut later = history.clone();
+        later.push(message(
+            Role::User,
+            "<atlas-lens>\nsrc/q.rs (→0) y\n</atlas-lens>\n\nnext",
+        ));
+        assert!(previous_map_matches(&later, drifted));
     }
 
     /// The same files again are not sent again, whatever order or reason; a
@@ -810,8 +889,9 @@ pub struct EngineConfig {
     pub approval_mode: ApprovalMode,
     /// Workspace root kept indexed turn-by-turn. `None` disables the Atlas.
     pub atlas_root: Option<PathBuf>,
-    /// Ranked files injected per prompt.
-    pub atlas_limit: usize,
+    /// Tokens the atlas may add to one turn, the prompt map and the lens
+    /// together (`atlas.budget`). `None` sizes it from the repository.
+    pub atlas_budget: Option<usize>,
     /// Workspace a subagent's tools are jailed to. `None` keeps its registry
     /// empty even when `agent_model` is set.
     pub workspace_root: Option<PathBuf>,
@@ -902,7 +982,7 @@ impl EngineConfig {
             max_tool_rounds: crate::tool_budget::DEFAULT_TOOL_ROUNDS,
             approval_mode: ApprovalMode::Write,
             atlas_root: None,
-            atlas_limit: 24,
+            atlas_budget: None,
             workspace_root: None,
             agent_model: None,
             agent_writes: false,
@@ -2441,7 +2521,7 @@ impl EngineRuntime {
     async fn atlas_system(&self) -> Option<SmolStr> {
         atlas_map(
             self.config.atlas_root.clone(),
-            self.config.atlas_limit,
+            self.config.atlas_budget,
             self.atlas.as_ref(),
             &self.touched,
             ATLAS_QUIESCE,
@@ -3136,7 +3216,7 @@ async fn run_turn(
     let recalled = recalled_memory(config.agent_dir.clone(), &touched, &prompt).await;
     let atlas_text = atlas_map(
         config.atlas_root.clone(),
-        config.atlas_limit,
+        config.atlas_budget,
         atlas.as_ref(),
         &touched,
         ATLAS_QUIESCE,
@@ -3146,6 +3226,7 @@ async fn run_turn(
     // lens either.
     let lens_text = atlas_lens(
         config.atlas_root.clone(),
+        config.atlas_budget,
         atlas.as_ref(),
         &prompt,
         &touched,
@@ -3161,7 +3242,7 @@ async fn run_turn(
     let atlas_block: Option<String> = {
         let map = atlas_text
             .as_deref()
-            .filter(|block| !previous_copy_matches(history, "<atlas", block));
+            .filter(|block| !previous_map_matches(history, block));
         let lens = lens_text
             .as_deref()
             .filter(|block| !previous_lens_matches(history, block));

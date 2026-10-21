@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use titi_atlas::{Atlas, SharedAtlas};
 
-/// Prompt-map line budget the engine uses (`atlas_limit` default).
+/// Prompt-map size the benchmark renders, in files (`ranking` order).
 const MAP_LIMIT: usize = 24;
 const SYNTH_FILES: usize = 5_000;
 

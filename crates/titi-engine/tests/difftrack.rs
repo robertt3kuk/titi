@@ -99,7 +99,7 @@ fn repo_with_an_outside_edit() -> tempfile::TempDir {
 }
 
 #[tokio::test]
-async fn the_turn_shows_the_working_tree_diff_and_boosts_the_edited_file() {
+async fn the_turn_shows_the_working_tree_diff_and_puts_the_edited_file_in_the_lens() {
     let workspace = repo_with_an_outside_edit();
     let transport = Arc::new(MockTransport::new(vec![MockBody::Events(vec![
         StreamEvent::Done {
@@ -135,14 +135,21 @@ async fn the_turn_shows_the_working_tree_diff_and_boosts_the_edited_file() {
     assert!(!prompt.content.contains("sk-test"), "{}", prompt.content);
     assert!(!prompt.content.contains(".env"), "{}", prompt.content);
 
-    let map = &prompt.content[..atlas_at];
-    let leaf_at = map.find("src/leaf.rs").expect("leaf in the map");
-    let hub_at = map.find("src/hub.rs").expect("hub in the map");
+    // The map is the repository's structure and does not follow the session;
+    // the file edited outside the agent is what the lens is for: it is listed
+    // there, with the reason, between the map and the diff.
+    let lens_at = prompt.content.find("<atlas-lens>").expect("a lens");
     assert!(
-        leaf_at < hub_at,
-        "a file edited outside the agent must lead the map:\n{}",
+        atlas_at < lens_at && lens_at < diff_at,
+        "{}",
         prompt.content
     );
+    let lens = &prompt.content[lens_at..diff_at];
+    let line = lens
+        .lines()
+        .find(|line| line.starts_with("src/leaf.rs"))
+        .unwrap_or_else(|| panic!("a file edited outside the agent is in the lens:\n{lens}"));
+    assert!(line.contains("changed in the working tree"), "{line}");
 }
 
 /// A committed key file, a committed `credentials.json`, and an ordinary

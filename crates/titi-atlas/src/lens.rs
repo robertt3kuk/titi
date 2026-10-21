@@ -725,7 +725,14 @@ fn unmapped_line(words: &[String]) -> String {
 impl LensEntry {
     /// `path (→N) why · +Sym +Sym`, one line, newline included.
     fn line(&self) -> String {
-        let mut line = format!("{} (→{}) {}", self.path, self.dependents, self.why);
+        let mut line = format!("{} (→{})", self.path, self.dependents);
+        if let Some(label) = crate::role::tag(&self.path) {
+            line.push_str(" [");
+            line.push_str(label);
+            line.push(']');
+        }
+        line.push(' ');
+        line.push_str(&self.why);
         for symbol in &self.symbols {
             line.push_str(" +");
             line.push_str(symbol);

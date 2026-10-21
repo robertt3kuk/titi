@@ -105,8 +105,8 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Bool,
     ),
     setting(
-        cfg::ATLAS_LIMIT_KEY,
-        "files the repo map keeps",
+        cfg::ATLAS_BUDGET_KEY,
+        "tokens the repo map and lens may add to a turn",
         Values::Free,
     ),
     setting(

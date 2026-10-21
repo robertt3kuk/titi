@@ -48,7 +48,7 @@ pub use lang::{Capability, Language, Level};
 pub use lens::{Lens, LensBudget, LensEntry, MAX_LENS_FILES, SeedInput, SeedKind, Seeds};
 pub use live::AtlasHandle;
 pub use lsp::serve_lsp;
-pub use project::{RankedFile, ranking, render};
+pub use project::{RankedFile, ranking, render, skeleton};
 pub use query::format_check_report;
 pub use scan::list_files;
 pub use shared::SharedAtlas;
@@ -1126,6 +1126,11 @@ impl Atlas {
         reresolved
     }
 
+    /// The prompt map within `budget` estimated tokens; see [`skeleton`].
+    pub fn skeleton(&self, budget: usize, pending: usize) -> String {
+        project::skeleton(self, budget, pending)
+    }
+
     pub fn project(&self, limit: usize) -> String {
         render(self, limit, &HashSet::new(), 0)
     }
@@ -1141,6 +1146,25 @@ impl Atlas {
         let touched: HashSet<String> = touched.iter().filter_map(|path| self.key(path)).collect();
         render(self, limit, &touched, pending)
     }
+}
+
+/// The default `atlas.budget`, in tokens, for a repository of `files` source
+/// files: what the map and the lens may add to a turn together. A small
+/// repository needs less orientation than a large one, and the prompt cache
+/// pays for every token, so it grows slowly.
+pub fn default_budget(files: usize) -> usize {
+    match files {
+        0..200 => 800,
+        200..2000 => 1000,
+        _ => 1300,
+    }
+}
+
+/// How a budget divides: the prompt map (sent once, rarely) gets 60%, the
+/// per-prompt lens 40%. Returns `(map, lens)` in tokens.
+pub fn split_budget(total: usize) -> (usize, usize) {
+    let lens = total * 2 / 5;
+    (total - lens, lens)
 }
 
 /// What `text` costs in prompt tokens, without a tokenizer: about one token per

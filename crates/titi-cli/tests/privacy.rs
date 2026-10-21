@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use titi_cli::engine::{atlas_limit_from, privacy_policy};
+use titi_cli::engine::{atlas_budget_from, privacy_policy};
 use titi_config::settings::{PROJECT_SUBPATH, Settings};
 
 fn write(path: &Path, text: &str) {
@@ -73,47 +73,59 @@ fn the_user_can_loosen_their_own_privacy() {
 }
 
 #[test]
-fn atlas_limit_read_from_settings() {
+fn atlas_budget_read_from_settings() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    write(&agent.path().join("config.yml"), "atlas:\n  limit: 4\n");
+    write(&agent.path().join("config.yml"), "atlas:\n  budget: 600\n");
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(atlas_limit_from(&settings), 4);
+    assert_eq!(atlas_budget_from(&settings), Some(600));
 }
 
 #[test]
-fn a_project_can_set_its_own_atlas_limit() {
+fn a_project_can_set_its_own_atlas_budget() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    write(&agent.path().join("config.yml"), "atlas:\n  limit: 4\n");
+    write(&agent.path().join("config.yml"), "atlas:\n  budget: 600\n");
     write(
         &project.path().join(PROJECT_SUBPATH),
-        "atlas:\n  limit: 8\n",
+        "atlas:\n  budget: 900\n",
     );
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(atlas_limit_from(&settings), 8);
+    assert_eq!(atlas_budget_from(&settings), Some(900));
 }
 
 #[test]
-fn atlas_limit_missing_keeps_default() {
+fn atlas_budget_missing_is_sized_from_the_repository() {
     let agent = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-    assert_eq!(atlas_limit_from(&settings), 24);
+    assert_eq!(atlas_budget_from(&settings), None);
+}
+
+/// The old key is gone, not aliased: a config that still says `atlas.limit`
+/// gets the automatic budget.
+#[test]
+fn the_old_limit_key_is_not_read() {
+    let agent = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write(&agent.path().join("config.yml"), "atlas:\n  limit: 4\n");
+    let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+    assert_eq!(atlas_budget_from(&settings), None);
 }
 
 #[test]
-fn atlas_limit_out_of_range_or_not_integer_keeps_default() {
+fn atlas_budget_out_of_range_or_not_integer_is_automatic() {
     for raw in [
-        "atlas:\n  limit: 0\n",
-        "atlas:\n  limit: 65\n",
-        "atlas:\n  limit: no\n",
+        "atlas:\n  budget: 0\n",
+        "atlas:\n  budget: 199\n",
+        "atlas:\n  budget: 4001\n",
+        "atlas:\n  budget: no\n",
     ] {
         let agent = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         write(&agent.path().join("config.yml"), raw);
         let settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
-        assert_eq!(atlas_limit_from(&settings), 24, "for {raw:?}");
+        assert_eq!(atlas_budget_from(&settings), None, "for {raw:?}");
     }
 }
 

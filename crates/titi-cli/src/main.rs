@@ -41,15 +41,18 @@ session.autoResume in the agent config.yml or the project .titi/config.yml
 means off. Either way the session continued is the newest one the agent
 directory holds.
 
-  titi atlas [on|off|limit <n>|check|dump|lens|lsp]
-                              manage the prompt map build: on, off, or a file cap
-                              (default: on, cap is 24; setting wins over default,
-                              TITI_NO_ATLAS=1 forces off for one run)
+  titi atlas [on|off|budget <tokens>|check|dump|lens|lsp]
+                              manage the prompt map build: on, off, or a token
+                              budget (default: on, budget sized from the repo;
+                              setting wins over default, TITI_NO_ATLAS=1 forces
+                              off for one run)
 
-atlas.limit in the agent config.yml or the project .titi/config.yml
-(project wins) caps the map: an integer from 1 to 64; unset keeps 24,
-out of range or not an integer keeps 24. TITI_NO_ATLAS=1 omits the
-map for one run without touching the limit.
+atlas.budget in the agent config.yml or the project .titi/config.yml
+(project wins) sets how many tokens the repo map and the per-prompt lens
+may add to a turn: an integer from 200 to 4000; unset sizes it from the
+repository, out of range or not an integer does too. It replaces
+atlas.limit, which nothing reads any more. TITI_NO_ATLAS=1 omits the
+map for one run without touching the budget.
 
 atlas.enabled in the agent config.yml or project .titi/config.yml
 (project wins) turns the prompt map on or off; unset means on,

@@ -744,19 +744,22 @@ pub fn privacy_policy(settings: &titi_config::settings::Settings) -> (SensitiveP
     (SensitivePolicy::new(extra, allow), mask_ips)
 }
 
-/// Atlas prompt-map cap from settings; `atlas.limit` as a plain integer.
+/// The atlas token budget from settings: `atlas.budget` as a plain integer.
 ///
 /// Read through the effective view, so a project's `.titi/config.yml` may set
-/// it: unlike privacy and approval, the cap is not a latch a cloned repo must
-/// not loosen. Anything but an integer in 1..=64 — missing key, failed load,
-/// wrong type, out of range — keeps the engine default: a bad cap must not
-/// stop startup.
-pub fn atlas_limit_from(settings: &titi_config::settings::Settings) -> usize {
+/// it: unlike privacy and approval, the budget is not a latch a cloned repo
+/// must not loosen. `None` — the engine sizes it from the repository — for a
+/// missing key, a failed load, the wrong type or a value outside
+/// [`MIN_ATLAS_BUDGET`](titi_config::settings::MIN_ATLAS_BUDGET)..=
+/// [`MAX_ATLAS_BUDGET`](titi_config::settings::MAX_ATLAS_BUDGET): a bad budget
+/// must not stop startup.
+pub fn atlas_budget_from(settings: &titi_config::settings::Settings) -> Option<usize> {
+    use titi_config::settings::{ATLAS_BUDGET_KEY, MAX_ATLAS_BUDGET, MIN_ATLAS_BUDGET};
     settings
-        .get(titi_config::settings::ATLAS_LIMIT_KEY)
+        .get(ATLAS_BUDGET_KEY)
         .and_then(|value| value.as_i64())
-        .filter(|limit| (1..=64).contains(limit))
-        .map_or(24, |limit| limit as usize)
+        .filter(|budget| (MIN_ATLAS_BUDGET..=MAX_ATLAS_BUDGET).contains(budget))
+        .map(|budget| budget as usize)
 }
 
 /// `agent.maxToolRounds` and `agent.subagentMaxToolRounds` onto the config.
@@ -881,9 +884,12 @@ pub fn atlas_note(
     } else {
         ("on", "default")
     };
-    let limit = settings.as_ref().map(atlas_limit_from).unwrap_or(24);
+    let budget = settings
+        .as_ref()
+        .and_then(atlas_budget_from)
+        .map_or_else(|| "auto".to_owned(), |tokens| format!("{tokens} tokens"));
     format!(
-        "atlas: {state}\nreason: {reason}\nlimit: {limit}\nconfig: {}",
+        "atlas: {state}\nreason: {reason}\nbudget: {budget}\nconfig: {}",
         agent_dir.join("config.yml").display()
     )
 }
@@ -1061,7 +1067,7 @@ pub fn start_engine_with(
         titi_config::settings::switch_on(settings, titi_config::settings::TRACE_THINKING_KEY)
     });
     if let Some(settings) = &settings {
-        engine_config.atlas_limit = atlas_limit_from(settings);
+        engine_config.atlas_budget = atlas_budget_from(settings);
         // The setting names how long a `bash` call may hold the turn before
         // it is handed to the background. A value that is zero or absurd is
         // refused here, by name, instead of starting with a bound nobody

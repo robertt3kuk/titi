@@ -6,6 +6,8 @@ All notable user-facing changes to titi, newest first.
 
 ### Changed (breaking)
 
+- `atlas.limit` (a number of files) is replaced by `atlas.budget`, a number of **tokens**: what the code map and the per-prompt lens may add to a turn together, 200 to 4000, split 60/40 between them; unset sizes it from the repository (800 below 200 files, 1000 below 2000, 1300 beyond). `titi atlas limit <n>` and `/atlas limit <n>` are now `titi atlas budget <tokens>` and `/atlas budget <tokens>`, and the status prints `budget: auto` or `budget: 800 tokens`. There is no fallback: a config that still says `atlas: {limit: …}` is ignored and gets the automatic budget, so rename the key if you want a fixed one. The map is no longer cut at a file count: it lists as many files as its share of the budget holds, then spends the rest on the symbols under them.
+
 - The genome is now the atlas. The crate is `titi-atlas`, the command is `titi atlas [on|off|limit <n>|check|capabilities|lsp]`, the chat command is `/atlas`, the settings are `atlas.enabled` and `atlas.limit`, the switch is `TITI_NO_ATLAS=1`, the prompt block is `<atlas>` (`<atlas pending="N">`), and the LSP reports `titi-atlas` (`serverInfo`, diagnostic `source`) and `experimental.titiAtlas`. Nothing reads the old names any more: rename a `genome:` block in your `config.yml` to `atlas:`, `TITI_NO_GENOME` to `TITI_NO_ATLAS`, and `titi genome …` to `titi atlas …` in scripts and editor configs. The first turn after upgrading is a prompt-cache miss because the block's tag changed.
 
 ### Added

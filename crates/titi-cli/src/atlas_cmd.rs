@@ -1,10 +1,10 @@
-//! `titi atlas` — turn the prompt map on and off, cap it, and report status,
+//! `titi atlas` — turn the prompt map on and off, size it, and report status,
 //! before the engine starts and without a model key.
 //!
 //! The same facts the chat's `/atlas` note states print here as plain lines,
 //! so a user who cannot reach the chat still sees why the map is on or off.
-//! `atlas.limit` is a separate key and this never touches it: enabling and
-//! capping are one verb each, not one decision.
+//! `atlas.budget` is a separate key and this never touches it: enabling and
+//! sizing are one verb each, not one decision.
 //!
 //! Two reports go past the switches. `check` is a vetter: the findings in the
 //! workspace, one line each, exit 1 on a Warning or Error. `capabilities` is
@@ -14,9 +14,11 @@
 
 use std::path::Path;
 
-use titi_config::settings::{ATLAS_ENABLED_KEY, ATLAS_LIMIT_KEY, Settings};
+use titi_config::settings::{
+    ATLAS_BUDGET_KEY, ATLAS_ENABLED_KEY, MAX_ATLAS_BUDGET, MIN_ATLAS_BUDGET, Settings,
+};
 
-/// The exit every refusal uses: unknown subcommand and an out-of-range limit.
+/// The exit every refusal uses: unknown subcommand and an out-of-range budget.
 /// A failed `check`/`lsp` exits 1 instead: the command was understood, the
 /// workspace was not.
 const USAGE_EXIT: i32 = 2;
@@ -36,21 +38,23 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         None => status(&settings, agent_dir),
         Some("on") => write_enabled(agent_dir, workspace, true),
         Some("off") => write_enabled(agent_dir, workspace, false),
-        Some("limit") => match args.get(1).map(|raw| raw.parse::<i64>()) {
-            Some(Ok(n)) if (1..=64).contains(&n) => {
+        Some("budget") => match args.get(1).map(|raw| raw.parse::<i64>()) {
+            Some(Ok(n)) if (MIN_ATLAS_BUDGET..=MAX_ATLAS_BUDGET).contains(&n) => {
                 save_setting(
                     agent_dir,
                     workspace,
-                    ATLAS_LIMIT_KEY,
+                    ATLAS_BUDGET_KEY,
                     serde_json::json!(n),
-                    &format!("atlas limit: {n}"),
+                    &format!("atlas budget: {n} tokens"),
                 );
             }
             // Out of range or not an integer: refused, and nothing written,
-            // so a typo cannot seed `atlas.limit` with a value every later
+            // so a typo cannot seed `atlas.budget` with a value every later
             // run has to ignore.
             _ => {
-                eprintln!("atlas limit: expected an integer from 1 to 64");
+                eprintln!(
+                    "atlas budget: expected an integer from {MIN_ATLAS_BUDGET} to {MAX_ATLAS_BUDGET} (tokens)"
+                );
                 std::process::exit(USAGE_EXIT);
             }
         },
@@ -78,7 +82,9 @@ fn dispatch(agent_dir: &Path, workspace: &Path, args: Vec<String>) {
         }
         Some(name) => {
             eprintln!("atlas: unknown command {name}");
-            eprintln!("usage: titi atlas [on|off|limit <n>|check|dump|lens|capabilities|lsp]");
+            eprintln!(
+                "usage: titi atlas [on|off|budget <tokens>|check|dump|lens|capabilities|lsp]"
+            );
             std::process::exit(USAGE_EXIT);
         }
     }
@@ -442,9 +448,17 @@ fn dump_cmd(workspace: &Path, args: &[String]) {
             }))
         })
         .collect();
+    // The map the prompt actually carries: the default token budget's share.
+    let budget = titi_atlas::default_budget(atlas.files.len());
+    let skeleton = atlas.skeleton(titi_atlas::split_budget(budget).0, 0);
     let out = serde_json::json!({
         "files": files,
         "map": { "limit": limit, "text": atlas.project(limit) },
+        "skeleton": {
+            "budget": budget,
+            "text": skeleton,
+            "tokens": titi_atlas::estimate_tokens(&skeleton),
+        },
     });
     println!("{out}");
 }

@@ -234,3 +234,34 @@ fn a_new_export_is_found_after_an_update() {
     let lens = lens_for(&atlas, "frobnicate_widgets", &[], &[]);
     assert_eq!(lens.entries[0].path, "src/store.rs");
 }
+
+/// A lens line says what kind of file it lists, so a test or an example is
+/// not read as the code it exercises.
+#[test]
+fn a_lens_line_carries_the_role_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/engine.rs", "pub struct Engine;\n");
+    write(
+        root,
+        "tests/engine_test.rs",
+        "use crate::engine::Engine;\nfn t() { let _ = Engine; }\n",
+    );
+    write(
+        root,
+        "src/main.rs",
+        "mod engine;\nfn main() { let _ = engine::Engine; }\n",
+    );
+    let atlas = Atlas::index(root).unwrap();
+    let lens = lens_for(&atlas, "the Engine struct", &[], &[]);
+    let block = lens.render(0);
+    let line = |path: &str| {
+        block
+            .lines()
+            .find(|l| l.starts_with(path))
+            .unwrap_or_else(|| panic!("{block}"))
+    };
+    assert!(line("tests/engine_test.rs").contains("[test]"), "{block}");
+    assert!(line("src/main.rs").contains("[entry]"), "{block}");
+    assert!(!line("src/engine.rs").contains('['), "{block}");
+}

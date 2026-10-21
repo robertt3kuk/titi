@@ -105,7 +105,7 @@ titi --mode plan
 | `/council` | Puts a question to a council of independent briefs on models and efforts of their own; one fold names who dissents |
 | `/graph` | Runs the orchestrator graph: the council decides, the goal loop works |
 | `/git` | Shows git status or diff, read-only |
-| `/atlas` | Manages the prompt map: `/atlas on`, `/atlas off`, `/atlas limit <n>` |
+| `/atlas` | Manages the prompt map: `/atlas on`, `/atlas off`, `/atlas budget <tokens>` |
 | `/diagnose` | Prints a diagnostics block to paste into a bug report |
 | `←` `→` / `alt+←` `alt+→` / `home` `end` | Move the caret: a character, a word, the ends of the draft. `ctrl+a` / `ctrl+e` are the ends too |
 | `delete` / `ctrl+u` | Delete what is after the caret, and everything before it |
@@ -151,7 +151,7 @@ A subagent definition is a `*.md` with YAML frontmatter under `.titi/agents`, `.
 
 The screen is a ratatui chat: model and session on top — plus a `plan` or `duck` badge when the engine confirms that mode — the transcript in the middle, one input line at the bottom. `/mouse` turns mouse reporting over (`off`, `wheel`, `buttons`, `all`; a drag selects, releasing inside the transcript copies), and its choice is remembered for the next run.
 
-The same settings style as `atlas.enabled` and `atlas.limit` covers the screen's own switches: `statusLine.preset` (`default|minimal|compact|full|ascii`, `default` when unset) chooses which row of the preset table the top line paints, and `statusLine.contextLine` (`off|percentage|embedded`, **default off** — the default frame stays byte-identical until a turn reports a context window for the gauge to fill) lets the gap between the status line's groups double as a context gauge. `notify.completion`, `notify.error` and `notify.ask` (each unset = on) raise a desktop notification when a turn finishes, fails or stops on an approval — OSC 777 where the terminal speaks it, a bell fallback where it does not; `terminal.progress` (unset = on) raises the terminal's own OSC 9;4 progress bar for a running turn; `composer.tokenRate` (unset = on) shows the generation rate on the working row, an estimate marked `~`, not a provider count.
+The same settings style as `atlas.enabled` and `atlas.budget` covers the screen's own switches: `statusLine.preset` (`default|minimal|compact|full|ascii`, `default` when unset) chooses which row of the preset table the top line paints, and `statusLine.contextLine` (`off|percentage|embedded`, **default off** — the default frame stays byte-identical until a turn reports a context window for the gauge to fill) lets the gap between the status line's groups double as a context gauge. `notify.completion`, `notify.error` and `notify.ask` (each unset = on) raise a desktop notification when a turn finishes, fails or stops on an approval — OSC 777 where the terminal speaks it, a bell fallback where it does not; `terminal.progress` (unset = on) raises the terminal's own OSC 9;4 progress bar for a running turn; `composer.tokenRate` (unset = on) shows the generation rate on the working row, an estimate marked `~`, not a provider count.
 
 In Kitty or Ghostty, a local photo named in the transcript is drawn in place: png, jpeg, gif, bmp, or ico, including a markdown image. The pixels are sent once. Other terminals leave the path as text. `TITI_NO_KITTY_PLACEHOLDERS=1` turns the pictures off.
 
@@ -227,7 +227,7 @@ Print the repository map on its own:
 cargo run -p titi-atlas --example map -- . 40
 ```
 
-`TITI_NO_ATLAS=1` leaves the map out of the prompt. `atlas.enabled` in the agent or project config turns the map on or off, `atlas.limit` (1 to 64, default 24) caps the files it projects; the project file wins, and `TITI_NO_ATLAS=1` forces one run off without touching either. A turn also carries a `<diff>` block: the working tree's changes next to the atlas map, so the model sees its own edits since the turn began. Atlas indexes thirteen languages, and every one of them is read from a syntax tree: a tree-sitter grammar sits on each row (`crates/titi-atlas/src/lang/mod.rs`), so the symbols in Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, C#, Ruby, Kotlin, Swift and PHP come from the parse, not from patterns. `titi atlas capabilities` prints the roster — level, extensions, and one honest note per language — and the LSP handshake carries the same table.
+`TITI_NO_ATLAS=1` leaves the map out of the prompt. `atlas.enabled` in the agent or project config turns the map on or off, `atlas.budget` (200 to 4000 tokens, sized from the repository when unset) caps what the map and the per-prompt lens may add to a turn, and replaces the old `atlas.limit`; the project file wins, and `TITI_NO_ATLAS=1` forces one run off without touching either. A turn also carries a `<diff>` block: the working tree's changes next to the atlas map, so the model sees its own edits since the turn began. Atlas indexes thirteen languages, and every one of them is read from a syntax tree: a tree-sitter grammar sits on each row (`crates/titi-atlas/src/lang/mod.rs`), so the symbols in Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, C#, Ruby, Kotlin, Swift and PHP come from the parse, not from patterns. `titi atlas capabilities` prints the roster — level, extensions, and one honest note per language — and the LSP handshake carries the same table.
 
 ### What is already here
 
@@ -368,7 +368,7 @@ titi --mode plan
 | `/council` | Отдаёт вопрос совету независимых брифов, каждый на своей модели и со своим усилием; свёртка называет несогласных |
 | `/graph` | Гоняет оркестратор-граф: совет решает, цикл цели работает |
 | `/git` | Показывает git status или diff, только чтение |
-| `/atlas` | Управляет картой промпта: `/atlas on`, `/atlas off`, `/atlas limit <n>` |
+| `/atlas` | Управляет картой промпта: `/atlas on`, `/atlas off`, `/atlas budget <tokens>` |
 | `/diagnose` | Печатает блок диагностики, чтобы вставить в баг-репорт |
 | `/btw` | Сообщение, которое не пишется в историю; во время хода это steering, а не новый ход |
 | `/pause` | Держит ввод и останавливает ход. Ещё раз `/pause` продолжает |
@@ -473,7 +473,7 @@ TUI / headless
 cargo run -p titi-atlas --example map -- . 40
 ```
 
-`TITI_NO_ATLAS=1` убирает карту из промпта. `atlas.enabled` в агентском или проектном конфиге включает и выключает карту, `atlas.limit` (от 1 до 64, по умолчанию 24) ограничивает число файлов в проекции; проектный файл решает, а `TITI_NO_ATLAS=1` выключает на один прогон, не трогая ни то, ни другое. Каждый ход несёт и блок `<diff>`: изменения рабочего дерева рядом с картой репозитория, чтобы модель видела собственные правки. Atlas индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
+`TITI_NO_ATLAS=1` убирает карту из промпта. `atlas.enabled` в агентском или проектном конфиге включает и выключает карту, `atlas.budget` (от 200 до 4000 токенов, по умолчанию подбирается по размеру репозитория) ограничивает, сколько токенов карта и линза запроса добавляют к ходу, и заменяет прежний `atlas.limit`; проектный файл решает, а `TITI_NO_ATLAS=1` выключает на один прогон, не трогая ни то, ни другое. Каждый ход несёт и блок `<diff>`: изменения рабочего дерева рядом с картой репозитория, чтобы модель видела собственные правки. Atlas индексирует двенадцать языков. Rust, TypeScript, TSX, JavaScript и Python разбираются грамматиками tree-sitter, поэтому символы берутся из синтаксического дерева; Go, Java, C, C++, C#, Ruby, Kotlin, Swift и PHP остаются на шаблонных парсерах — как и разрешение импортов везде: путь импорта это спецификатор модуля, а не объявление, и для него нужен список файлов репозитория, а не дерево.
 
 ### Что уже есть
 

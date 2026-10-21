@@ -108,6 +108,47 @@ pub(crate) fn classify(path: &str) -> Role {
     }
 }
 
+/// The one-word label of a path's job, for a map line: `entry`, `test`,
+/// `example`, `docs`, `bench`, `fixture`, `vendor` or `gen`. `None` for
+/// ordinary source, which a map does not annotate.
+pub(crate) fn tag(path: &str) -> Option<&'static str> {
+    let (dirs, name) = match path.rsplit_once('/') {
+        Some((dirs, name)) => (dirs, name),
+        None => ("", path),
+    };
+    match classify(path) {
+        Role::Source => None,
+        Role::Entry => Some("entry"),
+        Role::Auxiliary => {
+            for segment in dirs.split('/') {
+                let lower = segment.to_ascii_lowercase();
+                let label = match lower.as_str() {
+                    "example" | "examples" | "sample" | "samples" | "demo" | "demos" => "example",
+                    "doc" | "docs" | "documentation" => "docs",
+                    "bench" | "benches" | "benchmark" | "benchmarks" => "bench",
+                    "fixtures" | "fixture" | "__fixtures__" | "__mocks__" | "__snapshots__"
+                    | "snapshots" | "testdata" | "test_data" | "evals" => "fixture",
+                    "third_party" | "thirdparty" => "vendor",
+                    "generated" | "__generated__" => "gen",
+                    _ => continue,
+                };
+                return Some(label);
+            }
+            let lower = name.to_ascii_lowercase();
+            if GENERATED_SUFFIXES.iter().any(|suffix| {
+                lower
+                    .rsplit_once('.')
+                    .map_or(&*lower, |(stem, _)| stem)
+                    .ends_with(suffix)
+            }) {
+                Some("gen")
+            } else {
+                Some("test")
+            }
+        }
+    }
+}
+
 fn is_auxiliary_dir(segment: &str) -> bool {
     if segment.is_empty() {
         return false;
@@ -169,7 +210,7 @@ fn is_entry(dirs: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Role, classify};
+    use super::{Role, classify, tag};
 
     #[test]
     fn tests_examples_docs_and_generated_code_are_auxiliary() {
@@ -213,6 +254,25 @@ mod tests {
             "gen_utils.py",
         ] {
             assert_eq!(classify(path), Role::Source, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_tag_names_the_job() {
+        for (path, want) in [
+            ("src/main.rs", Some("entry")),
+            ("tests/a.rs", Some("test")),
+            ("pkg/user_test.go", Some("test")),
+            ("examples/x/main.rs", Some("example")),
+            ("docs/conf.py", Some("docs")),
+            ("benches/b.rs", Some("bench")),
+            ("tests/fixtures/data.ts", Some("fixture")),
+            ("third_party/zlib/zlib.c", Some("vendor")),
+            ("src/api.generated.ts", Some("gen")),
+            ("proto/user_pb2.py", Some("gen")),
+            ("src/lib/format.ts", None),
+        ] {
+            assert_eq!(tag(path), want, "{path}");
         }
     }
 

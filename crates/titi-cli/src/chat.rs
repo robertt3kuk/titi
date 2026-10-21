@@ -2657,18 +2657,28 @@ impl Chat {
                     Err(why) => self.push(LineKind::Error, format!("atlas: not saved ({why})")),
                 };
             }
-            "limit" => match rest.parse::<i64>() {
+            "budget" => match rest.parse::<i64>() {
                 // Out of range or not an integer is refused before anything
-                // is written, so a typo cannot seed `atlas.limit` with a
+                // is written, so a typo cannot seed `atlas.budget` with a
                 // value every later run has to ignore.
-                Ok(n) if (1..=64).contains(&n) => match atlas_set_limit(settings, n) {
-                    Ok(()) => self.push(LineKind::Note, format!("atlas limit: {n}")),
-                    Err(why) => self.push(LineKind::Error, format!("atlas: not saved ({why})")),
-                },
+                Ok(n)
+                    if (titi_config::settings::MIN_ATLAS_BUDGET
+                        ..=titi_config::settings::MAX_ATLAS_BUDGET)
+                        .contains(&n) =>
+                {
+                    match atlas_set_budget(settings, n) {
+                        Ok(()) => self.push(LineKind::Note, format!("atlas budget: {n} tokens")),
+                        Err(why) => self.push(LineKind::Error, format!("atlas: not saved ({why})")),
+                    }
+                }
                 _ => {
                     self.push(
                         LineKind::Error,
-                        "atlas limit: expected an integer from 1 to 64".to_owned(),
+                        format!(
+                            "atlas budget: expected an integer from {} to {} (tokens)",
+                            titi_config::settings::MIN_ATLAS_BUDGET,
+                            titi_config::settings::MAX_ATLAS_BUDGET
+                        ),
                     );
                 }
             },
@@ -2680,7 +2690,7 @@ impl Chat {
                 self.push(LineKind::Error, format!("atlas: unknown command {name}"));
                 self.push(
                     LineKind::Error,
-                    "usage: titi atlas [on|off|limit <n>|check|lsp]".to_owned(),
+                    "usage: titi atlas [on|off|budget <tokens>|check|lsp]".to_owned(),
                 );
             }
         }
@@ -5232,16 +5242,16 @@ fn atlas_set_enabled(
     Ok(enabled)
 }
 
-/// Writes `atlas.limit` after the range check, on the same canonical file.
-fn atlas_set_limit(
+/// Writes `atlas.budget` after the range check, on the same canonical file.
+fn atlas_set_budget(
     settings: Option<titi_config::settings::Settings>,
-    limit: i64,
+    budget: i64,
 ) -> Result<(), String> {
     let mut settings = settings.ok_or_else(|| "config could not be loaded".to_owned())?;
     settings
         .set(
-            titi_config::settings::ATLAS_LIMIT_KEY,
-            serde_json::json!(limit),
+            titi_config::settings::ATLAS_BUDGET_KEY,
+            serde_json::json!(budget),
         )
         .map_err(|why| why.to_string())
 }

@@ -76,12 +76,22 @@ pub const THEME_DARK_KEY: &str = "theme.dark";
 /// The theme the user chose for a light terminal. See [`THEME_DARK_KEY`].
 pub const THEME_LIGHT_KEY: &str = "theme.light";
 
-/// How many files the atlas prompt map keeps.
+/// How many tokens the atlas may add to one turn: the prompt map and the
+/// per-prompt lens together, which the allocator splits between them.
 ///
-/// Unset means the engine default (`EngineConfig::new` picks it, currently 24).
-/// This crate does not own that number — the constant is a key name, not a
-/// second source of the default, so it deliberately carries no value.
-pub const ATLAS_LIMIT_KEY: &str = "atlas.limit";
+/// Unset means the engine sizes it from the repository (`atlas::default_budget`).
+/// This crate owns the name and the bounds, not the number, so a default cannot
+/// live in two places. A value must be an integer from [`MIN_ATLAS_BUDGET`] to
+/// [`MAX_ATLAS_BUDGET`]; anything else keeps the automatic budget. It replaces
+/// `atlas.limit`, a file count, which nothing reads any more.
+pub const ATLAS_BUDGET_KEY: &str = "atlas.budget";
+
+/// Smallest `atlas.budget`: below it the map is a few lines and the lens none.
+pub const MIN_ATLAS_BUDGET: i64 = 200;
+
+/// Largest `atlas.budget`: past it the block is a context-window problem, not
+/// an orientation aid.
+pub const MAX_ATLAS_BUDGET: i64 = 4000;
 
 /// Whether the prompt map is built.
 ///
@@ -337,7 +347,7 @@ pub const SESSION_AUTO_RESUME_KEY: &str = "session.autoResume";
 /// background, in milliseconds: `bash.autoBackground.thresholdMs`.
 ///
 /// Unset means the engine default; this crate owns the name only, as with
-/// [`ATLAS_LIMIT_KEY`], so it carries no number. A value must be an integer
+/// [`ATLAS_BUDGET_KEY`], so it carries no number. A value must be an integer
 /// from 1 to [`MAX_AUTO_BACKGROUND_MS`]; 0 or anything larger is refused by
 /// [`Settings::auto_background_threshold`] rather than silently guessed.
 /// `TITI_BASH_BACKGROUND_MS` overrides this key when set.

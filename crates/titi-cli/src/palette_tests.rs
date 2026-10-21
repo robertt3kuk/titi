@@ -489,12 +489,12 @@ fn a_free_setting_is_only_reported() {
     let dir = tempfile::tempdir().expect("temp");
     let mut chat = chat_in(dir.path());
     press(&mut chat, Key::CtrlK);
-    type_text(&mut chat, "atlas.limit");
+    type_text(&mut chat, "atlas.budget");
     press(&mut chat, Key::Enter);
     assert!(
         notes(&chat)
             .iter()
-            .any(|line| line.starts_with("atlas.limit: not set")),
+            .any(|line| line.starts_with("atlas.budget: not set")),
         "{:?}",
         notes(&chat)
     );

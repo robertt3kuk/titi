@@ -677,7 +677,7 @@ async fn no_atlas_means_prompt_only() {
 }
 
 #[tokio::test]
-async fn touched_file_leads_the_next_projection() {
+async fn a_touched_file_is_in_the_next_turns_lens_and_the_map_is_not_resent() {
     use titi_tools::{ApprovalMode, EchoTool, ToolRegistry, workspace_tools};
 
     let workspace = workspace_with_hub_and_leaf();
@@ -724,10 +724,11 @@ async fn touched_file_leads_the_next_projection() {
         tools,
     );
 
-    // Turn 1 reads src/leaf.rs; turn 2 should lead with it.
+    // Turn 1 reads src/leaf.rs; turn 2 carries it in the lens. The map is the
+    // repository's structure: turn 1 sent it, and it has not changed.
     engine
         .send(EngineCommand::SubmitPrompt {
-            text: "read leaf".into(),
+            text: "open the one we discussed".into(),
         })
         .await
         .unwrap();
@@ -750,10 +751,18 @@ async fn touched_file_leads_the_next_projection() {
                 .is_some_and(|message| message.content.ends_with("again"))
         })
         .expect("second turn reached the provider");
-    let map = &second.messages.last().expect("a prompt").content;
-    let leaf_at = map.find("src/leaf.rs").unwrap();
-    let hub_at = map.find("src/hub.rs").unwrap();
-    assert!(leaf_at < hub_at, "touched file must lead the map:\n{map}");
+    let prompt = &second.messages.last().expect("a prompt").content;
+    let lens_at = prompt.find("<atlas-lens>").expect("a lens");
+    let lens = &prompt[lens_at..];
+    let leaf = lens
+        .lines()
+        .find(|line| line.starts_with("src/leaf.rs"))
+        .unwrap_or_else(|| panic!("the touched file is in the lens:\n{prompt}"));
+    assert!(leaf.contains("touched this session"), "{leaf}");
+    assert!(
+        !prompt.contains("<atlas>\n"),
+        "an unchanged map is not sent again:\n{prompt}"
+    );
 }
 
 #[tokio::test]

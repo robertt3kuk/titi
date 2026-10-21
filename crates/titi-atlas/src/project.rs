@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use crate::Atlas;
-use crate::role::{Role, classify};
+use crate::estimate_tokens;
+use crate::role::{Role, classify, tag};
 
 /// Symbol lines shown under one file in the prompt map. File ranking is
 /// untouched. An export nobody uses is omitted: a zero is not a blast radius.
@@ -116,5 +117,123 @@ pub fn render(atlas: &Atlas, limit: usize, touched: &HashSet<String>, pending: u
         }
     }
     out.push_str("</atlas>");
+    out
+}
+
+/// Files a skeleton lists at most, whatever the budget.
+const SKELETON_MAX_FILES: usize = 48;
+/// The share of a skeleton's budget the file lines may take before the symbols
+/// under them get their turn: breadth first, so a generous budget lists more
+/// of the repository rather than more of its top few files.
+const FILE_SHARE: f64 = 0.55;
+
+/// One file's line: path, dependents, what the path is for, recency.
+fn file_line(atlas: &Atlas, path: &str) -> String {
+    let dependents = atlas.dependents.get(path).copied().unwrap_or(0);
+    let mut line = format!("{path} (→{dependents})");
+    if let Some(label) = tag(path) {
+        line.push_str(" [");
+        line.push_str(label);
+        line.push(']');
+    }
+    if let Some(file) = atlas.files.get(path)
+        && atlas.is_recent(path, file.mtime)
+    {
+        line.push_str(" [RECENT]");
+    }
+    line.push('\n');
+    line
+}
+
+/// A symbol's line: `  +Name (users)`, then its signature when the language
+/// module extracted one, two spaces after so the prefix still parses.
+fn export_line(
+    atlas: &Atlas,
+    path: &str,
+    name: &str,
+    users: usize,
+    with_signature: bool,
+) -> String {
+    let mut line = format!("  +{name} ({users})");
+    if with_signature
+        && let Some(signature) = atlas
+            .files
+            .get(path)
+            .and_then(|file| {
+                file.symbols
+                    .iter()
+                    .find(|symbol| symbol.exported && symbol.name == name)
+            })
+            .and_then(|symbol| symbol.signature.as_deref())
+    {
+        line.push_str("  ");
+        // A signature is repository text inside a prompt block: it must not
+        // be able to close it.
+        line.push_str(&signature.replace("</", "< /"));
+    }
+    line.push('\n');
+    line
+}
+
+/// The prompt map under a token budget.
+///
+/// The map is the repository's structure, the same for every question, so it
+/// does not move with the session: no touched boost, nothing but the graph and
+/// the roles. That is what lets the engine send it once and leave it alone
+/// while the lens carries the task. File lines come first, in rank order, until
+/// they have used about half the budget; the rest goes to the symbols under
+/// them, highest-ranked file first, each with its one-line signature where the
+/// language module has one. The result never exceeds `budget` estimated tokens
+/// (one file at least, whatever the budget), and says what is behind in its
+/// header the way [`render`] does.
+pub fn skeleton(atlas: &Atlas, budget: usize, pending: usize) -> String {
+    let ranked = ranking(atlas, &HashSet::new());
+    let open = if pending == 0 {
+        String::from("<atlas>\n")
+    } else {
+        format!("<atlas pending=\"{pending}\">\n")
+    };
+    let close = "</atlas>";
+    let mut spent = estimate_tokens(&open) + estimate_tokens(close);
+    let file_budget = (budget as f64 * FILE_SHARE) as usize;
+
+    let mut chosen: Vec<(&str, String)> = Vec::new();
+    let mut headers = 0;
+    for entry in ranked.iter().take(SKELETON_MAX_FILES) {
+        let line = file_line(atlas, entry.path);
+        let cost = estimate_tokens(&line);
+        if !chosen.is_empty() && (spent + headers + cost > budget || headers + cost > file_budget) {
+            break;
+        }
+        headers += cost;
+        chosen.push((entry.path, line));
+    }
+    spent += headers;
+
+    let mut out = open;
+    for (path, line) in &chosen {
+        out.push_str(line);
+        for (name, users) in atlas
+            .used_by
+            .get(*path)
+            .into_iter()
+            .flatten()
+            .take(PROMPT_EXPORTS)
+        {
+            let with = export_line(atlas, path, name, *users, true);
+            let without = export_line(atlas, path, name, *users, false);
+            let pick = [with, without]
+                .into_iter()
+                .find(|candidate| spent + estimate_tokens(candidate) <= budget);
+            match pick {
+                Some(candidate) => {
+                    spent += estimate_tokens(&candidate);
+                    out.push_str(&candidate);
+                }
+                None => break,
+            }
+        }
+    }
+    out.push_str(close);
     out
 }
