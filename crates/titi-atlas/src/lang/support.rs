@@ -10,7 +10,11 @@ use std::collections::HashSet;
 use crate::refs;
 use crate::{Candidate, UnresolvedImport};
 
+use tree_sitter::Node;
+
 use super::ParsedFile;
+use crate::symbol::{SymbolKind, SymbolSite, one_line_signature};
+use crate::symbols::text;
 
 /// The first candidate `files` can satisfy, in the order it was emitted.
 ///
@@ -357,4 +361,189 @@ fn blank_block(out: &mut [u8], bytes: &[u8], start: usize) -> usize {
         }
     }
     end
+}
+
+// ---- spans and signatures ----------------------------------------------------
+
+/// Children that precede a declaration's own text: comments, attributes,
+/// decorators, annotations. A signature starts after them.
+const LEADING: &[&str] = &[
+    "comment",
+    "line_comment",
+    "block_comment",
+    "multiline_comment",
+    "attribute_item",
+    "inner_attribute_item",
+    "attribute_list",
+    "attribute",
+    "decorator",
+    "annotation",
+    "marker_annotation",
+    "single_line_comment",
+];
+
+/// Nodes whose children are modifiers mixed with annotations (`@Override
+/// public`): the annotations are skipped, the keywords stay.
+const MODIFIER_LISTS: &[&str] = &["modifiers", "modifier_list"];
+
+/// Where the declaration's own text starts: past comments, attributes,
+/// decorators and annotations.
+fn signature_start(outer: Node) -> usize {
+    let mut cursor = outer.walk();
+    for child in outer.children(&mut cursor) {
+        let kind = child.kind();
+        if LEADING.contains(&kind) {
+            continue;
+        }
+        if MODIFIER_LISTS.contains(&kind) {
+            let mut inner = child.walk();
+            if let Some(first) = child
+                .children(&mut inner)
+                .find(|part| !LEADING.contains(&part.kind()))
+            {
+                return first.start_byte();
+            }
+            continue;
+        }
+        return child.start_byte();
+    }
+    outer.start_byte()
+}
+
+/// Where the declaration's signature ends: the start of its body, or of the
+/// initialiser of a const or alias (`=`). Only the declarator chain is
+/// searched for a `value`, so a parameter's default is never taken for one.
+fn signature_end(decl: Node) -> usize {
+    fn cut(node: Node, depth: usize) -> Option<usize> {
+        if let Some(body) = node.child_by_field_name("body") {
+            return Some(body.start_byte());
+        }
+        let value = node.child_by_field_name("value").or_else(|| {
+            (node.kind() == "assignment")
+                .then(|| node.child_by_field_name("right"))
+                .flatten()
+        });
+        if let Some(value) = value {
+            // The `=` sits between the declarator and the value.
+            let mut cursor = node.walk();
+            let eq = node
+                .children(&mut cursor)
+                .find(|child| child.kind() == "=" && child.end_byte() <= value.start_byte());
+            return Some(eq.map_or(value.start_byte(), |eq| eq.start_byte()));
+        }
+        // An alias keeps its name and generics, not what it stands for.
+        if matches!(
+            node.kind(),
+            "type_item" | "type_alias_declaration" | "type_alias" | "typealias_declaration"
+        ) {
+            let mut cursor = node.walk();
+            if let Some(eq) = node.children(&mut cursor).find(|child| child.kind() == "=") {
+                return Some(eq.start_byte());
+            }
+        }
+        if depth == 0 {
+            return None;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .filter(|child| {
+                let kind = child.kind();
+                kind.contains("declarator")
+                    || kind == "variable_declaration"
+                    || kind == "const_element"
+            })
+            .find_map(|child| cut(child, depth - 1))
+    }
+    cut(decl, 3).unwrap_or_else(|| decl.end_byte())
+}
+
+/// The signature of a declaration: its text from the first keyword or
+/// modifier to the start of its body or initialiser, on one line.
+///
+/// `outer` is the node that starts the declaration (it may carry `export` or
+/// sit inside a decorator wrapper), `decl` the node that has the body.
+pub(crate) fn signature_of(outer: Node, decl: Node, source: &[u8]) -> Option<String> {
+    let start = signature_start(outer);
+    let end = signature_end(decl).max(start);
+    let mut raw = std::str::from_utf8(source.get(start..end)?).ok()?;
+    // No body or initialiser field (a Go `type T struct { … }`): the first
+    // brace opens the body.
+    if end == decl.end_byte() {
+        if let Some(brace) = raw.find('{') {
+            raw = &raw[..brace];
+        }
+    }
+    let raw = raw
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ';' | '=' | ':' | ',' | '{'));
+    one_line_signature(raw)
+}
+
+/// Wrappers that carry what the declaration's own node does not: `export`,
+/// a decorator list, and a Go `type`/`const`/`var` keyword with one spec.
+fn outer_of(decl: Node) -> Node {
+    let Some(parent) = decl.parent() else {
+        return decl;
+    };
+    match parent.kind() {
+        "export_statement" | "decorated_definition" => parent,
+        "type_declaration" | "const_declaration" | "var_declaration"
+            if parent.named_child_count() == 1 =>
+        {
+            parent
+        }
+        _ => decl,
+    }
+}
+
+/// Builds the symbols of a file from the exports its walker found: for each
+/// export site the nearest enclosing node `classify` accepts is the
+/// declaration, and `classify(node, name)` names its kind. An export whose
+/// declaration is not found gets no entry; the index derives one for it.
+pub(crate) fn symbols_from_sites(
+    root: Node,
+    source: &[u8],
+    sites: &[crate::ExportSite],
+    classify: &dyn Fn(Node, Node) -> Option<SymbolKind>,
+) -> Vec<SymbolSite> {
+    let mut out = Vec::new();
+    for site in sites {
+        let row = usize::try_from(site.line.saturating_sub(1)).unwrap_or(0);
+        let column = usize::try_from(site.character).unwrap_or(0);
+        let point = tree_sitter::Point::new(row, column);
+        let Some(name) = root.descendant_for_point_range(point, point) else {
+            continue;
+        };
+        let mut ancestor = name.parent();
+        while let Some(node) = ancestor {
+            if let Some(kind) = classify(node, name) {
+                let outer = outer_of(node);
+                let line = |row: usize| u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1);
+                out.push(SymbolSite {
+                    name: site.name.clone(),
+                    kind,
+                    span: (
+                        line(outer.start_position().row),
+                        line(outer.end_position().row.max(node.end_position().row)),
+                    ),
+                    signature: signature_of(outer, node, source),
+                    exported: true,
+                });
+                break;
+            }
+            ancestor = node.parent();
+        }
+    }
+    out
+}
+
+/// Whether any ancestor of `node` has one of `kinds`.
+pub(crate) fn inside(node: Node, kinds: &[&str]) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if kinds.contains(&parent.kind()) {
+            return true;
+        }
+        ancestor = parent.parent();
+    }
+    false
 }

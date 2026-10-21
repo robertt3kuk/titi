@@ -19,10 +19,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{Placement, finish, record, resolve_suffix};
+use super::support::{Placement, finish, record, resolve_suffix, symbols_from_sites};
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, Grammar, push_site, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> ParsedFile {
     let Some(tree) = symbols::parse(Grammar::Go, source) else {
@@ -43,13 +43,32 @@ pub(super) fn parse(_path: &str, source: &str, files: &HashSet<String>) -> Parse
         &mut imports,
         &mut unresolved,
     );
-    finish(
+    let mut parsed = finish(
         source,
         sites,
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
-    )
+    );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &go_kind);
+    parsed
+}
+
+/// The kind of a Go declaration node, for the symbols list. A `type` spec is
+/// a struct or an interface by what it names, otherwise a plain type.
+fn go_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "function_declaration" => SymbolKind::Function,
+        "method_declaration" => SymbolKind::Method,
+        "type_spec" => match node.child_by_field_name("type").map(|ty| ty.kind()) {
+            Some("struct_type") => SymbolKind::Struct,
+            Some("interface_type") => SymbolKind::Interface,
+            _ => SymbolKind::Type,
+        },
+        "type_alias" => SymbolKind::Type,
+        "const_spec" | "var_spec" => SymbolKind::Const,
+        _ => return None,
+    })
 }
 
 /// Package-level declarations a caller can reach: a `func`, a method, and the
@@ -158,4 +177,74 @@ fn place(
         Placement::Optional(candidates)
     };
     record(spec, placement, files, imports, unresolved);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"package app
+
+// Limit docs.
+const Limit = 24
+
+// Server serves.
+type Server struct {
+	addr string
+}
+
+type Handler interface {
+	Serve(addr string) error
+}
+
+type ID = string
+
+func New(addr string, opts ...Option) (*Server, error) {
+	return nil, nil
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	return nil
+}
+"#;
+
+    #[test]
+    fn go_symbols_carry_kind_span_and_signature() {
+        let limit = symbol("app/a.go", SRC, "Limit");
+        assert_eq!((limit.kind, limit.span), (SymbolKind::Const, (4, 4)));
+        assert_eq!(limit.signature.as_deref(), Some("const Limit"));
+        let server = symbol("app/a.go", SRC, "Server");
+        assert_eq!((server.kind, server.span), (SymbolKind::Struct, (7, 9)));
+        assert_eq!(server.signature.as_deref(), Some("type Server struct"));
+        let handler = symbol("app/a.go", SRC, "Handler");
+        assert_eq!(
+            (handler.kind, handler.span),
+            (SymbolKind::Interface, (11, 13))
+        );
+        assert_eq!(symbol("app/a.go", SRC, "ID").kind, SymbolKind::Type);
+        let new = symbol("app/a.go", SRC, "New");
+        assert_eq!((new.kind, new.span), (SymbolKind::Function, (17, 19)));
+        assert_eq!(
+            new.signature.as_deref(),
+            Some("func New(addr string, opts ...Option) (*Server, error)")
+        );
+        let start = symbol("app/a.go", SRC, "Start");
+        assert_eq!((start.kind, start.span), (SymbolKind::Method, (21, 23)));
+        assert_eq!(
+            start.signature.as_deref(),
+            Some("func (s *Server) Start(ctx context.Context) error")
+        );
+    }
+
+    #[test]
+    fn a_long_go_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument{n} int")).collect();
+        let source = format!("package a\n\nfunc Long({}) {{}}\n", params.join(", "));
+        let signature = symbol("a.go", &source, "Long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
+    }
 }

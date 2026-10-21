@@ -19,12 +19,12 @@ use tree_sitter::Node;
 
 use super::ParsedFile;
 use super::support::{
-    Comments, Placement, finish, first_known, mask_comments, record, resolve_python_relative,
-    resolve_suffix, root_segment,
+    Comments, Placement, finish, first_known, inside, mask_comments, record,
+    resolve_python_relative, resolve_suffix, root_segment, symbols_from_sites,
 };
 use crate::patterns::literal_regex;
 use crate::symbols::{self, Grammar, push_site, text};
-use crate::{Candidate, UnresolvedImport};
+use crate::{Candidate, SymbolKind, UnresolvedImport};
 
 /// The files a Python module path can land on: a module is a `.py` file, or a
 /// package's `__init__.py`.
@@ -85,6 +85,12 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
+    );
+    parsed.symbols = symbols_from_sites(
+        tree.root_node(),
+        source.as_bytes(),
+        &parsed.export_sites,
+        &python_kind,
     );
     // A package's `__init__.py` imports its submodules to publish them.
     if is_init {
@@ -289,6 +295,23 @@ fn python_module(node: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
             _ => {}
         }
     }
+}
+
+/// The kind of a Python declaration node, for the symbols list. A `def`
+/// inside a class is a method; a module-level assignment is a constant.
+fn python_kind(node: Node, name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "function_definition" => {
+            if inside(node, &["class_definition"]) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        "class_definition" => SymbolKind::Class,
+        "assignment" if node.child_by_field_name("left") == Some(name) => SymbolKind::Const,
+        _ => return None,
+    })
 }
 
 /// What decides whether a module re-publishes the names it imports.
@@ -567,5 +590,56 @@ def _helper():
         assert!(!names.contains(&"_private".to_owned()));
         assert!(!names.contains(&"__init__".to_owned()));
         assert!(!names.contains(&"_helper".to_owned()));
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"
+MAX_RETRIES = 3
+
+
+@decorator
+def run(first: int, second: str = "x") -> bool:
+    """Doc."""
+    return True
+
+
+class Service(Base):
+    def handle(self, request):
+        pass
+"#;
+
+    #[test]
+    fn python_symbols_carry_kind_span_and_signature() {
+        let limit = symbol("app/a.py", SRC, "MAX_RETRIES");
+        assert_eq!((limit.kind, limit.span), (SymbolKind::Const, (2, 2)));
+        assert_eq!(limit.signature.as_deref(), Some("MAX_RETRIES"));
+        let run = symbol("app/a.py", SRC, "run");
+        assert_eq!((run.kind, run.span), (SymbolKind::Function, (5, 8)));
+        assert_eq!(
+            run.signature.as_deref(),
+            Some("def run(first: int, second: str = \"x\") -> bool")
+        );
+        let service = symbol("app/a.py", SRC, "Service");
+        assert_eq!((service.kind, service.span), (SymbolKind::Class, (11, 13)));
+        assert_eq!(service.signature.as_deref(), Some("class Service(Base)"));
+        let handle = symbol("app/a.py", SRC, "handle");
+        assert_eq!((handle.kind, handle.span), (SymbolKind::Method, (12, 13)));
+        assert_eq!(
+            handle.signature.as_deref(),
+            Some("def handle(self, request)")
+        );
+    }
+
+    #[test]
+    fn a_long_python_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument_{n}: int")).collect();
+        let source = format!("def long({}):\n    pass\n", params.join(", "));
+        let signature = symbol("a.py", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }

@@ -23,12 +23,12 @@ use tree_sitter::Node;
 use super::ParsedFile;
 use super::support::{
     Comments, Placement, finish, first_known, internal, mask_comments, record, resolve_relative,
-    resolve_suffix,
+    resolve_suffix, symbols_from_sites,
 };
 use crate::patterns::literal_regex;
 
-use crate::UnresolvedImport;
 use crate::symbols::{self, has_child_kind, push_field, push_site, text};
+use crate::{SymbolKind, UnresolvedImport};
 
 /// The files a specifier can land on, relative or resolved by module path.
 const EXTS: &[&str] = &["ts", "tsx", "js", "jsx"];
@@ -89,6 +89,12 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         imports,
         unresolved,
         symbols::error_count(tree.root_node()),
+    );
+    parsed.symbols = symbols_from_sites(
+        tree.root_node(),
+        source.as_bytes(),
+        &parsed.export_sites,
+        &ts_kind,
     );
     parsed.reexports = reexports;
     parsed
@@ -307,6 +313,45 @@ fn cjs_value(value: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     }
 }
 
+/// The kind of a TypeScript/JavaScript declaration node, for the symbols list.
+/// A `const f = () => …` is a function; a CommonJS `exports.x = …` takes its
+/// kind from the value.
+fn ts_kind(node: Node, name: Node) -> Option<SymbolKind> {
+    let value_kind = |value: Option<Node>| match value.map(|value| value.kind()) {
+        Some("arrow_function" | "function_expression" | "function" | "generator_function") => {
+            SymbolKind::Function
+        }
+        Some("class") => SymbolKind::Class,
+        _ => SymbolKind::Const,
+    };
+    Some(match node.kind() {
+        "class_declaration" | "abstract_class_declaration" => SymbolKind::Class,
+        "function_declaration" | "generator_function_declaration" => SymbolKind::Function,
+        "interface_declaration" => SymbolKind::Interface,
+        "type_alias_declaration" => SymbolKind::Type,
+        "enum_declaration" => SymbolKind::Enum,
+        "internal_module" | "module" => SymbolKind::Module,
+        "method_definition" | "method_signature" => SymbolKind::Method,
+        "public_field_definition" => value_kind(node.child_by_field_name("value")),
+        "lexical_declaration" | "variable_declaration" => {
+            let mut cursor = node.walk();
+            let declarator = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "variable_declarator")?;
+            value_kind(declarator.child_by_field_name("value"))
+        }
+        "assignment_expression"
+            if node.child_by_field_name("left").is_some_and(|left| {
+                left.id() == name.id()
+                    || name.parent().is_some_and(|parent| parent.id() == left.id())
+            }) =>
+        {
+            value_kind(node.child_by_field_name("right"))
+        }
+        _ => return None,
+    })
+}
+
 fn ts_class_members(body: Node, source: &[u8], out: &mut Vec<crate::ExportSite>) {
     let mut cursor = body.walk();
     for member in body.named_children(&mut cursor) {
@@ -454,5 +499,94 @@ function notExported() {}
             "var res = Object.create(proto);\nmodule.exports = res;\nres.send = function send() {};\n",
         );
         assert!(res.contains(&"send".to_owned()), "{res:?}");
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SRC: &str = r#"
+/** Docs. */
+export class Client<T> extends Base {
+  @dec()
+  send(body: string): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+export function connect(url: string, retries = 3): Client<string> {
+  return new Client();
+}
+
+export const TIMEOUT = 30;
+export const handler = async (event: Event): Promise<void> => {};
+export interface Options {
+  retries: number;
+}
+export type Handler<T> = (x: T) => void;
+export enum Level { Info, Warn }
+"#;
+
+    #[test]
+    fn typescript_symbols_carry_kind_span_and_signature() {
+        let client = symbol("src/a.ts", SRC, "Client");
+        assert_eq!((client.kind, client.span), (SymbolKind::Class, (3, 8)));
+        assert_eq!(
+            client.signature.as_deref(),
+            Some("export class Client<T> extends Base")
+        );
+        let send = symbol("src/a.ts", SRC, "send");
+        assert_eq!(send.kind, SymbolKind::Method);
+        assert_eq!(
+            send.signature.as_deref(),
+            Some("send(body: string): Promise<void>")
+        );
+        let connect = symbol("src/a.ts", SRC, "connect");
+        assert_eq!(
+            (connect.kind, connect.span),
+            (SymbolKind::Function, (10, 12))
+        );
+        assert_eq!(
+            connect.signature.as_deref(),
+            Some("export function connect(url: string, retries = 3): Client<string>")
+        );
+        let timeout = symbol("src/a.ts", SRC, "TIMEOUT");
+        assert_eq!((timeout.kind, timeout.span), (SymbolKind::Const, (14, 14)));
+        assert_eq!(timeout.signature.as_deref(), Some("export const TIMEOUT"));
+        assert_eq!(
+            symbol("src/a.ts", SRC, "handler").kind,
+            SymbolKind::Function
+        );
+        assert_eq!(
+            symbol("src/a.ts", SRC, "Options").kind,
+            SymbolKind::Interface
+        );
+        let handler_type = symbol("src/a.ts", SRC, "Handler");
+        assert_eq!(handler_type.kind, SymbolKind::Type);
+        assert_eq!(
+            handler_type.signature.as_deref(),
+            Some("export type Handler<T>")
+        );
+        assert_eq!(symbol("src/a.ts", SRC, "Level").kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn commonjs_symbols_are_functions_or_consts() {
+        let source = "exports.methods = ['get'];\nexports.run = function run(a) { return a };\n";
+        assert_eq!(
+            symbol("lib/a.js", source, "methods").kind,
+            SymbolKind::Const
+        );
+        assert_eq!(symbol("lib/a.js", source, "run").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn a_long_typescript_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument{n}: number")).collect();
+        let source = format!("export function long({}) {{}}\n", params.join(", "));
+        let signature = symbol("a.ts", &source, "long")
+            .signature
+            .expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }

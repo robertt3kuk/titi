@@ -439,6 +439,23 @@ pub(crate) mod test_support {
         let parsed = (row.parse)(path, source, &HashSet::new());
         Some(parsed.exports)
     }
+
+    /// The one symbol called `name` a module returns for `source`.
+    pub(crate) fn symbol(path: &str, source: &str, name: &str) -> crate::SymbolSite {
+        let all = symbols(path, source).unwrap_or_else(|| panic!("{path} parses"));
+        all.iter()
+            .find(|symbol| symbol.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no symbol {name} in {all:?}"))
+    }
+
+    /// The symbols a module returns for `source`, or `None` when no grammar is
+    /// linked for `path`.
+    pub(crate) fn symbols(path: &str, source: &str) -> Option<Vec<crate::SymbolSite>> {
+        let row = row_for_path(path)?;
+        row.grammar?;
+        Some((row.parse)(path, source, &HashSet::new()).symbols)
+    }
 }
 
 #[cfg(test)]

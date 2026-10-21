@@ -12,7 +12,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::ParsedFile;
-use super::support::{finish, first_known, internal, join, normalize_join, parent, record};
+use super::support::{
+    finish, first_known, inside, internal, join, normalize_join, parent, record, symbols_from_sites,
+};
+use crate::SymbolKind;
 use crate::symbols::{self, Grammar, has_child_kind, push_field, text};
 use crate::{Candidate, UnresolvedImport};
 
@@ -184,6 +187,7 @@ pub(super) fn parse(path: &str, source: &str, files: &HashSet<String>) -> Parsed
         unresolved,
         rust_errors(&tree, source),
     );
+    parsed.symbols = symbols_from_sites(tree.root_node(), bytes, &parsed.export_sites, &rust_kind);
     for list in [&mut reexports, &mut inherits, &mut external_uses] {
         list.sort();
         list.dedup();
@@ -218,6 +222,27 @@ fn local_item_names(root: Node, source: &[u8]) -> HashSet<String> {
         stack.extend(node.named_children(&mut cursor));
     }
     names
+}
+
+/// The kind of a Rust declaration node, for the symbols list.
+fn rust_kind(node: Node, _name: Node) -> Option<SymbolKind> {
+    Some(match node.kind() {
+        "function_item" | "function_signature_item" => {
+            if inside(node, &["impl_item", "trait_item"]) {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+        "macro_definition" => SymbolKind::Function,
+        "struct_item" | "union_item" => SymbolKind::Struct,
+        "enum_item" => SymbolKind::Enum,
+        "trait_item" => SymbolKind::Trait,
+        "const_item" | "static_item" => SymbolKind::Const,
+        "type_item" | "associated_type" => SymbolKind::Type,
+        "mod_item" => SymbolKind::Module,
+        _ => return None,
+    })
 }
 
 /// Tree-sitter `ERROR` nodes, with the pinned grammar's `&raw` token ambiguity
@@ -754,5 +779,71 @@ pub mod inner { pub fn nested() {} }
     fn a_file_with_a_syntax_error_still_yields_what_parsed() {
         let names = names("src/lib.rs", "pub fn first() {}\npub fn second( {\n");
         assert!(names.contains(&"first".to_owned()), "{names:?}");
+    }
+
+    use crate::SymbolKind;
+    use crate::lang::test_support::symbol;
+
+    const SIGS: &str = r#"
+/// Docs are not part of the signature.
+#[derive(Debug)]
+pub struct Engine<T> where T: Clone {
+    field: T,
+}
+
+impl<T: Clone> Engine<T> {
+    /// A method.
+    #[inline]
+    pub fn start(&self, id: u32) -> Result<(), Error>
+    where
+        T: Send,
+    {
+        Ok(())
+    }
+}
+
+pub const LIMIT: usize = 24;
+pub type Handler = fn(u32) -> u32;
+pub trait Run { fn go(&self); }
+pub fn free() {}
+"#;
+
+    #[test]
+    fn rust_symbols_carry_kind_span_and_signature() {
+        let engine = symbol("src/lib.rs", SIGS, "Engine");
+        assert_eq!(engine.kind, SymbolKind::Struct);
+        assert_eq!(engine.span, (4, 6));
+        assert_eq!(
+            engine.signature.as_deref(),
+            Some("pub struct Engine<T> where T: Clone")
+        );
+        let start = symbol("src/lib.rs", SIGS, "start");
+        assert_eq!(start.kind, SymbolKind::Method);
+        assert_eq!(start.span, (11, 16));
+        assert_eq!(
+            start.signature.as_deref(),
+            Some("pub fn start(&self, id: u32) -> Result<(), Error> where T: Send")
+        );
+        let limit = symbol("src/lib.rs", SIGS, "LIMIT");
+        assert_eq!((limit.kind, limit.span), (SymbolKind::Const, (19, 19)));
+        assert_eq!(limit.signature.as_deref(), Some("pub const LIMIT: usize"));
+        let handler = symbol("src/lib.rs", SIGS, "Handler");
+        assert_eq!(handler.kind, SymbolKind::Type);
+        assert_eq!(handler.signature.as_deref(), Some("pub type Handler"));
+        assert_eq!(symbol("src/lib.rs", SIGS, "Run").kind, SymbolKind::Trait);
+        assert_eq!(
+            symbol("src/lib.rs", SIGS, "free").kind,
+            SymbolKind::Function
+        );
+    }
+
+    #[test]
+    fn a_long_rust_signature_is_cut_to_the_limit() {
+        let params: Vec<String> = (0..30).map(|n| format!("argument_{n}: u64")).collect();
+        let source = format!("pub fn long({}) {{}}\n", params.join(", "));
+        let long = symbol("src/lib.rs", &source, "long");
+        let signature = long.signature.expect("a signature");
+        assert_eq!(signature.chars().count(), crate::MAX_SIGNATURE);
+        assert!(signature.ends_with('…'), "{signature}");
     }
 }
