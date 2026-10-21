@@ -62,6 +62,12 @@ call may hold a turn before it is handed to the background; unset keeps
 larger is refused at startup. TITI_BASH_BACKGROUND_MS overrides it
 when set.
 
+agent.maxToolRounds in the agent config.yml or project .titi/config.yml
+(project wins) is how many tool rounds a turn may spend: an integer from
+1 to 500, unset keeps 100. At the limit the model is asked for a summary
+instead of the turn failing. agent.subagentMaxToolRounds is the same for
+one subagent; unset keeps 40. Anything else is refused at startup.
+
 In the chat: Enter sends, and steers while a turn is running. Ctrl+C stops
 the turn; press it twice to leave. A bare exit (or quit, or q) leaves too:
 straight away before the first turn, and on a second Enter once the session

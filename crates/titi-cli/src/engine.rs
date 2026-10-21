@@ -759,6 +759,31 @@ pub fn genome_limit_from(settings: &titi_config::settings::Settings) -> usize {
         .map_or(24, |limit| limit as usize)
 }
 
+/// `agent.maxToolRounds` and `agent.subagentMaxToolRounds` onto the config.
+///
+/// Unset keeps the engine's defaults (100 and 40). A value that is zero, past
+/// 500 or not a whole number refuses startup by name, like the other bounds
+/// that are not a latch: a cap nobody meant is worse than an error.
+pub fn apply_tool_round_limits(
+    config: &mut EngineConfig,
+    settings: &titi_config::settings::Settings,
+) -> Result<(), String> {
+    use titi_config::settings::{AGENT_MAX_TOOL_ROUNDS_KEY, AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY};
+    if let Some(rounds) = settings
+        .tool_round_limit(AGENT_MAX_TOOL_ROUNDS_KEY)
+        .map_err(|error| error.to_string())?
+    {
+        config.max_tool_rounds = rounds;
+    }
+    if let Some(rounds) = settings
+        .tool_round_limit(AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY)
+        .map_err(|error| error.to_string())?
+    {
+        config.agent_rounds = rounds;
+    }
+    Ok(())
+}
+
 /// Whether the genome prompt map is enabled from settings; `genome.enabled` as a boolean.
 ///
 /// Missing key → true (default on). JSON bool true/false → that. String `on`/`true`/`yes` →
@@ -1016,6 +1041,7 @@ pub fn start_engine_with(
             .auto_background_threshold()
             .map_err(|error| error.to_string())?;
         engine_config.background_after = Some(titi_tools::background_after_with(threshold));
+        apply_tool_round_limits(&mut engine_config, settings)?;
     }
     let mut tools = ToolRegistry::new();
     // One cache for the main turn and every subagent it spawns.
@@ -1125,6 +1151,37 @@ pub fn start_engine_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two round limits reach the engine config; unset keeps the engine's
+    /// defaults and a bad value is refused by name.
+    #[test]
+    fn the_tool_round_settings_reach_the_engine_config() {
+        use titi_config::settings::{
+            AGENT_MAX_TOOL_ROUNDS_KEY, AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY, Settings,
+        };
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+
+        let mut config = EngineConfig::new("primary");
+        apply_tool_round_limits(&mut config, &settings).unwrap();
+        assert_eq!((config.max_tool_rounds, config.agent_rounds), (100, 40));
+
+        settings
+            .set_runtime(AGENT_MAX_TOOL_ROUNDS_KEY, 250u64.into())
+            .unwrap();
+        settings
+            .set_runtime(AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY, 7u64.into())
+            .unwrap();
+        apply_tool_round_limits(&mut config, &settings).unwrap();
+        assert_eq!((config.max_tool_rounds, config.agent_rounds), (250, 7));
+
+        settings
+            .set_runtime(AGENT_MAX_TOOL_ROUNDS_KEY, 501u64.into())
+            .unwrap();
+        let error = apply_tool_round_limits(&mut config, &settings).unwrap_err();
+        assert!(error.contains("agent.maxToolRounds"), "{error}");
+    }
 
     /// The session's starting model: unset is the first available one, a pin
     /// that resolves is the session's, and a pin that does not is the default

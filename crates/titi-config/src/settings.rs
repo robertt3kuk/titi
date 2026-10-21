@@ -348,6 +348,22 @@ pub const BASH_AUTO_BACKGROUND_KEY: &str = "bash.autoBackground.thresholdMs";
 /// a typo (a seconds value in a milliseconds slot) and is refused.
 pub const MAX_AUTO_BACKGROUND_MS: u64 = 3_600_000;
 
+/// How many tool rounds the main turn may spend before it is asked to wrap
+/// up: `agent.maxToolRounds`.
+///
+/// Unset means the engine default, so this crate owns the name and the
+/// bound ([`MAX_TOOL_ROUNDS`]), not the number. [`Settings::tool_round_limit`]
+/// reads it.
+pub const AGENT_MAX_TOOL_ROUNDS_KEY: &str = "agent.maxToolRounds";
+
+/// How many tool rounds one subagent may spend: `agent.subagentMaxToolRounds`.
+/// Bounded like [`AGENT_MAX_TOOL_ROUNDS_KEY`].
+pub const AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY: &str = "agent.subagentMaxToolRounds";
+
+/// Largest tool-round limit either key accepts. Past it the cap is not a
+/// bound a runaway loop could be stopped by, so a larger number is refused.
+pub const MAX_TOOL_ROUNDS: u32 = 500;
+
 /// How many lines a paste must reach before the screen offers a menu of ways
 /// to attach it: `paste.menuThreshold`.
 ///
@@ -509,6 +525,33 @@ impl Settings {
             .chain(self.overlays.iter().rev())
             .chain(std::iter::once(&self.global))
             .find_map(|layer| lookup(layer, key))
+    }
+
+    /// A tool-round limit key ([`AGENT_MAX_TOOL_ROUNDS_KEY`] or
+    /// [`AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY`]) as a round count.
+    ///
+    /// `Ok(None)` when the key is unset (the engine's default, then).
+    /// `Ok(Some(n))` for an integer from 1 to [`MAX_TOOL_ROUNDS`]; anything
+    /// else is a [`SettingsError::Key`] naming the key, so a typo is refused
+    /// rather than turned into a bound nobody meant.
+    pub fn tool_round_limit(&self, key: &str) -> Result<Option<u32>, SettingsError> {
+        let refuse = |reason: String| SettingsError::Key {
+            key: key.to_owned(),
+            reason,
+        };
+        let Some(value) = self.get(key) else {
+            return Ok(None);
+        };
+        let rounds = value
+            .as_u64()
+            .and_then(|rounds| u32::try_from(rounds).ok())
+            .filter(|rounds| (1..=MAX_TOOL_ROUNDS).contains(rounds))
+            .ok_or_else(|| {
+                refuse(format!(
+                    "expected a whole number of rounds from 1 to {MAX_TOOL_ROUNDS}"
+                ))
+            })?;
+        Ok(Some(rounds))
     }
 
     /// The `bash.autoBackground.thresholdMs` key as a duration.
@@ -1122,6 +1165,44 @@ mod tests {
                 matches!(error, SettingsError::Key { .. }),
                 "{bad}: {error:?}"
             );
+        }
+    }
+
+    /// `agent.maxToolRounds` and `agent.subagentMaxToolRounds` read as round
+    /// counts from 1 to 500, are absent when unset, and are refused by name
+    /// when zero, past the bound, or not an integer.
+    #[test]
+    fn the_tool_round_limits_are_read_and_refused_out_of_range() {
+        let agent = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let mut settings = Settings::load(agent.path(), project.path(), &[]).unwrap();
+        for key in [
+            AGENT_MAX_TOOL_ROUNDS_KEY,
+            AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY,
+        ] {
+            assert_eq!(settings.tool_round_limit(key).unwrap(), None, "{key}");
+            for (set, want) in [
+                (1u64, 1u32),
+                (100, 100),
+                (MAX_TOOL_ROUNDS as u64, MAX_TOOL_ROUNDS),
+            ] {
+                settings.set_runtime(key, Value::from(set)).unwrap();
+                assert_eq!(settings.tool_round_limit(key).unwrap(), Some(want), "{key}");
+            }
+            for bad in [
+                Value::from(0u64),
+                Value::from(MAX_TOOL_ROUNDS as u64 + 1),
+                Value::from(-3i64),
+                Value::from(2.5f64),
+                Value::String("many".into()),
+            ] {
+                settings.set_runtime(key, bad.clone()).unwrap();
+                let error = settings.tool_round_limit(key).unwrap_err();
+                assert!(
+                    matches!(&error, SettingsError::Key { key: named, .. } if named == key),
+                    "{key} {bad}: {error:?}"
+                );
+            }
         }
     }
 

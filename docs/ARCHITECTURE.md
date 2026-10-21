@@ -331,6 +331,16 @@ through the effective view into `EngineConfig::background_after`; a value of 0
 or past an hour refuses startup by name, and `TITI_BASH_BACKGROUND_MS` overrides
 the key when set.
 
+Two more keys bound the tool loop: `agent.maxToolRounds` (1 to 500, default 100;
+`EngineConfig::max_tool_rounds`) and `agent.subagentMaxToolRounds` (1 to 500,
+default 40; `agent_rounds`). At the main turn's limit nothing is failed: one
+last request goes out with tool calls forbidden (`WireRequest::forbid_tool_calls`,
+tools still declared so the cached prefix and Anthropic's tool-history rule hold)
+and a note asking for what is done and what is left; its answer streams and the
+turn ends with a notice. `tool_budget::LoopWatch` appends a one-line nudge, once
+per turn, to a tool result when the same call has come back with the same result
+three times, or four rounds in a row only re-read unchanged files.
+
 **Why it matters:** `git status` after a session shows nothing new, keys
 cannot end up in a commit, profiles are isolated from each other, and a
 clone carries no one's chat history or credentials.

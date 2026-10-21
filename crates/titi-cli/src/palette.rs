@@ -269,6 +269,16 @@ pub(crate) const SETTINGS: &[Setting] = &[
         Values::Free,
     ),
     setting(
+        cfg::AGENT_MAX_TOOL_ROUNDS_KEY,
+        "tool rounds a turn may spend, 1 to 500",
+        Values::Free,
+    ),
+    setting(
+        cfg::AGENT_SUBAGENT_MAX_TOOL_ROUNDS_KEY,
+        "tool rounds a subagent may spend, 1 to 500",
+        Values::Free,
+    ),
+    setting(
         cfg::PASTE_MENU_THRESHOLD_KEY,
         "lines before a paste offers a menu",
         Values::Free,
