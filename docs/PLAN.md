@@ -10,7 +10,7 @@
 ## M1 — Core Runtime
 - Темы: sessions-persistence, trajectory-gepa, compaction-context, system-prompt-soul, memory-learning.
 - Код: UI-независимый `titi-engine`, `EngineCommand`/`EngineEvent`, bounded provider/tool loop, сессии + персистентность, trajectory, compaction, SOUL и memory.
-- Порядок: engine protocol → provider registry/credentials → TUI vertical slice → tool loop → persistence/headless. GPUI начинается только после рабочего TUI/headless пути.
+- Порядок: engine protocol → provider registry/credentials → TUI vertical slice → tool loop → persistence/headless. GPUI-поверхности не будет (владелец отказался 2026-11-02).
 - DoD: реальный prompt стримится через engine; cancel работает; transient fallback доказан тестом; permanent errors не повторяются; сессия переживает рестарт.
 
 ## M2 — Providers
@@ -49,11 +49,10 @@
 - Код: пер-бот домашние папки, SOUL.md identity, bot-to-bot сообщения, обмен опытом (memory/skills), экспорт/импорт души, проактивный cron, каналы (Telegram первым).
 - DoD: два бота обмениваются сообщениями и переносят скилл.
 
-## M9 — GPUI Workbench + Packaging
-- Темы: gui-gpui, packaging-headless.
-- Код: `titi-desktop` на Zed GPUI поверх того же `EngineCommand`/`EngineEvent`; Work, Files, Changes, Atlas, Tools, Costs, Settings, Help; RPC/headless, packaging/signing.
-- Запрет: никаких provider/tool/session реализаций внутри desktop crate.
-- DoD: TUI, headless и GPUI управляют одной engine-сессией; RPC-клиент управляет turn; .app собирается и подписывается.
+## M9 — Packaging + Headless/RPC
+- Тема: packaging-headless.
+- Код: RPC/headless поверх `EngineCommand`/`EngineEvent`, packaging/signing. GPUI убран: владелец отказался от него 2026-11-02.
+- DoD: RPC-клиент управляет turn; собирается и подписывается релизный артефакт.
 
 ## Спринты
 Собираются позже из DoD тем: спринт = подмножество задач одного milestone, закрываемое за итерацию, с общим интеграционным прогоном в конце (runbook в CONVEYOR.md).

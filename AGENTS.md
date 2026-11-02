@@ -2,7 +2,7 @@
 
 titi is a terminal coding agent written in Rust: one loop, one session, one
 set of tools. The same engine drives a full-screen TUI and a headless JSONL
-interface; a native GPUI window comes later. Public repo `robertt3kuk/titi`
+interface. There is no GUI surface (owner decision, 2026-11-02). Public repo `robertt3kuk/titi`
 with two owners (Beka and nvimq); everyone works straight on `master`.
 
 omp, Codex, Cline, grok, and Antigravity load this file on their own. Claude
@@ -111,7 +111,8 @@ agent is the supervisor; its playbook is skill `supervisor-review`.
 
 - Empryo is a closed, untrusted binary: never vendor it, run it, or download
   it. Re-implement its ideas in open Rust only.
-- PLAN gates GPUI (M9); do not start it early. M6 (skills, commands, hooks,
+- No GPUI or native desktop surface: the owner dropped it on 2026-11-02.
+  M6 (skills, commands, hooks,
   MCP) was opened by the owner on 2026-10-21, layer by layer as
   `docs/research/extensibility-marketplace/design-2026-10.md` lays out:
   code-bearing project config (hooks, MCP servers) runs only with the user's

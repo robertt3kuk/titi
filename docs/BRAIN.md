@@ -9,8 +9,8 @@
 
 A terminal coding agent in Rust that follows a reference product's model
 (one loop, one session, one tool set) without Electron. One UI-free engine
-(`titi-engine`) serves the TUI and headless JSONL; a GPUI desktop comes later
-(PLAN M9). Built by two owners pushing straight to `master`.
+(`titi-engine`) serves the TUI and headless JSONL; no GUI surface (the owner dropped
+GPUI on 2026-11-02). Built by two owners pushing straight to `master`.
 
 ## Current state — honest scorecard
 

@@ -6,7 +6,7 @@
 
 ## Активное направление
 
-Текущее направление разработки — функциональная модель reference product с единым Rust engine и нативным GPUI desktop. Точки возобновления для любой модели:
+Текущее направление разработки — функциональная модель reference product с единым Rust engine и без GUI: GPUI снят владельцем 2026-11-02 (тема 19 — история). Точки возобновления для любой модели:
 
 - [карта тем, граф зависимостей и порядок](README.md) — этот файл;
 - [текущий checkpoint, NEXT и риски](STATE.md);
@@ -34,7 +34,7 @@
 | 16 | [mcp](mcp/README.md) | MCP клиент/сервер | STATE.md |
 | 17 | [agents-hub-security](agents-hub-security/README.md) | Subagents, hub, checkpoint, actor identity | STATE.md |
 | 18 | [bot-network-soul](bot-network-soul/README.md) | Сеть ботов, SOUL, обмен опытом, каналы | STATE.md |
-| 19 | [gui-gpui](gui-gpui/README.md) | GUI (gpui) поверх общего ядра | STATE.md |
+| 19 | [gui-gpui](gui-gpui/README.md) | GUI (gpui) — снято владельцем 2026-11-02, история | — |
 | 20 | [packaging-headless](packaging-headless/README.md) | CLI, установка, RPC/SDK/collab | STATE.md |
 
 Статусы ведутся в [STATE.md](STATE.md) — единая точка возобновления.
@@ -78,9 +78,8 @@ graph TD
     SPS --> BNS
     CFG --> TUI[tui-renderer]
     TUI --> AUX[agent-ux]
-    TUI --> GUI[gui-gpui]
     AHS --> PAK[packaging-headless]
-    GUI --> PAK
+    TUI --> PAK
 ```
 
 Топологический порядок реализации: config-settings, secrets-env → sessions-persistence, providers-streaming → … (см. PLAN.md).

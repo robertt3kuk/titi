@@ -24,7 +24,7 @@ then report what you checked.
 ## Architecture
 - [ ] Surfaces (`titi-cli`, `titi-tui`) talk to the engine only via
       `EngineCommand`/`EngineEvent`.
-- [ ] No GPUI or MCP/hooks runtime work (gated by PLAN).
+- [ ] No GPUI/desktop surface (dropped 2026-11-02); no MCP/hooks runtime work beyond what PLAN opens.
 - [ ] Nothing from the Empryo binary vendored or invoked.
 
 ## Safety

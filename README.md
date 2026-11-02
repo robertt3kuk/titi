@@ -1,6 +1,6 @@
 # titi
 
-A terminal coding agent in Rust. It follows the product model of its reference product, omp — one loop, one session, one set of tools — without Electron. The same engine drives a full-screen terminal and a headless JSONL interface. A native GPUI window comes later.
+A terminal coding agent in Rust. It follows the product model of its reference product, omp — one loop, one session, one set of tools — without Electron. The same engine drives a full-screen terminal and a headless JSONL interface. There is no GUI window: the owner dropped the GPUI plan on 2026-11-02.
 
 [English](#english) · [Русский](#русский)
 
@@ -235,7 +235,7 @@ The engine, streaming, model switching and a fallback chain across providers, to
 
 ### What is not
 
-A desktop window on GPUI (M9). MCP, hooks, and a skills runtime that runs anything: a skill is found and its text is expanded, never executed (M6). A shipped price table: no built-in model carries a price, so a money cap over one is refused by name rather than converted at a rate nobody wrote down. A model you declare may carry its own `price` (see above), and then the cap is enforced against it.
+A desktop window (dropped by the owner on 2026-11-02). MCP, hooks, and a skills runtime that runs anything: a skill is found and its text is expanded, never executed (M6). A shipped price table: no built-in model carries a price, so a money cap over one is refused by name rather than converted at a rate nobody wrote down. A model you declare may carry its own `price` (see above), and then the cap is enforced against it.
 
 ### Safe to publish
 
@@ -260,7 +260,7 @@ CI runs fmt, clippy (informational), the workspace tests, and a smoke of the rea
 
 ## Русский
 
-Терминальный агент на Rust. Продуктовая модель его reference product, omp: один цикл, одна сессия, одни инструменты — без Electron. Тот же движок обслуживает полноэкранный терминал и headless JSONL. Нативное окно на GPUI ещё впереди.
+Терминальный агент на Rust. Продуктовая модель его reference product, omp: один цикл, одна сессия, одни инструменты — без Electron. Тот же движок обслуживает полноэкранный терминал и headless JSONL. Окна GUI не будет: владелец отказался от GPUI 2026-11-02.
 
 ### Запуск
 
@@ -481,7 +481,7 @@ cargo run -p titi-atlas --example map -- . 40
 
 ### Чего ещё нет
 
-Настольного окна на GPUI (M9). MCP, хуков и рантайма скиллов, который что-то запускает: скилл находится, его текст разворачивается, но не исполняется (M6). Прайс-таблицы в поставке: ни одна встроенная модель не несёт цены, поэтому денежный лимит по ней отклоняется с названием модели, а не пересчитывается по ставке, которую никто не писал. Объявленная вами модель может нести свою `price` (см. выше), и тогда лимит по ней соблюдается.
+Настольного окна (владелец отказался 2026-11-02). MCP, хуков и рантайма скиллов, который что-то запускает: скилл находится, его текст разворачивается, но не исполняется (M6). Прайс-таблицы в поставке: ни одна встроенная модель не несёт цены, поэтому денежный лимит по ней отклоняется с названием модели, а не пересчитывается по ставке, которую никто не писал. Объявленная вами модель может нести свою `price` (см. выше), и тогда лимит по ней соблюдается.
 
 ### Можно публиковать
 
