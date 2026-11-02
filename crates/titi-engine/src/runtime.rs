@@ -1024,7 +1024,7 @@ pub enum EngineError {
     CommandChannelClosed,
 }
 
-/// Surface-side handle. TUI, GPUI, and headless RPC use the same contract.
+/// Surface-side handle. TUI and headless RPC use the same contract.
 pub struct Engine {
     commands: mpsc::Sender<EngineCommand>,
     events: mpsc::Receiver<EngineEvent>,

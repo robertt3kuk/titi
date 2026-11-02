@@ -250,7 +250,7 @@ pub enum EngineCommand {
     Shutdown,
 }
 
-/// UI-independent events rendered by TUI, GPUI, or serialized by headless RPC.
+/// UI-independent events rendered by the TUI or serialized by headless RPC.
 ///
 /// `#[non_exhaustive]`: a surface matching exhaustively must handle an
 /// unknown variant instead of failing to compile when one is added. The

@@ -1,4 +1,4 @@
-//! UI-independent agent runtime shared by terminal, desktop, and headless surfaces.
+//! UI-independent agent runtime shared by terminal and headless surfaces.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
